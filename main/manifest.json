@@ -1,10 +1,10 @@
 {
     "branch":  "main",
-    "generated":  "2026-01-09T13:05:16.0679881-05:00",
-    "commit":  "c3f204ed37c1725268e7d1f89ffe450df69ea997",
+    "generated":  "2026-01-09T13:27:37.6859668-05:00",
+    "commit":  "37e79b1e8c50d605a3387ec707c323a414d807c5",
     "version":  "1.0",
     "files":  {
-                  "src/Win11Config.App.ps1":  "fb0a0d70ef095270c65d9977ab5f8e1350e6ead97d6f4074dd70c1c93dbd4732",
+                  "src/Win11Config.App.ps1":  "7369ba8f7c1346c4544580ad3f45151d78fdbdab1aa7b581526193445be0bb88",
                   "src/Modules/Paths.psm1":  "d56f6bc8e942b2f0e568f84c5a5503e823abd6a330532a93938766205bb373d3",
                   "src/VERSION.psd1":  "ff6ee1fdba00afd4e7713d356ed92d752ac386a4528909aa02e29e5c68778622",
                   "src/Modules/Console.psm1":  "7ee2925c69a762ee3fb7d6e98195928f6b1ce103c1d526411b1087d8701dcc63",

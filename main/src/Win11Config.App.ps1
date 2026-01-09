@@ -196,19 +196,14 @@ try {
     return
 }
 
-# Configure GitHub authentication
+# Configure GitHub authentication (optional - only needed for some features)
 # Backward compatibility: alias GITHUB_TOKEN to WINCONFIG_GITHUB_TOKEN
 if (-not $env:WINCONFIG_GITHUB_TOKEN -and $env:GITHUB_TOKEN) {
     $env:WINCONFIG_GITHUB_TOKEN = $env:GITHUB_TOKEN
 }
 
 $GitHubToken = $env:WINCONFIG_GITHUB_TOKEN
-if (-not $GitHubToken) {
-    throw "Missing required environment variable: WINCONFIG_GITHUB_TOKEN"
-}
-$headers = @{
-    Authorization = "Bearer $GitHubToken"
-}
+# Token is optional - features requiring it will check and prompt if needed
 
 # Enable DPI awareness
 if (-not ("DPIAware" -as [type])) {
@@ -973,6 +968,16 @@ $buttonHandlers = @{
         $updateForm.ShowDialog()
     }
 "Windows Insider" = {
+    if (-not $GitHubToken) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "This feature requires a GitHub token.`n`nSet WINCONFIG_GITHUB_TOKEN environment variable and restart.",
+            "Token Required",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        return
+    }
+
     $headers = @{
         Authorization = "Bearer $GitHubToken"
         Accept = "application/vnd.github.v3.raw"
@@ -984,7 +989,7 @@ $buttonHandlers = @{
 
     try {
         $ProgressPreference = 'SilentlyContinue'
-        
+
         $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Verbose
         
         # Fix the typo in the script content
