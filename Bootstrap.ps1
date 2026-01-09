@@ -521,13 +521,10 @@ try {
     # (inherits to child process)
     $env:WINCONFIG_ITERATION = $iterationValue
 
-    # Execute the entry point script with explicit ExecutionPolicy bypass
-    # This ensures scripts run regardless of system ExecutionPolicy settings
-    $exitCode = 0
-    $proc = Start-Process -FilePath "powershell.exe" `
-        -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$entryPointPath`"" `
-        -Wait -PassThru -NoNewWindow
-    $exitCode = $proc.ExitCode
+    # Execute the entry point script
+    # ExecutionPolicy is already bypassed (user ran Bootstrap.ps1 with -ExecutionPolicy Bypass)
+    # Using & preserves loaded modules (ModuleLoader) in the current session
+    & $entryPointPath
 } catch {
     Write-Host ""
     Write-Status "Execution error: $($_.Exception.Message)" "ERROR"
