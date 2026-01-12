@@ -4988,6 +4988,9 @@ $form.Add_FormClosing({
             Rename-Item -Path $tempFilePath -NewName $exportFileName -Force
 
             Write-Host "[Analytics Export] SUCCESS - published: $exportFileName (server will cleanup)" -ForegroundColor Green
+            if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
+                Write-WinConfigLog -Action "AnalyticsExport" -Message "Exported diagnostics to $DiagnosticsIngestPath\$exportFileName"
+            }
 
             # Register success in session timeline
             $script:DiagnosticActions += [PSCustomObject]@{
@@ -5003,6 +5006,9 @@ $form.Add_FormClosing({
             # Visible failure - register WARN in session timeline
             $errorMsg = $_.Exception.Message
             Write-Host "[Analytics Export] FAILED: $errorMsg" -ForegroundColor Red
+            if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
+                Write-WinConfigLog -Action "AnalyticsExport" -Message "FAILED to export diagnostics: $errorMsg"
+            }
             if ($errorMsg -match "path" -or $errorMsg -match "access" -or $errorMsg -match "network") {
                 Register-ExportWarning -Summary "Analytics export failed: ingest path not writable"
             } else {
