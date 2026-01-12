@@ -1687,6 +1687,9 @@ $buttonHandlers = @{
     }
 }
 "Domain, IP && Ports Test" = {
+    # Import in click handler runspace (WinForms delegates don't inherit modules)
+    Import-Module (Join-Path $PSScriptRoot 'Modules\DiagnosticTypes.psm1') -Force
+
     # GUARD: Verify required Console module functions are available (DIAG-GUI-001)
     if (-not (Get-Command Initialize-WinConfigGuiDiagnosticBox -ErrorAction SilentlyContinue)) {
         [System.Windows.Forms.MessageBox]::Show(
@@ -3838,6 +3841,9 @@ foreach ($tabPage in $tabControl.TabPages) {
 
             $btnProbe = New-Button "Run 30-Second Probe"
             $btnProbe.Add_Click({
+                # Import in click handler runspace (WinForms delegates don't inherit modules)
+                Import-Module (Join-Path $PSScriptRoot 'Modules\DiagnosticTypes.psm1') -Force
+
                 $btnProbe.Enabled = $false
                 $btnProbe.Text = "Probe Running..."
 
@@ -4996,6 +5002,9 @@ $form.Add_FormClosing({
 # Populates deferred tabs on first selection (Bluetooth, Diagnostics)
 # ============================================================================
 $tabControl.Add_SelectedIndexChanged({
+    # Import in event handler runspace (WinForms delegates don't inherit modules)
+    Import-Module (Join-Path $PSScriptRoot 'Modules\DiagnosticTypes.psm1') -Force
+
     $selectedTab = $tabControl.SelectedTab
     if ($null -eq $selectedTab) { return }
 
