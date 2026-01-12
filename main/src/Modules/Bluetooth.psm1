@@ -1,6 +1,12 @@
 # Bluetooth.psm1 - Bluetooth audio diagnostics for WinConfig
 # Provides diagnostics, service control, and Kodi audio path analysis
 
+# Import DiagnosticResult type constants
+$script:DiagnosticsTypesPath = Join-Path $PSScriptRoot "DiagnosticTypes.psm1"
+if (Test-Path $script:DiagnosticsTypesPath) {
+    Import-Module $script:DiagnosticsTypesPath -Force -ErrorAction SilentlyContinue
+}
+
 # Import ExecutionIntent for mutation guards (must be loaded by caller first)
 # This module enforces the non-mutating diagnostic contract
 $ExecutionIntentModule = Get-Module -Name ExecutionIntent
@@ -1240,7 +1246,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "NO_ADAPTER"
                     Title = "No Bluetooth Adapter"
-                    Severity = "FAIL"
+                    Result = "FAIL"
                     AppliesTo = "Hardware"
                     Evidence = @("No Bluetooth radio detected on this system")
                     ActionHint = "Verify Bluetooth hardware is installed or enable in BIOS"
@@ -1250,7 +1256,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "ADAPTER_DISABLED"
                     Title = "Bluetooth Adapter Disabled"
-                    Severity = "FAIL"
+                    Result = "FAIL"
                     AppliesTo = "Hardware"
                     Evidence = @("Bluetooth adapter status: $($Diagnostics.Adapter.Status)")
                     ActionHint = "Enable Bluetooth in Windows Settings or Device Manager"
@@ -1260,7 +1266,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "AUDIO_SERVICE_DEAD"
                     Title = "Windows Audio Service Stopped"
-                    Severity = "FAIL"
+                    Result = "FAIL"
                     AppliesTo = "Audio"
                     Evidence = @("Audiosrv service is not running")
                     ActionHint = "Restart Windows Audio service"
@@ -1270,7 +1276,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "PASSTHROUGH_BT_CONFLICT"
                     Title = "Passthrough Incompatible with Bluetooth"
-                    Severity = "FAIL"
+                    Result = "FAIL"
                     AppliesTo = "Kodi Audio"
                     Evidence = @("Kodi passthrough enabled", "Bluetooth device selected", "Bitstream audio requires digital connection")
                     ActionHint = "Disable Kodi passthrough or switch to wired audio output"
@@ -1281,7 +1287,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "HFP_ACTIVE"
                     Title = "Hands-Free Profile Active"
-                    Severity = "WARN"
+                    Result = "WARN"
                     AppliesTo = "Audio Quality"
                     Evidence = @("Device: $($hfpDevice.Name)", "HFP provides mono 8kHz audio", "Stereo A2DP profile preferred")
                     ActionHint = "Switch to Stereo output in Windows Sound settings"
@@ -1291,7 +1297,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "DEFAULT_IS_HFP"
                     Title = "Default Playback is Hands-Free"
-                    Severity = "WARN"
+                    Result = "WARN"
                     AppliesTo = "Audio Quality"
                     Evidence = @("Default device: $($Diagnostics.DefaultPlayback.RegistryDevice)", "HFP mode has reduced audio quality")
                     ActionHint = "Set Stereo variant as default in Sound settings"
@@ -1301,7 +1307,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "WASAPI_BT_RISK"
                     Title = "WASAPI Mode with Bluetooth"
-                    Severity = "WARN"
+                    Result = "WARN"
                     AppliesTo = "Stability"
                     Evidence = @("Kodi using WASAPI output", "Bluetooth device active", "Exclusive mode may cause audio dropouts")
                     ActionHint = "Change Kodi to DirectSound: Default output"
@@ -1311,7 +1317,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "FREQUENT_DISCONNECTS"
                     Title = "Frequent Bluetooth Disconnects"
-                    Severity = "WARN"
+                    Result = "WARN"
                     AppliesTo = "Stability"
                     Evidence = @("$($Diagnostics.EventLogHints.DisconnectEvents) disconnect events in last 60 min", "May indicate interference or driver issues")
                     ActionHint = "Move closer to source or update Bluetooth driver"
@@ -1322,7 +1328,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "GHOST_ENDPOINTS"
                     Title = "Stale Audio Endpoints"
-                    Severity = "WARN"
+                    Result = "WARN"
                     AppliesTo = "Device Routing"
                     Evidence = @("$ghostCount disconnected Bluetooth audio endpoint(s)", "May cause routing confusion")
                     ActionHint = "Use 'Remove Stale BT Audio Endpoints' to clean up"
@@ -1332,7 +1338,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "BTHSERV_STOPPED"
                     Title = "Bluetooth Service Stopped"
-                    Severity = "WARN"
+                    Result = "WARN"
                     AppliesTo = "Connectivity"
                     Evidence = @("Bluetooth Support Service (bthserv) not running")
                     ActionHint = "Use 'Restart Bluetooth + Audio Services' button"
@@ -1342,7 +1348,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "BTAG_STOPPED"
                     Title = "Bluetooth Audio Gateway Stopped"
-                    Severity = "WARN"
+                    Result = "WARN"
                     AppliesTo = "Audio Routing"
                     Evidence = @("BTAGService not running", "May affect audio device discovery")
                     ActionHint = "Use 'Restart Bluetooth + Audio Services' button"
@@ -1352,7 +1358,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "EVENT_LOG_ERRORS"
                     Title = "Bluetooth Errors in Event Log"
-                    Severity = "INFO"
+                    Result = "WARN"
                     AppliesTo = "Diagnostics"
                     Evidence = @("$($Diagnostics.EventLogHints.Count) relevant events in last 60 min", "Check Advanced Details for specifics")
                     ActionHint = $null
@@ -1364,7 +1370,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "SAMPLERATE_MISMATCH"
                     Title = "Audio Sample Rate Mismatch"
-                    Severity = "WARN"
+                    Result = "WARN"
                     AppliesTo = "Audio Quality"
                     Evidence = @(
                         "Kodi: $($sr.KodiSampleRate) Hz",
@@ -1378,7 +1384,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "HFP_HIJACK_RISK"
                     Title = "Bluetooth Call Mode Likely Active"
-                    Severity = "WARN"
+                    Result = "WARN"
                     AppliesTo = "Audio Quality"
                     Evidence = @(
                         "Bluetooth mic endpoint present",
@@ -1393,7 +1399,7 @@ function Get-BluetoothFindings {
                 @{
                     Id = "BUFFER_UNDERRUN_RISK"
                     Title = "Audio Buffer Underrun Risk"
-                    Severity = "WARN"
+                    Result = "WARN"
                     AppliesTo = "Stability"
                     Evidence = @(
                         "Bluetooth audio active",
@@ -1421,7 +1427,7 @@ function Get-BluetoothFindings {
             $findings += @{
                 Id = "AUDIO_SINK_MISMATCH"
                 Title = "Kodi Output Differs from Windows Default"
-                Severity = "INFO"
+                Result = "WARN"
                 AppliesTo = "Device Routing"
                 Evidence = @("Kodi: $kodiDeviceName", "Windows: $winDefault", "Audio may play on unexpected device")
                 ActionHint = "Set Kodi output to 'Default' or match Windows setting"
@@ -1494,7 +1500,7 @@ function Invoke-BluetoothProbe {
     $silentWavPath = Join-Path $moduleRoot "assets\silence-1s.wav"
 
     if (-not (Test-Path $silentWavPath)) {
-        $probeResult.Result = "FAIL"
+        $probeResult.Result = $DiagnosticResult.FAIL
         $probeResult.TerminalState = "ProbeFailed"
         $probeResult.Error = "Silent WAV file not found: $silentWavPath"
         $probeResult.Confidence = "Low"
@@ -1626,22 +1632,22 @@ function Invoke-BluetoothProbe {
         $probeResult.Confidence = "High"
     }
     elseif ($probeResult.TimedOut) {
-        $probeResult.Result = "FAIL"
+        $probeResult.Result = $DiagnosticResult.FAIL
         $probeResult.TerminalState = "ProbeTimedOut"
         $probeResult.Confidence = "Low"
     }
     elseif ($probeResult.Disconnects -gt 0) {
-        $probeResult.Result = "FAIL"
+        $probeResult.Result = $DiagnosticResult.FAIL
         $probeResult.TerminalState = "ProbeCompleted"
         $probeResult.Confidence = "High"
     }
     elseif ($probeResult.DeviceChanges -gt 1) {
-        $probeResult.Result = "FAIL"
+        $probeResult.Result = $DiagnosticResult.FAIL
         $probeResult.TerminalState = "ProbeCompleted"
         $probeResult.Confidence = "Med"
     }
     elseif ($probeResult.Error) {
-        $probeResult.Result = "FAIL"
+        $probeResult.Result = $DiagnosticResult.FAIL
         $probeResult.TerminalState = "ProbeFailed"
         $probeResult.Confidence = "Low"
     }

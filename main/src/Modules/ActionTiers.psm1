@@ -2,6 +2,12 @@
 # Context-Aware Action Contract Implementation
 # Provides tiered, evidence-based recommendations following the lowest-cost-first principle
 
+# Import DiagnosticResult type constants
+$script:DiagnosticsTypesPath = Join-Path $PSScriptRoot "DiagnosticTypes.psm1"
+if (Test-Path $script:DiagnosticsTypesPath) {
+    Import-Module $script:DiagnosticsTypesPath -Force -ErrorAction SilentlyContinue
+}
+
 <#
 .SYNOPSIS
     Action Tier Model for context-aware recommendations.
@@ -76,7 +82,7 @@ function Resolve-ContextAwareActions {
         [string]$Category,
 
         [Parameter(Mandatory = $true)]
-        [ValidateSet("PASS", "WARN", "FAIL")]
+        [ValidateSet("PASS", "WARN", "FAIL", "NOT_RUN")]
         [string]$Result,
 
         [Parameter(Mandatory = $true)]
@@ -141,11 +147,25 @@ function Resolve-DiagnosticsActions {
     $tlsIntercepted = if ($Evidence.ContainsKey('TLSIntercepted')) { $Evidence.TLSIntercepted } else { $false }
     $isManagedNetwork = if ($Context.ContainsKey('IsManagedNetwork')) { $Context.IsManagedNetwork } else { $false }
 
+    # Handle NOT_RUN before evidence checks (evidence may be incomplete)
+    if ($Result -eq $DiagnosticResult.NOT_RUN) {
+        $response.Classification = "Undetermined - Retest Recommended"
+        $response.Status = $DiagnosticResult.NOT_RUN
+        $response.MinimumTier = 1
+        $response.OperationalImpact = "Informational"
+        $response.Recommendations = @(
+            "Wait a moment and run the test again",
+            "The test did not gather enough evidence to make a determination",
+            "If retests consistently show this result, check network stability"
+        )
+        return $response
+    }
+
     # Decision matrix - determines classification and minimum tier
     if ($dnsOK -and $portsOK -and $timeOK) {
         if ($tlsIntercepted) {
             $response.Classification = "Operational - SSL Inspection Detected"
-            $response.Status = "WARN"
+            $response.Status = $DiagnosticResult.WARN
             $response.MinimumTier = 0
             $response.OperationalImpact = "NonBlocking"
             $response.Recommendations = @(
@@ -157,7 +177,7 @@ function Resolve-DiagnosticsActions {
         }
         else {
             $response.Classification = "Fully Operational"
-            $response.Status = "PASS"
+            $response.Status = $DiagnosticResult.PASS
             $response.MinimumTier = 0
             $response.OperationalImpact = "Informational"
             $response.Recommendations = @(
@@ -169,7 +189,7 @@ function Resolve-DiagnosticsActions {
     }
     elseif ($dnsOK -and $portsOK -and -not $timeOK) {
         $response.Classification = "Time Sync Required"
-        $response.Status = "FAIL"
+        $response.Status = $DiagnosticResult.FAIL
         $response.MinimumTier = 1
         $response.OperationalImpact = "Blocking"
         $response.Recommendations = @(
@@ -181,7 +201,7 @@ function Resolve-DiagnosticsActions {
     }
     elseif (-not $dnsOK -and $portsOK) {
         $response.Classification = "DNS Issue Detected"
-        $response.Status = "WARN"
+        $response.Status = $DiagnosticResult.WARN
         $response.MinimumTier = 1
         $response.OperationalImpact = "NonBlocking"
         $response.Recommendations = @(
@@ -198,7 +218,7 @@ function Resolve-DiagnosticsActions {
     elseif (-not $portsOK) {
         # Ports blocked - requires careful tier assessment
         $response.Classification = "Required Ports Blocked"
-        $response.Status = "FAIL"
+        $response.Status = $DiagnosticResult.FAIL
         $response.OperationalImpact = "Blocking"
 
         # Start with lowest tier actions
@@ -224,7 +244,7 @@ function Resolve-DiagnosticsActions {
     else {
         # Multiple issues
         $response.Classification = "Multiple Connectivity Issues"
-        $response.Status = "FAIL"
+        $response.Status = $DiagnosticResult.FAIL
         $response.MinimumTier = 1
         $response.OperationalImpact = "Blocking"
         $response.Recommendations = @(
