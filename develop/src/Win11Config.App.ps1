@@ -25,6 +25,9 @@ if (-not (Get-Command 'Import-OptionalModule' -ErrorAction SilentlyContinue)) {
 # ExecutionIntent MUST load first - provides non-mutating diagnostic contract
 Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\ExecutionIntent.psm1")
 
+# DiagnosticTypes - typed result constants and Switch-DiagnosticResult helper
+Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\DiagnosticTypes.psm1")
+
 # Console module for diagnostic output formatting
 Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\Console.psm1") -Prefix WinConfig
 
@@ -1390,21 +1393,21 @@ $buttonHandlers = @{
 
             if ($networkEvidence.PacketLossDetected) {
                 Write-Log "  packet loss: detected ($pingCount/3 responses)"
-                $riskFlags += @{ Id = "PACKET_LOSS"; Severity = "warn" }
+                $riskFlags += @{ Id = "PACKET_LOSS"; Result = "WARN" }
             }
 
             if ($avgPing -gt 150) {
-                $riskFlags += @{ Id = "HIGH_LATENCY"; Severity = "warn" }
+                $riskFlags += @{ Id = "HIGH_LATENCY"; Result = "WARN" }
             }
             if ($jitter -gt 30) {
-                $riskFlags += @{ Id = "HIGH_JITTER"; Severity = "warn" }
+                $riskFlags += @{ Id = "HIGH_JITTER"; Result = "WARN" }
             }
         } else {
             Write-Log "Latency: Unable to reach neuroptimal.com"
             $networkEvidence.LatencyMs = -1
             $networkEvidence.LatencyQuality = "unreachable"
             $networkEvidence.PacketLossDetected = $true
-            $riskFlags += @{ Id = "UNREACHABLE"; Severity = "fail" }
+            $riskFlags += @{ Id = "UNREACHABLE"; Result = "FAIL" }
             $networkEvidence.TestResult = "WARN"
         }
 
@@ -1463,7 +1466,7 @@ $buttonHandlers = @{
 
             if ($ipType -eq "datacenter") {
                 # Context flag only - per governance contract, does not create severity
-                $riskFlags += @{ Id = "DATACENTER_IP"; Severity = "info" }
+                $riskFlags += @{ Id = "DATACENTER_IP"; Result = "PASS" }
             }
 
         } catch {
@@ -1507,12 +1510,12 @@ $buttonHandlers = @{
 
         # Context flag: multiple active adapters (informational only)
         if ($networkEvidence.ActiveAdapterCount -gt 1) {
-            $riskFlags += @{ Id = "MULTIPLE_ADAPTERS"; Severity = "info" }
+            $riskFlags += @{ Id = "MULTIPLE_ADAPTERS"; Result = "PASS" }
         }
 
         # Context flag: Bluetooth PAN (informational only)
         if ($btPan) {
-            $riskFlags += @{ Id = "BLUETOOTH_PAN"; Severity = "info" }
+            $riskFlags += @{ Id = "BLUETOOTH_PAN"; Result = "PASS" }
         }
 
         Write-Log ""
@@ -1525,26 +1528,26 @@ $buttonHandlers = @{
 
         # Context flag: Wi-Fi in use (informational only)
         if ($wifiAdapter -and -not $ethernetAdapter) {
-            $riskFlags += @{ Id = "WIFI_IN_USE"; Severity = "info" }
+            $riskFlags += @{ Id = "WIFI_IN_USE"; Result = "PASS" }
         }
 
         # Context flag: weak signal (informational - only escalates if paired with metric failure)
         if ($networkEvidence.SignalStrength -and $networkEvidence.SignalStrength -lt 40) {
-            $riskFlags += @{ Id = "WEAK_SIGNAL"; Severity = "info" }
+            $riskFlags += @{ Id = "WEAK_SIGNAL"; Result = "PASS" }
         }
 
         # Add positive confirmations (severity = "ok")
         if ($networkEvidence.LatencyMs -and $networkEvidence.LatencyMs -gt 0 -and $networkEvidence.LatencyMs -le 150) {
-            $riskFlags += @{ Id = "LATENCY_OK"; Severity = "ok" }
+            $riskFlags += @{ Id = "LATENCY_OK"; Result = "PASS" }
         }
         if ($networkEvidence.LinkSpeedMbps -and $networkEvidence.LinkSpeedMbps -ge 50) {
-            $riskFlags += @{ Id = "BANDWIDTH_OK"; Severity = "ok" }
+            $riskFlags += @{ Id = "BANDWIDTH_OK"; Result = "PASS" }
         }
         if ($ethernetAdapter -and -not $wifiAdapter) {
-            $riskFlags += @{ Id = "ETHERNET_CONNECTED"; Severity = "ok" }
+            $riskFlags += @{ Id = "ETHERNET_CONNECTED"; Result = "PASS" }
         }
         if (-not $networkEvidence.PacketLossDetected -and $networkEvidence.LatencyMs -gt 0) {
-            $riskFlags += @{ Id = "NO_PACKET_LOSS"; Severity = "ok" }
+            $riskFlags += @{ Id = "NO_PACKET_LOSS"; Result = "PASS" }
         }
 
         $networkEvidence.RiskFlags = $riskFlags
@@ -1585,9 +1588,9 @@ $buttonHandlers = @{
 
         # Display flags by severity category
         # Per governance contract: info flags are context only (no warnings, no action hints)
-        $failures = $riskFlags | Where-Object { $_.Severity -eq "fail" -or $_.Severity -eq "warn" }
-        $context = $riskFlags | Where-Object { $_.Severity -eq "info" }
-        $positives = $riskFlags | Where-Object { $_.Severity -eq "ok" }
+        $failures = $riskFlags | Where-Object { $_.Result -eq $DiagnosticResult.FAIL -or $_.Result -eq $DiagnosticResult.WARN }
+        $context = @()  # Info flags now mapped to PASS - shown with positives
+        $positives = $riskFlags | Where-Object { $_.Result -eq $DiagnosticResult.PASS }
 
         # Show failures/warnings first (with action hints)
         foreach ($flag in $failures) {
@@ -1652,8 +1655,8 @@ $buttonHandlers = @{
         Write-Log "You can now close this window."
 
         # Set test result based on critical flags
-        $hasFailure = $riskFlags | Where-Object { $_.Severity -eq "fail" }
-        $hasWarning = $riskFlags | Where-Object { $_.Severity -eq "warn" }
+        $hasFailure = $riskFlags | Where-Object { $_.Result -eq $DiagnosticResult.FAIL }
+        $hasWarning = $riskFlags | Where-Object { $_.Result -eq $DiagnosticResult.WARN }
 
         if ($hasFailure) {
             $networkEvidence.TestResult = "FAIL"
@@ -2130,7 +2133,7 @@ $buttonHandlers = @{
                         RecordCount = 0
                         ResolveTime = $resolveTime
                         Error = "No DNS records returned"
-                        Severity = "FAIL"
+                        Result = "FAIL"
                         Type = "DNS"
                     }
                 }
@@ -2140,7 +2143,7 @@ $buttonHandlers = @{
                 $ipv6Count = @($dnsResult | Where-Object { $_.AddressFamily -eq 'InterNetworkV6' }).Count
 
                 # Warn if resolution is slow (>500ms suggests DNS issues)
-                $severity = if ($resolveTime -gt 500) { "WARN" } else { "PASS" }
+                $result = if ($resolveTime -gt 500) { "WARN" } else { "PASS" }
 
                 return @{
                     Domain = $Domain
@@ -2149,7 +2152,7 @@ $buttonHandlers = @{
                     IPv4Count = $ipv4Count
                     IPv6Count = $ipv6Count
                     ResolveTime = $resolveTime
-                    Severity = $severity
+                    Result = $result
                     Type = "DNS"
                 }
             } catch {
@@ -2160,7 +2163,7 @@ $buttonHandlers = @{
                     RecordCount = 0
                     ResolveTime = $stopwatch.ElapsedMilliseconds
                     Error = $_.Exception.Message
-                    Severity = "FAIL"
+                    Result = "FAIL"
                     Type = "DNS"
                 }
             }
@@ -2264,7 +2267,7 @@ $buttonHandlers = @{
                     Intercepted = $intercepted
                     InterceptedBy = $interceptedBy
                     Issuer = $issuer
-                    Severity = if ($intercepted) { "WARN" } else { "PASS" }
+                    Result = if ($intercepted) { "WARN" } else { "PASS" }
                     Type = "TLS"
                 }
             } catch {
@@ -2273,7 +2276,7 @@ $buttonHandlers = @{
                     Description = $description
                     Success = $false
                     Error = $_.Exception.Message
-                    Severity = if ($critical) { "FAIL" } else { "WARN" }
+                    Result = if ($critical) { "FAIL" } else { "WARN" }
                     Type = "TLS"
                     Intercepted = $false
                 }
@@ -2319,7 +2322,7 @@ $buttonHandlers = @{
                             Success = $true
                             ResponseTime = $stopwatch.ElapsedMilliseconds
                             Method = "TCP"
-                            Severity = "PASS"
+                            Result = "PASS"
                         }
                     } else {
                         $tcpClient.Close()
@@ -2330,7 +2333,7 @@ $buttonHandlers = @{
                 Start-Sleep -Milliseconds 500
             }
 
-            # All attempts failed - FAIL severity (ports are critical)
+            # All attempts failed - FAIL result (ports are critical)
             return @{
                 Server = $PortTest.Server
                 Port = $PortTest.Port
@@ -2338,7 +2341,7 @@ $buttonHandlers = @{
                 Success = $false
                 Error = "Connection timed out after 3 attempts"
                 Method = "TCP"
-                Severity = "FAIL"
+                Result = "FAIL"
             }
         }).AddArgument($portTest)
 
@@ -2459,14 +2462,14 @@ $buttonHandlers = @{
             $drift = [Math]::Abs(($localTime - $serverTime).TotalSeconds)
 
             # More than 60 seconds drift can cause TLS/licensing issues
-            $severity = if ($drift -gt 300) { "FAIL" } elseif ($drift -gt 60) { "WARN" } else { "PASS" }
+            $result = if ($drift -gt 300) { "FAIL" } elseif ($drift -gt 60) { "WARN" } else { "PASS" }
 
             return @{
                 Success = $true
                 LocalTime = $localTime.ToString("yyyy-MM-dd HH:mm:ss")
                 ServerTime = $serverTime.ToString("yyyy-MM-dd HH:mm:ss")
                 DriftSeconds = [Math]::Round($drift, 1)
-                Severity = $severity
+                Result = $result
                 Type = "Time"
             }
         } catch {
@@ -2476,7 +2479,7 @@ $buttonHandlers = @{
                 LocalTime = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
                 ServerTime = "Unable to fetch"
                 DriftSeconds = -1
-                Severity = "WARN"
+                Result = "WARN"
                 Error = "Could not verify time against server"
                 Type = "Time"
             }
@@ -2648,12 +2651,12 @@ $buttonHandlers = @{
     $dnsOK = $dnsSuccessCount -eq $domains.Count
     $tlsOK = $tlsSuccessCount -eq $tlsEndpoints.Count
     $portsOK = $portSuccessCount -eq $ports.Count
-    $timeOK = $timeResult -and $timeResult.Severity -ne "FAIL"
+    $timeOK = $timeResult -and $timeResult.Result -ne $DiagnosticResult.FAIL
     $tlsIntercepted = ($tlsResults | Where-Object { $_.Intercepted -eq $true }).Count -gt 0
 
-    # DCTC: Track INSUFFICIENT_SIGNAL port results (probes with incomplete evidence)
-    $portInsufficientCount = ($portResults | Where-Object { $_.Severity -eq "INSUFFICIENT_SIGNAL" }).Count
-    $portFailedCount = ($portResults | Where-Object { $_.Severity -eq "FAIL" }).Count
+    # DCTC: Track NOT_RUN port results (probes with incomplete evidence)
+    $portInsufficientCount = ($portResults | Where-Object { $_.Result -eq $DiagnosticResult.NOT_RUN }).Count
+    $portFailedCount = ($portResults | Where-Object { $_.Result -eq $DiagnosticResult.FAIL }).Count
     $portsInsufficientSignal = $portInsufficientCount -gt 0
     $portsConfirmedFailed = $portFailedCount -gt 0 -and $portInsufficientCount -eq 0
 
@@ -2685,25 +2688,31 @@ $buttonHandlers = @{
     Write-ColoredLog "Verifies system clock accuracy - incorrect time breaks TLS certificates and licensing." $infoColor
     if ($timeResult) {
         if ($timeResult.DriftSeconds -ge 0) {
-            $timeIndicator = switch ($timeResult.Severity) {
-                "PASS" { "[OK]" }
-                "WARN" { "[!!]" }
-                "FAIL" { "[FAIL]" }
+            $timeIndicator = Switch-DiagnosticResult -Result $timeResult.Result -Cases @{
+                'PASS'    = { "[OK]" }
+                'WARN'    = { "[!!]" }
+                'FAIL'    = { "[FAIL]" }
+                'NOT_RUN' = { "[SKIP]" }
             }
-            $timeColor = switch ($timeResult.Severity) {
-                "PASS" { $successColor }
-                "WARN" { $warningColor }
-                "FAIL" { $failureColor }
+            $timeColor = Switch-DiagnosticResult -Result $timeResult.Result -Cases @{
+                'PASS'    = { $successColor }
+                'WARN'    = { $warningColor }
+                'FAIL'    = { $failureColor }
+                'NOT_RUN' = { $infoColor }
             }
             Write-ColoredLog "$timeIndicator System time within acceptable range (drift: $($timeResult.DriftSeconds)s)" $timeColor
         } else {
             Write-ColoredLog "[!!] Could not verify time against server" $warningColor
         }
-        if ($timeResult.Severity -eq "FAIL") {
-            Write-ColoredLog "    System clock is significantly off - this can break TLS and licensing!" $failureColor
-            Write-ColoredLog "    Fix: Settings > Time & Language > Sync now" $explanationColor
-        } elseif ($timeResult.Severity -eq "WARN") {
-            Write-ColoredLog "    System clock may be slightly off - consider syncing" $warningColor
+        # Additional guidance based on result
+        Switch-DiagnosticResult -Result $timeResult.Result -Cases @{
+            'PASS'    = { }  # No additional message needed
+            'WARN'    = { Write-ColoredLog "    System clock may be slightly off - consider syncing" $warningColor }
+            'FAIL'    = {
+                Write-ColoredLog "    System clock is significantly off - this can break TLS and licensing!" $failureColor
+                Write-ColoredLog "    Fix: Settings > Time & Language > Sync now" $explanationColor
+            }
+            'NOT_RUN' = { }  # No additional message needed
         }
     }
 
@@ -2714,11 +2723,24 @@ $buttonHandlers = @{
         if ($result.Success) {
             $recordInfo = "$($result.RecordCount) records"
             $timeInfo = "$($result.ResolveTime) ms"
-            $indicator = if ($result.Severity -eq "WARN") { "[!!]" } else { "[OK]" }
-            $color = if ($result.Severity -eq "WARN") { $warningColor } else { $successColor }
+            $indicator = Switch-DiagnosticResult -Result $result.Result -Cases @{
+                'PASS'    = { "[OK]" }
+                'WARN'    = { "[!!]" }
+                'FAIL'    = { "[FAIL]" }
+                'NOT_RUN' = { "[SKIP]" }
+            }
+            $color = Switch-DiagnosticResult -Result $result.Result -Cases @{
+                'PASS'    = { $successColor }
+                'WARN'    = { $warningColor }
+                'FAIL'    = { $failureColor }
+                'NOT_RUN' = { $infoColor }
+            }
             Write-ColoredLog "$indicator $($result.Domain) resolved ($recordInfo, $timeInfo)" $color
-            if ($result.Severity -eq "WARN") {
-                Write-ColoredLog "    Slow DNS resolution detected" $warningColor
+            Switch-DiagnosticResult -Result $result.Result -Cases @{
+                'PASS'    = { }
+                'WARN'    = { Write-ColoredLog "    Slow DNS resolution detected" $warningColor }
+                'FAIL'    = { }
+                'NOT_RUN' = { }
             }
         } else {
             Write-ColoredLog "[FAIL] $($result.Domain) - $($result.Error)" $failureColor
@@ -2745,8 +2767,18 @@ $buttonHandlers = @{
                 Write-ColoredLog "[OK] $($result.Domain) - $($result.TlsVersion) ($($result.HandshakeTime) ms)" $successColor
             }
         } else {
-            $indicator = if ($result.Severity -eq "FAIL") { "[FAIL]" } else { "[!!]" }
-            $color = if ($result.Severity -eq "FAIL") { $failureColor } else { $warningColor }
+            $indicator = Switch-DiagnosticResult -Result $result.Result -Cases @{
+                'PASS'    = { "[OK]" }
+                'WARN'    = { "[!!]" }
+                'FAIL'    = { "[FAIL]" }
+                'NOT_RUN' = { "[??]" }
+            }
+            $color = Switch-DiagnosticResult -Result $result.Result -Cases @{
+                'PASS'    = { $successColor }
+                'WARN'    = { $warningColor }
+                'FAIL'    = { $failureColor }
+                'NOT_RUN' = { $infoColor }
+            }
             Write-ColoredLog "$indicator $($result.Domain) - $($result.Error)" $color
         }
     }
@@ -2766,28 +2798,36 @@ $buttonHandlers = @{
     }
 
     foreach ($result in $portResults) {
-        if ($result.Success) {
-            # DCTC UI Mapping: PASS -> "OK"
-            Write-ColoredLog "[OK] $($result.Server):$($result.Port) - OPEN ($($result.Description))" $successColor
-        } elseif ($result.Severity -eq "INSUFFICIENT_SIGNAL") {
-            # DCTC UI Mapping: INSUFFICIENT_SIGNAL -> "UNDETERMINED"
-            Write-ColoredLog "[??] $($result.Server):$($result.Port) - UNDETERMINED ($($result.Description))" $warningColor
-            if ($result.Attempts -and $result.Attempts.Count -gt 0) {
-                $attemptSummary = ($result.Attempts | ForEach-Object { "$($_.result)" }) -join ", "
-                Write-ColoredLog "    Attempts: $attemptSummary" $explanationColor
+        # Use Switch-DiagnosticResult for exhaustive handling
+        Switch-DiagnosticResult -Result $result.Result -Cases @{
+            'PASS'    = {
+                # DCTC UI Mapping: PASS -> "OK"
+                Write-ColoredLog "[OK] $($result.Server):$($result.Port) - OPEN ($($result.Description))" $successColor
             }
-        } else {
-            # DCTC UI Mapping: FAIL -> "BLOCKED" (only with evidence)
-            Write-ColoredLog "[FAIL] $($result.Server):$($result.Port) - BLOCKED ($($result.Description))" $failureColor
-            if ($result.Attempts -and $result.Attempts.Count -gt 0) {
-                Write-ColoredLog "    All $($result.Attempts.Count) attempts failed" $explanationColor
+            'WARN'    = {
+                Write-ColoredLog "[!!] $($result.Server):$($result.Port) - WARNING ($($result.Description))" $warningColor
+            }
+            'FAIL'    = {
+                # DCTC UI Mapping: FAIL -> "BLOCKED" (only with evidence)
+                Write-ColoredLog "[FAIL] $($result.Server):$($result.Port) - BLOCKED ($($result.Description))" $failureColor
+                if ($result.Attempts -and $result.Attempts.Count -gt 0) {
+                    Write-ColoredLog "    All $($result.Attempts.Count) attempts failed" $explanationColor
+                }
+            }
+            'NOT_RUN' = {
+                # DCTC UI Mapping: NOT_RUN -> "UNDETERMINED"
+                Write-ColoredLog "[??] $($result.Server):$($result.Port) - UNDETERMINED ($($result.Description))" $warningColor
+                if ($result.Attempts -and $result.Attempts.Count -gt 0) {
+                    $attemptSummary = ($result.Attempts | ForEach-Object { "$($_.result)" }) -join ", "
+                    Write-ColoredLog "    Attempts: $attemptSummary" $explanationColor
+                }
             }
         }
     }
 
     # DCTC: Different messaging based on evidence quality
-    $portFailures = $portResults | Where-Object { $_.Severity -eq "FAIL" }
-    $portInsufficient = $portResults | Where-Object { $_.Severity -eq "INSUFFICIENT_SIGNAL" }
+    $portFailures = $portResults | Where-Object { $_.Result -eq $DiagnosticResult.FAIL }
+    $portInsufficient = $portResults | Where-Object { $_.Result -eq $DiagnosticResult.NOT_RUN }
 
     if ($portInsufficient.Count -gt 0) {
         Write-ColoredLog "`nSome port checks were inconclusive:" $warningColor
@@ -3585,14 +3625,15 @@ foreach ($tabPage in $tabControl.TabPages) {
                     $findingPanel.Padding = New-Object System.Windows.Forms.Padding(10, 5, 10, 5)
                     $findingPanel.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 5)
 
-                    # Title with severity color
+                    # Title with result color
                     $titleLabel = New-Object System.Windows.Forms.Label
-                    $titleLabel.Text = "[$($finding.Severity)] $($finding.Title)"
+                    $titleLabel.Text = "[$($finding.Result)] $($finding.Title)"
                     $titleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-                    $titleLabel.ForeColor = switch ($finding.Severity) {
-                        "FAIL" { [System.Drawing.Color]::Crimson }
-                        "WARN" { [System.Drawing.Color]::DarkOrange }
-                        default { [System.Drawing.Color]::FromArgb(60, 60, 60) }
+                    $titleLabel.ForeColor = Switch-DiagnosticResult -Result $finding.Result -Cases @{
+                        'PASS'    = { [System.Drawing.Color]::ForestGreen }
+                        'WARN'    = { [System.Drawing.Color]::DarkOrange }
+                        'FAIL'    = { [System.Drawing.Color]::Crimson }
+                        'NOT_RUN' = { [System.Drawing.Color]::FromArgb(60, 60, 60) }
                     }
                     $titleLabel.AutoSize = $true
                     $titleLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 3)
@@ -3810,7 +3851,12 @@ foreach ($tabPage in $tabControl.TabPages) {
                         Register-WinConfigSessionAction -Action "BT Active Probe" -Detail "30s probe completed" -Category "Diagnostics" -Result $probeResult.Result -Tier 0 -Summary "$($probeResult.Result) (Confidence: $($probeResult.Confidence))" -Evidence $probeEvidence
                     }
 
-                    $resultIcon = if ($probeResult.Result -eq "PASS") { [System.Windows.Forms.MessageBoxIcon]::Information } else { [System.Windows.Forms.MessageBoxIcon]::Warning }
+                    $resultIcon = Switch-DiagnosticResult -Result $probeResult.Result -Cases @{
+                        'PASS'    = { [System.Windows.Forms.MessageBoxIcon]::Information }
+                        'WARN'    = { [System.Windows.Forms.MessageBoxIcon]::Warning }
+                        'FAIL'    = { [System.Windows.Forms.MessageBoxIcon]::Error }
+                        'NOT_RUN' = { [System.Windows.Forms.MessageBoxIcon]::Question }
+                    }
                     $eventsText = if ($probeResult.Events.Count -gt 0) {
                         "`n`nEvents detected:`n" + (($probeResult.Events | ForEach-Object { "- $($_.Type): $($_.Detail)" }) -join "`n")
                     } else { "" }
@@ -5022,12 +5068,13 @@ $tabControl.Add_SelectedIndexChanged({
                     $findingPanel.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 5)
 
                     $titleLabel = New-Object System.Windows.Forms.Label
-                    $titleLabel.Text = "[$($finding.Severity)] $($finding.Title)"
+                    $titleLabel.Text = "[$($finding.Result)] $($finding.Title)"
                     $titleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-                    $titleLabel.ForeColor = switch ($finding.Severity) {
-                        "FAIL" { [System.Drawing.Color]::Crimson }
-                        "WARN" { [System.Drawing.Color]::DarkOrange }
-                        default { [System.Drawing.Color]::FromArgb(60, 60, 60) }
+                    $titleLabel.ForeColor = Switch-DiagnosticResult -Result $finding.Result -Cases @{
+                        'PASS'    = { [System.Drawing.Color]::ForestGreen }
+                        'WARN'    = { [System.Drawing.Color]::DarkOrange }
+                        'FAIL'    = { [System.Drawing.Color]::Crimson }
+                        'NOT_RUN' = { [System.Drawing.Color]::FromArgb(60, 60, 60) }
                     }
                     $titleLabel.AutoSize = $true
                     $findingPanel.Controls.Add($titleLabel)
