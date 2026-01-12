@@ -94,6 +94,10 @@ $script:DiagActionsContainer = $null
 $script:DiagActionsLabel = $null
 $script:DiagTabColor = $null
 
+# --- Diagnostics ingest endpoints ---
+$script:DiagnosticsSmbPath  = "\\192.168.2.90\no-support-ingest\incoming"
+$script:DiagnosticsHttpsUrl = "http://<NAS_HOST_OR_IP>:8443/ingest"
+
 # Function to refresh the actions display (called on tab switch to Diagnostics)
 function Update-DiagActionsDisplay {
     if ($null -eq $script:DiagActionsContainer) { return }
@@ -4848,6 +4852,45 @@ $tabControl.Add_SelectedIndexChanged({
     }
 })
 
+# --- Diagnostics transport helper (SMB → HTTPS fallback) ---
+function Send-DiagnosticsPayload {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Json,
+
+        [Parameter(Mandatory)]
+        [string]$SessionId
+    )
+
+    $tmpName = "NST-$SessionId.json.tmp"
+
+    # --- SMB fast path ---
+    try {
+        if (Test-Path $script:DiagnosticsSmbPath) {
+            $full = Join-Path $script:DiagnosticsSmbPath $tmpName
+            [System.IO.File]::WriteAllText($full, $Json)
+            return "smb"
+        }
+    } catch {
+        # swallow and fall through
+    }
+
+    # --- HTTPS fallback ---
+    try {
+        Invoke-RestMethod `
+            -Uri $script:DiagnosticsHttpsUrl `
+            -Method POST `
+            -ContentType "application/json" `
+            -Body $Json `
+            -TimeoutSec 10 `
+            -ErrorAction Stop
+
+        return "https"
+    } catch {
+        throw "Diagnostics upload failed via SMB and HTTPS: $($_.Exception.Message)"
+    }
+}
+
 # Log shutdown when form closes
 # EXEMPT-CONTRACT-001: Shutdown logging, no Switch-DiagnosticResult usage
 $form.Add_FormClosing({
@@ -4972,24 +5015,15 @@ $form.Add_FormClosing({
                 return  # Hard stop: do not write
             }
 
-            # === WRITE ATTEMPT (Atomic Publish Pattern) ===
-            # Generate unique filename (NST-<SessionId>-<UTC>.json for dedup)
-            $exportFileName = "NST-$($script:SessionId)-$((Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')).json"
-            $tempFilePath = Join-Path $DiagnosticsIngestPath "$exportFileName.tmp"
-            $finalFilePath = Join-Path $DiagnosticsIngestPath $exportFileName
+            # === WRITE ATTEMPT (Dual Transport: SMB → HTTPS fallback) ===
+            $json = $payload | ConvertTo-Json -Depth 10
+            $transport = Send-DiagnosticsPayload `
+                -Json $json `
+                -SessionId $script:SessionId
 
-            # DEV: Console logging for E2E verification
-            Write-Host "[Analytics Export] Writing to temp: $tempFilePath" -ForegroundColor Cyan
-
-            # Write JSON to temp file first (prevents partial reads)
-            $payload | ConvertTo-Json -Depth 10 | Out-File -FilePath $tempFilePath -Encoding UTF8 -Force
-
-            # Atomic rename to final filename (publish signal for watcher)
-            Rename-Item -Path $tempFilePath -NewName $exportFileName -Force
-
-            Write-Host "[Analytics Export] SUCCESS - published: $exportFileName (server will cleanup)" -ForegroundColor Green
+            Write-Host "[Analytics Export] Uploaded via $transport" -ForegroundColor Green
             if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
-                Write-WinConfigLog -Action "AnalyticsExport" -Message "Exported diagnostics to $DiagnosticsIngestPath\$exportFileName"
+                Write-WinConfigLog -Action "AnalyticsExport" -Message "Exported diagnostics via $transport"
             }
 
             # Register success in session timeline
@@ -4997,7 +5031,7 @@ $form.Add_FormClosing({
                 ActionId  = [guid]::NewGuid().ToString().Substring(0,8).ToUpper()
                 Timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffffff")
                 Action    = "Analytics Export"
-                Detail    = "Exported to: $exportFileName"
+                Detail    = "Uploaded via $transport"
                 Category  = "Diagnostics"
                 Result    = "PASS"
             }
