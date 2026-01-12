@@ -5017,21 +5017,30 @@ $form.Add_FormClosing({
 
             # === WRITE ATTEMPT (Dual Transport: SMB → HTTPS fallback) ===
             $json = $payload | ConvertTo-Json -Depth 10
-            $transport = Send-DiagnosticsPayload `
-                -Json $json `
-                -SessionId $script:SessionId
 
-            Write-Host "[Analytics Export] Uploaded via $transport" -ForegroundColor Green
+            # Fire-and-forget export to avoid UI freeze
+            Start-Job -ScriptBlock {
+                param($Json, $SessionId)
+
+                try {
+                    Send-DiagnosticsPayload -Json $Json -SessionId $SessionId | Out-Null
+                } catch {
+                    # Best-effort only — log to console, never block shutdown
+                    Write-Host "[Analytics Export] FAILED (async): $($_.Exception.Message)" -ForegroundColor Red
+                }
+            } -ArgumentList $json, $script:SessionId | Out-Null
+
+            Write-Host "[Analytics Export] Submitted (async)" -ForegroundColor Green
             if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
-                Write-WinConfigLog -Action "AnalyticsExport" -Message "Exported diagnostics via $transport"
+                Write-WinConfigLog -Action "AnalyticsExport" -Message "Submitted diagnostics export (async)"
             }
 
-            # Register success in session timeline
+            # Register submission in session timeline
             $script:DiagnosticActions += [PSCustomObject]@{
                 ActionId  = [guid]::NewGuid().ToString().Substring(0,8).ToUpper()
                 Timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffffff")
                 Action    = "Analytics Export"
-                Detail    = "Uploaded via $transport"
+                Detail    = "Submitted (async)"
                 Category  = "Diagnostics"
                 Result    = "PASS"
             }
