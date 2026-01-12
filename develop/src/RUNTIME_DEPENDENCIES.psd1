@@ -19,6 +19,7 @@
         "src/Modules/Env.psm1"                # System info: admin check, machine info
         "src/Modules/Paths.psm1"              # Directory constants
         "src/Modules/DiagnosticTypes.psm1"    # Type system: closed enum constants, Switch-DiagnosticResult
+        "src/Modules/UiAction.psm1"           # CONTRACT-001: self-bootstrapping delegate wrappers
     )
 
     # Modules that gracefully degrade if missing - warning only
