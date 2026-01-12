@@ -1,20 +1,21 @@
 {
-  "version": "1.0",
   "files": {
+    "src/Modules/DiagnosticTypes.psm1": "e72022251c07915668bd2bb367865d2904fc25e5b87d7368fa50897ba023b88f",
+    "Win11Config.ps1": "9cc50ce31dde70c6e7f3a7f99106cb0131672de829fa406733f067972639b183",
+    "src/Modules/Paths.psm1": "d56f6bc8e942b2f0e568f84c5a5503e823abd6a330532a93938766205bb373d3",
     "src/Modules/Env.psm1": "54acdf0c5157b7293f50b62743b28f060d2f6eae46a42e1b1cee3399603ee802",
-    "src/Win11Config.App.ps1": "adf1857d6f5adafaec67f9928491d1fa2e43e13ae3d53616b659b13361766c5d",
-    "src/Logging/Logger.psm1": "ab81a12667fc1a54db5bdbe4a8d46ec661eef89de924747e65a515a5d1cad5d8",
+    "src/Modules/Bluetooth.psm1": "50ef831f90dc31cafe77b77b6175bface14ae78aa6aa2347ca67917b5c9f959f",
+    "src/Modules/ExecutionIntent.psm1": "bb520efa229110133e36f8b2fe1de0b2337cf01704e1474e8833fb5795a85e60",
     "src/VERSION.psd1": "ff6ee1fdba00afd4e7713d356ed92d752ac386a4528909aa02e29e5c68778622",
     "src/Modules/ActionTiers.psm1": "abf0bf7bb5004a627173d51f26319f866851c97e10623d28ca8cd0090f2d1e71",
-    "src/Modules/ModuleLoader.psm1": "3ea4d54dd3da99b7db42b18b0355852b55d0500333ae471cb2a7d14cb49cfaf2",
-    "Win11Config.ps1": "9cc50ce31dde70c6e7f3a7f99106cb0131672de829fa406733f067972639b183",
-    "src/Modules/Bluetooth.psm1": "50ef831f90dc31cafe77b77b6175bface14ae78aa6aa2347ca67917b5c9f959f",
-    "src/Modules/Paths.psm1": "d56f6bc8e942b2f0e568f84c5a5503e823abd6a330532a93938766205bb373d3",
-    "src/Modules/ExecutionIntent.psm1": "bb520efa229110133e36f8b2fe1de0b2337cf01704e1474e8833fb5795a85e60",
+    "src/Logging/Logger.psm1": "ab81a12667fc1a54db5bdbe4a8d46ec661eef89de924747e65a515a5d1cad5d8",
+    "src/RUNTIME_DEPENDENCIES.psd1": "4437207b5a8b94a5c8333ccde892512feb9a4d03258d10f8791dc2cd37c91a1c",
     "src/Modules/Console.psm1": "7ee2925c69a762ee3fb7d6e98195928f6b1ce103c1d526411b1087d8701dcc63",
-    "src/RUNTIME_DEPENDENCIES.psd1": "ef3e506ed48400ee9a57dc96d773382b3650289536c21131e47b141e19f6915b"
+    "src/Win11Config.App.ps1": "adf1857d6f5adafaec67f9928491d1fa2e43e13ae3d53616b659b13361766c5d",
+    "src/Modules/ModuleLoader.psm1": "3ea4d54dd3da99b7db42b18b0355852b55d0500333ae471cb2a7d14cb49cfaf2"
   },
-  "commit": "5d8518413ac39662218d7db0afb510275592df99",
-  "branch": "develop",
-  "generated": "2026-01-12T19:46:48.3061919+00:00"
+  "version": "1.0",
+  "commit": "f30baa1e8452b55d2132785d1cb648df375cc432",
+  "generated": "2026-01-12T19:59:07.3712867+00:00",
+  "branch": "develop"
 }
