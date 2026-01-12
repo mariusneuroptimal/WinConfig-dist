@@ -4937,7 +4937,7 @@ $form.Add_FormClosing({
                         Result = $_.Result
                         Tier = $_.Tier
                         Summary = $_.Summary
-                        Evidence = $_.Evidence
+                        # Evidence excluded - may contain PII (PublicIP, etc.)
                     }
                 }
             } else { @() }
