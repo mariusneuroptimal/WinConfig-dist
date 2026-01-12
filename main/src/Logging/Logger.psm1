@@ -2,11 +2,18 @@
 # Phase 2A: Deterministic audit trail for client systems and forensic debugging
 
 # CONTRACT:
-# Every session action MUST end with PASS/WARN/FAIL.
+# Every session action MUST end with PASS/WARN/FAIL/NOT_RUN.
 # PENDING is transitional only - never a valid final state.
 # Unresolved actions (PENDING at render time) are auto-coerced to FAIL.
-# Tier constraints: PASS=0, WARN≥1, FAIL≥2
+# NOT_RUN indicates preconditions not met (replaces INSUFFICIENT_SIGNAL).
+# Tier constraints: PASS=0, WARN≥1, FAIL≥2, NOT_RUN≥1
 # ActionId (GUID) ensures deterministic completion of concurrent/retried actions.
+
+# Import type definitions for result validation
+$script:DiagnosticsTypesPath = Join-Path (Split-Path $PSScriptRoot -Parent) "Modules\DiagnosticTypes.psm1"
+if (Test-Path $script:DiagnosticsTypesPath) {
+    Import-Module $script:DiagnosticsTypesPath -Force -ErrorAction SilentlyContinue
+}
 
 # Script-scoped state
 $script:SessionId = $null
@@ -243,7 +250,7 @@ function Register-SessionAction {
         [string]$Category = "Diagnostics",
 
         [Parameter(Mandatory = $false)]
-        [ValidateSet("PASS", "WARN", "FAIL", "PENDING")]
+        [ValidateSet("PASS", "WARN", "FAIL", "PENDING", "NOT_RUN")]
         [string]$Result = "PENDING",
 
         [Parameter(Mandatory = $false)]
@@ -325,8 +332,9 @@ function Get-SessionActions {
         }
 
         # Coerce PENDING to FAIL (Tier 3 = Guided Technical Step minimum)
+        # Uses typed constant from DiagnosticTypes.psm1
         if ($resolved.Result -eq "PENDING") {
-            $resolved.Result = "FAIL"
+            $resolved.Result = $DiagnosticResult.FAIL
             $resolved.Tier = [Math]::Max($resolved.Tier, 3)
             if ([string]::IsNullOrEmpty($resolved.Summary)) {
                 $resolved.Summary = "Action did not complete (auto-failed)"
@@ -355,7 +363,7 @@ function Complete-SessionAction {
     .PARAMETER ActionId
         The unique ActionId returned by Register-SessionAction
     .PARAMETER Result
-        The final result: PASS, WARN, or FAIL
+        The final result: PASS, WARN, FAIL, or NOT_RUN
     .PARAMETER Tier
         The escalation tier (0-5). Auto-adjusted to meet constraints.
     .PARAMETER Summary
@@ -369,7 +377,7 @@ function Complete-SessionAction {
         [string]$ActionId,
 
         [Parameter(Mandatory = $true)]
-        [ValidateSet("PASS", "WARN", "FAIL")]
+        [ValidateSet("PASS", "WARN", "FAIL", "NOT_RUN")]
         [string]$Result,
 
         [Parameter(Mandatory = $false)]
@@ -383,11 +391,13 @@ function Complete-SessionAction {
         [hashtable]$Evidence = @{}
     )
 
-    # Enforce tier constraints: PASS=0, WARN>=1, FAIL>=2
+    # Enforce tier constraints: PASS=0, WARN>=1, FAIL>=2, NOT_RUN>=1
+    # NOTE: This switch is internal infrastructure for tier validation, not consumer branching
     $validatedTier = switch ($Result) {
-        "PASS" { 0 }
-        "WARN" { [Math]::Max($Tier, 1) }
-        "FAIL" { [Math]::Max($Tier, 2) }
+        "PASS"    { 0 }
+        "WARN"    { [Math]::Max($Tier, 1) }
+        "FAIL"    { [Math]::Max($Tier, 2) }
+        "NOT_RUN" { [Math]::Max($Tier, 1) }
     }
 
     # Find action by ActionId
