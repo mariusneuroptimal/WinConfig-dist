@@ -76,7 +76,7 @@ function Resolve-ContextAwareActions {
         [string]$Category,
 
         [Parameter(Mandatory = $true)]
-        [ValidateSet("PASS", "WARN", "FAIL")]
+        [ValidateSet("PASS", "WARN", "FAIL", "INSUFFICIENT_SIGNAL")]
         [string]$Result,
 
         [Parameter(Mandatory = $true)]
@@ -140,6 +140,20 @@ function Resolve-DiagnosticsActions {
     $timeOK = if ($Evidence.ContainsKey('Time')) { $Evidence.Time } else { $true }
     $tlsIntercepted = if ($Evidence.ContainsKey('TLSIntercepted')) { $Evidence.TLSIntercepted } else { $false }
     $isManagedNetwork = if ($Context.ContainsKey('IsManagedNetwork')) { $Context.IsManagedNetwork } else { $false }
+
+    # Handle INSUFFICIENT_SIGNAL before evidence checks (evidence may be incomplete)
+    if ($Result -eq "INSUFFICIENT_SIGNAL") {
+        $response.Classification = "Undetermined - Retest Recommended"
+        $response.Status = "INSUFFICIENT_SIGNAL"
+        $response.MinimumTier = 1
+        $response.OperationalImpact = "Informational"
+        $response.Recommendations = @(
+            "Wait a moment and run the test again",
+            "The test did not gather enough evidence to make a determination",
+            "If retests consistently show this result, check network stability"
+        )
+        return $response
+    }
 
     # Decision matrix - determines classification and minimum tier
     if ($dnsOK -and $portsOK -and $timeOK) {

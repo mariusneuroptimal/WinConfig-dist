@@ -57,36 +57,62 @@ function Assert-WinConfigIsAdmin {
     return $true
 }
 
+# PERF-001: CIM query cache - these values never change during a session
+$script:CimCache = $null
+
 function Get-WinConfigMachineInfo {
     <#
     .SYNOPSIS
-        Returns machine information as a PSObject.
+        Returns cached machine information as a PSObject.
     .DESCRIPTION
-        Fetches device name, serial number, OS caption, build number, and revision.
-        Consolidates repeated CimInstance calls.
+        PERF-001: CIM queries execute AT MOST ONCE per session.
+        First call populates cache, subsequent calls return cached data instantly.
+        Eliminates 500-1000ms delays from repeated WMI queries.
     .OUTPUTS
         PSObject with properties: DeviceName, SerialNumber, WindowsCaption, BuildNumber, RevisionNumber, FormattedVersion
     #>
     [CmdletBinding()]
     param()
 
-    $deviceName = (Get-CimInstance -ClassName Win32_ComputerSystem).Name
-    $serialNumber = (Get-CimInstance -ClassName Win32_BIOS).SerialNumber
-    $windowsCaption = (Get-CimInstance -ClassName Win32_OperatingSystem).Caption
-    $buildNumber = (Get-CimInstance -ClassName Win32_OperatingSystem).BuildNumber
-    $revisionNumber = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name UBR).UBR
-
-    $formattedCaption = $windowsCaption -replace "Microsoft Windows", "Windows"
-    $formattedVersion = "$formattedCaption $buildNumber.$revisionNumber"
-
-    return [PSCustomObject]@{
-        DeviceName       = $deviceName
-        SerialNumber     = $serialNumber
-        WindowsCaption   = $windowsCaption
-        BuildNumber      = $buildNumber
-        RevisionNumber   = $revisionNumber
-        FormattedVersion = $formattedVersion
+    # Return cached result if available (PERF-001: CIM queries once per session)
+    if ($null -ne $script:CimCache) {
+        return $script:CimCache
     }
+
+    # First call - populate cache
+    try {
+        $deviceName = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).Name
+        $serialNumber = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SerialNumber
+        $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $windowsCaption = $osInfo.Caption
+        $buildNumber = $osInfo.BuildNumber
+        $revisionNumber = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name UBR -ErrorAction Stop).UBR
+
+        $formattedCaption = $windowsCaption -replace "Microsoft Windows", "Windows"
+        $formattedVersion = "$formattedCaption $buildNumber.$revisionNumber"
+
+        $script:CimCache = [PSCustomObject]@{
+            DeviceName       = $deviceName
+            SerialNumber     = $serialNumber
+            WindowsCaption   = $windowsCaption
+            BuildNumber      = $buildNumber
+            RevisionNumber   = $revisionNumber
+            FormattedVersion = $formattedVersion
+        }
+    }
+    catch {
+        # Graceful degradation - return placeholder on error
+        $script:CimCache = [PSCustomObject]@{
+            DeviceName       = "Unknown"
+            SerialNumber     = "Unknown"
+            WindowsCaption   = "Unknown"
+            BuildNumber      = "Unknown"
+            RevisionNumber   = "Unknown"
+            FormattedVersion = "Unknown"
+        }
+    }
+
+    return $script:CimCache
 }
 
 function Get-SessionCountryInfo {

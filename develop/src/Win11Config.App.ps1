@@ -36,14 +36,42 @@ if (Import-OptionalModule -Path (Join-Path $PSScriptRoot "Logging\Logger.psm1") 
     Write-WinConfigLog -Action "Startup" -Message "WinConfig application initialized"
 }
 
+# SessionOperationLedger for session-scoped operation recording (prefixed)
+if (Import-OptionalModule -Path (Join-Path $PSScriptRoot "Modules\SessionOperationLedger.psm1") -Prefix WinConfig) {
+    Initialize-WinConfigSessionLedger -Version $AppVersion -Iteration $Iteration
+}
+
 # ActionTiers for context-aware recommendations
 $null = Import-OptionalModule -Path (Join-Path $PSScriptRoot "Modules\ActionTiers.psm1") -Prefix WinConfig
 
-# Bluetooth for BT audio diagnostics
-$null = Import-OptionalModule -Path (Join-Path $PSScriptRoot "Modules\Bluetooth.psm1") -Prefix WinConfig
+# ============================================================================
+# DEFERRED MODULE LOADING - Performance optimization (PERF-001)
+# These modules are NOT loaded at startup. They load on first use.
+# Rule: No code from these modules executes before their tab/button is activated.
+# ============================================================================
 
-# Network Diagnostics for testable network health assessment
-$null = Import-OptionalModule -Path (Join-Path $PSScriptRoot "diagnostics\Network.Diagnostics.psm1") -Prefix WinConfig
+# Bluetooth module - deferred until Bluetooth tab is selected
+$script:BluetoothModulePath = Join-Path $PSScriptRoot "Modules\Bluetooth.psm1"
+$script:BluetoothModuleLoaded = $false
+
+function Ensure-BluetoothModule {
+    <#
+    .SYNOPSIS
+        Lazy-loads the Bluetooth module on first use.
+    .DESCRIPTION
+        PERF-001: Bluetooth.psm1 (2400+ lines) is only needed when user
+        accesses the Bluetooth tab (~10% of sessions). Deferring saves ~100ms startup.
+    #>
+    if (-not $script:BluetoothModuleLoaded) {
+        if (Test-Path $script:BluetoothModulePath) {
+            $null = Import-OptionalModule -Path $script:BluetoothModulePath -Prefix WinConfig
+            $script:BluetoothModuleLoaded = $true
+        }
+    }
+}
+
+# Network.Diagnostics module - NOT loaded in prod (only used by tests)
+# Tests import it directly when needed. No runtime dependency.
 
 # Generate session ID for diagnostics (operator support)
 $script:SessionId = [guid]::NewGuid().ToString("N").Substring(0, 8).ToUpper()
@@ -73,7 +101,7 @@ function Update-DiagActionsDisplay {
         @()
     }
 
-    # --- Actions Table ---
+    # --- Actions Table (Phase 3: TableLayoutPanel, no absolute positioning) ---
     if ($sessionActions.Count -eq 0) {
         $noActionsLabel = New-Object System.Windows.Forms.Label
         $noActionsLabel.Text = "  (No actions executed yet)"
@@ -83,50 +111,60 @@ function Update-DiagActionsDisplay {
         $noActionsLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 5)
         $script:DiagActionsContainer.Controls.Add($noActionsLabel)
     } else {
-        # Table header
-        $headerPanel = New-Object System.Windows.Forms.Panel
-        $headerPanel.Width = 620
-        $headerPanel.Height = 22
-        $headerPanel.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 2)
-        $headerPanel.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
+        # Create TableLayoutPanel for actions table
+        $actionsTable = New-Object System.Windows.Forms.TableLayoutPanel
+        $actionsTable.Dock = [System.Windows.Forms.DockStyle]::Top
+        $actionsTable.AutoSize = $true
+        $actionsTable.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+        $actionsTable.ColumnCount = 4
+        $actionsTable.RowCount = 0
+        $actionsTable.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 0)
+        $actionsTable.CellBorderStyle = [System.Windows.Forms.TableLayoutPanelCellBorderStyle]::None
+        # Column styles: Time (Auto), Result (Auto), Action (Auto), Summary (Fill)
+        [void]$actionsTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+        [void]$actionsTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+        [void]$actionsTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+        [void]$actionsTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+
+        # Header row
+        $actionsTable.RowCount++
+        [void]$actionsTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
 
         $colTime = New-Object System.Windows.Forms.Label
         $colTime.Text = "Time"
         $colTime.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
-        $colTime.Location = New-Object System.Drawing.Point(5, 3)
-        $colTime.Width = 55
-        $headerPanel.Controls.Add($colTime)
+        $colTime.AutoSize = $true
+        $colTime.Margin = New-Object System.Windows.Forms.Padding(5, 3, 10, 3)
+        $actionsTable.Controls.Add($colTime, 0, 0)
 
         $colResult = New-Object System.Windows.Forms.Label
         $colResult.Text = "Result"
         $colResult.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
-        $colResult.Location = New-Object System.Drawing.Point(60, 3)
-        $colResult.Width = 50
-        $headerPanel.Controls.Add($colResult)
+        $colResult.AutoSize = $true
+        $colResult.Margin = New-Object System.Windows.Forms.Padding(0, 3, 10, 3)
+        $actionsTable.Controls.Add($colResult, 1, 0)
 
         $colAction = New-Object System.Windows.Forms.Label
         $colAction.Text = "Action"
         $colAction.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
-        $colAction.Location = New-Object System.Drawing.Point(115, 3)
-        $colAction.Width = 150
-        $headerPanel.Controls.Add($colAction)
+        $colAction.AutoSize = $true
+        $colAction.Margin = New-Object System.Windows.Forms.Padding(0, 3, 10, 3)
+        $actionsTable.Controls.Add($colAction, 2, 0)
 
         $colSummary = New-Object System.Windows.Forms.Label
         $colSummary.Text = "Summary"
         $colSummary.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
-        $colSummary.Location = New-Object System.Drawing.Point(270, 3)
-        $colSummary.Width = 345
-        $headerPanel.Controls.Add($colSummary)
+        $colSummary.AutoSize = $true
+        $colSummary.Margin = New-Object System.Windows.Forms.Padding(0, 3, 5, 3)
+        $actionsTable.Controls.Add($colSummary, 3, 0)
 
-        $script:DiagActionsContainer.Controls.Add($headerPanel)
-
-        # Table rows
+        # Data rows
         foreach ($action in $sessionActions) {
             $timeStr = $action.Timestamp.ToString("HH:mm:ss")
             $result = if ($action.Result) { $action.Result } else { "PENDING" }
             $summary = if ($action.Summary) { $action.Summary } else { $action.Detail }
 
-            # Result color and text
+            # Result color
             $resultColor = switch ($result) {
                 "PASS" { [System.Drawing.Color]::ForestGreen }
                 "WARN" { [System.Drawing.Color]::DarkOrange }
@@ -134,50 +172,48 @@ function Update-DiagActionsDisplay {
                 default { [System.Drawing.Color]::Gray }
             }
 
-            $actionPanel = New-Object System.Windows.Forms.Panel
-            $actionPanel.Width = 620
-            $actionPanel.Height = 40
-            $actionPanel.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 1)
+            $rowIndex = $actionsTable.RowCount
+            $actionsTable.RowCount++
+            [void]$actionsTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
 
             # Time column
             $timeLabel = New-Object System.Windows.Forms.Label
             $timeLabel.Text = $timeStr
             $timeLabel.Font = New-Object System.Drawing.Font("Consolas", 8)
             $timeLabel.ForeColor = [System.Drawing.Color]::Black
-            $timeLabel.Location = New-Object System.Drawing.Point(5, 2)
-            $timeLabel.Width = 55
-            $actionPanel.Controls.Add($timeLabel)
+            $timeLabel.AutoSize = $true
+            $timeLabel.Margin = New-Object System.Windows.Forms.Padding(5, 2, 10, 2)
+            $actionsTable.Controls.Add($timeLabel, 0, $rowIndex)
 
-            # Result column (icon + text for accessibility)
+            # Result column
             $resultLabel = New-Object System.Windows.Forms.Label
             $resultLabel.Text = $result
             $resultLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
             $resultLabel.ForeColor = $resultColor
-            $resultLabel.Location = New-Object System.Drawing.Point(60, 2)
-            $resultLabel.Width = 50
-            $actionPanel.Controls.Add($resultLabel)
+            $resultLabel.AutoSize = $true
+            $resultLabel.Margin = New-Object System.Windows.Forms.Padding(0, 2, 10, 2)
+            $actionsTable.Controls.Add($resultLabel, 1, $rowIndex)
 
             # Action column
             $actionLabel = New-Object System.Windows.Forms.Label
             $actionLabel.Text = $action.Action
             $actionLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
             $actionLabel.ForeColor = [System.Drawing.Color]::Black
-            $actionLabel.Location = New-Object System.Drawing.Point(115, 2)
-            $actionLabel.Width = 150
-            $actionPanel.Controls.Add($actionLabel)
+            $actionLabel.AutoSize = $true
+            $actionLabel.Margin = New-Object System.Windows.Forms.Padding(0, 2, 10, 2)
+            $actionsTable.Controls.Add($actionLabel, 2, $rowIndex)
 
             # Summary column - full text, no truncation (audit surface)
             $summaryLabel = New-Object System.Windows.Forms.Label
             $summaryLabel.Text = $summary
             $summaryLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
             $summaryLabel.ForeColor = [System.Drawing.Color]::DimGray
-            $summaryLabel.Location = New-Object System.Drawing.Point(270, 2)
-            $summaryLabel.Size = New-Object System.Drawing.Size(345, 36)
-            $summaryLabel.AutoSize = $false
-            $actionPanel.Controls.Add($summaryLabel)
-
-            $script:DiagActionsContainer.Controls.Add($actionPanel)
+            $summaryLabel.AutoSize = $true
+            $summaryLabel.Margin = New-Object System.Windows.Forms.Padding(0, 2, 5, 2)
+            $actionsTable.Controls.Add($summaryLabel, 3, $rowIndex)
         }
+
+        $script:DiagActionsContainer.Controls.Add($actionsTable)
     }
 }
 
@@ -240,6 +276,8 @@ $form.Size = New-Object System.Drawing.Size(1300, 850)
 $form.StartPosition = "CenterScreen"
 $form.BackColor = $backgroundColor
 $form.Font = New-Object System.Drawing.Font("Segoe UI", 12)
+$form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+$form.MinimumSize = New-Object System.Drawing.Size(1100, 750)
 
 # Create tab control
 $tabControl = New-Object System.Windows.Forms.TabControl
@@ -626,41 +664,135 @@ $buttonClickHandler = {
     }
 }
 
+# =============================================================================
+# SESSION LEDGER INSTRUMENTATION HELPER
+# =============================================================================
+# Wrapper function that ensures operations are recorded BEFORE execution.
+# If recording fails, the operation is NOT executed (fail-closed).
+
+function Invoke-InstrumentedAction {
+    <#
+    .SYNOPSIS
+        Wraps an action with automatic session ledger recording.
+    .DESCRIPTION
+        Records the operation start BEFORE executing the scriptblock.
+        If recording fails, the operation is NOT executed (fail-closed).
+        After execution, completes the operation with the result.
+    .PARAMETER Name
+        Human-readable name of the operation
+    .PARAMETER Source
+        Source identifier (e.g., "Button:DISM")
+    .PARAMETER Category
+        Network | System | Audio | Bluetooth | Maintenance | Other
+    .PARAMETER OperationType
+        Test | Action | ExternalTool | UI
+    .PARAMETER MutatesSystem
+        Whether this action changes system state
+    .PARAMETER Script
+        The scriptblock to execute
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Network", "System", "Audio", "Bluetooth", "Maintenance", "Other")]
+        [string]$Category,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Test", "Action", "ExternalTool", "UI")]
+        [string]$OperationType,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$MutatesSystem,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Script
+    )
+
+    # Check if ledger is available
+    $ledgerAvailable = Get-Command Start-WinConfigSessionOperation -ErrorAction SilentlyContinue
+
+    $opId = $null
+    if ($ledgerAvailable) {
+        # CRITICAL: Record BEFORE execute - throws on failure, aborting operation
+        $opId = Start-WinConfigSessionOperation `
+            -Category $Category `
+            -OperationType $OperationType `
+            -Name $Name `
+            -Source $Source `
+            -MutatesSystem $MutatesSystem
+        # If we reach here, operation was recorded successfully
+    }
+
+    $result = "Success"
+    $summary = ""
+    $evidence = @{}
+
+    try {
+        $output = & $Script
+
+        # Attempt to extract result from output if it's a result object
+        if ($output -is [hashtable]) {
+            if ($output.Success -eq $false) { $result = "Failed" }
+            elseif ($output.Warning -eq $true) { $result = "Warning" }
+            if ($output.Message) { $summary = $output.Message }
+            if ($output.Summary) { $summary = $output.Summary }
+            if ($output.Evidence -and $output.Evidence -is [hashtable]) { $evidence = $output.Evidence }
+        }
+        elseif ($output -is [PSCustomObject]) {
+            if ($output.PSObject.Properties['Success'] -and $output.Success -eq $false) { $result = "Failed" }
+            elseif ($output.PSObject.Properties['Warning'] -and $output.Warning -eq $true) { $result = "Warning" }
+            if ($output.PSObject.Properties['Message']) { $summary = $output.Message }
+            if ($output.PSObject.Properties['Summary']) { $summary = $output.Summary }
+        }
+    }
+    catch {
+        $result = "Failed"
+        $summary = $_.Exception.Message
+    }
+
+    # Complete operation in ledger
+    if ($opId -and $ledgerAvailable) {
+        Complete-WinConfigSessionOperation `
+            -OperationId $opId `
+            -Result $result `
+            -Summary $summary `
+            -Evidence $evidence
+    }
+
+    return $output
+}
+
 # Button event handlers
+# PERF-001: Use Get-WinConfigMachineInfo for cached CIM queries (no repeated WMI calls)
 $buttonHandlers = @{
     "Copy System Info" = {
-        $deviceName = (Get-CimInstance -ClassName Win32_ComputerSystem).Name
-        $serialNumber = (Get-CimInstance -ClassName Win32_BIOS).SerialNumber
-        $windowsCaption = (Get-CimInstance -ClassName Win32_OperatingSystem).Caption
-        $buildNumber = (Get-CimInstance -ClassName Win32_OperatingSystem).BuildNumber
-        $revisionNumber = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name UBR).UBR
-
-        $formattedWindowsVersion = $windowsCaption -replace "Microsoft Windows", "Windows"
-        $formattedWindowsVersion = "$formattedWindowsVersion $buildNumber.$revisionNumber"
-
-        $clipboardText = "Device Name: $deviceName`nSerial Number: $serialNumber`nOS: $formattedWindowsVersion"
+        $machineInfo = Get-WinConfigMachineInfo
+        $clipboardText = "Device Name: $($machineInfo.DeviceName)`nSerial Number: $($machineInfo.SerialNumber)`nOS: $($machineInfo.FormattedVersion)"
         [System.Windows.Forms.Clipboard]::SetText($clipboardText)
 
-        $infoMessage = "The following Device Information was copied to the clipboard:`n`nDevice Name: $deviceName`nSerial Number: $serialNumber`nOS: $formattedWindowsVersion"
+        $infoMessage = "The following Device Information was copied to the clipboard:`n`nDevice Name: $($machineInfo.DeviceName)`nSerial Number: $($machineInfo.SerialNumber)`nOS: $($machineInfo.FormattedVersion)"
         [System.Windows.Forms.MessageBox]::Show($infoMessage, "Device Information", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     }
     "Copy Device Name" = {
-        $deviceName = (Get-CimInstance -ClassName Win32_ComputerSystem).Name
-        [System.Windows.Forms.Clipboard]::SetText($deviceName)
-        [System.Windows.Forms.MessageBox]::Show("Device Name copied to clipboard: $deviceName", "Device Name", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        $machineInfo = Get-WinConfigMachineInfo
+        [System.Windows.Forms.Clipboard]::SetText($machineInfo.DeviceName)
+        [System.Windows.Forms.MessageBox]::Show("Device Name copied to clipboard: $($machineInfo.DeviceName)", "Device Name", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     }
     "Copy Serial Number" = {
-        $serialNumber = (Get-CimInstance -ClassName Win32_BIOS).SerialNumber
-        [System.Windows.Forms.Clipboard]::SetText($serialNumber)
-        [System.Windows.Forms.MessageBox]::Show("Serial Number copied to clipboard: $serialNumber", "Serial Number", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        $machineInfo = Get-WinConfigMachineInfo
+        [System.Windows.Forms.Clipboard]::SetText($machineInfo.SerialNumber)
+        [System.Windows.Forms.MessageBox]::Show("Serial Number copied to clipboard: $($machineInfo.SerialNumber)", "Serial Number", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     }
     "Copy Windows version" = {
-        $windowsCaption = (Get-CimInstance -ClassName Win32_OperatingSystem).Caption
-        $buildNumber = (Get-CimInstance -ClassName Win32_OperatingSystem).BuildNumber
-        $revisionNumber = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name UBR).UBR
-        $formattedWindowsVersion = "$windowsCaption $buildNumber.$revisionNumber"
-        [System.Windows.Forms.Clipboard]::SetText($formattedWindowsVersion)
-        [System.Windows.Forms.MessageBox]::Show("Windows version copied to clipboard: $formattedWindowsVersion", "Windows Version", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        $machineInfo = Get-WinConfigMachineInfo
+        [System.Windows.Forms.Clipboard]::SetText($machineInfo.FormattedVersion)
+        [System.Windows.Forms.MessageBox]::Show("Windows version copied to clipboard: $($machineInfo.FormattedVersion)", "Windows Version", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     }
     "%programdata%" = { Start-Process "explorer.exe" "$env:ProgramData" }
     "%localappdata%" = { Start-Process "explorer.exe" "$env:LocalAppData" }
@@ -672,10 +804,38 @@ $buttonHandlers = @{
             [System.Windows.Forms.MessageBox]::Show("ScreenConnect folder not found.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
         }
     }
-    "Device Manager" = { Start-Process "devmgmt.msc" }
-    "Task Manager" = { Start-Process "taskmgr.exe" }
-    "Control Panel" = { Start-Process "control.exe" }
-    "Sound Panel" = { Start-Process "mmsys.cpl" }
+    "Device Manager" = {
+        if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+            Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+                -Name "Open Device Manager" -Source "Button:DeviceManager" -MutatesSystem $false `
+                -Result "Success" -Summary "Launched devmgmt.msc"
+        }
+        Start-Process "devmgmt.msc"
+    }
+    "Task Manager" = {
+        if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+            Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+                -Name "Open Task Manager" -Source "Button:TaskManager" -MutatesSystem $false `
+                -Result "Success" -Summary "Launched taskmgr.exe"
+        }
+        Start-Process "taskmgr.exe"
+    }
+    "Control Panel" = {
+        if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+            Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+                -Name "Open Control Panel" -Source "Button:ControlPanel" -MutatesSystem $false `
+                -Result "Success" -Summary "Launched control.exe"
+        }
+        Start-Process "control.exe"
+    }
+    "Sound Panel" = {
+        if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+            Record-WinConfigSessionOperation -Category "Audio" -OperationType "ExternalTool" `
+                -Name "Open Sound Panel" -Source "Button:SoundPanel" -MutatesSystem $false `
+                -Result "Success" -Summary "Launched mmsys.cpl"
+        }
+        Start-Process "mmsys.cpl"
+    }
     "Apply Win 11 Start Menu" = {
         # Register session action
         if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
@@ -1029,16 +1189,22 @@ $buttonHandlers = @{
 }
         "Remove Intel SST Audio Driver" = $buttonClickHandler
         "DISM Restore Health" = {
-            if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                Register-WinConfigSessionAction -Action "DISM Restore Health" -Detail "DISM system image repair initiated" -Category "Diagnostics" -Result "PASS" -Tier 0 -Summary "DISM launched in new window"
+            # Record operation in session ledger (mutating system operation)
+            if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+                Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+                    -Name "DISM Restore Health" -Source "Button:DISM" -MutatesSystem $true `
+                    -Result "Success" -Summary "DISM launched in elevated window"
             }
             $wrapperPath = Join-Path (Split-Path $PSScriptRoot -Parent) "scripts\Invoke-DiagnosticConsole.ps1"
             $scriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) "scripts\Run-DISMRestoreHealth.ps1"
             Start-Process "powershell" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $wrapperPath, "-Title", "DISM Restore Health", "-Mode", "System Repair (requires elevation)", "-ScriptPath", $scriptPath, "-KeepOpen" -Verb RunAs
         }
         "/sfc scannow" = {
-            if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                Register-WinConfigSessionAction -Action "SFC Scan" -Detail "System File Checker scan initiated" -Category "Diagnostics" -Result "PASS" -Tier 0 -Summary "SFC launched in new window"
+            # Record operation in session ledger (mutating system operation)
+            if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+                Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+                    -Name "SFC Scannow" -Source "Button:SFC" -MutatesSystem $true `
+                    -Result "Success" -Summary "SFC launched in elevated window"
             }
             $wrapperPath = Join-Path (Split-Path $PSScriptRoot -Parent) "scripts\Invoke-DiagnosticConsole.ps1"
             $scriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) "scripts\Run-SFCScannow.ps1"
@@ -1482,6 +1648,9 @@ $buttonHandlers = @{
             }
         }
 
+        Write-Log ""
+        Write-Log "You can now close this window."
+
         # Set test result based on critical flags
         $hasFailure = $riskFlags | Where-Object { $_.Severity -eq "fail" }
         $hasWarning = $riskFlags | Where-Object { $_.Severity -eq "warn" }
@@ -1754,7 +1923,7 @@ $buttonHandlers = @{
             7000 { $explanation += "`r`nThis port (7000) is used for BLT Server communication. Without this connection, NeurOptimal may not be able to validate licenses properly." }
             7001 { $explanation += "`r`nThis port (7001) is used for BLT Server communication. Without this connection, NeurOptimal may not be able to validate licenses properly." }
             7002 { $explanation += "`r`nThis port (7002) is used for BLT Server communication. Without this connection, NeurOptimal may not be able to validate licenses properly." }
-            443 { $explanation += "`r`nThis port (443) is used for secure HTTPS connections. Without this connection, NeurOptimal may not be able to download updates or access online resources." }
+            443 { $explanation += "`r`nThis port (443) is used for secure HTTPS connections." }
         }
         
         return $explanation
@@ -1782,12 +1951,31 @@ $buttonHandlers = @{
     )
 
     # List of ports to test (CRITICAL - required for licensing)
+    # Note: Only BLT ports matter for licensing - these are the actual licensing servers
     $ports = @(
         @{Server = "blt-server.neuroptimal.com"; Port = 7000; Description = "BLT Server Port 7000"; Critical = $true},
         @{Server = "blt-server.neuroptimal.com"; Port = 7001; Description = "BLT Server Port 7001"; Critical = $true},
-        @{Server = "blt-server.neuroptimal.com"; Port = 7002; Description = "BLT Server Port 7002"; Critical = $true},
-        @{Server = "noreleases.neuroptimal.com"; Port = 443; Description = "Download Product Updates"; Critical = $true}
+        @{Server = "blt-server.neuroptimal.com"; Port = 7002; Description = "BLT Server Port 7002"; Critical = $true}
     )
+
+    # ============================================================================
+    # UPDATE REACHABILITY TEST - CONTRACT (REGRESSION GUARD)
+    # ============================================================================
+    # 1. Update delivery uses HTTPS + CDN infrastructure, NOT static port probing
+    # 2. Static port probing is INVALID for update verification (different infra)
+    # 3. This test is INTENTIONALLY NON-BLOCKING - update failures don't break runtime
+    # 4. Update functionality is primarily verified in-application, not by this diagnostic
+    # 5. Any HTTPS response (200, 204, 302, 307, 401, 403) = REACHABLE
+    # 6. Timeout/connection failure = NOT REACHABLE (informational only)
+    # ============================================================================
+    $updateEndpoint = @{
+        # Primary: Use neuroptimal.com main site as sentinel - same CDN/infrastructure class
+        # This tests HTTPS reachability using system HTTP stack (WinHTTP/.NET HttpClient)
+        Url = "https://neuroptimal.com"
+        Description = "Update server reachability"
+        # NON-BLOCKING: Failure does NOT affect overall verdict or licensing
+        Critical = $false
+    }
 
     # SNI test endpoint (for educational comparison)
     $sniTestDomain = "connectwise.com"
@@ -1795,11 +1983,11 @@ $buttonHandlers = @{
 
     Write-ColoredLog "Starting comprehensive connectivity diagnostics..." $headerColor
     Write-ColoredLog "System Region: $($countryInfo.CountryName)" $infoColor
-    Write-ColoredLog "Testing DNS, TLS security, ports, and system time." $infoColor
+    Write-ColoredLog "Testing DNS, TLS security, licensing ports, update reachability, and system time." $infoColor
     Write-ColoredLog "--------------------------------------------------------------" $headerColor
 
-    # Progress tracking (DNS + TLS + Ports + Time + SNI = domains + tlsEndpoints + ports + 1 + 1)
-    $totalTests = $domains.Count + $tlsEndpoints.Count + $ports.Count + 2
+    # Progress tracking (DNS + TLS + Ports + Time + SNI + Update = domains + tlsEndpoints + ports + 1 + 1 + 1)
+    $totalTests = $domains.Count + $tlsEndpoints.Count + $ports.Count + 3
     $completedTests = 0
 
     # Show initial progress with dots that will animate
@@ -2164,6 +2352,100 @@ $buttonHandlers = @{
         }
     }
 
+    # ============================================================================
+    # UPDATE REACHABILITY TEST (HTTPS-based, NON-BLOCKING)
+    # ============================================================================
+    # This test uses the system HTTP stack (WinHTTP/.NET HttpClient) which:
+    #   - Supports SNI (Server Name Indication)
+    #   - Uses TLS 1.2+
+    #   - Respects system proxy configuration
+    #   - Follows redirects automatically
+    #
+    # RESULT CLASSIFICATION:
+    #   REACHABLE: Any HTTP response (200, 204, 302, 307, 401, 403) = success
+    #   NOT REACHABLE: Timeout, connection refused, DNS failure = informational warning
+    #
+    # This test is NON-BLOCKING - failure does NOT affect overall licensing verdict
+    # ============================================================================
+    $updatePowershell = [powershell]::Create().AddScript({
+        param ($Endpoint)
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+
+        $url = $Endpoint.Url
+        $description = $Endpoint.Description
+
+        try {
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+            # Use Invoke-WebRequest with system HTTP stack
+            # This ensures we use the same stack as real applications:
+            # - SNI support
+            # - TLS 1.2+ negotiation
+            # - System proxy settings
+            # - Redirect following
+            $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 15 -Method HEAD -ErrorAction Stop
+
+            $stopwatch.Stop()
+
+            # Any HTTP response means the endpoint is reachable
+            # 200, 204, 302, 307, 401, 403 all indicate reachability
+            return @{
+                Url = $url
+                Description = $description
+                Success = $true
+                StatusCode = $response.StatusCode
+                ResponseTime = $stopwatch.ElapsedMilliseconds
+                Method = "HTTPS"
+                # NON-BLOCKING: Always INFO severity regardless of result
+                Severity = "INFO"
+                Type = "Update"
+                Message = "Update server reachable"
+            }
+        } catch {
+            $errorMsg = $_.Exception.Message
+
+            # Check if this is an HTTP error response (which still means reachable)
+            if ($_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                # 401, 403, 404, etc. all mean the server IS reachable
+                return @{
+                    Url = $url
+                    Description = $description
+                    Success = $true
+                    StatusCode = $statusCode
+                    ResponseTime = -1
+                    Method = "HTTPS"
+                    Severity = "INFO"
+                    Type = "Update"
+                    Message = "Update server reachable (HTTP $statusCode)"
+                }
+            }
+
+            # True connectivity failure - but NON-BLOCKING
+            return @{
+                Url = $url
+                Description = $description
+                Success = $false
+                StatusCode = 0
+                ResponseTime = -1
+                Method = "HTTPS"
+                Error = $errorMsg
+                # NON-BLOCKING: Failure is informational only
+                Severity = "INFO"
+                Type = "Update"
+                Message = "Update server not reachable from this network (non-blocking)"
+            }
+        }
+    }).AddArgument($updateEndpoint)
+
+    $updatePowershell.RunspacePool = $runspacePool
+    $runspaces += [PSCustomObject]@{
+        Runspace = $updatePowershell.BeginInvoke()
+        PowerShell = $updatePowershell
+        Type = "Update"
+    }
+
     # Time Drift Check - detects clock issues that break TLS/licensing
     $timePowershell = [powershell]::Create().AddScript({
         Set-StrictMode -Version Latest
@@ -2280,6 +2562,7 @@ $buttonHandlers = @{
     $portResults = @()
     $timeResult = $null
     $sniResult = $null
+    $updateResult = $null
     
     # Process results as they complete
     $pendingRunspaces = $runspaces.Clone()
@@ -2303,6 +2586,7 @@ $buttonHandlers = @{
                 "Port" { $portResults += $result }
                 "Time" { $timeResult = $result }
                 "SNI" { $sniResult = $result }
+                "Update" { $updateResult = $result }
             }
 
             # Update progress - add a dot for each completed test
@@ -2513,7 +2797,29 @@ $buttonHandlers = @{
     } elseif ($portFailures.Count -gt 0) {
         Write-ColoredLog "`nBlocked ports will prevent NeurOptimal licensing:" $failureColor
         Write-ColoredLog "  * Firewall may be blocking specific ports" $explanationColor
-        Write-ColoredLog "  * Required: ports 7000-7002 (BLT), 443 (Updates)" $explanationColor
+        Write-ColoredLog "  * Required: ports 7000-7002 (BLT Server licensing)" $explanationColor
+    }
+
+    # === UPDATE REACHABILITY (HTTPS-based, NON-BLOCKING) ===
+    # CONTRACT: This section is INFORMATIONAL ONLY and MUST NOT affect the licensing verdict.
+    # Update reachability is separate from licensing - the app can function without updates.
+    Write-ColoredLog "`nUPDATE SERVER REACHABILITY (Informational):" $headerColor
+    Write-ColoredLog "Tests if update infrastructure is reachable - does not affect licensing or runtime." $infoColor
+
+    if ($updateResult) {
+        if ($updateResult.Success) {
+            $responseInfo = if ($updateResult.ResponseTime -gt 0) { " ($($updateResult.ResponseTime) ms)" } else { "" }
+            Write-ColoredLog "[OK] $($updateResult.Message)$responseInfo" $successColor
+        } else {
+            # NON-BLOCKING: Show as informational, not as failure
+            Write-ColoredLog "[i] $($updateResult.Message)" $infoColor
+            if ($updateResult.Error) {
+                Write-ColoredLog "    Note: $($updateResult.Error)" $explanationColor
+            }
+            Write-ColoredLog "    This does not affect NeurOptimal licensing or operation." $successColor
+        }
+    } else {
+        Write-ColoredLog "[i] Update reachability test did not complete" $infoColor
     }
 
     # === SNI vs DIRECT IP EXPLANATION (INFORMATIONAL ONLY - DCTC Contract) ===
@@ -2672,6 +2978,12 @@ $buttonHandlers = @{
 
     Write-ColoredLog "$(if ($timeOK) { '[OK]' } else { '[FAIL]' }) System time" $(if ($timeOK) { $successColor } else { $failureColor })
 
+    # Update reachability - NON-BLOCKING, purely informational
+    $updateIndicator = if ($updateResult -and $updateResult.Success) { '[OK]' } else { '[i]' }
+    $updateLabel = if ($updateResult -and $updateResult.Success) { 'Updates (reachable)' } else { 'Updates (informational)' }
+    $updateColor = if ($updateResult -and $updateResult.Success) { $successColor } else { $infoColor }
+    Write-ColoredLog "$updateIndicator $updateLabel" $updateColor
+
     # Tiered recommendations (Context-Aware Action Contract)
     # Principle: Always recommend the lowest-cost, lowest-authority action first
     # Tier 0: No Action | Tier 1: Local User Action | Tier 2: Alternate Context
@@ -2732,12 +3044,13 @@ $buttonHandlers = @{
             Write-ColoredLog "* Try a different network (mobile hotspot) to verify if ports are blocked locally" $explanationColor
             Write-ColoredLog "* Restart modem/router if you have access - some routers block unusual ports by default" $explanationColor
             Write-ColoredLog "* If mobile hotspot works: the local network is blocking ports 7000-7002" $infoColor
-            Write-ColoredLog "* Required ports: 7000, 7001, 7002 (BLT Server) and 443 (Updates)" $infoColor
+            Write-ColoredLog "* Required ports: 7000, 7001, 7002 (BLT Server licensing)" $infoColor
         }
     }
 
     Write-ColoredLog "`n==============================================================" $headerColor
     Write-ColoredLog "Test completed at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" $infoColor
+    Write-ColoredLog "`nYou can now close this window." $infoColor
 
     # Update session action with classification, tier, and result
     if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
@@ -2765,6 +3078,8 @@ $buttonHandlers = @{
             PortsConfirmedFailed = $portsConfirmedFailed
             VerdictType = $overallStatus
             ColdStartViolation = $coldStartViolation
+            # Update reachability (NON-BLOCKING, informational only - does NOT affect verdict)
+            UpdateReachable = if ($updateResult) { $updateResult.Success } else { $null }
         }
 
         # Include country context in summary for operator visibility
@@ -2901,6 +3216,11 @@ foreach ($tabName in $tabPages) {
     $tabPage = New-TabPage $tabName
     $tabControl.TabPages.Add($tabPage) | Out-Null
 }
+
+# PERF-001: Lazy loading flags for expensive tabs
+# The UI must render before expensive work (module loads, CIM queries) begins
+$script:DiagnosticsTabInitialized = $false
+$script:BluetoothTabInitialized = $false
 
 # Populate tab pages
 $tabContents = @{
@@ -3106,6 +3426,26 @@ foreach ($tabPage in $tabControl.TabPages) {
     if ($tabPage.Text -eq "Bluetooth") {
         $tabPage.Controls.Clear()
 
+        # PERF-001: Store reference for lazy initialization handler
+        $script:BluetoothTabPage = $tabPage
+
+        # PERF-001: Show placeholder during initial population
+        # Actual content loads on first tab selection (via SelectedIndexChanged handler)
+        if (-not $script:BluetoothTabInitialized) {
+            $placeholderLabel = New-Object System.Windows.Forms.Label
+            $placeholderLabel.Text = "Bluetooth diagnostics will load when this tab is selected..."
+            $placeholderLabel.Font = New-Object System.Drawing.Font("Segoe UI", 11)
+            $placeholderLabel.ForeColor = [System.Drawing.Color]::Gray
+            $placeholderLabel.AutoSize = $true
+            $placeholderLabel.Padding = New-Object System.Windows.Forms.Padding(20)
+            $tabPage.Controls.Add($placeholderLabel)
+            $tabPage.Tag = "NeedsInit"
+            continue  # Skip the rest of this tab's initialization
+        }
+
+        # PERF-001: Lazy-load Bluetooth module on first tab access
+        Ensure-BluetoothModule
+
         # === ROOT LAYOUT: TableLayoutPanel with 2 columns (60%/40%) ===
         $btLayout = New-Object System.Windows.Forms.TableLayoutPanel
         $btLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
@@ -3164,10 +3504,14 @@ foreach ($tabPage in $tabControl.TabPages) {
                 $kodiHeadline = New-Headline "Kodi Audio Path"
                 $leftPanel.Controls.Add($kodiHeadline)
 
-                $kodiPanel = New-Object System.Windows.Forms.Panel
-                $kodiPanel.Width = 380
-                $kodiPanel.Height = 85
+                # Kodi panel (Phase 3: FlowLayoutPanel, no absolute positioning)
+                $kodiPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+                $kodiPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+                $kodiPanel.WrapContents = $false
+                $kodiPanel.AutoSize = $true
+                $kodiPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
                 $kodiPanel.BackColor = [System.Drawing.Color]::FromArgb(248, 248, 248)
+                $kodiPanel.Padding = New-Object System.Windows.Forms.Padding(10, 8, 10, 8)
                 $kodiPanel.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 10)
 
                 # Audio device
@@ -3175,9 +3519,9 @@ foreach ($tabPage in $tabControl.TabPages) {
                 $kodiDeviceLabel.Text = "Output: $($btDiagnostics.KodiSettings.AudioDevice)"
                 $kodiDeviceLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
                 $kodiDeviceLabel.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
-                $kodiDeviceLabel.Location = New-Object System.Drawing.Point(10, 8)
                 $kodiDeviceLabel.MaximumSize = New-Object System.Drawing.Size(360, 0)
                 $kodiDeviceLabel.AutoSize = $true
+                $kodiDeviceLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
                 $kodiPanel.Controls.Add($kodiDeviceLabel)
 
                 # Mode
@@ -3186,8 +3530,8 @@ foreach ($tabPage in $tabControl.TabPages) {
                 $kodiModeLabel.Text = "Mode: $modeText"
                 $kodiModeLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
                 $kodiModeLabel.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
-                $kodiModeLabel.Location = New-Object System.Drawing.Point(10, 28)
                 $kodiModeLabel.AutoSize = $true
+                $kodiModeLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
                 $kodiPanel.Controls.Add($kodiModeLabel)
 
                 # Passthrough status
@@ -3197,8 +3541,8 @@ foreach ($tabPage in $tabControl.TabPages) {
                 $kodiPTLabel.Text = "Passthrough: $ptText"
                 $kodiPTLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
                 $kodiPTLabel.ForeColor = $ptColor
-                $kodiPTLabel.Location = New-Object System.Drawing.Point(10, 48)
                 $kodiPTLabel.AutoSize = $true
+                $kodiPTLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
                 $kodiPanel.Controls.Add($kodiPTLabel)
 
                 # Channels
@@ -3207,10 +3551,9 @@ foreach ($tabPage in $tabControl.TabPages) {
                     $kodiChannelsLabel.Text = "Channels: $($btDiagnostics.KodiSettings.Channels)"
                     $kodiChannelsLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
                     $kodiChannelsLabel.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
-                    $kodiChannelsLabel.Location = New-Object System.Drawing.Point(10, 68)
                     $kodiChannelsLabel.AutoSize = $true
+                    $kodiChannelsLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
                     $kodiPanel.Controls.Add($kodiChannelsLabel)
-                    $kodiPanel.Height = 95
                 }
 
                 $leftPanel.Controls.Add($kodiPanel)
@@ -3232,10 +3575,14 @@ foreach ($tabPage in $tabControl.TabPages) {
                 $leftPanel.Controls.Add($findingsHeadline)
 
                 foreach ($finding in $btDiagnostics.Findings) {
-                    $findingPanel = New-Object System.Windows.Forms.Panel
-                    $findingPanel.Width = 380
-                    $findingPanel.Height = 75
+                    # Finding panel (Phase 3: FlowLayoutPanel, no absolute positioning)
+                    $findingPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+                    $findingPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+                    $findingPanel.WrapContents = $false
+                    $findingPanel.AutoSize = $true
+                    $findingPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
                     $findingPanel.BackColor = [System.Drawing.Color]::FromArgb(248, 248, 248)
+                    $findingPanel.Padding = New-Object System.Windows.Forms.Padding(10, 5, 10, 5)
                     $findingPanel.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 5)
 
                     # Title with severity color
@@ -3247,8 +3594,8 @@ foreach ($tabPage in $tabControl.TabPages) {
                         "WARN" { [System.Drawing.Color]::DarkOrange }
                         default { [System.Drawing.Color]::FromArgb(60, 60, 60) }
                     }
-                    $titleLabel.Location = New-Object System.Drawing.Point(10, 5)
                     $titleLabel.AutoSize = $true
+                    $titleLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 3)
                     $findingPanel.Controls.Add($titleLabel)
 
                     # Applies to
@@ -3256,8 +3603,8 @@ foreach ($tabPage in $tabControl.TabPages) {
                     $appliesToLabel.Text = "Applies to: $($finding.AppliesTo)"
                     $appliesToLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
                     $appliesToLabel.ForeColor = [System.Drawing.Color]::DimGray
-                    $appliesToLabel.Location = New-Object System.Drawing.Point(10, 28)
                     $appliesToLabel.AutoSize = $true
+                    $appliesToLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
                     $findingPanel.Controls.Add($appliesToLabel)
 
                     # Evidence
@@ -3266,9 +3613,9 @@ foreach ($tabPage in $tabControl.TabPages) {
                     $evidenceLabel.Text = $evidenceText
                     $evidenceLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
                     $evidenceLabel.ForeColor = [System.Drawing.Color]::DimGray
-                    $evidenceLabel.Location = New-Object System.Drawing.Point(10, 43)
                     $evidenceLabel.MaximumSize = New-Object System.Drawing.Size(360, 0)
                     $evidenceLabel.AutoSize = $true
+                    $evidenceLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
                     $findingPanel.Controls.Add($evidenceLabel)
 
                     # Action hint
@@ -3277,10 +3624,9 @@ foreach ($tabPage in $tabControl.TabPages) {
                         $hintLabel.Text = "-> $($finding.ActionHint)"
                         $hintLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
                         $hintLabel.ForeColor = $tabColor
-                        $hintLabel.Location = New-Object System.Drawing.Point(10, 58)
                         $hintLabel.AutoSize = $true
+                        $hintLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
                         $findingPanel.Controls.Add($hintLabel)
-                        $findingPanel.Height = 80
                     }
 
                     $leftPanel.Controls.Add($findingPanel)
@@ -3289,7 +3635,8 @@ foreach ($tabPage in $tabControl.TabPages) {
                 # Spacer after findings
                 $spacerFindings = New-Object System.Windows.Forms.Panel
                 $spacerFindings.Height = 10
-                $spacerFindings.Width = 380
+                $spacerFindings.AutoSize = $false
+                $spacerFindings.Dock = [System.Windows.Forms.DockStyle]::Top
                 $leftPanel.Controls.Add($spacerFindings)
             }
 
@@ -3430,7 +3777,8 @@ foreach ($tabPage in $tabControl.TabPages) {
             # === LEFT: Active Probe Section ===
             $spacerProbe = New-Object System.Windows.Forms.Panel
             $spacerProbe.Height = 15
-            $spacerProbe.Width = 380
+            $spacerProbe.AutoSize = $false
+            $spacerProbe.Dock = [System.Windows.Forms.DockStyle]::Top
             $leftPanel.Controls.Add($spacerProbe)
 
             $probeHeadline = New-Headline "Active Probe"
@@ -3550,7 +3898,8 @@ foreach ($tabPage in $tabControl.TabPages) {
             # Spacer
             $spacerSvc = New-Object System.Windows.Forms.Panel
             $spacerSvc.Height = 10
-            $spacerSvc.Width = 280
+            $spacerSvc.AutoSize = $false
+            $spacerSvc.Dock = [System.Windows.Forms.DockStyle]::Top
             $rightPanel.Controls.Add($spacerSvc)
 
             # === RIGHT: Bluetooth Audio Devices (Phase 1 & 2) ===
@@ -3559,11 +3908,14 @@ foreach ($tabPage in $tabControl.TabPages) {
                 $rightPanel.Controls.Add($audioDevicesHeadline)
 
                 foreach ($audioDevice in $btDiagnostics.BluetoothAudioDevices) {
-                    # Device panel
-                    $devicePanel = New-Object System.Windows.Forms.Panel
-                    $devicePanel.Width = 280
-                    $devicePanel.Height = 90
+                    # Device panel (Phase 3: FlowLayoutPanel, no absolute positioning)
+                    $devicePanel = New-Object System.Windows.Forms.FlowLayoutPanel
+                    $devicePanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+                    $devicePanel.WrapContents = $false
+                    $devicePanel.AutoSize = $true
+                    $devicePanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
                     $devicePanel.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
+                    $devicePanel.Padding = New-Object System.Windows.Forms.Padding(8, 5, 8, 5)
                     $devicePanel.Margin = New-Object System.Windows.Forms.Padding(0, 3, 0, 3)
 
                     # Device name (bold)
@@ -3571,9 +3923,9 @@ foreach ($tabPage in $tabControl.TabPages) {
                     $deviceNameLabel.Text = $audioDevice.Name
                     $deviceNameLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
                     $deviceNameLabel.ForeColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
-                    $deviceNameLabel.Location = New-Object System.Drawing.Point(8, 5)
-                    $deviceNameLabel.MaximumSize = New-Object System.Drawing.Size(200, 0)
+                    $deviceNameLabel.MaximumSize = New-Object System.Drawing.Size(260, 0)
                     $deviceNameLabel.AutoSize = $true
+                    $deviceNameLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
                     $devicePanel.Controls.Add($deviceNameLabel)
 
                     # Connection state
@@ -3586,8 +3938,8 @@ foreach ($tabPage in $tabControl.TabPages) {
                     $stateLabel.Text = "State: $($audioDevice.ConnectionState)"
                     $stateLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
                     $stateLabel.ForeColor = $stateColor
-                    $stateLabel.Location = New-Object System.Drawing.Point(8, 23)
                     $stateLabel.AutoSize = $true
+                    $stateLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
                     $devicePanel.Controls.Add($stateLabel)
 
                     # Profile info (only show if known)
@@ -3599,8 +3951,8 @@ foreach ($tabPage in $tabControl.TabPages) {
                         $profileLabel.Text = "Profiles: $($profiles -join ', ')"
                         $profileLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
                         $profileLabel.ForeColor = [System.Drawing.Color]::DimGray
-                        $profileLabel.Location = New-Object System.Drawing.Point(8, 37)
                         $profileLabel.AutoSize = $true
+                        $profileLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
                         $devicePanel.Controls.Add($profileLabel)
                     }
 
@@ -3612,24 +3964,25 @@ foreach ($tabPage in $tabControl.TabPages) {
                         $defaultLabel.Text = $defaultText
                         $defaultLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
                         $defaultLabel.ForeColor = $defaultColor
-                        $defaultLabel.Location = New-Object System.Drawing.Point(8, 51)
                         $defaultLabel.AutoSize = $true
+                        $defaultLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
                         $devicePanel.Controls.Add($defaultLabel)
                     }
 
                     # Action buttons panel
                     $btnPanel = New-Object System.Windows.Forms.FlowLayoutPanel
-                    $btnPanel.Location = New-Object System.Drawing.Point(8, 67)
-                    $btnPanel.Width = 260
-                    $btnPanel.Height = 25
+                    $btnPanel.AutoSize = $true
+                    $btnPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+                    $btnPanel.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 0)
                     $btnPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
 
                     # Disable button
                     $btnDisable = New-Object System.Windows.Forms.Button
                     $btnDisable.Text = "Disable"
                     $btnDisable.Font = New-Object System.Drawing.Font("Segoe UI", 7)
-                    $btnDisable.Width = 60
-                    $btnDisable.Height = 22
+                    $btnDisable.AutoSize = $true
+                    $btnDisable.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+                    $btnDisable.Padding = New-Object System.Windows.Forms.Padding(8, 2, 8, 2)
                     $btnDisable.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
                     $btnDisable.BackColor = [System.Drawing.Color]::FromArgb(230, 230, 230)
 
@@ -3719,8 +4072,9 @@ foreach ($tabPage in $tabControl.TabPages) {
                     $btnRemove = New-Object System.Windows.Forms.Button
                     $btnRemove.Text = "Remove (Unpair)"
                     $btnRemove.Font = New-Object System.Drawing.Font("Segoe UI", 7)
-                    $btnRemove.Width = 90
-                    $btnRemove.Height = 22
+                    $btnRemove.AutoSize = $true
+                    $btnRemove.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+                    $btnRemove.Padding = New-Object System.Windows.Forms.Padding(8, 2, 8, 2)
                     $btnRemove.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
                     $btnRemove.BackColor = [System.Drawing.Color]::FromArgb(230, 180, 180)
                     $btnRemove.Margin = New-Object System.Windows.Forms.Padding(5, 0, 0, 0)
@@ -3775,15 +4129,17 @@ foreach ($tabPage in $tabControl.TabPages) {
                 # Spacer after audio devices
                 $spacerAudioDev = New-Object System.Windows.Forms.Panel
                 $spacerAudioDev.Height = 10
-                $spacerAudioDev.Width = 280
+                $spacerAudioDev.AutoSize = $false
+                $spacerAudioDev.Dock = [System.Windows.Forms.DockStyle]::Top
                 $rightPanel.Controls.Add($spacerAudioDev)
             }
 
-            # === RIGHT: Advanced Details (Collapsible) ===
-            $advancedContainer = New-Object System.Windows.Forms.Panel
-            $advancedContainer.Width = 280
-            $advancedContainer.Height = 30
-            $advancedContainer.AutoSize = $false
+            # === RIGHT: Advanced Details (Collapsible) - Phase 3: FlowLayoutPanel ===
+            $advancedContainer = New-Object System.Windows.Forms.FlowLayoutPanel
+            $advancedContainer.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $advancedContainer.WrapContents = $false
+            $advancedContainer.AutoSize = $true
+            $advancedContainer.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
 
             $toggleAdvanced = New-Object System.Windows.Forms.Button
             $toggleAdvanced.Text = "+ Details"
@@ -3791,17 +4147,15 @@ foreach ($tabPage in $tabControl.TabPages) {
             $toggleAdvanced.BackColor = [System.Drawing.Color]::FromArgb(230, 230, 230)
             $toggleAdvanced.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
             $toggleAdvanced.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-            $toggleAdvanced.Width = 100
-            $toggleAdvanced.Height = 25
-            $toggleAdvanced.Location = New-Object System.Drawing.Point(0, 0)
+            $toggleAdvanced.AutoSize = $true
+            $toggleAdvanced.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 5)
             $advancedContainer.Controls.Add($toggleAdvanced)
 
             $advancedContent = New-Object System.Windows.Forms.FlowLayoutPanel
-            $advancedContent.Width = 270
             $advancedContent.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
             $advancedContent.WrapContents = $false
             $advancedContent.AutoSize = $true
-            $advancedContent.Location = New-Object System.Drawing.Point(0, 30)
+            $advancedContent.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
             $advancedContent.Visible = $false
             $advancedContainer.Controls.Add($advancedContent)
 
@@ -3850,10 +4204,8 @@ foreach ($tabPage in $tabControl.TabPages) {
                 $advancedContent.Visible = -not $advancedContent.Visible
                 if ($advancedContent.Visible) {
                     $toggleAdvanced.Text = "- Details"
-                    $advancedContainer.Height = $advancedContent.Height + 35
                 } else {
                     $toggleAdvanced.Text = "+ Details"
-                    $advancedContainer.Height = 30
                 }
             }.GetNewClosure())
 
@@ -3879,22 +4231,39 @@ foreach ($tabPage in $tabControl.TabPages) {
         $diagFlow.AutoScroll = $true
         $diagPanel.Controls.Add($diagFlow)
 
-        # Helper to create a read-only info row
-        function New-DiagnosticRow {
-            param([string]$Label, [string]$Value)
+        # Create TableLayoutPanel for diagnostic rows (Phase 1: DPI-safe layout)
+        $diagTable = New-Object System.Windows.Forms.TableLayoutPanel
+        $diagTable.Dock = [System.Windows.Forms.DockStyle]::Top
+        $diagTable.AutoSize = $true
+        $diagTable.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+        $diagTable.ColumnCount = 2
+        $diagTable.RowCount = 0
+        $diagTable.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
+        $diagTable.MinimumSize = New-Object System.Drawing.Size(700, 0)
+        # Column 0: Labels (AutoSize)
+        [void]$diagTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+        # Column 1: Values (Fill remaining space)
+        [void]$diagTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
 
-            $rowPanel = New-Object System.Windows.Forms.Panel
-            $rowPanel.Width = 650
-            $rowPanel.Height = 35
-            $rowPanel.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 5)
+        # Helper to add a diagnostic row to the TableLayoutPanel
+        function Add-DiagnosticRow {
+            param(
+                [System.Windows.Forms.TableLayoutPanel]$Table,
+                [string]$Label,
+                [string]$Value
+            )
+            $rowIndex = $Table.RowCount
+            $Table.RowCount++
+            [void]$Table.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
 
             $lblLabel = New-Object System.Windows.Forms.Label
             $lblLabel.Text = "${Label}:"
             $lblLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
             $lblLabel.ForeColor = $tabColor
-            $lblLabel.Location = New-Object System.Drawing.Point(0, 8)
             $lblLabel.AutoSize = $true
-            $rowPanel.Controls.Add($lblLabel)
+            $lblLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Left
+            $lblLabel.Margin = New-Object System.Windows.Forms.Padding(0, 8, 15, 8)
+            $Table.Controls.Add($lblLabel, 0, $rowIndex)
 
             $txtValue = New-Object System.Windows.Forms.TextBox
             $txtValue.Text = $Value
@@ -3902,11 +4271,9 @@ foreach ($tabPage in $tabControl.TabPages) {
             $txtValue.ReadOnly = $true
             $txtValue.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
             $txtValue.BackColor = [System.Drawing.Color]::White
-            $txtValue.Location = New-Object System.Drawing.Point(200, 5)
-            $txtValue.Width = 420
-            $rowPanel.Controls.Add($txtValue)
-
-            return $rowPanel
+            $txtValue.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $txtValue.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 5)
+            $Table.Controls.Add($txtValue, 1, $rowIndex)
         }
 
         # Add headline
@@ -3933,18 +4300,20 @@ foreach ($tabPage in $tabControl.TabPages) {
             default       { "Logging disabled for this session" }
         }
 
-        # Add diagnostic rows (operator-optimized layout)
-        $diagFlow.Controls.Add((New-DiagnosticRow -Label "Support Tool Session ID" -Value $script:SessionId))
-        $diagFlow.Controls.Add((New-DiagnosticRow -Label "NO Support Tool Version" -Value $AppVersion))
-        $diagFlow.Controls.Add((New-DiagnosticRow -Label "Started" -Value $script:SessionStartTime))
-        $diagFlow.Controls.Add((New-DiagnosticRow -Label "Device Name" -Value $machineInfo.DeviceName))
-        $diagFlow.Controls.Add((New-DiagnosticRow -Label "Serial Number" -Value $machineInfo.SerialNumber))
-        $diagFlow.Controls.Add((New-DiagnosticRow -Label "Log File" -Value $logFileDisplay))
+        # Add diagnostic rows to TableLayoutPanel (Phase 1: no absolute positioning)
+        Add-DiagnosticRow -Table $diagTable -Label "Support Tool Session ID" -Value $script:SessionId
+        Add-DiagnosticRow -Table $diagTable -Label "NO Support Tool Version" -Value $AppVersion
+        Add-DiagnosticRow -Table $diagTable -Label "Started" -Value $script:SessionStartTime
+        Add-DiagnosticRow -Table $diagTable -Label "Device Name" -Value $machineInfo.DeviceName
+        Add-DiagnosticRow -Table $diagTable -Label "Serial Number" -Value $machineInfo.SerialNumber
+        Add-DiagnosticRow -Table $diagTable -Label "Log File" -Value $logFileDisplay
+        $diagFlow.Controls.Add($diagTable)
 
         # Add spacer before Network Insights
         $spacer1 = New-Object System.Windows.Forms.Panel
         $spacer1.Height = 15
-        $spacer1.Width = 650
+        $spacer1.AutoSize = $false
+        $spacer1.Dock = [System.Windows.Forms.DockStyle]::Top
         $diagFlow.Controls.Add($spacer1)
 
         # === NETWORK INSIGHTS PANEL ===
@@ -3967,13 +4336,26 @@ foreach ($tabPage in $tabControl.TabPages) {
             $networkInsightsLabel.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 5)
             $diagFlow.Controls.Add($networkInsightsLabel)
 
-            # Create network insights container
+            # Create network insights container (Phase 2: FlowLayoutPanel + TableLayoutPanel)
             $networkInsightsContainer = New-Object System.Windows.Forms.Panel
-            $networkInsightsContainer.Width = 640
-            $networkInsightsContainer.Height = 120
+            $networkInsightsContainer.Dock = [System.Windows.Forms.DockStyle]::Top
+            $networkInsightsContainer.AutoSize = $true
+            $networkInsightsContainer.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
             $networkInsightsContainer.BackColor = [System.Drawing.Color]::FromArgb(248, 248, 248)
             $networkInsightsContainer.Padding = New-Object System.Windows.Forms.Padding(10)
             $networkInsightsContainer.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 10)
+
+            # Inner TableLayoutPanel for structured layout
+            $insightsTable = New-Object System.Windows.Forms.TableLayoutPanel
+            $insightsTable.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $insightsTable.AutoSize = $true
+            $insightsTable.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $insightsTable.ColumnCount = 2
+            $insightsTable.RowCount = 0
+            # Column 0: Primary info (50%), Column 1: Secondary info (50%)
+            [void]$insightsTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 50)))
+            [void]$insightsTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 50)))
+            $networkInsightsContainer.Controls.Add($insightsTable)
 
             # Extract country info from the most recent network action
             $latestNetworkAction = $networkActions | Sort-Object Timestamp -Descending | Select-Object -First 1
@@ -3983,14 +4365,17 @@ foreach ($tabPage in $tabControl.TabPages) {
                 @{ CountryCode = "XX"; CountryName = "Unknown"; CountryFlag = "" }
             }
 
-            # Country display (no flag in UI - flags are for external dashboard only)
+            # Row 0: Country (spans both columns as header)
+            $insightsTable.RowCount++
+            [void]$insightsTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
             $countryLabel = New-Object System.Windows.Forms.Label
             $countryLabel.Text = $countryInfo.CountryName
             $countryLabel.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
             $countryLabel.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
-            $countryLabel.Location = New-Object System.Drawing.Point(10, 10)
             $countryLabel.AutoSize = $true
-            $networkInsightsContainer.Controls.Add($countryLabel)
+            $countryLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 5)
+            $insightsTable.Controls.Add($countryLabel, 0, 0)
+            $insightsTable.SetColumnSpan($countryLabel, 2)
 
             # Collect latency data from Network Test actions
             $latencyValues = @()
@@ -4005,7 +4390,10 @@ foreach ($tabPage in $tabControl.TabPages) {
                 [math]::Round(($latencyValues | Measure-Object -Average).Average, 1)
             } else { $null }
 
-            # Latency display (line 2)
+            # Row 1: Latency | Connection
+            $insightsTable.RowCount++
+            [void]$insightsTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+
             $latencyText = if ($null -ne $avgLatency) {
                 $latencyQuality = if ($avgLatency -le 50) { "good" } elseif ($avgLatency -le 150) { "average" } else { "slow" }
                 "Avg Latency: ${avgLatency}ms ($latencyQuality)"
@@ -4016,9 +4404,29 @@ foreach ($tabPage in $tabControl.TabPages) {
             $latencyLabel.Text = $latencyText
             $latencyLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
             $latencyLabel.ForeColor = [System.Drawing.Color]::DimGray
-            $latencyLabel.Location = New-Object System.Drawing.Point(10, 35)
             $latencyLabel.AutoSize = $true
-            $networkInsightsContainer.Controls.Add($latencyLabel)
+            $latencyLabel.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 2)
+            $insightsTable.Controls.Add($latencyLabel, 0, 1)
+
+            # Connection type (right column of row 1)
+            $connectionTypes = @()
+            foreach ($action in $networkActions) {
+                if ($action.Evidence.ConnectionType -and $action.Evidence.ConnectionType -ne "None") {
+                    $connectionTypes += $action.Evidence.ConnectionType
+                }
+            }
+            $connectionText = if ($connectionTypes.Count -gt 0) {
+                "Connection: $($connectionTypes | Select-Object -Unique | Select-Object -First 1)"
+            } else {
+                "Connection: Unknown"
+            }
+            $connectionLabel = New-Object System.Windows.Forms.Label
+            $connectionLabel.Text = $connectionText
+            $connectionLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+            $connectionLabel.ForeColor = [System.Drawing.Color]::DimGray
+            $connectionLabel.AutoSize = $true
+            $connectionLabel.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 2)
+            $insightsTable.Controls.Add($connectionLabel, 1, 1)
 
             # Collect link speed data
             $linkSpeeds = @()
@@ -4031,7 +4439,10 @@ foreach ($tabPage in $tabControl.TabPages) {
                 [math]::Round(($linkSpeeds | Measure-Object -Average).Average, 0)
             } else { $null }
 
-            # Link Speed display (line 3)
+            # Row 2: Link Speed
+            $insightsTable.RowCount++
+            [void]$insightsTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+
             $linkSpeedText = if ($null -ne $avgLinkSpeed) {
                 if ($avgLinkSpeed -ge 1000) {
                     "Link Speed: $([math]::Round($avgLinkSpeed / 1000, 1)) Gbps"
@@ -4045,11 +4456,12 @@ foreach ($tabPage in $tabControl.TabPages) {
             $linkSpeedLabel.Text = $linkSpeedText
             $linkSpeedLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
             $linkSpeedLabel.ForeColor = [System.Drawing.Color]::DimGray
-            $linkSpeedLabel.Location = New-Object System.Drawing.Point(10, 55)
             $linkSpeedLabel.AutoSize = $true
-            $networkInsightsContainer.Controls.Add($linkSpeedLabel)
+            $linkSpeedLabel.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 2)
+            $insightsTable.Controls.Add($linkSpeedLabel, 0, 2)
+            $insightsTable.SetColumnSpan($linkSpeedLabel, 2)
 
-            # Failure counts by type (line 4)
+            # Failure counts by type
             $dnsFailures = 0
             $portFailures = 0
             $tlsInterceptions = 0
@@ -4073,40 +4485,26 @@ foreach ($tabPage in $tabControl.TabPages) {
             }
             $failureColor = if ($failureSummary.Count -gt 0) { [System.Drawing.Color]::DarkOrange } else { [System.Drawing.Color]::ForestGreen }
 
+            # Row 3: Issues
+            $insightsTable.RowCount++
+            [void]$insightsTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+
             $failureLabel = New-Object System.Windows.Forms.Label
             $failureLabel.Text = $failureText
             $failureLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
             $failureLabel.ForeColor = $failureColor
-            $failureLabel.Location = New-Object System.Drawing.Point(10, 75)
             $failureLabel.AutoSize = $true
-            $networkInsightsContainer.Controls.Add($failureLabel)
-
-            # Connection type display (line 5 - right side)
-            $connectionTypes = @()
-            foreach ($action in $networkActions) {
-                if ($action.Evidence.ConnectionType -and $action.Evidence.ConnectionType -ne "None") {
-                    $connectionTypes += $action.Evidence.ConnectionType
-                }
-            }
-            $connectionText = if ($connectionTypes.Count -gt 0) {
-                "Connection: $($connectionTypes | Select-Object -Unique | Select-Object -First 1)"
-            } else {
-                "Connection: Unknown"
-            }
-            $connectionLabel = New-Object System.Windows.Forms.Label
-            $connectionLabel.Text = $connectionText
-            $connectionLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-            $connectionLabel.ForeColor = [System.Drawing.Color]::DimGray
-            $connectionLabel.Location = New-Object System.Drawing.Point(200, 35)
-            $connectionLabel.AutoSize = $true
-            $networkInsightsContainer.Controls.Add($connectionLabel)
+            $failureLabel.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 2)
+            $insightsTable.Controls.Add($failureLabel, 0, 3)
+            $insightsTable.SetColumnSpan($failureLabel, 2)
 
             $diagFlow.Controls.Add($networkInsightsContainer)
 
             # Spacer after network insights
             $spacerNetworkInsights = New-Object System.Windows.Forms.Panel
             $spacerNetworkInsights.Height = 10
-            $spacerNetworkInsights.Width = 650
+            $spacerNetworkInsights.AutoSize = $false
+            $spacerNetworkInsights.Dock = [System.Windows.Forms.DockStyle]::Top
             $diagFlow.Controls.Add($spacerNetworkInsights)
         }
 
@@ -4124,7 +4522,8 @@ foreach ($tabPage in $tabControl.TabPages) {
         $actionsContainer.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
         $actionsContainer.WrapContents = $false
         $actionsContainer.AutoSize = $true
-        $actionsContainer.Width = 640
+        $actionsContainer.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+        $actionsContainer.Dock = [System.Windows.Forms.DockStyle]::Top
         $diagFlow.Controls.Add($actionsContainer)
 
         # Store reference for refresh
@@ -4136,7 +4535,8 @@ foreach ($tabPage in $tabControl.TabPages) {
         # Add spacer before button
         $spacer2 = New-Object System.Windows.Forms.Panel
         $spacer2.Height = 20
-        $spacer2.Width = 650
+        $spacer2.AutoSize = $false
+        $spacer2.Dock = [System.Windows.Forms.DockStyle]::Top
         $diagFlow.Controls.Add($spacer2)
 
         # Add "Copy to Clipboard" button
@@ -4146,8 +4546,7 @@ foreach ($tabPage in $tabControl.TabPages) {
         $copyDiagButton.BackColor = $tabColor
         $copyDiagButton.ForeColor = $textColor
         $copyDiagButton.Font = New-Object System.Drawing.Font("Segoe UI", 10)
-        $copyDiagButton.Width = 180
-        $copyDiagButton.Height = 40
+        $copyDiagButton.AutoSize = $true
         $copyDiagButton.Add_Click({
             # Get machine info for clipboard
             $clipMachineInfo = Get-WinConfigMachineInfo
@@ -4287,7 +4686,8 @@ $actionsText
         if ($DiagnosticsIngestPath) {
             $spacer3 = New-Object System.Windows.Forms.Panel
             $spacer3.Height = 15
-            $spacer3.Width = 650
+            $spacer3.AutoSize = $false
+            $spacer3.Dock = [System.Windows.Forms.DockStyle]::Top
             $diagFlow.Controls.Add($spacer3)
 
             $script:chkExportDiagnostics = New-Object System.Windows.Forms.CheckBox
@@ -4382,6 +4782,11 @@ $tabControl.Add_SelectedIndexChanged({
 
 # Log shutdown when form closes
 $form.Add_FormClosing({
+    # Finalize session ledger (makes session immutable, generates markdown)
+    if (Get-Command Finalize-WinConfigSession -ErrorAction SilentlyContinue) {
+        Finalize-WinConfigSession | Out-Null
+    }
+
     if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
         Write-WinConfigLog -Action "Shutdown" -Message "WinConfig application closed"
     }
@@ -4537,6 +4942,164 @@ $form.Add_FormClosing({
         }
     }
 })
+
+# ============================================================================
+# PERF-001: Lazy tab initialization handler
+# Populates deferred tabs on first selection (Bluetooth, Diagnostics)
+# ============================================================================
+$tabControl.Add_SelectedIndexChanged({
+    $selectedTab = $tabControl.SelectedTab
+    if ($null -eq $selectedTab) { return }
+
+    # Bluetooth tab lazy initialization
+    if ($selectedTab.Text -eq "Bluetooth" -and $selectedTab.Tag -eq "NeedsInit") {
+        $selectedTab.Tag = $null
+        $script:BluetoothTabInitialized = $true
+
+        # Clear placeholder and load module
+        $selectedTab.Controls.Clear()
+        Ensure-BluetoothModule
+
+        # Check if module loaded successfully
+        $btModuleAvailable = Get-Command Get-WinConfigBluetoothDiagnostics -ErrorAction SilentlyContinue
+
+        if (-not $btModuleAvailable) {
+            $noModuleLabel = New-Object System.Windows.Forms.Label
+            $noModuleLabel.Text = "Bluetooth diagnostics module could not be loaded."
+            $noModuleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 12)
+            $noModuleLabel.ForeColor = [System.Drawing.Color]::Gray
+            $noModuleLabel.AutoSize = $true
+            $noModuleLabel.Padding = New-Object System.Windows.Forms.Padding(20)
+            $selectedTab.Controls.Add($noModuleLabel)
+        } else {
+            # Build Bluetooth tab content directly
+            # === ROOT LAYOUT: TableLayoutPanel with 2 columns (60%/40%) ===
+            $btLayout = New-Object System.Windows.Forms.TableLayoutPanel
+            $btLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $btLayout.ColumnCount = 2
+            $btLayout.RowCount = 1
+            $btLayout.Padding = New-Object System.Windows.Forms.Padding(15)
+            [void]$btLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 60)))
+            [void]$btLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 40)))
+            [void]$btLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+            $selectedTab.Controls.Add($btLayout)
+
+            # === LEFT COLUMN ===
+            $leftPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+            $leftPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $leftPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $leftPanel.WrapContents = $false
+            $leftPanel.AutoScroll = $true
+            $leftPanel.Padding = New-Object System.Windows.Forms.Padding(0, 0, 10, 0)
+            $btLayout.Controls.Add($leftPanel, 0, 0)
+
+            # === RIGHT COLUMN ===
+            $rightPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+            $rightPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $rightPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $rightPanel.WrapContents = $false
+            $rightPanel.AutoScroll = $true
+            $rightPanel.Padding = New-Object System.Windows.Forms.Padding(10, 0, 0, 0)
+            $rightPanel.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
+            $btLayout.Controls.Add($rightPanel, 1, 0)
+
+            # Collect diagnostics
+            $btDiagnostics = Get-WinConfigBluetoothDiagnostics
+
+            # === LEFT: Findings ===
+            if ($btDiagnostics.Findings.Count -gt 0) {
+                $findingsHeadline = New-Headline "Findings"
+                $leftPanel.Controls.Add($findingsHeadline)
+
+                foreach ($finding in $btDiagnostics.Findings) {
+                    $findingPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+                    $findingPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+                    $findingPanel.WrapContents = $false
+                    $findingPanel.AutoSize = $true
+                    $findingPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+                    $findingPanel.BackColor = [System.Drawing.Color]::FromArgb(248, 248, 248)
+                    $findingPanel.Padding = New-Object System.Windows.Forms.Padding(10, 5, 10, 5)
+                    $findingPanel.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 5)
+
+                    $titleLabel = New-Object System.Windows.Forms.Label
+                    $titleLabel.Text = "[$($finding.Severity)] $($finding.Title)"
+                    $titleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+                    $titleLabel.ForeColor = switch ($finding.Severity) {
+                        "FAIL" { [System.Drawing.Color]::Crimson }
+                        "WARN" { [System.Drawing.Color]::DarkOrange }
+                        default { [System.Drawing.Color]::FromArgb(60, 60, 60) }
+                    }
+                    $titleLabel.AutoSize = $true
+                    $findingPanel.Controls.Add($titleLabel)
+
+                    if ($finding.ActionHint) {
+                        $hintLabel = New-Object System.Windows.Forms.Label
+                        $hintLabel.Text = "-> $($finding.ActionHint)"
+                        $hintLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
+                        $hintLabel.ForeColor = $tabColor
+                        $hintLabel.AutoSize = $true
+                        $findingPanel.Controls.Add($hintLabel)
+                    }
+
+                    $leftPanel.Controls.Add($findingPanel)
+                }
+            } else {
+                $noFindingsLabel = New-Object System.Windows.Forms.Label
+                $noFindingsLabel.Text = "No Bluetooth issues detected."
+                $noFindingsLabel.Font = New-Object System.Drawing.Font("Segoe UI", 11)
+                $noFindingsLabel.ForeColor = [System.Drawing.Color]::DimGray
+                $noFindingsLabel.AutoSize = $true
+                $noFindingsLabel.Padding = New-Object System.Windows.Forms.Padding(0, 10, 0, 10)
+                $leftPanel.Controls.Add($noFindingsLabel)
+            }
+
+            # === RIGHT: Adapter Info ===
+            if ($btDiagnostics.Adapter) {
+                $adapterHeadline = New-Headline "Bluetooth Adapter"
+                $rightPanel.Controls.Add($adapterHeadline)
+
+                $adapterInfo = New-Object System.Windows.Forms.Label
+                $adapterInfo.Text = "$($btDiagnostics.Adapter.Name)`nStatus: $($btDiagnostics.Adapter.Status)"
+                $adapterInfo.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+                $adapterInfo.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
+                $adapterInfo.AutoSize = $true
+                $adapterInfo.Padding = New-Object System.Windows.Forms.Padding(0, 5, 0, 10)
+                $rightPanel.Controls.Add($adapterInfo)
+            }
+
+            # === RIGHT: Connected Devices ===
+            if ($btDiagnostics.ConnectedDevices.Count -gt 0) {
+                $devicesHeadline = New-Headline "Connected Devices"
+                $rightPanel.Controls.Add($devicesHeadline)
+
+                foreach ($device in $btDiagnostics.ConnectedDevices) {
+                    $deviceLabel = New-Object System.Windows.Forms.Label
+                    $deviceLabel.Text = "$($device.Name) ($($device.Type))"
+                    $deviceLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+                    $deviceLabel.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
+                    $deviceLabel.AutoSize = $true
+                    $deviceLabel.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 2)
+                    $rightPanel.Controls.Add($deviceLabel)
+                }
+            }
+
+            $selectedTab.Refresh()
+        }
+    }
+})
+
+# ============================================================================
+# STARTUP INVARIANT GUARDRAILS (PERF-001)
+# Prevents regression: deferred modules must NOT be loaded before ShowDialog()
+# ============================================================================
+$deferredModules = @('Bluetooth', 'Network.Diagnostics')
+foreach ($moduleName in $deferredModules) {
+    if (Get-Module -Name $moduleName -ErrorAction SilentlyContinue) {
+        Write-Warning "PERF-001 VIOLATION: $moduleName loaded during startup - performance regression"
+        # In debug mode, this could throw. In prod, just warn.
+        # throw "PERF-001: $moduleName loaded during startup — regression"
+    }
+}
 
 # Show the form
 $form.ShowDialog() | Out-Null
