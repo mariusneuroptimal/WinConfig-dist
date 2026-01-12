@@ -18,6 +18,7 @@
         "src/Modules/Console.psm1"            # Required UI: diagnostic output formatting
         "src/Modules/Env.psm1"                # System info: admin check, machine info
         "src/Modules/Paths.psm1"              # Directory constants
+        "src/Modules/DiagnosticTypes.psm1"    # Type system: closed enum constants, Switch-DiagnosticResult
     )
 
     # Modules that gracefully degrade if missing - warning only
