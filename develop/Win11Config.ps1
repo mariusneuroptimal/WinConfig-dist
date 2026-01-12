@@ -34,6 +34,9 @@ switch ($Iteration.ToLower()) {
     }
 }
 
+# Diagnostics ingest (production) - enables ephemeral analytics export
+$DiagnosticsIngestPath = "\\192.168.2.90\no-support-ingest\incoming"
+
 # === PRODUCTION IMMUTABILITY GUARD (P1) ===
 if ($Iteration -eq "production" -and $env:CI -ne "true") {
     $acl = Get-Acl $VersionFile
