@@ -96,7 +96,7 @@ $script:DiagTabColor = $null
 
 # --- Diagnostics ingest endpoints ---
 $script:DiagnosticsSmbPath  = "\\192.168.2.90\no-support-ingest\incoming"
-$script:DiagnosticsHttpsUrl = "http://192.168.2.90:8443/ingest"
+$script:DiagnosticsHttpsUrl = "https://log-vehicles-scratch-birthday.trycloudflare.com/ingest"
 
 # Function to refresh the actions display (called on tab switch to Diagnostics)
 function Update-DiagActionsDisplay {

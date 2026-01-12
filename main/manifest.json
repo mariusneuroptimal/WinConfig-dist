@@ -1,7 +1,7 @@
 {
     "branch":  "main",
-    "generated":  "2026-01-12T17:23:08.2789239-05:00",
-    "commit":  "0de6651e940a41909b33b591ff01fa39dd42b283",
+    "generated":  "2026-01-12T17:34:59.6700740-05:00",
+    "commit":  "0b3f676448a22d0234fd3af9d61e235769361c24",
     "version":  "1.0",
     "files":  {
                   "Win11Config.ps1":  "afacf6ea77bd8e02fa246d75f550aaa17e65c731263ba61441eebd2d72ec6e34",
@@ -16,7 +16,7 @@
                   "src/Modules/DiagnosticTypes.psm1":  "e72022251c07915668bd2bb367865d2904fc25e5b87d7368fa50897ba023b88f",
                   "src/RUNTIME_DEPENDENCIES.psd1":  "0adcc4685f6b5ff5ef3e6a6c55fa06b3a6754494f1941971596c0a4afa2fea8d",
                   "src/VERSION.psd1":  "ff6ee1fdba00afd4e7713d356ed92d752ac386a4528909aa02e29e5c68778622",
-                  "src/Win11Config.App.ps1":  "0ad5b845cdce3fabe4e87da7834adb9a05a379b44b6a01fb188ccc79d3bb22d3",
+                  "src/Win11Config.App.ps1":  "b7010640b57d63732d6ea05bc0a269f7e290616f8e3ee5e9da947c62662ebd65",
                   "src/Modules/ModuleLoader.psm1":  "3ea4d54dd3da99b7db42b18b0355852b55d0500333ae471cb2a7d14cb49cfaf2"
               }
 }
