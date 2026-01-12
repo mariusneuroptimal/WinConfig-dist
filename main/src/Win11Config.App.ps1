@@ -27,6 +27,8 @@ Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\ExecutionIntent.ps
 
 # DiagnosticTypes - typed result constants and Switch-DiagnosticResult helper
 Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\DiagnosticTypes.psm1")
+# Ensure DiagnosticTypes functions available in UI runspace (WinForms event handlers)
+Import-Module (Join-Path $PSScriptRoot 'Modules\DiagnosticTypes.psm1') -Force
 
 # Console module for diagnostic output formatting
 Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\Console.psm1") -Prefix WinConfig
@@ -1040,6 +1042,7 @@ $buttonHandlers = @{
         $copyButton.Size = New-Object System.Drawing.Size(100,30)
         $copyButton.Text = "Copy KB"
         $copyButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+        # EXEMPT-CONTRACT-001: Simple clipboard operation, no diagnostic functions
         $copyButton.Add_Click({
             $selectedItem = $listView.SelectedItems[0]
             if ($selectedItem) {
@@ -1062,6 +1065,7 @@ $buttonHandlers = @{
         $searchButton.Size = New-Object System.Drawing.Size(220,30)
         $searchButton.Text = "Search Microsoft Catalog"
         $searchButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+        # EXEMPT-CONTRACT-001: Simple navigation action, no diagnostic functions
         $searchButton.Add_Click({
             $selectedItem = $listView.SelectedItems[0]
             if ($selectedItem) {
@@ -1089,6 +1093,7 @@ $buttonHandlers = @{
         $decreaseFont.Size = New-Object System.Drawing.Size(30,28)
         $decreaseFont.Location = New-Object System.Drawing.Point(0,0)
         $decreaseFont.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        # EXEMPT-CONTRACT-001: Font size adjustment, no diagnostic functions
         $decreaseFont.Add_Click({
             $currentFont = $listView.Font
             $newSize = [Math]::Max($currentFont.Size - 1, 6)  # Min size of 6
@@ -1108,6 +1113,7 @@ $buttonHandlers = @{
         $increaseFont.Size = New-Object System.Drawing.Size(30,28)
         $increaseFont.Location = New-Object System.Drawing.Point(68,0)
         $increaseFont.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        # EXEMPT-CONTRACT-001: Font size adjustment, no diagnostic functions
         $increaseFont.Add_Click({
             $currentFont = $listView.Font
             $newSize = [Math]::Min($currentFont.Size + 1, 20)  # Max size of 20
@@ -1685,6 +1691,9 @@ $buttonHandlers = @{
     }
 }
 "Domain, IP && Ports Test" = {
+    # Import in click handler runspace (WinForms delegates don't inherit modules)
+    Import-Module (Join-Path $PSScriptRoot 'Modules\DiagnosticTypes.psm1') -Force
+
     # GUARD: Verify required Console module functions are available (DIAG-GUI-001)
     if (-not (Get-Command Initialize-WinConfigGuiDiagnosticBox -ErrorAction SilentlyContinue)) {
         [System.Windows.Forms.MessageBox]::Show(
@@ -3377,6 +3386,7 @@ foreach ($tabPage in $tabControl.TabPages) {
 
         $gpoEnableButton = New-Button "Enable"
         $gpoDisableButton = New-Button "Disable"
+        # EXEMPT-CONTRACT-001: Registry operations only, no diagnostic functions
         $gpoEnableButton.Add_Click({
             # Ensure running as administrator
             if (-not (Assert-WinConfigIsAdmin)) { return }
@@ -3418,6 +3428,7 @@ foreach ($tabPage in $tabControl.TabPages) {
                 Restart-Computer -Force
             }
         })
+        # EXEMPT-CONTRACT-001: Registry operations only, no diagnostic functions
         $gpoDisableButton.Add_Click({
             # Ensure running as administrator
             if (-not (Assert-WinConfigIsAdmin)) { return }
@@ -3696,6 +3707,7 @@ foreach ($tabPage in $tabControl.TabPages) {
 
             # Restart Services button
             $btnRestartServices = New-Button "Restart BT + Audio Services"
+            # EXEMPT-CONTRACT-001: Service operations, uses string result not DiagnosticResult
             $btnRestartServices.Add_Click({
                 if (-not (Assert-WinConfigIsAdmin)) { return }
 
@@ -3737,6 +3749,7 @@ foreach ($tabPage in $tabControl.TabPages) {
 
             # Cleanup Endpoints button
             $btnCleanupEndpoints = New-Button "Remove Stale BT Endpoints"
+            # EXEMPT-CONTRACT-001: Endpoint cleanup, uses string result not DiagnosticResult
             $btnCleanupEndpoints.Add_Click({
                 if (-not (Assert-WinConfigIsAdmin)) { return }
 
@@ -3779,6 +3792,7 @@ foreach ($tabPage in $tabControl.TabPages) {
             # Reset Adapter button
             $btnResetAdapter = New-Button "Reset Bluetooth Adapter"
             $btnResetAdapter.BackColor = [System.Drawing.Color]::FromArgb(180, 80, 80)
+            # EXEMPT-CONTRACT-001: Adapter reset, uses string result not DiagnosticResult
             $btnResetAdapter.Add_Click({
                 if (-not (Assert-WinConfigIsAdmin)) { return }
 
@@ -3836,6 +3850,9 @@ foreach ($tabPage in $tabControl.TabPages) {
 
             $btnProbe = New-Button "Run 30-Second Probe"
             $btnProbe.Add_Click({
+                # Import in click handler runspace (WinForms delegates don't inherit modules)
+                Import-Module (Join-Path $PSScriptRoot 'Modules\DiagnosticTypes.psm1') -Force
+
                 $btnProbe.Enabled = $false
                 $btnProbe.Text = "Probe Running..."
 
@@ -4054,6 +4071,7 @@ foreach ($tabPage in $tabControl.TabPages) {
                     $deviceIsDefault = $audioDevice.IsDefaultPlayback
                     $deviceConnectionState = $audioDevice.ConnectionState
 
+                    # EXEMPT-CONTRACT-001: Device management, uses string result not DiagnosticResult
                     $btnDisable.Add_Click({
                         # Check probe guard
                         if (Test-WinConfigBluetoothProbeInProgress) {
@@ -4125,6 +4143,7 @@ foreach ($tabPage in $tabControl.TabPages) {
                     $btnRemove.BackColor = [System.Drawing.Color]::FromArgb(230, 180, 180)
                     $btnRemove.Margin = New-Object System.Windows.Forms.Padding(5, 0, 0, 0)
 
+                    # EXEMPT-CONTRACT-001: Device management, uses string result not DiagnosticResult
                     $btnRemove.Add_Click({
                         # Check probe guard
                         if (Test-WinConfigBluetoothProbeInProgress) {
@@ -4246,6 +4265,7 @@ foreach ($tabPage in $tabControl.TabPages) {
                 }
             }
 
+            # EXEMPT-CONTRACT-001: Simple visibility toggle, no diagnostic functions
             $toggleAdvanced.Add_Click({
                 $advancedContent.Visible = -not $advancedContent.Visible
                 if ($advancedContent.Visible) {
@@ -4593,6 +4613,7 @@ foreach ($tabPage in $tabControl.TabPages) {
         $copyDiagButton.ForeColor = $textColor
         $copyDiagButton.Font = New-Object System.Drawing.Font("Segoe UI", 10)
         $copyDiagButton.AutoSize = $true
+        # EXEMPT-CONTRACT-001: Clipboard operations, no Switch-DiagnosticResult usage
         $copyDiagButton.Add_Click({
             # Get machine info for clipboard
             $clipMachineInfo = Get-WinConfigMachineInfo
@@ -4819,6 +4840,7 @@ $tabControl.Add_DrawItem({
 })
 
 # Refresh actions display when switching to Diagnostics tab
+# EXEMPT-CONTRACT-001: Simple UI refresh, no diagnostic functions
 $tabControl.Add_SelectedIndexChanged({
     $selectedTab = $tabControl.SelectedTab
     if ($selectedTab -and $selectedTab.Text -eq "Diagnostics") {
@@ -4827,6 +4849,7 @@ $tabControl.Add_SelectedIndexChanged({
 })
 
 # Log shutdown when form closes
+# EXEMPT-CONTRACT-001: Shutdown logging, no Switch-DiagnosticResult usage
 $form.Add_FormClosing({
     # Finalize session ledger (makes session immutable, generates markdown)
     if (Get-Command Finalize-WinConfigSession -ErrorAction SilentlyContinue) {
@@ -4994,6 +5017,9 @@ $form.Add_FormClosing({
 # Populates deferred tabs on first selection (Bluetooth, Diagnostics)
 # ============================================================================
 $tabControl.Add_SelectedIndexChanged({
+    # Import in event handler runspace (WinForms delegates don't inherit modules)
+    Import-Module (Join-Path $PSScriptRoot 'Modules\DiagnosticTypes.psm1') -Force
+
     $selectedTab = $tabControl.SelectedTab
     if ($null -eq $selectedTab) { return }
 
