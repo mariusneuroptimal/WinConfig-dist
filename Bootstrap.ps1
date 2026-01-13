@@ -41,17 +41,13 @@
     Optional. Specify 'staging' or 'production' to skip interactive prompt.
     If not provided, prompts for input (legacy behavior).
 
-.PARAMETER Verbose
-    Show detailed verification output (file-by-file hashes, dependency checks).
-    Also enabled by: WINCONFIG_DIAGNOSTICS=1 environment variable.
-
-.PARAMETER Debug
-    Superset of -Verbose. Adds timing information (elapsed ms per phase) and
-    call-site info for each status line. Enable with WINCONFIG_DIAGNOSTICS=2.
-
 .PARAMETER Quiet
     Suppress all output including compact summary. Silent launch mode.
     Errors still show. Useful for scripted/automated launches.
+
+.PARAMETER Trace
+    Superset of -Verbose. Adds timing information (elapsed ms per phase) and
+    call-site info for each status line. Enable with WINCONFIG_DIAGNOSTICS=2.
 
 .PARAMETER SelfCheck
     Verify-only mode. Downloads, verifies integrity and dependencies, then
@@ -73,11 +69,15 @@
     .\Bootstrap.ps1 -Environment staging
 
 .EXAMPLE
-    # Verbose mode - show all verification details
+    # Verbose mode - show all verification details (PowerShell common parameter)
     .\Bootstrap.ps1 -Verbose
 
 .EXAMPLE
-    # Debug mode - verbose + timing + call-site info
+    # Trace mode - verbose + timing + call-site info
+    .\Bootstrap.ps1 -Trace
+
+.EXAMPLE
+    # Debug mode - PowerShell common parameter (same as -Verbose)
     .\Bootstrap.ps1 -Debug
 
 .EXAMPLE
@@ -88,6 +88,7 @@
     # Self-check mode - verify without launching
     .\Bootstrap.ps1 -SelfCheck
 #>
+[CmdletBinding()]
 param(
     [Parameter()]
     [ValidateSet('staging', 'production', '')]
@@ -97,24 +98,24 @@ param(
     [switch]$SimulateProd,  # CI mode: download, verify, import modules, exit before GUI
 
     [Parameter()]
-    [switch]$Verbose,       # Show detailed verification output
-
-    [Parameter()]
-    [switch]$Debug,         # Superset of Verbose: adds timing + call-site info
-
-    [Parameter()]
     [switch]$Quiet,         # Suppress even compact summary (silent launch)
 
     [Parameter()]
-    [switch]$SelfCheck      # Verify-only mode, don't launch
+    [switch]$SelfCheck,     # Verify-only mode, don't launch
+
+    [Parameter()]
+    [switch]$Trace          # Superset of -Verbose: adds timing + call-site info
 )
+
+# Note: -Verbose and -Debug are PowerShell common parameters (via CmdletBinding)
+# Use -Verbose for detailed output, -Trace for timing + call-site info
 
 # ============================================================================
 # CONFIGURATION - TRUST ANCHORS
 # ============================================================================
 
 # Bootstrap version - update when Bootstrap.ps1 changes
-$BootstrapVersion = "2.2.0"
+$BootstrapVersion = "2.2.1"
 
 # GitHub owner - HARDCODED TRUST ANCHOR (do not parameterize)
 $GitHubOwner = "mariusneuroptimal"
@@ -157,11 +158,15 @@ if ($Quiet) {
 }
 
 # Check for explicit verbose/debug request (overrides quiet)
-if ($Verbose -or $SelfCheck -or $SimulateProd) {
+# -Verbose and -Debug are PowerShell common parameters (CmdletBinding)
+$isVerbose = $VerbosePreference -eq 'Continue' -or $SelfCheck -or $SimulateProd
+$isDebug = $DebugPreference -eq 'Continue' -or $Trace
+
+if ($isVerbose) {
     $script:VerbosityLevel = 2
 }
-if ($Debug) {
-    $script:VerbosityLevel = 3  # Debug is superset of Verbose
+if ($isDebug) {
+    $script:VerbosityLevel = 3  # Debug/Trace is superset of Verbose
 }
 
 # Check environment variable override
