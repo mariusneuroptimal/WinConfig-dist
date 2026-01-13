@@ -27,7 +27,7 @@
 
     PREREQUISITES:
     - PowerShell 5.1 or later
-    - Internet access to raw.githubusercontent.com
+    - Internet access to api.github.com
 
     SECURITY CONTROLS:
     - Branch allow-list (fail-closed)
@@ -367,9 +367,10 @@ function Show-FailureDump {
 function Get-RawGitHubContent {
     <#
     .SYNOPSIS
-        Fetches raw file content from GitHub via raw.githubusercontent.com.
+        Fetches raw file content from GitHub via the GitHub API.
     .DESCRIPTION
-        Uses unauthenticated access to the public distribution repository.
+        Uses the GitHub Contents API with raw accept header.
+        This bypasses CDN caching issues with GitHub's raw content CDN.
         Strips UTF-8 BOM if present for compatibility.
     #>
     param(
@@ -379,11 +380,15 @@ function Get-RawGitHubContent {
         [string]$Path
     )
 
-    $url = "https://raw.githubusercontent.com/$Owner/$Repo/$Branch/$Path"
+    # Use GitHub API instead of raw CDN to avoid caching issues
+    $url = "https://api.github.com/repos/$Owner/$Repo/contents/$Path`?ref=$Branch"
     $ProgressPreference = 'SilentlyContinue'
 
     try {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -ErrorAction Stop
+        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -ErrorAction Stop -Headers @{
+            "Accept" = "application/vnd.github.v3.raw"
+            "User-Agent" = "WinConfig-Bootstrap"
+        }
         $content = $response.Content
 
         # Strip UTF-8 BOM if present (EF BB BF)
@@ -410,7 +415,7 @@ function Get-DistManifest {
         Fetches and parses manifest.json from the distribution repository.
     .DESCRIPTION
         Dist repo structure: main branch contains main/ and develop/ directories.
-        URL: raw.githubusercontent.com/{owner}/{repo}/main/{environment}/manifest.json
+        Uses GitHub API to bypass CDN caching.
     #>
     param(
         [string]$Owner,
