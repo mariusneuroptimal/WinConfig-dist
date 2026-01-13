@@ -42,11 +42,11 @@
     This file MUST be fetched via raw.githubusercontent.com, NOT the GitHub API.
     The API is rate-limited (60/hr unauthenticated) and will fail on repeated use.
 
-    From an open PowerShell window:
-    irm https://raw.githubusercontent.com/mariusneuroptimal/WinConfig-dist/main/Bootstrap.ps1 | iex
+    Recommended (most reliable, works everywhere):
+    [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $t="$env:TEMP\Bootstrap.ps1"; (New-Object Net.WebClient).DownloadFile("https://raw.githubusercontent.com/mariusneuroptimal/WinConfig-dist/main/Bootstrap.ps1",$t); powershell -NoProfile -NoExit -ExecutionPolicy Bypass -File $t
 
-    From Win+R, shortcut, or cold start (keeps window open):
-    powershell -NoExit -Command "irm https://raw.githubusercontent.com/mariusneuroptimal/WinConfig-dist/main/Bootstrap.ps1 | iex"
+    Alternative (from open PowerShell window only, may have caching issues):
+    irm https://raw.githubusercontent.com/mariusneuroptimal/WinConfig-dist/main/Bootstrap.ps1 | iex
 
     DO NOT USE: api.github.com/repos/.../contents/Bootstrap.ps1
     ========================================================================
