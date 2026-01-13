@@ -42,11 +42,11 @@
     This file MUST be fetched via raw.githubusercontent.com, NOT the GitHub API.
     The API is rate-limited (60/hr unauthenticated) and will fail on repeated use.
 
-    Production:
+    From an open PowerShell window:
     irm https://raw.githubusercontent.com/mariusneuroptimal/WinConfig-dist/main/Bootstrap.ps1 | iex
 
-    Or (explicit file save):
-    $c=(irm https://raw.githubusercontent.com/mariusneuroptimal/WinConfig-dist/main/Bootstrap.ps1); $c|Out-File "$env:TEMP\Bootstrap.ps1" -Encoding utf8; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\Bootstrap.ps1"
+    From Win+R, shortcut, or cold start (keeps window open):
+    powershell -NoExit -Command "irm https://raw.githubusercontent.com/mariusneuroptimal/WinConfig-dist/main/Bootstrap.ps1 | iex"
 
     DO NOT USE: api.github.com/repos/.../contents/Bootstrap.ps1
     ========================================================================
