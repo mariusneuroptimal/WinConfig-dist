@@ -115,7 +115,7 @@ param(
 # ============================================================================
 
 # Bootstrap version - update when Bootstrap.ps1 changes
-$BootstrapVersion = "2.2.1"
+$BootstrapVersion = "2.3.0"
 
 # GitHub owner - HARDCODED TRUST ANCHOR (do not parameterize)
 $GitHubOwner = "mariusneuroptimal"
@@ -367,32 +367,44 @@ function Show-FailureDump {
 function Get-RawGitHubContent {
     <#
     .SYNOPSIS
-        Fetches raw file content from GitHub via the GitHub API.
+        Fetches raw file content from GitHub via API with CDN fallback.
     .DESCRIPTION
-        Uses the GitHub Contents API with raw accept header.
-        This bypasses CDN caching issues with GitHub's raw content CDN.
+        Primary: GitHub Contents API (always fresh, but rate-limited at 60/hr unauthenticated)
+        Fallback: raw.githubusercontent.com CDN (no rate limit, hash verification ensures integrity)
         Strips UTF-8 BOM if present for compatibility.
     #>
     param(
         [string]$Owner,
         [string]$Repo,
         [string]$Branch,
-        [string]$Path
+        [string]$Path,
+        [switch]$PreferCdn  # Skip API, go straight to CDN (for bulk file downloads)
     )
 
-    # Use GitHub API instead of raw CDN to avoid caching issues
-    $url = "https://api.github.com/repos/$Owner/$Repo/contents/$Path`?ref=$Branch"
     $ProgressPreference = 'SilentlyContinue'
 
-    try {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -ErrorAction Stop -Headers @{
+    # Helper to fetch from raw CDN
+    $fetchFromCdn = {
+        $cdnUrl = "https://raw.githubusercontent.com/$Owner/$Repo/$Branch/$Path"
+        $response = Invoke-WebRequest -Uri $cdnUrl -UseBasicParsing -ErrorAction Stop -Headers @{
+            "User-Agent" = "WinConfig-Bootstrap"
+        }
+        return $response.Content
+    }
+
+    # Helper to fetch from API
+    $fetchFromApi = {
+        $apiUrl = "https://api.github.com/repos/$Owner/$Repo/contents/$Path`?ref=$Branch"
+        $response = Invoke-WebRequest -Uri $apiUrl -UseBasicParsing -ErrorAction Stop -Headers @{
             "Accept" = "application/vnd.github.v3.raw"
             "User-Agent" = "WinConfig-Bootstrap"
         }
+        return $response.Content
+    }
 
-        # PS 5.1 returns Content as byte[], PS 7 returns string
-        # Normalize to string for consistent handling
-        $rawContent = $response.Content
+    # Helper to normalize content (handle byte[] vs string, strip BOM)
+    $normalizeContent = {
+        param($rawContent)
         if ($rawContent -is [byte[]]) {
             $bytes = $rawContent
         } else {
@@ -405,8 +417,35 @@ function Get-RawGitHubContent {
             $startIndex = 3
         }
 
-        $content = [System.Text.Encoding]::UTF8.GetString($bytes, $startIndex, $bytes.Length - $startIndex)
-        return $content
+        return [System.Text.Encoding]::UTF8.GetString($bytes, $startIndex, $bytes.Length - $startIndex)
+    }
+
+    try {
+        if ($PreferCdn) {
+            # Direct to CDN (used for file downloads where hash verification ensures integrity)
+            $rawContent = & $fetchFromCdn
+            return & $normalizeContent $rawContent
+        }
+
+        # Try API first (always fresh)
+        try {
+            $rawContent = & $fetchFromApi
+            return & $normalizeContent $rawContent
+        } catch {
+            $statusCode = $null
+            if ($_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+
+            # Fall back to CDN on rate limit (403) or server error (5xx)
+            if ($statusCode -eq 403 -or ($statusCode -ge 500 -and $statusCode -lt 600)) {
+                $rawContent = & $fetchFromCdn
+                return & $normalizeContent $rawContent
+            }
+
+            # Re-throw for other errors (404, etc.)
+            throw
+        }
     } catch {
         $statusCode = $null
         if ($_.Exception.Response) {
@@ -544,7 +583,8 @@ foreach ($filePath in $FileManifest.Keys) {
     try {
         # Download file content from distribution repo
         # Dist repo structure: main branch with environment directories (main/, develop/)
-        $content = Get-RawGitHubContent -Owner $GitHubOwner -Repo $DistRepoName -Branch "main" -Path "$Branch/$filePath"
+        # Use CDN for bulk downloads (no rate limit) - hash verification ensures integrity
+        $content = Get-RawGitHubContent -Owner $GitHubOwner -Repo $DistRepoName -Branch "main" -Path "$Branch/$filePath" -PreferCdn
 
         if ([string]::IsNullOrWhiteSpace($content)) {
             Write-BufferedLog "EMPTY" -Color "Red"
@@ -611,7 +651,7 @@ Write-Status "All $filesVerified files verified and staged." "OK"
 # --- Step 6a: Fetch SOURCE_COMMIT.txt (traceability marker) ---
 # This file is not in the manifest - it's a build-time artifact for traceability
 try {
-    $sourceCommitContent = Get-RawGitHubContent -Owner $GitHubOwner -Repo $DistRepoName -Branch "main" -Path "$Branch/SOURCE_COMMIT.txt"
+    $sourceCommitContent = Get-RawGitHubContent -Owner $GitHubOwner -Repo $DistRepoName -Branch "main" -Path "$Branch/SOURCE_COMMIT.txt" -PreferCdn
     $sourceCommitPath = Join-Path $stagingRoot "SOURCE_COMMIT.txt"
     [System.IO.File]::WriteAllText($sourceCommitPath, $sourceCommitContent, [System.Text.UTF8Encoding]::new($false))
     Write-BufferedLog "  SOURCE_COMMIT.txt ... " -Color "Gray" -NoNewline
