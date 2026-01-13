@@ -5119,38 +5119,59 @@ $form.Add_FormClosing({
             # === WRITE ATTEMPT (Cloudflare R2 only) ===
             $json = $payload | ConvertTo-Json -Depth 10
 
-            Send-DiagnosticsPayloadCloudflare `
+            # CONTRACT: Result MUST be captured and checked - DO NOT pipe to Out-Null
+            # Regression guard: .github/workflows/lint-export-result.yml
+            # History: Silent failure bug caused uploads to fail without user notification
+            $uploadResult = Send-DiagnosticsPayloadCloudflare `
                 -JsonPayload $json `
                 -SessionId   $script:SessionId `
-                -IngestUrl   $script:DiagnosticsIngestUrl | Out-Null
+                -IngestUrl   $script:DiagnosticsIngestUrl
 
-            Write-Host "[Analytics Export] Submitted (async)" -ForegroundColor Green
-            if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
-                Write-WinConfigLog -Action "AnalyticsExport" -Message "Submitted diagnostics export (async)"
-            }
+            # Check actual result status
+            $resultStatus = if ($uploadResult) { $uploadResult.Status } else { "unknown" }
+            $isSuccess = $resultStatus -in @("uploaded", "duplicate")
 
-            # Register submission in session timeline
-            $script:DiagnosticActions += [PSCustomObject]@{
-                ActionId  = [guid]::NewGuid().ToString().Substring(0,8).ToUpper()
-                Timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffffff")
-                Action    = "Analytics Export"
-                Detail    = "Submitted (async)"
-                Category  = "Diagnostics"
-                Result    = "PASS"
+            if ($isSuccess) {
+                # Silent success - log internally only (no console output)
+                if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
+                    Write-WinConfigLog -Action "AnalyticsExport" -Message "Export succeeded: $resultStatus"
+                }
+
+                # Register success in session timeline
+                $script:DiagnosticActions += [PSCustomObject]@{
+                    ActionId  = [guid]::NewGuid().ToString().Substring(0,8).ToUpper()
+                    Timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffffff")
+                    Action    = "Analytics Export"
+                    Detail    = "Uploaded ($resultStatus)"
+                    Category  = "Diagnostics"
+                    Result    = "PASS"
+                }
+            } else {
+                # Silent failure - log internally only (no console output)
+                $errorDetail = if ($uploadResult.Error) { $uploadResult.Error } else { $resultStatus }
+                if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
+                    Write-WinConfigLog -Action "AnalyticsExport" -Message "Export failed: $resultStatus - $errorDetail"
+                }
+                Register-ExportWarning -Summary "Analytics export failed: $errorDetail"
+
+                # Register failure in session timeline
+                $script:DiagnosticActions += [PSCustomObject]@{
+                    ActionId  = [guid]::NewGuid().ToString().Substring(0,8).ToUpper()
+                    Timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffffff")
+                    Action    = "Analytics Export"
+                    Detail    = "Failed: $resultStatus"
+                    Category  = "Diagnostics"
+                    Result    = "FAIL"
+                }
             }
 
         } catch {
-            # Visible failure - register WARN in session timeline
+            # Silent exception - log internally only (no console output)
             $errorMsg = $_.Exception.Message
-            Write-Host "[Analytics Export] FAILED: $errorMsg" -ForegroundColor Red
             if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
-                Write-WinConfigLog -Action "AnalyticsExport" -Message "FAILED to export diagnostics: $errorMsg"
+                Write-WinConfigLog -Action "AnalyticsExport" -Message "Export exception: $errorMsg"
             }
-            if ($errorMsg -match "path" -or $errorMsg -match "access" -or $errorMsg -match "network") {
-                Register-ExportWarning -Summary "Analytics export failed: ingest path not writable"
-            } else {
-                Register-ExportWarning -Summary "Analytics export failed: $errorMsg"
-            }
+            Register-ExportWarning -Summary "Analytics export exception: $errorMsg"
         }
     }
 })
