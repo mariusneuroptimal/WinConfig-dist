@@ -94,9 +94,15 @@ $script:DiagActionsContainer = $null
 $script:DiagActionsLabel = $null
 $script:DiagTabColor = $null
 
-# --- Diagnostics ingest endpoints ---
-$script:DiagnosticsSmbPath  = "\\192.168.2.90\no-support-ingest\incoming"
-$script:DiagnosticsHttpsUrl = "https://log-vehicles-scratch-birthday.trycloudflare.com/ingest"
+# --- Diagnostics ingest (Cloudflare R2 only) ---
+$script:DiagnosticsIngestUrl = "https://ingest.dashboards.work/diagnostics"
+
+# Token guard for Cloudflare ingest (Machine scope only)
+function Get-NoSupportIngestToken {
+    $t = [Environment]::GetEnvironmentVariable("NOSUPPORT_INGEST_TOKEN", "Machine")
+    if ([string]::IsNullOrWhiteSpace($t)) { return $null }
+    return $t.Trim()
+}
 
 # Function to refresh the actions display (called on tab switch to Diagnostics)
 function Update-DiagActionsDisplay {
@@ -4753,8 +4759,8 @@ $actionsText
         })
         $diagFlow.Controls.Add($copyDiagButton)
 
-        # Add export checkbox (only visible if ingest path is configured)
-        if ($DiagnosticsIngestPath) {
+        # Add export checkbox (Cloudflare R2 ingest is always available)
+        if ($true) {
             $spacer3 = New-Object System.Windows.Forms.Panel
             $spacer3.Height = 15
             $spacer3.AutoSize = $false
@@ -4774,9 +4780,8 @@ $actionsText
             $exportTooltip.SetToolTip($script:chkExportDiagnostics, @"
 Export happens only at session end.
 Data is anonymized (country-level only).
-File is written to a network location, then immediately deleted.
-No local files are retained.
-No network transmission beyond the configured UNC path.
+Uploaded directly to Cloudflare R2 via HTTPS.
+No local files are retained after upload.
 "@)
 
             # Status line (visible only when checkbox is checked)
@@ -4852,42 +4857,109 @@ $tabControl.Add_SelectedIndexChanged({
     }
 })
 
-# --- Diagnostics transport helper (SMB → HTTPS fallback) ---
-function Send-DiagnosticsPayload {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Json,
+# --- Cloudflare Diagnostics Transport (Phase 2: spool-first, single-POST) ---
 
-        [Parameter(Mandatory)]
-        [string]$SessionId
+function Ensure-DiagnosticsDir([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) {
+        New-Item -ItemType Directory -Path $path -Force | Out-Null
+    }
+}
+
+function Compress-GzipBytes([byte[]]$bytes) {
+    $ms = [System.IO.MemoryStream]::new()
+    try {
+        $gz = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionMode]::Compress, $true)
+        try { $gz.Write($bytes, 0, $bytes.Length) } finally { $gz.Dispose() }
+        return $ms.ToArray()
+    } finally { $ms.Dispose() }
+}
+
+function Send-DiagnosticsPayloadCloudflare {
+    param(
+        [Parameter(Mandatory)] [string] $JsonPayload,
+        [Parameter(Mandatory)] [string] $SessionId,
+        [Parameter(Mandatory)] [string] $IngestUrl
     )
 
-    $tmpName = "NST-$SessionId.json.tmp"
+    $pendingRoot = Join-Path $env:ProgramData "NoSupport\PendingDiagnostics"
+    Ensure-DiagnosticsDir $pendingRoot
 
-    # --- SMB fast path ---
-    try {
-        if (Test-Path $script:DiagnosticsSmbPath) {
-            $full = Join-Path $script:DiagnosticsSmbPath $tmpName
-            [System.IO.File]::WriteAllText($full, $Json)
-            return "smb"
-        }
-    } catch {
-        # swallow and fall through
+    $spoolPath = Join-Path $pendingRoot "$SessionId.json"
+
+    # 1) Spool FIRST (durability)
+    if (-not (Test-Path -LiteralPath $spoolPath)) {
+        $JsonPayload | Out-File -LiteralPath $spoolPath -Encoding utf8 -Force
     }
 
-    # --- HTTPS fallback ---
-    try {
-        Invoke-RestMethod `
-            -Uri $script:DiagnosticsHttpsUrl `
-            -Method POST `
-            -ContentType "application/json" `
-            -Body $Json `
-            -TimeoutSec 10 `
-            -ErrorAction Stop
+    # 2) Token guard
+    $token = Get-NoSupportIngestToken
+    if (-not $token) {
+        return @{ Status="spooled_no_token"; SessionId=$SessionId; Path=$spoolPath }
+    }
 
-        return "https"
-    } catch {
-        throw "Diagnostics upload failed via SMB and HTTPS: $($_.Exception.Message)"
+    # 3) Compress
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($JsonPayload)
+    $compressed = Compress-GzipBytes $bytes
+
+    $headers = @{
+        Authorization      = "Bearer $token"
+        "Content-Encoding" = "gzip"
+        "Content-Type"     = "application/json"
+    }
+
+    # 4) Upload with bounded retries (using WebClient for reliable HTTP handling)
+    $maxAttempts = 3
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            $wc = [System.Net.WebClient]::new()
+            $wc.Headers['Authorization'] = "Bearer $token"
+            $wc.Headers['Content-Encoding'] = 'gzip'
+            $wc.Headers['Content-Type'] = 'application/json'
+
+            $responseBytes = $wc.UploadData($IngestUrl, 'POST', $compressed)
+            $responseText = [System.Text.Encoding]::UTF8.GetString($responseBytes)
+
+            # Success (2xx) - parse response to check status
+            Remove-Item -LiteralPath $spoolPath -Force -ErrorAction SilentlyContinue
+            return @{ Status="uploaded"; SessionId=$SessionId; Http=201; Response=$responseText }
+        }
+        catch [System.Net.WebException] {
+            $webEx = $_.Exception
+            $httpResp = $webEx.Response -as [System.Net.HttpWebResponse]
+
+            if ($httpResp) {
+                $statusCode = [int]$httpResp.StatusCode
+
+                # 409 Conflict = duplicate, treat as success
+                if ($statusCode -eq 409) {
+                    Remove-Item -LiteralPath $spoolPath -Force -ErrorAction SilentlyContinue
+                    return @{ Status="duplicate"; SessionId=$SessionId; Http=409 }
+                }
+
+                # 400/401/403 = fatal, don't retry
+                if ($statusCode -in 400,401,403) {
+                    return @{ Status="fatal"; SessionId=$SessionId; Http=$statusCode; Path=$spoolPath }
+                }
+            }
+
+            # Transient error - retry if attempts remain
+            if ($attempt -lt $maxAttempts) {
+                $base = [Math]::Pow(2, $attempt) # 2,4
+                $jitter = Get-Random -Minimum 0 -Maximum 250
+                Start-Sleep -Milliseconds ([int]($base*500 + $jitter))
+                continue
+            }
+            return @{ Status="spooled_upload_failed"; SessionId=$SessionId; Error=$webEx.Message; Path=$spoolPath }
+        }
+        catch {
+            if ($attempt -lt $maxAttempts) {
+                $base = [Math]::Pow(2, $attempt)
+                $jitter = Get-Random -Minimum 0 -Maximum 250
+                Start-Sleep -Milliseconds ([int]($base*500 + $jitter))
+                continue
+            }
+            return @{ Status="spooled_upload_failed"; SessionId=$SessionId; Error=$_.Exception.Message; Path=$spoolPath }
+        }
     }
 }
 
@@ -4903,8 +4975,8 @@ $form.Add_FormClosing({
         Write-WinConfigLog -Action "Shutdown" -Message "WinConfig application closed"
     }
 
-    # Ephemeral diagnostics export (checkbox-gated, zero local artifacts)
-    if ($DiagnosticsIngestPath -and $script:chkExportDiagnostics -and $script:chkExportDiagnostics.Checked) {
+    # Ephemeral diagnostics export (checkbox-gated, Cloudflare R2)
+    if ($script:chkExportDiagnostics -and $script:chkExportDiagnostics.Checked) {
 
         # Helper: Register export warning in session timeline
         function Register-ExportWarning {
@@ -5015,20 +5087,13 @@ $form.Add_FormClosing({
                 return  # Hard stop: do not write
             }
 
-            # === WRITE ATTEMPT (Dual Transport: SMB → HTTPS fallback) ===
+            # === WRITE ATTEMPT (Cloudflare R2 only) ===
             $json = $payload | ConvertTo-Json -Depth 10
 
-            # Fire-and-forget export to avoid UI freeze
-            Start-Job -ScriptBlock {
-                param($Json, $SessionId)
-
-                try {
-                    Send-DiagnosticsPayload -Json $Json -SessionId $SessionId | Out-Null
-                } catch {
-                    # Best-effort only — log to console, never block shutdown
-                    Write-Host "[Analytics Export] FAILED (async): $($_.Exception.Message)" -ForegroundColor Red
-                }
-            } -ArgumentList $json, $script:SessionId | Out-Null
+            Send-DiagnosticsPayloadCloudflare `
+                -JsonPayload $json `
+                -SessionId   $script:SessionId `
+                -IngestUrl   $script:DiagnosticsIngestUrl | Out-Null
 
             Write-Host "[Analytics Export] Submitted (async)" -ForegroundColor Green
             if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
