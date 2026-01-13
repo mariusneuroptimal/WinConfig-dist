@@ -37,6 +37,20 @@
     - Staged execution (not in-memory)
     - Explicit ExecutionPolicy bypass for staged scripts
 
+    CANONICAL LAUNCH (COPY THIS):
+    ========================================================================
+    This file MUST be fetched via raw.githubusercontent.com, NOT the GitHub API.
+    The API is rate-limited (60/hr unauthenticated) and will fail on repeated use.
+
+    Production:
+    irm https://raw.githubusercontent.com/mariusneuroptimal/WinConfig-dist/main/Bootstrap.ps1 | iex
+
+    Or (explicit file save):
+    $c=(irm https://raw.githubusercontent.com/mariusneuroptimal/WinConfig-dist/main/Bootstrap.ps1); $c|Out-File "$env:TEMP\Bootstrap.ps1" -Encoding utf8; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\Bootstrap.ps1"
+
+    DO NOT USE: api.github.com/repos/.../contents/Bootstrap.ps1
+    ========================================================================
+
 .PARAMETER Environment
     Optional. Specify 'staging' or 'production' to skip interactive prompt.
     If not provided, prompts for input (legacy behavior).
@@ -115,7 +129,7 @@ param(
 # ============================================================================
 
 # Bootstrap version - update when Bootstrap.ps1 changes
-$BootstrapVersion = "2.3.0"
+$BootstrapVersion = "2.4.0"
 
 # GitHub owner - HARDCODED TRUST ANCHOR (do not parameterize)
 $GitHubOwner = "mariusneuroptimal"
@@ -369,8 +383,15 @@ function Get-RawGitHubContent {
     .SYNOPSIS
         Fetches raw file content from GitHub via API with CDN fallback.
     .DESCRIPTION
-        Primary: GitHub Contents API (always fresh, but rate-limited at 60/hr unauthenticated)
-        Fallback: raw.githubusercontent.com CDN (no rate limit, hash verification ensures integrity)
+        Control plane: GitHub Contents API (always fresh, rate-limited at 60/hr unauthenticated)
+        Data plane: raw.githubusercontent.com CDN (no rate limit, relies on hash verification)
+
+        TRUST MODEL:
+        - PreferCdn bypasses freshness guarantees and relies solely on hash verification
+        - CDN fallback only triggers on confirmed rate-limit (X-RateLimit-Remaining: 0)
+        - Other 403 errors (auth, forbidden) are NOT masked - they rethrow
+        - Server errors (5xx) trigger CDN fallback with retry
+
         Strips UTF-8 BOM if present for compatibility.
     #>
     param(
@@ -378,28 +399,82 @@ function Get-RawGitHubContent {
         [string]$Repo,
         [string]$Branch,
         [string]$Path,
-        [switch]$PreferCdn  # Skip API, go straight to CDN (for bulk file downloads)
+        # Data-plane-only mode: bypasses API freshness guarantees.
+        # Safe only when hash verification is enforced by caller.
+        [switch]$PreferCdn
     )
 
     $ProgressPreference = 'SilentlyContinue'
 
-    # Helper to fetch from raw CDN
+    # Helper to fetch from raw CDN (with 1 retry on transient failure)
     $fetchFromCdn = {
+        param([int]$MaxRetries = 1)
         $cdnUrl = "https://raw.githubusercontent.com/$Owner/$Repo/$Branch/$Path"
-        $response = Invoke-WebRequest -Uri $cdnUrl -UseBasicParsing -ErrorAction Stop -Headers @{
-            "User-Agent" = "WinConfig-Bootstrap"
+        $attempt = 0
+        $lastError = $null
+
+        while ($attempt -le $MaxRetries) {
+            try {
+                $response = Invoke-WebRequest -Uri $cdnUrl -UseBasicParsing -ErrorAction Stop -Headers @{
+                    "User-Agent" = "WinConfig-Bootstrap"
+                }
+                $script:LastFetchSource = "CDN"
+                return $response.Content
+            } catch {
+                $lastError = $_
+                $attempt++
+                if ($attempt -le $MaxRetries) {
+                    Start-Sleep -Milliseconds 500
+                }
+            }
         }
-        return $response.Content
+        throw $lastError
     }
 
-    # Helper to fetch from API
+    # Helper to fetch from API (no retry - rate limit sensitive)
     $fetchFromApi = {
         $apiUrl = "https://api.github.com/repos/$Owner/$Repo/contents/$Path`?ref=$Branch"
         $response = Invoke-WebRequest -Uri $apiUrl -UseBasicParsing -ErrorAction Stop -Headers @{
             "Accept" = "application/vnd.github.v3.raw"
             "User-Agent" = "WinConfig-Bootstrap"
         }
-        return $response.Content
+        $script:LastFetchSource = "API"
+        # Capture rate limit headers for diagnostics
+        $script:LastRateLimitRemaining = $response.Headers["X-RateLimit-Remaining"]
+        return $response
+    }
+
+    # Helper to check if error is specifically a rate limit (not generic 403)
+    $isRateLimitError = {
+        param($Exception)
+        if (-not $Exception.Response) { return $false }
+        $statusCode = [int]$Exception.Response.StatusCode
+        if ($statusCode -ne 403) { return $false }
+
+        # Check X-RateLimit-Remaining header
+        try {
+            $remaining = $Exception.Response.Headers["X-RateLimit-Remaining"]
+            if ($null -ne $remaining -and [int]$remaining -eq 0) {
+                return $true
+            }
+        } catch {
+            # Header parsing failed - be conservative, don't assume rate limit
+        }
+
+        # Also check response body for rate limit message (fallback detection)
+        try {
+            $stream = $Exception.Response.GetResponseStream()
+            $reader = [System.IO.StreamReader]::new($stream)
+            $body = $reader.ReadToEnd()
+            $reader.Close()
+            if ($body -match "rate limit exceeded") {
+                return $true
+            }
+        } catch {
+            # Body read failed - be conservative
+        }
+
+        return $false
     }
 
     # Helper to normalize content (handle byte[] vs string, strip BOM)
@@ -422,28 +497,40 @@ function Get-RawGitHubContent {
 
     try {
         if ($PreferCdn) {
-            # Direct to CDN (used for file downloads where hash verification ensures integrity)
+            # Data-plane-only: direct to CDN, caller must enforce hash verification
             $rawContent = & $fetchFromCdn
             return & $normalizeContent $rawContent
         }
 
-        # Try API first (always fresh)
+        # Control plane: try API first (always fresh)
         try {
-            $rawContent = & $fetchFromApi
-            return & $normalizeContent $rawContent
+            $response = & $fetchFromApi
+            return & $normalizeContent $response.Content
         } catch {
             $statusCode = $null
             if ($_.Exception.Response) {
                 $statusCode = [int]$_.Exception.Response.StatusCode
             }
 
-            # Fall back to CDN on rate limit (403) or server error (5xx)
-            if ($statusCode -eq 403 -or ($statusCode -ge 500 -and $statusCode -lt 600)) {
+            # Only fall back to CDN on confirmed rate limit or server error
+            $shouldFallback = $false
+            $fallbackReason = $null
+
+            if (& $isRateLimitError $_.Exception) {
+                $shouldFallback = $true
+                $fallbackReason = "rate-limit"
+            } elseif ($statusCode -ge 500 -and $statusCode -lt 600) {
+                $shouldFallback = $true
+                $fallbackReason = "server-error-$statusCode"
+            }
+
+            if ($shouldFallback) {
+                Write-BufferedLog "    [FALLBACK] API->CDN ($fallbackReason)" -Color "Yellow"
                 $rawContent = & $fetchFromCdn
                 return & $normalizeContent $rawContent
             }
 
-            # Re-throw for other errors (404, etc.)
+            # Re-throw for other errors (404, auth 403, etc.) - don't mask config errors
             throw
         }
     } catch {
@@ -595,11 +682,14 @@ foreach ($filePath in $FileManifest.Keys) {
 
         # Verify hash
         $actualHash = Get-Sha256Hash -Content $content
+        $fetchSource = if ($script:LastFetchSource) { $script:LastFetchSource } else { "unknown" }
 
         if ($actualHash -ne $expectedHash) {
             Write-BufferedLog "HASH MISMATCH" -Color "Red"
+            Write-BufferedLog "    Source:   $fetchSource" -Color "Gray"
             Write-BufferedLog "    Expected: $expectedHash" -Color "Yellow"
             Write-BufferedLog "    Actual:   $actualHash" -Color "Red"
+            Write-BufferedLog "    (If CDN, may be stale - retry in a few minutes)" -Color "DarkYellow"
             $allFilesValid = $false
             $filesFailed++
             continue
@@ -635,6 +725,7 @@ if (-not $allFilesValid) {
     Show-FailureDump
     Write-Host ""
     Write-Host "Possible causes:" -ForegroundColor Yellow
+    Write-Host "  - CDN cache stale (wait 2-5 minutes, retry)" -ForegroundColor Gray
     Write-Host "  - Distribution repo out of sync" -ForegroundColor Gray
     Write-Host "  - Network or download issues" -ForegroundColor Gray
     Write-Host "  - Manifest corruption" -ForegroundColor Gray
