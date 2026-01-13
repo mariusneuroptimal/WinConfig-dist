@@ -5175,10 +5175,11 @@ function Send-DiagnosticsPayloadCloudflare {
         $JsonPayload | Out-File -LiteralPath $spoolPath -Encoding utf8 -Force
     }
 
-    # 2) Token guard
+    # 2) Token acquisition (zero-config via /ingest-token)
+    # SSOT: docs/SSOT_INGEST_AUTH.md - hard-fail if broker unavailable
     $token = Get-NoSupportIngestToken
     if (-not $token) {
-        return @{ Status="spooled_no_token"; SessionId=$SessionId; Path=$spoolPath }
+        return @{ Status="auth_broker_unavailable"; SessionId=$SessionId; AuthMethod="JWT (runtime)"; TokenSource="/ingest-token"; Error="Token broker unreachable" }
     }
 
     # 3) Compress
@@ -5205,7 +5206,7 @@ function Send-DiagnosticsPayloadCloudflare {
 
             # Success (2xx) - parse response to check status
             Remove-Item -LiteralPath $spoolPath -Force -ErrorAction SilentlyContinue
-            return @{ Status="uploaded"; SessionId=$SessionId; Http=201; Response=$responseText }
+            return @{ Status="uploaded"; SessionId=$SessionId; Http=201; Response=$responseText; AuthMethod="JWT (runtime)"; TokenSource="/ingest-token" }
         }
         catch [System.Net.WebException] {
             $webEx = $_.Exception
@@ -5217,12 +5218,12 @@ function Send-DiagnosticsPayloadCloudflare {
                 # 409 Conflict = duplicate, treat as success
                 if ($statusCode -eq 409) {
                     Remove-Item -LiteralPath $spoolPath -Force -ErrorAction SilentlyContinue
-                    return @{ Status="duplicate"; SessionId=$SessionId; Http=409 }
+                    return @{ Status="duplicate"; SessionId=$SessionId; Http=409; AuthMethod="JWT (runtime)"; TokenSource="/ingest-token" }
                 }
 
                 # 400/401/403 = fatal, don't retry
                 if ($statusCode -in 400,401,403) {
-                    return @{ Status="fatal"; SessionId=$SessionId; Http=$statusCode; Path=$spoolPath }
+                    return @{ Status="fatal"; SessionId=$SessionId; Http=$statusCode; Path=$spoolPath; AuthMethod="JWT (runtime)"; TokenSource="/ingest-token" }
                 }
             }
 
