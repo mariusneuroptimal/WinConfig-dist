@@ -22,7 +22,11 @@ if (-not (Get-Command 'Import-OptionalModule' -ErrorAction SilentlyContinue)) {
 # REQUIRED MODULES - Application fails without these
 # Order matters: dependencies must load before dependents
 
-# ExecutionIntent MUST load first - provides non-mutating diagnostic contract
+# Paths MUST load first - provides ephemeral temp root for zero-footprint operation
+Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\Paths.psm1")
+Initialize-WinConfigPaths | Out-Null
+
+# ExecutionIntent provides non-mutating diagnostic contract
 Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\ExecutionIntent.psm1")
 
 # DiagnosticTypes - typed result constants and Switch-DiagnosticResult helper
@@ -39,6 +43,10 @@ Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\Console.psm1") -Pr
 if (Import-OptionalModule -Path (Join-Path $PSScriptRoot "Logging\Logger.psm1") -Prefix WinConfig) {
     Initialize-WinConfigLogger -Version $AppVersion -Iteration $Iteration
     Write-WinConfigLog -Action "Startup" -Message "WinConfig application initialized"
+
+    # Log ephemeral temp root ONCE at startup (for support verification)
+    $tempRoot = Get-WinConfigTempRoot
+    Write-WinConfigLog -Action "Startup" -Message "Session temp root: $tempRoot"
 }
 
 # SessionOperationLedger for session-scoped operation recording (prefixed)
@@ -388,6 +396,9 @@ $buttonClickHandler = {
     # Check if running as administrator
     if (-not (Assert-WinConfigIsAdmin)) { return }
 
+    # SAFETY: Block mutations if audit trail is broken
+    if (-not (Assert-AuditTrailHealthyForMutation)) { return }
+
     # Register session action (admin verified, interactive operation)
     if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
         Register-WinConfigSessionAction -Action "Intel SST Removal" -Detail "Intel Smart Sound Technology driver removal initiated" -Category "AdminChange" -Result "PASS" -Tier 0 -Summary "Removal wizard launched"
@@ -501,13 +512,61 @@ $buttonClickHandler = {
                 Write-Log "Removing driver: $($driverInfo.Driver)"
                 pnputil /delete-driver $driverInfo.Driver /uninstall /force
 
-                # Delete driver files
+                # Delete driver files with STRICT path validation
+                # SECURITY: Multi-layer validation to prevent directory traversal and reparse point attacks
                 $driverPath = Split-Path $driverInfo.OriginalFileName -Parent
-                if (Test-Path $driverPath) {
-                    Remove-Item -Path $driverPath -Recurse -Force -ErrorAction Stop
-                    Write-Log "Removed driver files from $driverPath"
-                } else {
-                    Write-Log "Driver files not found at $driverPath" -Type "WARNING"
+
+                # Step 1: Canonicalize path using GetFullPath (handles ../ sequences, doesn't require path to exist)
+                $canonicalPath = $null
+                try {
+                    $canonicalPath = [System.IO.Path]::GetFullPath($driverPath)
+                } catch {
+                    Write-Log "SECURITY: Path canonicalization failed for: $driverPath" -Type "FAIL"
+                    throw "Invalid driver path - canonicalization failed"
+                }
+
+                # Step 2: Normalize the allowed base path
+                $driverStoreBase = [System.IO.Path]::GetFullPath((Join-Path $env:SystemRoot "System32\DriverStore\FileRepository"))
+
+                # Step 3: Strict prefix check (case-insensitive, handles trailing slashes)
+                $normalizedCanonical = $canonicalPath.TrimEnd('\', '/')
+                $normalizedBase = $driverStoreBase.TrimEnd('\', '/')
+                if (-not $normalizedCanonical.StartsWith($normalizedBase + '\', [StringComparison]::OrdinalIgnoreCase) -and
+                    -not $normalizedCanonical.Equals($normalizedBase, [StringComparison]::OrdinalIgnoreCase)) {
+                    Write-Log "SECURITY: Refusing to delete path outside DriverStore" -Type "FAIL"
+                    Write-Log "  Raw path: $driverPath" -Type "FAIL"
+                    Write-Log "  Canonical: $canonicalPath" -Type "FAIL"
+                    Write-Log "  Expected prefix: $driverStoreBase" -Type "FAIL"
+                    throw "Invalid driver path - outside allowed directory"
+                }
+
+                # Step 4: Check if path exists before attempting deletion
+                if (-not (Test-Path $canonicalPath)) {
+                    Write-Log "Driver files not found at $canonicalPath (already removed)" -Type "WARNING"
+                }
+                else {
+                    # Step 5: REPARSE POINT PROTECTION - check if target or any parent is a junction/symlink
+                    $pathToCheck = $canonicalPath
+                    $reparsePointDetected = $false
+                    while ($pathToCheck -and $pathToCheck.Length -gt $normalizedBase.Length) {
+                        if (Test-Path $pathToCheck) {
+                            $item = Get-Item $pathToCheck -Force -ErrorAction SilentlyContinue
+                            if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                                Write-Log "SECURITY: Reparse point detected in path: $pathToCheck" -Type "FAIL"
+                                $reparsePointDetected = $true
+                                break
+                            }
+                        }
+                        $pathToCheck = Split-Path $pathToCheck -Parent
+                    }
+
+                    if ($reparsePointDetected) {
+                        throw "Invalid driver path - contains reparse point (junction/symlink)"
+                    }
+
+                    # Step 6: Safe to delete
+                    Remove-Item -Path $canonicalPath -Recurse -Force -ErrorAction Stop
+                    Write-Log "Removed driver files from $canonicalPath"
                 }
             }
             catch {
@@ -652,6 +711,75 @@ $buttonClickHandler = {
             }
         }
 
+        # SAFETY: Create backups BEFORE any driver mutations
+        # Strategy: Restore point (primary) + Driver export (fallback)
+        $hasRestorePoint = $false
+        $hasDriverBackup = $false
+        $driverBackupPath = $null
+
+        # Step 1: Try to create system restore point
+        Write-Log "Creating system restore point before driver removal..."
+        $restoreResult = New-WinConfigSafetyRestorePoint -Description "Before Intel SST Audio Driver Removal"
+        if ($restoreResult.Success) {
+            if ($restoreResult.Throttled) {
+                Write-Log "Restore point was throttled (recent restore point exists)" -Type "WARNING"
+                $hasRestorePoint = $true  # A recent one exists
+            } else {
+                Write-Log "Restore point created successfully"
+                $hasRestorePoint = $true
+            }
+        } else {
+            Write-Log "Could not create restore point: $($restoreResult.Error)" -Type "WARNING"
+        }
+
+        # Step 2: Export drivers as additional backup (always try, even if restore point succeeded)
+        $driverNames = $intelAudioDrivers | ForEach-Object { $_.Driver }
+        if ($driverNames.Count -gt 0) {
+            Write-Log "Exporting driver packages as backup..."
+            $exportResult = Export-WinConfigDriverBackup -DriverNames $driverNames
+            if ($exportResult.Success) {
+                Write-Log "Drivers exported to: $($exportResult.BackupPath)"
+                $hasDriverBackup = $true
+                $driverBackupPath = $exportResult.BackupPath
+            } else {
+                Write-Log "Driver export failed: $($exportResult.Error)" -Type "WARNING"
+            }
+        }
+
+        # Step 3: If neither backup method worked, require explicit acknowledgment
+        if (-not $hasRestorePoint -and -not $hasDriverBackup) {
+            Write-Log "NO ROLLBACK PATH AVAILABLE - both restore point and driver export failed" -Type "FAIL"
+            $proceedWithoutRollback = [System.Windows.Forms.MessageBox]::Show(
+                "WARNING: No rollback path available!`n`n" +
+                "- Restore point: $($restoreResult.Error)`n" +
+                "- Driver export: $($exportResult.Error)`n`n" +
+                "If something goes wrong, you may need to reinstall Windows or manually restore drivers.`n`n" +
+                "Proceed anyway? (NOT RECOMMENDED)",
+                "No Rollback Path - Data Loss Risk",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Exclamation
+            )
+            if ($proceedWithoutRollback -ne [System.Windows.Forms.DialogResult]::Yes) {
+                Write-Log "Operation cancelled - no rollback path available." -Type "WARNING"
+                return
+            }
+            Write-Log "User acknowledged proceeding without rollback path" -Type "WARNING"
+        } elseif ($hasDriverBackup -and -not $hasRestorePoint) {
+            # Only driver backup - inform user
+            [System.Windows.Forms.MessageBox]::Show(
+                "System restore point could not be created, but drivers have been exported to:`n$driverBackupPath`n`nYou can reinstall from this backup if needed.",
+                "Driver Backup Created",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            ) | Out-Null
+        }
+
+        # SAFETY: Final audit check before irreversible driver mutations
+        if (-not (Assert-AuditTrailHealthyForMutation)) {
+            Write-Log "Operation blocked - audit trail failure detected" -Type "FAIL"
+            return
+        }
+
         # Remove the drivers
         Remove-Driver -Drivers $intelAudioDrivers
 
@@ -664,6 +792,22 @@ $buttonClickHandler = {
         }
 
         Write-Log "Script execution completed. A system restart is recommended for changes to take full effect."
+
+        # SAFETY: Check for other logged-in users before reboot
+        $safetyCheck = Test-WinConfigSafeToReboot
+        if (-not $safetyCheck.Safe) {
+            $multiUserWarning = [System.Windows.Forms.MessageBox]::Show(
+                "WARNING: $($safetyCheck.Reason)`n`nRebooting now may cause data loss for other users.`n`nProceed anyway?",
+                "Multi-User Warning",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Exclamation
+            )
+            if ($multiUserWarning -ne [System.Windows.Forms.DialogResult]::Yes) {
+                Write-Log "Reboot cancelled due to other active sessions." -Type "WARNING"
+                return
+            }
+        }
+
         $restart = [System.Windows.Forms.MessageBox]::Show(
             "Do you want to restart now?",
             "Restart Required",
@@ -671,7 +815,12 @@ $buttonClickHandler = {
             [System.Windows.Forms.MessageBoxIcon]::Question
         )
         if ($restart -eq [System.Windows.Forms.DialogResult]::Yes) {
-            Restart-Computer -Force
+            # SAFETY: Final audit check before reboot
+            if (-not (Assert-AuditTrailHealthyForMutation)) {
+                Write-Log "Reboot blocked - audit trail failure detected" -Type "FAIL"
+                return
+            }
+            Restart-Computer
         }
     }
     catch {
@@ -973,7 +1122,16 @@ $buttonHandlers = @{
 </LayoutModificationTemplate>
 "@
 
-        [System.IO.FileInfo]$provisioning = "$($env:ProgramData)\provisioning\tasbar_layout.xml"
+        # EPHEMERAL: Use session temp runtime path (zero-footprint)
+        # NOTE: This XML file is referenced by a registry policy. The policy will break
+        # after session ends since the file is deleted. For persistent taskbar layout,
+        # the policy mechanism should be refactored.
+        $runtimePath = if (Get-Command Get-WinConfigRuntimePath -ErrorAction SilentlyContinue) {
+            Get-WinConfigRuntimePath
+        } else {
+            Join-Path $env:TEMP "WinConfig-runtime"
+        }
+        [System.IO.FileInfo]$provisioning = Join-Path $runtimePath "taskbar_layout.xml"
         if (!$provisioning.Directory.Exists) {
             $provisioning.Directory.Create()
         }
@@ -2080,8 +2238,9 @@ $buttonHandlers = @{
                     $attemptDetail.TcpConfirmed = $true
                     $attemptDetail.FailureStage = "TLS"
 
-                    # Step 3: TLS handshake (REQUIRED)
-                    $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false, { return $true })
+                    # Step 3: TLS handshake (REQUIRED) - using standard validation
+                    # SECURITY: No cert bypass - warmup domain should have valid cert
+                    $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false)
                     $sslStream.AuthenticateAsClient($phase0Result.WarmupDomain)
                     $attemptDetail.HttpsConfirmed = $true
                     $attemptDetail.FailureStage = "NONE"
@@ -2230,7 +2389,13 @@ $buttonHandlers = @{
 
                 $tcpClient.EndConnect($connect)
 
-                # Perform TLS handshake
+                # SECURITY EXCEPTION: SSL Inspection Detection
+                # This callback INTENTIONALLY accepts all certificates to:
+                # 1. Retrieve the certificate for issuer inspection
+                # 2. Detect corporate proxy/firewall TLS interception (MITM)
+                # 3. Report when cert issuer doesn't match expected CAs
+                # This is DIAGNOSTIC ONLY - no data is sent, only cert metadata is inspected.
+                # DO NOT copy this pattern to other locations.
                 $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false, {
                     param($sender, $cert, $chain, $errors)
                     return $true  # Accept all certs for inspection detection
@@ -2518,53 +2683,107 @@ $buttonHandlers = @{
         Set-StrictMode -Version Latest
         $ErrorActionPreference = 'Stop'
 
-        $domainSuccess = $false
-        $directIPSuccess = $false
-        $domainError = ""
-        $directIPError = ""
+        # RESULT SEMANTICS (clear distinction between failure modes):
+        # - TcpOk: TCP socket connected successfully
+        # - TlsOk: TLS handshake completed (regardless of cert validation)
+        # - CertOk: Certificate validated successfully (CN/SAN match, chain trusted)
+        # - Error: Human-readable error message for the failure point
+
         $timeoutMs = 5000
 
         # Test 1: HTTPS with domain name (SNI)
+        $domainTcpOk = $false
+        $domainTlsOk = $false
+        $domainCertOk = $false
+        $domainError = ""
         try {
             $tcpClient = New-Object System.Net.Sockets.TcpClient
             $connect = $tcpClient.BeginConnect($Domain, 443, $null, $null)
             if ($connect.AsyncWaitHandle.WaitOne($timeoutMs, $false)) {
                 $tcpClient.EndConnect($connect)
+                $domainTcpOk = $true  # TCP connected
+
                 $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false)
-                $sslStream.AuthenticateAsClient($Domain)
-                $domainSuccess = $true
+                try {
+                    $sslStream.AuthenticateAsClient($Domain)
+                    $domainTlsOk = $true   # TLS handshake completed
+                    $domainCertOk = $true  # Cert validated (no exception)
+                }
+                catch [System.Security.Authentication.AuthenticationException] {
+                    # TLS started but cert failed
+                    $domainTlsOk = $true  # TLS handshake initiated
+                    $domainError = "Certificate error: $($_.Exception.Message)"
+                }
                 $sslStream.Close()
+            } else {
+                $domainError = "TCP connection timeout"
             }
             $tcpClient.Close()
         } catch {
-            $domainError = $_.Exception.Message
+            if (-not $domainTcpOk) {
+                $domainError = "TCP error: $($_.Exception.Message)"
+            } else {
+                $domainError = "TLS error: $($_.Exception.Message)"
+            }
         }
 
-        # Test 2: HTTPS to direct IP (no SNI)
+        # Test 2: HTTPS to direct IP (no SNI) - WITHOUT cert validation bypass
+        # SECURITY: We test TCP+TLS handshake without bypassing certificate validation.
+        # Certificate will fail (expected - IP won't match cert CN), but TLS handshake confirms connectivity.
+        $directIPTcpOk = $false
+        $directIPTlsOk = $false
+        $directIPCertOk = $false  # Expected to be false (IP won't match CN)
+        $directIPError = ""
         try {
             $tcpClient = New-Object System.Net.Sockets.TcpClient
             $connect = $tcpClient.BeginConnect($DirectIP, 443, $null, $null)
             if ($connect.AsyncWaitHandle.WaitOne($timeoutMs, $false)) {
                 $tcpClient.EndConnect($connect)
-                $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false, {
-                    param($s, $c, $ch, $e) return $true  # Accept any cert for this test
-                })
-                $sslStream.AuthenticateAsClient($DirectIP)
-                $directIPSuccess = $true
+                $directIPTcpOk = $true  # TCP connected
+
+                # Use standard SSL stream with default validation
+                $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false)
+                try {
+                    $sslStream.AuthenticateAsClient($DirectIP)
+                    $directIPTlsOk = $true   # TLS handshake completed
+                    $directIPCertOk = $true  # Cert validated (unexpected for IP test)
+                }
+                catch [System.Security.Authentication.AuthenticationException] {
+                    # Expected: certificate won't match IP address
+                    # But TLS handshake succeeded (we got far enough to check cert)
+                    $directIPTlsOk = $true
+                    # Not an error for this test - cert mismatch is expected
+                }
                 $sslStream.Close()
+            } else {
+                $directIPError = "TCP connection timeout"
             }
             $tcpClient.Close()
         } catch {
-            $directIPError = $_.Exception.Message
+            if (-not $directIPTcpOk) {
+                $directIPError = "TCP error: $($_.Exception.Message)"
+            } else {
+                $directIPError = "TLS error: $($_.Exception.Message)"
+            }
         }
 
         return @{
             Domain = $Domain
             DirectIP = $DirectIP
-            DomainSuccess = $domainSuccess
-            DirectIPSuccess = $directIPSuccess
+            # Domain test results (clear semantics)
+            DomainTcpOk = $domainTcpOk
+            DomainTlsOk = $domainTlsOk
+            DomainCertOk = $domainCertOk
             DomainError = $domainError
+            # Direct IP test results (clear semantics)
+            DirectIPTcpOk = $directIPTcpOk
+            DirectIPTlsOk = $directIPTlsOk
+            DirectIPCertOk = $directIPCertOk  # Expected false (IP won't match CN)
             DirectIPError = $directIPError
+            # Legacy compatibility (DomainSuccess = full success, DirectIPSuccess = TLS worked)
+            DomainSuccess = ($domainTcpOk -and $domainTlsOk -and $domainCertOk)
+            DirectIPSuccess = ($directIPTcpOk -and $directIPTlsOk)  # Cert mismatch expected, not failure
+            DirectIPCertMismatch = ($directIPTcpOk -and $directIPTlsOk -and -not $directIPCertOk)
             Type = "SNI"
             # This is purely educational - not a pass/fail
             Severity = "INFO"
@@ -3401,6 +3620,9 @@ foreach ($tabPage in $tabControl.TabPages) {
             # Ensure running as administrator
             if (-not (Assert-WinConfigIsAdmin)) { return }
 
+            # SAFETY: Block mutations if audit trail is broken
+            if (-not (Assert-AuditTrailHealthyForMutation)) { return }
+
             $regPaths = @(
                 'HKCU:\Software\Policies\Microsoft\Control Panel\International',
                 'HKLM:\Software\Policies\Microsoft\Control Panel\International'
@@ -3428,6 +3650,20 @@ foreach ($tabPage in $tabControl.TabPages) {
                 [System.Windows.Forms.MessageBoxIcon]::Information
             )
 
+            # SAFETY: Check for other logged-in users before reboot
+            $safetyCheck = Test-WinConfigSafeToReboot
+            if (-not $safetyCheck.Safe) {
+                $multiUserWarning = [System.Windows.Forms.MessageBox]::Show(
+                    "WARNING: $($safetyCheck.Reason)`n`nRebooting now may cause data loss for other users.`n`nProceed anyway?",
+                    "Multi-User Warning",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Exclamation
+                )
+                if ($multiUserWarning -ne [System.Windows.Forms.DialogResult]::Yes) {
+                    return
+                }
+            }
+
             $result = [System.Windows.Forms.MessageBox]::Show(
                 "A reboot is recommended for changes to take effect. Reboot now?",
                 "Reboot Required",
@@ -3435,13 +3671,18 @@ foreach ($tabPage in $tabControl.TabPages) {
                 [System.Windows.Forms.MessageBoxIcon]::Question
             )
             if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-                Restart-Computer -Force
+                # SAFETY: Final audit check before reboot
+                if (-not (Assert-AuditTrailHealthyForMutation)) { return }
+                Restart-Computer
             }
         })
         # EXEMPT-CONTRACT-001: Registry operations only, no diagnostic functions
         $gpoDisableButton.Add_Click({
             # Ensure running as administrator
             if (-not (Assert-WinConfigIsAdmin)) { return }
+
+            # SAFETY: Block mutations if audit trail is broken
+            if (-not (Assert-AuditTrailHealthyForMutation)) { return }
 
             $regPaths = @(
                 'HKCU:\Software\Policies\Microsoft\Control Panel\International',
@@ -3468,6 +3709,20 @@ foreach ($tabPage in $tabControl.TabPages) {
                 [System.Windows.Forms.MessageBoxIcon]::Information
             )
 
+            # SAFETY: Check for other logged-in users before reboot
+            $safetyCheck = Test-WinConfigSafeToReboot
+            if (-not $safetyCheck.Safe) {
+                $multiUserWarning = [System.Windows.Forms.MessageBox]::Show(
+                    "WARNING: $($safetyCheck.Reason)`n`nRebooting now may cause data loss for other users.`n`nProceed anyway?",
+                    "Multi-User Warning",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Exclamation
+                )
+                if ($multiUserWarning -ne [System.Windows.Forms.DialogResult]::Yes) {
+                    return
+                }
+            }
+
             $result = [System.Windows.Forms.MessageBox]::Show(
                 "A reboot is recommended for changes to take effect. Reboot now?",
                 "Reboot Required",
@@ -3475,7 +3730,9 @@ foreach ($tabPage in $tabControl.TabPages) {
                 [System.Windows.Forms.MessageBoxIcon]::Question
             )
             if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-                Restart-Computer -Force
+                # SAFETY: Final audit check before reboot
+                if (-not (Assert-AuditTrailHealthyForMutation)) { return }
+                Restart-Computer
             }
         })
         $flowLayoutPanel.Controls.Add($gpoEnableButton)
@@ -4881,7 +5138,14 @@ function Send-DiagnosticsPayloadCloudflare {
         [Parameter(Mandatory)] [string] $IngestUrl
     )
 
-    $pendingRoot = Join-Path $env:ProgramData "NoSupport\PendingDiagnostics"
+    # EPHEMERAL: Use session temp cache path (zero-footprint)
+    # NOTE: Spooled diagnostics are deleted on session exit. If upload fails,
+    # the data is lost. This is acceptable for a zero-footprint support tool.
+    $pendingRoot = if (Get-Command Get-WinConfigCachePath -ErrorAction SilentlyContinue) {
+        Join-Path (Get-WinConfigCachePath) "PendingDiagnostics"
+    } else {
+        Join-Path $env:TEMP "WinConfig-cache\PendingDiagnostics"
+    }
     Ensure-DiagnosticsDir $pendingRoot
 
     $spoolPath = Join-Path $pendingRoot "$SessionId.json"
@@ -4973,6 +5237,12 @@ $form.Add_FormClosing({
 
     if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
         Write-WinConfigLog -Action "Shutdown" -Message "WinConfig application closed"
+    }
+
+    # EPHEMERAL CLEANUP: Remove session temp root (zero-footprint)
+    # This ensures no persistent artifacts remain after application exit
+    if (Get-Command Remove-WinConfigTempRoot -ErrorAction SilentlyContinue) {
+        Remove-WinConfigTempRoot
     }
 
     # Ephemeral diagnostics export (checkbox-gated, Cloudflare R2)
