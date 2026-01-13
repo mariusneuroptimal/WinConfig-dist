@@ -2201,7 +2201,7 @@ $buttonHandlers = @{
     # TLS Handshake Test - detects SSL inspection, MITM proxies, outdated TLS
     foreach ($endpoint in $tlsEndpoints) {
         $powershell = [powershell]::Create().AddScript({
-            param ($Endpoint)
+            param ($Endpoint, $DiagnosticResultEnum)
             Set-StrictMode -Version Latest
             $ErrorActionPreference = 'Stop'
 
@@ -2222,7 +2222,7 @@ $buttonHandlers = @{
                         Description = $description
                         Success = $false
                         Error = "Connection timeout"
-                        Severity = if ($critical) { "FAIL" } else { "WARN" }
+                        Result = if ($critical) { $DiagnosticResultEnum.FAIL } else { $DiagnosticResultEnum.WARN }
                         Type = "TLS"
                         Intercepted = $false
                     }
@@ -2286,7 +2286,7 @@ $buttonHandlers = @{
                     Intercepted = $intercepted
                     InterceptedBy = $interceptedBy
                     Issuer = $issuer
-                    Result = if ($intercepted) { "WARN" } else { "PASS" }
+                    Result = if ($intercepted) { $DiagnosticResultEnum.WARN } else { $DiagnosticResultEnum.PASS }
                     Type = "TLS"
                 }
             } catch {
@@ -2295,12 +2295,12 @@ $buttonHandlers = @{
                     Description = $description
                     Success = $false
                     Error = $_.Exception.Message
-                    Result = if ($critical) { "FAIL" } else { "WARN" }
+                    Result = if ($critical) { $DiagnosticResultEnum.FAIL } else { $DiagnosticResultEnum.WARN }
                     Type = "TLS"
                     Intercepted = $false
                 }
             }
-        }).AddArgument($endpoint)
+        }).AddArgument($endpoint).AddArgument($DiagnosticResult)
 
         $powershell.RunspacePool = $runspacePool
 
@@ -5044,6 +5044,35 @@ $form.Add_FormClosing({
             # Build diagnostics payload
             $exportSessionActions = if (Get-Command Get-WinConfigSessionActions -ErrorAction SilentlyContinue) {
                 Get-WinConfigSessionActions | ForEach-Object {
+                    # Extract ONLY safe evidence fields (no IPs, hostnames, usernames)
+                    $safeEvidence = @{}
+                    if ($_.Evidence) {
+                        $ev = $_.Evidence
+                        # Country info (safe - geographic only)
+                        if ($ev.CountryCode) { $safeEvidence.CountryCode = $ev.CountryCode }
+                        if ($ev.Country -is [string] -and $ev.Country.Length -eq 2) {
+                            $safeEvidence.CountryCode = $ev.Country
+                        }
+                        if ($ev.Country -is [hashtable] -and $ev.Country.CountryCode) {
+                            $safeEvidence.CountryCode = $ev.Country.CountryCode
+                            if ($ev.Country.Name) { $safeEvidence.CountryName = $ev.Country.Name }
+                        }
+                        # Latency (safe - numeric only)
+                        if ($ev.LatencyMs) { $safeEvidence.LatencyMs = $ev.LatencyMs }
+                        if ($ev.Latency) { $safeEvidence.LatencyMs = $ev.Latency }
+                        # DNS resolver type (safe - known public resolvers only)
+                        if ($ev.ResolverType) { $safeEvidence.ResolverType = $ev.ResolverType }
+                        # TLS info (safe - protocol info only)
+                        if ($ev.TlsVersion) { $safeEvidence.TlsVersion = $ev.TlsVersion }
+                        if ($ev.CipherSuite) { $safeEvidence.CipherSuite = $ev.CipherSuite }
+                        # Port test results (safe - port numbers only)
+                        if ($ev.PortsTested) { $safeEvidence.PortsTested = $ev.PortsTested }
+                        if ($ev.PortsBlocked) { $safeEvidence.PortsBlocked = $ev.PortsBlocked }
+                        if ($ev.PortsOpen) { $safeEvidence.PortsOpen = $ev.PortsOpen }
+                        # Error codes (safe - structured error info)
+                        if ($ev.ErrorCode) { $safeEvidence.ErrorCode = $ev.ErrorCode }
+                        if ($ev.ErrorPhase) { $safeEvidence.ErrorPhase = $ev.ErrorPhase }
+                    }
                     @{
                         Timestamp = $_.Timestamp.ToString("o")
                         Action = $_.Action
@@ -5052,7 +5081,7 @@ $form.Add_FormClosing({
                         Result = $_.Result
                         Tier = $_.Tier
                         Summary = $_.Summary
-                        # Evidence excluded - may contain PII (PublicIP, etc.)
+                        Evidence = if ($safeEvidence.Count -gt 0) { $safeEvidence } else { $null }
                     }
                 }
             } else { @() }
