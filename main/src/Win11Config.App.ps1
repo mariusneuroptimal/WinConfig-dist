@@ -32,7 +32,8 @@ Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\ExecutionIntent.ps
 # DiagnosticTypes - typed result constants and Switch-DiagnosticResult helper
 Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\DiagnosticTypes.psm1")
 # Ensure DiagnosticTypes functions available in UI runspace (WinForms event handlers)
-Import-Module (Join-Path $PSScriptRoot 'Modules\DiagnosticTypes.psm1') -Force
+# CRITICAL: Use -Global to avoid removing the already-imported global module
+Import-Module (Join-Path $PSScriptRoot 'Modules\DiagnosticTypes.psm1') -Force -Global
 
 # Console module for diagnostic output formatting
 Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\Console.psm1") -Prefix WinConfig

@@ -15,15 +15,18 @@
 # ActionId (GUID) ensures deterministic completion of concurrent/retried actions.
 
 # Import Paths module for ephemeral temp root
+# CRITICAL: Use -Global to preserve already-imported module in global scope
+# Without -Global, -Force would remove the global module and re-import locally
 $script:PathsModulePath = Join-Path (Split-Path $PSScriptRoot -Parent) "Modules\Paths.psm1"
 if (Test-Path $script:PathsModulePath) {
-    Import-Module $script:PathsModulePath -Force -ErrorAction SilentlyContinue
+    Import-Module $script:PathsModulePath -Force -ErrorAction SilentlyContinue -Global
 }
 
 # Import type definitions for result validation
+# CRITICAL: Use -Global to preserve already-imported module in global scope
 $script:DiagnosticsTypesPath = Join-Path (Split-Path $PSScriptRoot -Parent) "Modules\DiagnosticTypes.psm1"
 if (Test-Path $script:DiagnosticsTypesPath) {
-    Import-Module $script:DiagnosticsTypesPath -Force -ErrorAction SilentlyContinue
+    Import-Module $script:DiagnosticsTypesPath -Force -ErrorAction SilentlyContinue -Global
 }
 
 # Script-scoped state

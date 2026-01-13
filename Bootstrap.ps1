@@ -802,7 +802,7 @@ if (-not (Test-Path $moduleLoaderPath)) {
     exit 14  # Module loader failed
 }
 
-Import-Module $moduleLoaderPath -Force -ErrorAction Stop
+Import-Module $moduleLoaderPath -Force -ErrorAction Stop -Global
 
 # --- Assert loader contract (fail fast if functions missing) ---
 foreach ($fn in @("Import-RequiredModule", "Import-OptionalModule")) {
