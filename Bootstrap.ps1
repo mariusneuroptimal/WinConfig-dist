@@ -643,7 +643,8 @@ if ($script:VerbosityLevel -ge 2) {
     Write-Host "  Bootstrap:   v$BootstrapVersion" -ForegroundColor Gray
     Write-Host "  App:         v$appVersion ($EnvironmentLabel)" -ForegroundColor Gray
     Write-Host "  Manifest:    $($FileManifest.Count) files verified" -ForegroundColor Gray
-    Write-Host "  Source:      $($sourceCommit ? $sourceCommit.Substring(0, 7) : $manifest.commit.Substring(0, 7))" -ForegroundColor Gray
+    $sourceDisplay = if ($sourceCommit) { $sourceCommit.Substring(0, 7) } else { $manifest.commit.Substring(0, 7) }
+    Write-Host "  Source:      $sourceDisplay" -ForegroundColor Gray
     Write-Host "----------------------------------------" -ForegroundColor DarkGray
 }
 
