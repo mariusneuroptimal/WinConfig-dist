@@ -596,6 +596,20 @@ if (-not $allFilesValid) {
 
 Write-Status "All $filesVerified files verified and staged." "OK"
 
+# --- Step 6a: Fetch SOURCE_COMMIT.txt (traceability marker) ---
+# This file is not in the manifest - it's a build-time artifact for traceability
+try {
+    $sourceCommitContent = Get-RawGitHubContent -Owner $GitHubOwner -Repo $DistRepoName -Branch "main" -Path "$Branch/SOURCE_COMMIT.txt"
+    $sourceCommitPath = Join-Path $stagingRoot "SOURCE_COMMIT.txt"
+    [System.IO.File]::WriteAllText($sourceCommitPath, $sourceCommitContent, [System.Text.UTF8Encoding]::new($false))
+    Write-BufferedLog "  SOURCE_COMMIT.txt ... " -Color "Gray" -NoNewline
+    Write-BufferedLog "OK" -Color "Green"
+} catch {
+    # SOURCE_COMMIT.txt may not exist in older dist builds - warn but continue
+    Write-BufferedLog "  SOURCE_COMMIT.txt ... " -Color "Gray" -NoNewline
+    Write-BufferedLog "NOT FOUND (older dist)" -Color "Yellow"
+}
+
 # --- Step 6b: Extract App Version from VERSION.psd1 ---
 $versionFilePath = Join-Path $stagingRoot "src\VERSION.psd1"
 $appVersion = "unknown"
@@ -610,6 +624,18 @@ if (Test-Path $versionFilePath) {
     }
 }
 
+# --- Step 6b2: Verify SOURCE_COMMIT.txt (traceability guard) ---
+$sourceCommitFile = Join-Path $stagingRoot "SOURCE_COMMIT.txt"
+$sourceCommit = $null
+if (Test-Path $sourceCommitFile) {
+    $sourceCommit = (Get-Content $sourceCommitFile -Raw).Trim()
+    Write-Status "Source commit: $($sourceCommit.Substring(0, 7))" "OK"
+} else {
+    # SOURCE_COMMIT.txt missing - this means dist was built before the guard was added
+    # Warn but don't fail (backward compatibility during transition)
+    Write-Status "SOURCE_COMMIT.txt not found (dist may be stale)" "WARN"
+}
+
 # Version summary - only in verbose mode
 if ($script:VerbosityLevel -ge 2) {
     Write-Host ""
@@ -617,7 +643,7 @@ if ($script:VerbosityLevel -ge 2) {
     Write-Host "  Bootstrap:   v$BootstrapVersion" -ForegroundColor Gray
     Write-Host "  App:         v$appVersion ($EnvironmentLabel)" -ForegroundColor Gray
     Write-Host "  Manifest:    $($FileManifest.Count) files verified" -ForegroundColor Gray
-    Write-Host "  Commit:      $($manifest.commit.Substring(0, 7))" -ForegroundColor Gray
+    Write-Host "  Source:      $($sourceCommit ? $sourceCommit.Substring(0, 7) : $manifest.commit.Substring(0, 7))" -ForegroundColor Gray
     Write-Host "----------------------------------------" -ForegroundColor DarkGray
 }
 
@@ -793,8 +819,9 @@ if ($SelfCheck) {
 # Level 1 (Normal): Compact summary
 # Level 2+ (Verbose/Debug): Full trace (already shown above)
 if ($script:VerbosityLevel -eq 1) {
+    $commitDisplay = if ($sourceCommit) { $sourceCommit.Substring(0, 7) } else { $manifest.commit.Substring(0, 7) }
     Write-Host ""
-    Write-Host "WinConfig v$appVersion ($EnvironmentLabel)" -ForegroundColor Cyan
+    Write-Host "WinConfig v$appVersion ($EnvironmentLabel) [$commitDisplay]" -ForegroundColor Cyan
     Write-Host "$([char]0x2714) Integrity verified" -ForegroundColor Green
     Write-Host "$([char]0x2714) Dependencies OK" -ForegroundColor Green
     Write-Host "$([char]0x2714) Environment authorized" -ForegroundColor Green
@@ -828,6 +855,9 @@ try {
     # (inherits to child process)
     $env:WINCONFIG_ITERATION = $iterationValue
 
+    # Set source commit for traceability (used by app startup display)
+    $env:WINCONFIG_SOURCE_COMMIT = if ($sourceCommit) { $sourceCommit } else { $manifest.commit }
+
     # Execute the entry point script
     # ExecutionPolicy is already bypassed (user ran Bootstrap.ps1 with -ExecutionPolicy Bypass)
     # Using & preserves loaded modules (ModuleLoader) in the current session
@@ -837,8 +867,9 @@ try {
     Write-Status "Execution error: $($_.Exception.Message)" "ERROR"
     Show-FailureDump
 } finally {
-    # Clean up environment variable
+    # Clean up environment variables
     $env:WINCONFIG_ITERATION = $null
+    $env:WINCONFIG_SOURCE_COMMIT = $null
 }
 
 # --- Step 8: Cleanup ---

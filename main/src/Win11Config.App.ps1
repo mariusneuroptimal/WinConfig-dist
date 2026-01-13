@@ -4633,9 +4633,14 @@ foreach ($tabPage in $tabControl.TabPages) {
             default       { "Logging disabled for this session" }
         }
 
+        # Get source commit for traceability display
+        $sourceCommitDisplay = if ($env:WINCONFIG_SOURCE_COMMIT) {
+            $env:WINCONFIG_SOURCE_COMMIT.Substring(0, 7)
+        } else { "unknown" }
+
         # Add diagnostic rows to TableLayoutPanel (Phase 1: no absolute positioning)
         Add-DiagnosticRow -Table $diagTable -Label "Support Tool Session ID" -Value $script:SessionId
-        Add-DiagnosticRow -Table $diagTable -Label "NO Support Tool Version" -Value $AppVersion
+        Add-DiagnosticRow -Table $diagTable -Label "NO Support Tool Version" -Value "$AppVersion [$sourceCommitDisplay]"
         Add-DiagnosticRow -Table $diagTable -Label "Started" -Value $script:SessionStartTime
         Add-DiagnosticRow -Table $diagTable -Label "Device Name" -Value $machineInfo.DeviceName
         Add-DiagnosticRow -Table $diagTable -Label "Serial Number" -Value $machineInfo.SerialNumber
@@ -4989,12 +4994,17 @@ Network Insights (This Session):
                 $actionsText = $actionsText.TrimEnd("`n")
             }
 
+            # Get source commit for clipboard
+            $clipSourceCommit = if ($env:WINCONFIG_SOURCE_COMMIT) {
+                $env:WINCONFIG_SOURCE_COMMIT.Substring(0, 7)
+            } else { "unknown" }
+
             $diagText = @"
 NO Support Tool Diagnostics
 ===========================
 
 Support Tool Session ID:  $($script:SessionId)
-NO Support Tool Version:  $AppVersion
+NO Support Tool Version:  $AppVersion [$clipSourceCommit]
 Started:                  $($script:SessionStartTime)
 
 Device Name:              $($clipMachineInfo.DeviceName)
