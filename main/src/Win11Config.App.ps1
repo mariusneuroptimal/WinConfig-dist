@@ -106,11 +106,20 @@ $script:DiagTabColor = $null
 # --- Diagnostics ingest (Cloudflare R2 only) ---
 $script:DiagnosticsIngestUrl = "https://ingest.dashboards.work/diagnostics"
 
-# Token guard for Cloudflare ingest (Machine scope only)
+# Zero-config token acquisition from ingest worker
+# Fetches short-lived JWT at runtime - no local configuration required
 function Get-NoSupportIngestToken {
-    $t = [Environment]::GetEnvironmentVariable("NOSUPPORT_INGEST_TOKEN", "Machine")
-    if ([string]::IsNullOrWhiteSpace($t)) { return $null }
-    return $t.Trim()
+    try {
+        $resp = Invoke-RestMethod `
+            -Uri "https://ingest.dashboards.work/ingest-token" `
+            -Method GET `
+            -TimeoutSec 5
+        return $resp.token
+    }
+    catch {
+        Write-Warning "Failed to retrieve ingest token: $_"
+        return $null
+    }
 }
 
 # Function to refresh the actions display (called on tab switch to Diagnostics)
