@@ -389,16 +389,23 @@ function Get-RawGitHubContent {
             "Accept" = "application/vnd.github.v3.raw"
             "User-Agent" = "WinConfig-Bootstrap"
         }
-        $content = $response.Content
 
-        # Strip UTF-8 BOM if present (EF BB BF)
-        if ($content.Length -ge 3) {
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($content)
-            if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-                $content = [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
-            }
+        # PS 5.1 returns Content as byte[], PS 7 returns string
+        # Normalize to string for consistent handling
+        $rawContent = $response.Content
+        if ($rawContent -is [byte[]]) {
+            $bytes = $rawContent
+        } else {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($rawContent)
         }
 
+        # Strip UTF-8 BOM if present (EF BB BF)
+        $startIndex = 0
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            $startIndex = 3
+        }
+
+        $content = [System.Text.Encoding]::UTF8.GetString($bytes, $startIndex, $bytes.Length - $startIndex)
         return $content
     } catch {
         $statusCode = $null
