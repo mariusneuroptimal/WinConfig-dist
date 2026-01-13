@@ -1,22 +1,22 @@
 {
-  "branch": "main",
-  "commit": "0d82cacc988a81585b8e7fccfac6e78c24ebd5e9",
+  "generated": "2026-01-13T04:28:37.1916653+00:00",
   "files": {
-    "src/Modules/Bluetooth.psm1": "50ef831f90dc31cafe77b77b6175bface14ae78aa6aa2347ca67917b5c9f959f",
-    "src/Modules/ModuleLoader.psm1": "3ea4d54dd3da99b7db42b18b0355852b55d0500333ae471cb2a7d14cb49cfaf2",
-    "src/Modules/Paths.psm1": "d56f6bc8e942b2f0e568f84c5a5503e823abd6a330532a93938766205bb373d3",
-    "src/Modules/ExecutionIntent.psm1": "bb520efa229110133e36f8b2fe1de0b2337cf01704e1474e8833fb5795a85e60",
-    "src/Win11Config.App.ps1": "e3c156ef0744a078a4fae6fdcf8d71131ddebf9ecca3d836724a61a2bf65fefa",
     "src/Modules/Env.psm1": "54acdf0c5157b7293f50b62743b28f060d2f6eae46a42e1b1cee3399603ee802",
-    "src/Logging/Logger.psm1": "ab81a12667fc1a54db5bdbe4a8d46ec661eef89de924747e65a515a5d1cad5d8",
-    "Win11Config.ps1": "9cc50ce31dde70c6e7f3a7f99106cb0131672de829fa406733f067972639b183",
-    "src/VERSION.psd1": "ff6ee1fdba00afd4e7713d356ed92d752ac386a4528909aa02e29e5c68778622",
-    "src/Modules/DiagnosticTypes.psm1": "e72022251c07915668bd2bb367865d2904fc25e5b87d7368fa50897ba023b88f",
-    "src/Modules/Console.psm1": "7ee2925c69a762ee3fb7d6e98195928f6b1ce103c1d526411b1087d8701dcc63",
+    "src/Modules/ModuleLoader.psm1": "3ea4d54dd3da99b7db42b18b0355852b55d0500333ae471cb2a7d14cb49cfaf2",
     "src/RUNTIME_DEPENDENCIES.psd1": "0adcc4685f6b5ff5ef3e6a6c55fa06b3a6754494f1941971596c0a4afa2fea8d",
+    "src/VERSION.psd1": "ff6ee1fdba00afd4e7713d356ed92d752ac386a4528909aa02e29e5c68778622",
+    "src/Modules/ExecutionIntent.psm1": "bb520efa229110133e36f8b2fe1de0b2337cf01704e1474e8833fb5795a85e60",
+    "src/Modules/Bluetooth.psm1": "50ef831f90dc31cafe77b77b6175bface14ae78aa6aa2347ca67917b5c9f959f",
+    "src/Win11Config.App.ps1": "8cbeab7748556ec4b9c9a6e4447edb7aad40843d5af402f2b11388f71df13432",
+    "src/Modules/Paths.psm1": "d56f6bc8e942b2f0e568f84c5a5503e823abd6a330532a93938766205bb373d3",
     "src/Modules/UiAction.psm1": "26865143416cd647870da49fd8bf7ca5f61e461b8d78b877d681ac02981af3e6",
-    "src/Modules/ActionTiers.psm1": "abf0bf7bb5004a627173d51f26319f866851c97e10623d28ca8cd0090f2d1e71"
+    "src/Modules/DiagnosticTypes.psm1": "e72022251c07915668bd2bb367865d2904fc25e5b87d7368fa50897ba023b88f",
+    "src/Modules/ActionTiers.psm1": "abf0bf7bb5004a627173d51f26319f866851c97e10623d28ca8cd0090f2d1e71",
+    "Win11Config.ps1": "9cc50ce31dde70c6e7f3a7f99106cb0131672de829fa406733f067972639b183",
+    "src/Logging/Logger.psm1": "ab81a12667fc1a54db5bdbe4a8d46ec661eef89de924747e65a515a5d1cad5d8",
+    "src/Modules/Console.psm1": "7ee2925c69a762ee3fb7d6e98195928f6b1ce103c1d526411b1087d8701dcc63"
   },
-  "generated": "2026-01-13T04:10:20.3538179+00:00",
-  "version": "1.0"
+  "version": "1.0",
+  "commit": "7a06cdc4524f241a42559f62cf2c507f433f10f1",
+  "branch": "main"
 }

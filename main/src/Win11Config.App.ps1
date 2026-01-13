@@ -2201,7 +2201,7 @@ $buttonHandlers = @{
     # TLS Handshake Test - detects SSL inspection, MITM proxies, outdated TLS
     foreach ($endpoint in $tlsEndpoints) {
         $powershell = [powershell]::Create().AddScript({
-            param ($Endpoint)
+            param ($Endpoint, $DiagnosticResultEnum)
             Set-StrictMode -Version Latest
             $ErrorActionPreference = 'Stop'
 
@@ -2222,7 +2222,7 @@ $buttonHandlers = @{
                         Description = $description
                         Success = $false
                         Error = "Connection timeout"
-                        Severity = if ($critical) { "FAIL" } else { "WARN" }
+                        Result = if ($critical) { $DiagnosticResultEnum.FAIL } else { $DiagnosticResultEnum.WARN }
                         Type = "TLS"
                         Intercepted = $false
                     }
@@ -2286,7 +2286,7 @@ $buttonHandlers = @{
                     Intercepted = $intercepted
                     InterceptedBy = $interceptedBy
                     Issuer = $issuer
-                    Result = if ($intercepted) { "WARN" } else { "PASS" }
+                    Result = if ($intercepted) { $DiagnosticResultEnum.WARN } else { $DiagnosticResultEnum.PASS }
                     Type = "TLS"
                 }
             } catch {
@@ -2295,12 +2295,12 @@ $buttonHandlers = @{
                     Description = $description
                     Success = $false
                     Error = $_.Exception.Message
-                    Result = if ($critical) { "FAIL" } else { "WARN" }
+                    Result = if ($critical) { $DiagnosticResultEnum.FAIL } else { $DiagnosticResultEnum.WARN }
                     Type = "TLS"
                     Intercepted = $false
                 }
             }
-        }).AddArgument($endpoint)
+        }).AddArgument($endpoint).AddArgument($DiagnosticResult)
 
         $powershell.RunspacePool = $runspacePool
 
