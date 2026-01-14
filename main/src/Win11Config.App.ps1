@@ -55,6 +55,9 @@ if (Import-OptionalModule -Path (Join-Path $PSScriptRoot "Modules\SessionOperati
     Initialize-WinConfigSessionLedger -Version $AppVersion -Iteration $Iteration
 }
 
+# PpfFingerprint for problem pattern fingerprinting (prefixed)
+$null = Import-OptionalModule -Path (Join-Path $PSScriptRoot "Modules\PpfFingerprint.psm1") -Prefix WinConfig
+
 # ActionTiers for context-aware recommendations
 $null = Import-OptionalModule -Path (Join-Path $PSScriptRoot "Modules\ActionTiers.psm1") -Prefix WinConfig
 
@@ -5009,6 +5012,38 @@ Network Insights (This Session):
                 $env:WINCONFIG_SOURCE_COMMIT.Substring(0, 7)
             } else { "unknown" }
 
+            # === Generate PPF (Problem Pattern Fingerprint) ===
+            $ppfText = ""
+            try {
+                $ppfFunction = Get-Command New-WinConfigProblemPatternFingerprint -ErrorAction SilentlyContinue
+                if (-not $ppfFunction) {
+                    $ppfFunction = Get-Command New-ProblemPatternFingerprint -ErrorAction SilentlyContinue
+                }
+
+                if ($ppfFunction) {
+                    # Get operations from ledger
+                    $ledgerOps = if (Get-Command Get-WinConfigLedgerOperations -ErrorAction SilentlyContinue) {
+                        @(Get-WinConfigLedgerOperations)
+                    } else { @() }
+
+                    $ppf = & $ppfFunction -Operations $ledgerOps
+                    if ($ppf) {
+                        $ppfText = @"
+
+Problem Pattern Fingerprint:
+  PPF ID:        $($ppf.Id)
+  OS Bucket:     $($ppf.OsBucket)
+  Network Class: $($ppf.NetworkClass)
+  Failures:      $($ppf.FailureCount)
+
+"@
+                    }
+                }
+            }
+            catch {
+                # PPF generation failed - non-fatal, continue without it
+            }
+
             $diagText = @"
 NO Support Tool Diagnostics
 ===========================
@@ -5022,7 +5057,7 @@ Serial Number:            $($clipMachineInfo.SerialNumber)
 
 Log File:
   $clipLogFileDisplay
-$networkInsightsText
+$networkInsightsText$ppfText
 Actions Executed This Session:
 $actionsText
 "@
@@ -5377,6 +5412,36 @@ $form.Add_FormClosing({
                 }
             } else { @() }
 
+            # === Generate PPF for export ===
+            $exportPpf = $null
+            try {
+                $ppfFunction = Get-Command New-WinConfigProblemPatternFingerprint -ErrorAction SilentlyContinue
+                if (-not $ppfFunction) {
+                    $ppfFunction = Get-Command New-ProblemPatternFingerprint -ErrorAction SilentlyContinue
+                }
+
+                if ($ppfFunction) {
+                    $ledgerOps = if (Get-Command Get-WinConfigLedgerOperations -ErrorAction SilentlyContinue) {
+                        @(Get-WinConfigLedgerOperations)
+                    } else { @() }
+
+                    $ppfResult = & $ppfFunction -Operations $ledgerOps
+                    if ($ppfResult) {
+                        $exportPpf = @{
+                            id           = $ppfResult.Id
+                            schema       = $ppfResult.Schema
+                            failureCount = $ppfResult.FailureCount
+                            failures     = @($ppfResult.Failures)
+                            osBucket     = $ppfResult.OsBucket
+                            networkClass = $ppfResult.NetworkClass
+                        }
+                    }
+                }
+            }
+            catch {
+                # PPF generation failed - non-fatal, export without it
+            }
+
             $payload = @{
                 SchemaVersion = "1.0"
                 ExportedAt = (Get-Date).ToString("o")
@@ -5385,6 +5450,7 @@ $form.Add_FormClosing({
                 Iteration = $Iteration
                 SessionStartTime = $script:SessionStartTime
                 Actions = @($exportSessionActions)
+                ppf = $exportPpf
             }
 
             # === SCHEMA VALIDATION (fail-closed) ===
