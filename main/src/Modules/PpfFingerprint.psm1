@@ -10,7 +10,7 @@
 # - This module is PURE (no mutations, no network calls)
 #
 # LIFECYCLE:
-# - Called by Finalize-Session AFTER diagnostic results are frozen
+# - Called by Close-Session AFTER diagnostic results are frozen
 # - Called BEFORE session ledger is sealed
 # - NEVER recomputed after finalization
 

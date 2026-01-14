@@ -67,10 +67,11 @@ function Import-RequiredModule {
     }
 
     $importParams = @{
-        Name        = $Path
-        Force       = $true
-        ErrorAction = 'Stop'
-        Global      = $true
+        Name               = $Path
+        Force              = $true
+        ErrorAction        = 'Stop'
+        Global             = $true
+        DisableNameChecking = $true
     }
     if ($Prefix) {
         $importParams.Prefix = $Prefix
@@ -126,10 +127,11 @@ function Import-OptionalModule {
     }
 
     $importParams = @{
-        Name        = $Path
-        Force       = $true
-        ErrorAction = 'Stop'
-        Global      = $true
+        Name               = $Path
+        Force              = $true
+        ErrorAction        = 'Stop'
+        Global             = $true
+        DisableNameChecking = $true
     }
     if ($Prefix) {
         $importParams.Prefix = $Prefix

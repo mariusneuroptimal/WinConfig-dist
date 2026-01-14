@@ -20,7 +20,7 @@
 # - Write-SessionOperation:   THROWS on failure (caller must not proceed)
 # - Start-SessionOperation:   THROWS on failure (caller must not proceed)
 # - Complete-SessionOperation: THROWS on failure (state may be inconsistent)
-# - Finalize-Session:         Returns $false if not initialized; THROWS on persistence failure
+# - Close-Session:            Returns $false if not initialized; THROWS on persistence failure
 # - ConvertTo-SessionMarkdown: Returns $null if not initialized; never throws
 # - Get-* accessors:          Never throw, return null/empty if not initialized
 #
@@ -678,7 +678,7 @@ function Complete-SessionOperation {
     return $true
 }
 
-function Finalize-Session {
+function Close-Session {
     <#
     .SYNOPSIS
         Finalizes the session, making it immutable.
@@ -1140,7 +1140,7 @@ Export-ModuleMember -Function @(
     'Write-SessionOperation',
     'Start-SessionOperation',
     'Complete-SessionOperation',
-    'Finalize-Session',
+    'Close-Session',
     'ConvertTo-SessionMarkdown',
     'Get-LedgerSessionId',
     'Get-LedgerSessionPath',

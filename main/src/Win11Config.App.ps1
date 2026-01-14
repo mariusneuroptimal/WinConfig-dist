@@ -5286,9 +5286,9 @@ function Send-DiagnosticsPayloadCloudflare {
 # Log shutdown when form closes
 # EXEMPT-CONTRACT-001: Shutdown logging, no Switch-DiagnosticResult usage
 $form.Add_FormClosing({
-    # Finalize session ledger (makes session immutable, generates markdown)
-    if (Get-Command Finalize-WinConfigSession -ErrorAction SilentlyContinue) {
-        Finalize-WinConfigSession | Out-Null
+    # Close session ledger (makes session immutable, generates markdown)
+    if (Get-Command Close-WinConfigSession -ErrorAction SilentlyContinue) {
+        Close-WinConfigSession | Out-Null
     }
 
     if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
