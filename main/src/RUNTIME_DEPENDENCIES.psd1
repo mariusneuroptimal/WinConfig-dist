@@ -27,6 +27,8 @@
         "src/Logging/Logger.psm1"             # JSONL session logging
         "src/Modules/Bluetooth.psm1"          # BT audio diagnostics
         "src/Modules/ActionTiers.psm1"        # Tier recommendations
+        "src/Modules/SessionOperationLedger.psm1"  # Operation tracking for PPF
+        "src/Modules/PpfFingerprint.psm1"     # Problem Pattern Fingerprinting
     )
 
     # Documentation of invariants (for governance reference)
