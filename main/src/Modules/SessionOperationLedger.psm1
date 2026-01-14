@@ -17,11 +17,11 @@
 #
 # ERROR SEMANTICS:
 # - Initialize-SessionLedger: THROWS on failure (fatal)
-# - Record-SessionOperation:  THROWS on failure (caller must not proceed)
+# - Write-SessionOperation:   THROWS on failure (caller must not proceed)
 # - Start-SessionOperation:   THROWS on failure (caller must not proceed)
 # - Complete-SessionOperation: THROWS on failure (state may be inconsistent)
 # - Finalize-Session:         Returns $false if not initialized; THROWS on persistence failure
-# - Render-SessionMarkdown:   Returns $null if not initialized; never throws
+# - ConvertTo-SessionMarkdown: Returns $null if not initialized; never throws
 # - Get-* accessors:          Never throw, return null/empty if not initialized
 #
 # CONCURRENCY:
@@ -362,7 +362,7 @@ function Initialize-SessionLedger {
     }
 }
 
-function Record-SessionOperation {
+function Write-SessionOperation {
     <#
     .SYNOPSIS
         Records a completed operation in the session ledger.
@@ -734,7 +734,7 @@ function Finalize-Session {
     }
 
     # Generate markdown (outside lock - non-critical)
-    Render-SessionMarkdown | Out-Null
+    ConvertTo-SessionMarkdown | Out-Null
 
     # Save PPF markdown separately (outside lock - non-critical)
     if ($ppfResult -and $script:LedgerSessionDir) {
@@ -913,7 +913,7 @@ function Build-MinimalPpf {
     }
 }
 
-function Render-SessionMarkdown {
+function ConvertTo-SessionMarkdown {
     <#
     .SYNOPSIS
         Generates a Jira-ready, LLM-ready markdown summary from the operations ledger.
@@ -1137,11 +1137,11 @@ function Get-LedgerLastWriteError {
 
 Export-ModuleMember -Function @(
     'Initialize-SessionLedger',
-    'Record-SessionOperation',
+    'Write-SessionOperation',
     'Start-SessionOperation',
     'Complete-SessionOperation',
     'Finalize-Session',
-    'Render-SessionMarkdown',
+    'ConvertTo-SessionMarkdown',
     'Get-LedgerSessionId',
     'Get-LedgerSessionPath',
     'Get-LedgerOperations',

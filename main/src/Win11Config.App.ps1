@@ -982,32 +982,32 @@ $buttonHandlers = @{
         }
     }
     "Device Manager" = {
-        if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
-            Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+        if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+            Write-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
                 -Name "Open Device Manager" -Source "Button:DeviceManager" -MutatesSystem $false `
                 -Result "Success" -Summary "Launched devmgmt.msc"
         }
         Start-Process "devmgmt.msc"
     }
     "Task Manager" = {
-        if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
-            Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+        if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+            Write-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
                 -Name "Open Task Manager" -Source "Button:TaskManager" -MutatesSystem $false `
                 -Result "Success" -Summary "Launched taskmgr.exe"
         }
         Start-Process "taskmgr.exe"
     }
     "Control Panel" = {
-        if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
-            Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+        if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+            Write-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
                 -Name "Open Control Panel" -Source "Button:ControlPanel" -MutatesSystem $false `
                 -Result "Success" -Summary "Launched control.exe"
         }
         Start-Process "control.exe"
     }
     "Sound Panel" = {
-        if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
-            Record-WinConfigSessionOperation -Category "Audio" -OperationType "ExternalTool" `
+        if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+            Write-WinConfigSessionOperation -Category "Audio" -OperationType "ExternalTool" `
                 -Name "Open Sound Panel" -Source "Button:SoundPanel" -MutatesSystem $false `
                 -Result "Success" -Summary "Launched mmsys.cpl"
         }
@@ -1380,8 +1380,8 @@ $buttonHandlers = @{
         "Remove Intel SST Audio Driver" = $buttonClickHandler
         "DISM Restore Health" = {
             # Record operation in session ledger (mutating system operation)
-            if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
-                Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+            if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+                Write-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
                     -Name "DISM Restore Health" -Source "Button:DISM" -MutatesSystem $true `
                     -Result "Success" -Summary "DISM launched in elevated window"
             }
@@ -1391,8 +1391,8 @@ $buttonHandlers = @{
         }
         "/sfc scannow" = {
             # Record operation in session ledger (mutating system operation)
-            if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
-                Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+            if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+                Write-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
                     -Name "SFC Scannow" -Source "Button:SFC" -MutatesSystem $true `
                     -Result "Success" -Summary "SFC launched in elevated window"
             }
