@@ -4626,9 +4626,9 @@ foreach ($tabPage in $tabControl.TabPages) {
         $diagHeadline = New-Headline "NO Support Tool Diagnostics"
         $diagFlow.Controls.Add($diagHeadline)
 
-        # Add description with session ID clarification
+        # Add description with run ID clarification
         $descLabel = New-Object System.Windows.Forms.Label
-        $descLabel.Text = "Read-only session information for support escalation. (Session ID is unique to this Support Tool session)"
+        $descLabel.Text = "Read-only diagnostic information for support escalation. (Run ID is unique to this Support Tool run)"
         $descLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
         $descLabel.ForeColor = [System.Drawing.Color]::Gray
         $descLabel.AutoSize = $true
@@ -4642,8 +4642,8 @@ foreach ($tabPage in $tabControl.TabPages) {
         $logFileDisplay = switch ($script:LogPathInfo.Status) {
             "Active"      { $script:LogPathInfo.Path }
             "Initialized" { "Initialized (no actions logged yet)" }
-            "Disabled"    { "Logging disabled for this session" }
-            default       { "Logging disabled for this session" }
+            "Disabled"    { "Logging disabled for this run" }
+            default       { "Logging disabled for this run" }
         }
 
         # Get source commit for traceability display
@@ -4652,7 +4652,7 @@ foreach ($tabPage in $tabControl.TabPages) {
         } else { "unknown" }
 
         # Add diagnostic rows to TableLayoutPanel (Phase 1: no absolute positioning)
-        Add-DiagnosticRow -Table $diagTable -Label "Support Tool Session ID" -Value $script:SessionId
+        Add-DiagnosticRow -Table $diagTable -Label "Support Tool Run ID" -Value $script:SessionId
         Add-DiagnosticRow -Table $diagTable -Label "NO Support Tool Version" -Value "$AppVersion [$sourceCommitDisplay]"
         Add-DiagnosticRow -Table $diagTable -Label "Started" -Value $script:SessionStartTime
         Add-DiagnosticRow -Table $diagTable -Label "Device Name" -Value $machineInfo.DeviceName
@@ -4680,7 +4680,7 @@ foreach ($tabPage in $tabControl.TabPages) {
         # Build Network Insights section if any network tests were run
         if ($networkActions.Count -gt 0) {
             $networkInsightsLabel = New-Object System.Windows.Forms.Label
-            $networkInsightsLabel.Text = "Network Insights (This Session):"
+            $networkInsightsLabel.Text = "Network Insights (This Run):"
             $networkInsightsLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
             $networkInsightsLabel.ForeColor = $tabColor
             $networkInsightsLabel.AutoSize = $true
@@ -4861,7 +4861,7 @@ foreach ($tabPage in $tabControl.TabPages) {
 
         # Add Session Actions Timeline section
         $actionsLabel = New-Object System.Windows.Forms.Label
-        $actionsLabel.Text = "Actions Executed This Session:"
+        $actionsLabel.Text = "Actions Executed This Run:"
         $actionsLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
         $actionsLabel.ForeColor = $tabColor
         $actionsLabel.AutoSize = $true
@@ -4907,8 +4907,8 @@ foreach ($tabPage in $tabControl.TabPages) {
             $clipLogFileDisplay = switch ($script:LogPathInfo.Status) {
                 "Active"      { $script:LogPathInfo.Path }
                 "Initialized" { "Initialized (no actions logged yet)" }
-                "Disabled"    { "Logging disabled for this session" }
-                default       { "Logging disabled for this session" }
+                "Disabled"    { "Logging disabled for this run" }
+                default       { "Logging disabled for this run" }
             }
 
             # Get session actions for clipboard
@@ -5048,7 +5048,7 @@ Problem Pattern Fingerprint:
 NO Support Tool Diagnostics
 ===========================
 
-Support Tool Session ID:  $($script:SessionId)
+Support Tool Run ID:      $($script:SessionId)
 NO Support Tool Version:  $AppVersion [$clipSourceCommit]
 Started:                  $($script:SessionStartTime)
 
@@ -5058,7 +5058,7 @@ Serial Number:            $($clipMachineInfo.SerialNumber)
 Log File:
   $clipLogFileDisplay
 $networkInsightsText$ppfText
-Actions Executed This Session:
+Actions Executed This Run:
 $actionsText
 "@
             [System.Windows.Forms.Clipboard]::SetText($diagText)

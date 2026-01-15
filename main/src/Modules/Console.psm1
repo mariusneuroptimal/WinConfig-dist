@@ -210,7 +210,7 @@ function Write-ConsoleHeader {
     Write-Diagnostic STEP "$ToolName - $Title"
 
     if ($SessionId) {
-        Write-Diagnostic INFO "Session: $SessionId"
+        Write-Diagnostic INFO "Run: $SessionId"
     }
 
     if ($Mode) {
