@@ -326,6 +326,61 @@ function Register-SessionAction {
 
     $script:SessionActions += $actionEntry
 
+    # ==========================================================================
+    # BRIDGE TO LEDGER: Diagnostic actions must populate ledger with Test ops
+    # This ensures PPF generation sees diagnostic runs (PPF-EMPTY fix)
+    # ==========================================================================
+    if ($Category -eq "Diagnostics" -and $Result -ne "PENDING") {
+        # Check if ledger system is available and initialized
+        # Note: SessionOperationLedger exports Write-SessionOperation, which becomes
+        # Write-WinConfigSessionOperation when loaded with -Prefix "WinConfig"
+        $ledgerAvailable = (Get-Command Test-WinConfigLedgerInitialized -ErrorAction SilentlyContinue) -and
+                           (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) -and
+                           (Test-WinConfigLedgerInitialized)
+
+        if ($ledgerAvailable) {
+            try {
+                # Map session action result to ledger result
+                $ledgerResult = switch ($Result) {
+                    "PASS"    { "Success" }
+                    "WARN"    { "Warning" }
+                    "FAIL"    { "Failed" }
+                    "NOT_RUN" { "Skipped" }
+                    default   { "Success" }  # Safe default for unknown states
+                }
+
+                # Map action name to ledger category (Network for most diagnostics)
+                $ledgerCategory = switch -Wildcard ($Action) {
+                    "*Network*"      { "Network" }
+                    "*DNS*"          { "Network" }
+                    "*TCP*"          { "Network" }
+                    "*HTTPS*"        { "Network" }
+                    "*Connectivity*" { "Network" }
+                    "*BT*"           { "Bluetooth" }
+                    "*Bluetooth*"    { "Bluetooth" }
+                    "*Audio*"        { "Audio" }
+                    default          { "Network" }  # Default to Network for diagnostics
+                }
+
+                # Register to ledger with OperationType="Test"
+                # Uses Write-WinConfigSessionOperation (the ledger's write function)
+                Write-WinConfigSessionOperation `
+                    -Category $ledgerCategory `
+                    -OperationType "Test" `
+                    -Name $Action `
+                    -Source "SessionAction-Bridge" `
+                    -MutatesSystem $false `
+                    -Result $ledgerResult `
+                    -Summary $Summary `
+                    -Evidence $Evidence
+            }
+            catch {
+                # Non-fatal: ledger bridge failure should not break session action
+                # PPF will fall back to build-time computation if needed
+            }
+        }
+    }
+
     if ($LogAction) {
         Write-Log -Action $Action -Message $Detail -Result $Result -Tier $Tier -Summary $Summary
     }
