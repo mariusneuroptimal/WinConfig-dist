@@ -5250,8 +5250,9 @@ function Send-DiagnosticsPayloadCloudflare {
             if ($httpResp) {
                 $statusCode = [int]$httpResp.StatusCode
 
-                # 409 Conflict = duplicate, treat as success
+                # 409 Conflict = duplicate, treat as success (no retry, clean exit)
                 if ($statusCode -eq 409) {
+                    Write-Host "[Upload] Already uploaded: Session $SessionId (HTTP 409 - duplicate detected)" -ForegroundColor Cyan
                     Remove-Item -LiteralPath $spoolPath -Force -ErrorAction SilentlyContinue
                     return @{ Status="duplicate"; SessionId=$SessionId; Http=409; AuthMethod="JWT (runtime)"; TokenSource="/ingest-token" }
                 }
