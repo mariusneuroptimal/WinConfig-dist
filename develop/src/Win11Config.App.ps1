@@ -22,13 +22,18 @@ if (-not (Get-Command 'Import-OptionalModule' -ErrorAction SilentlyContinue)) {
 # REQUIRED MODULES - Application fails without these
 # Order matters: dependencies must load before dependents
 
-# ExecutionIntent MUST load first - provides non-mutating diagnostic contract
+# Paths MUST load first - provides ephemeral temp root for zero-footprint operation
+Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\Paths.psm1")
+Initialize-WinConfigPaths | Out-Null
+
+# ExecutionIntent provides non-mutating diagnostic contract
 Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\ExecutionIntent.psm1")
 
 # DiagnosticTypes - typed result constants and Switch-DiagnosticResult helper
 Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\DiagnosticTypes.psm1")
 # Ensure DiagnosticTypes functions available in UI runspace (WinForms event handlers)
-Import-Module (Join-Path $PSScriptRoot 'Modules\DiagnosticTypes.psm1') -Force
+# CRITICAL: Use -Global to avoid removing the already-imported global module
+Import-Module (Join-Path $PSScriptRoot 'Modules\DiagnosticTypes.psm1') -Force -Global
 
 # Console module for diagnostic output formatting
 Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\Console.psm1") -Prefix WinConfig
@@ -39,12 +44,19 @@ Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\Console.psm1") -Pr
 if (Import-OptionalModule -Path (Join-Path $PSScriptRoot "Logging\Logger.psm1") -Prefix WinConfig) {
     Initialize-WinConfigLogger -Version $AppVersion -Iteration $Iteration
     Write-WinConfigLog -Action "Startup" -Message "WinConfig application initialized"
+
+    # Log ephemeral temp root ONCE at startup (for support verification)
+    $tempRoot = Get-WinConfigTempRoot
+    Write-WinConfigLog -Action "Startup" -Message "Session temp root: $tempRoot"
 }
 
 # SessionOperationLedger for session-scoped operation recording (prefixed)
 if (Import-OptionalModule -Path (Join-Path $PSScriptRoot "Modules\SessionOperationLedger.psm1") -Prefix WinConfig) {
     Initialize-WinConfigSessionLedger -Version $AppVersion -Iteration $Iteration
 }
+
+# PpfFingerprint for problem pattern fingerprinting (prefixed)
+$null = Import-OptionalModule -Path (Join-Path $PSScriptRoot "Modules\PpfFingerprint.psm1") -Prefix WinConfig
 
 # ActionTiers for context-aware recommendations
 $null = Import-OptionalModule -Path (Join-Path $PSScriptRoot "Modules\ActionTiers.psm1") -Prefix WinConfig
@@ -97,11 +109,20 @@ $script:DiagTabColor = $null
 # --- Diagnostics ingest (Cloudflare R2 only) ---
 $script:DiagnosticsIngestUrl = "https://ingest.dashboards.work/diagnostics"
 
-# Token guard for Cloudflare ingest (Machine scope only)
+# Zero-config token acquisition from ingest worker
+# Fetches short-lived JWT at runtime - no local configuration required
 function Get-NoSupportIngestToken {
-    $t = [Environment]::GetEnvironmentVariable("NOSUPPORT_INGEST_TOKEN", "Machine")
-    if ([string]::IsNullOrWhiteSpace($t)) { return $null }
-    return $t.Trim()
+    try {
+        $resp = Invoke-RestMethod `
+            -Uri "https://ingest.dashboards.work/ingest-token" `
+            -Method GET `
+            -TimeoutSec 5
+        return $resp.token
+    }
+    catch {
+        Write-Warning "Failed to retrieve ingest token: $_"
+        return $null
+    }
 }
 
 # Function to refresh the actions display (called on tab switch to Diagnostics)
@@ -388,6 +409,9 @@ $buttonClickHandler = {
     # Check if running as administrator
     if (-not (Assert-WinConfigIsAdmin)) { return }
 
+    # SAFETY: Block mutations if audit trail is broken
+    if (-not (Assert-AuditTrailHealthyForMutation)) { return }
+
     # Register session action (admin verified, interactive operation)
     if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
         Register-WinConfigSessionAction -Action "Intel SST Removal" -Detail "Intel Smart Sound Technology driver removal initiated" -Category "AdminChange" -Result "PASS" -Tier 0 -Summary "Removal wizard launched"
@@ -501,13 +525,61 @@ $buttonClickHandler = {
                 Write-Log "Removing driver: $($driverInfo.Driver)"
                 pnputil /delete-driver $driverInfo.Driver /uninstall /force
 
-                # Delete driver files
+                # Delete driver files with STRICT path validation
+                # SECURITY: Multi-layer validation to prevent directory traversal and reparse point attacks
                 $driverPath = Split-Path $driverInfo.OriginalFileName -Parent
-                if (Test-Path $driverPath) {
-                    Remove-Item -Path $driverPath -Recurse -Force -ErrorAction Stop
-                    Write-Log "Removed driver files from $driverPath"
-                } else {
-                    Write-Log "Driver files not found at $driverPath" -Type "WARNING"
+
+                # Step 1: Canonicalize path using GetFullPath (handles ../ sequences, doesn't require path to exist)
+                $canonicalPath = $null
+                try {
+                    $canonicalPath = [System.IO.Path]::GetFullPath($driverPath)
+                } catch {
+                    Write-Log "SECURITY: Path canonicalization failed for: $driverPath" -Type "FAIL"
+                    throw "Invalid driver path - canonicalization failed"
+                }
+
+                # Step 2: Normalize the allowed base path
+                $driverStoreBase = [System.IO.Path]::GetFullPath((Join-Path $env:SystemRoot "System32\DriverStore\FileRepository"))
+
+                # Step 3: Strict prefix check (case-insensitive, handles trailing slashes)
+                $normalizedCanonical = $canonicalPath.TrimEnd('\', '/')
+                $normalizedBase = $driverStoreBase.TrimEnd('\', '/')
+                if (-not $normalizedCanonical.StartsWith($normalizedBase + '\', [StringComparison]::OrdinalIgnoreCase) -and
+                    -not $normalizedCanonical.Equals($normalizedBase, [StringComparison]::OrdinalIgnoreCase)) {
+                    Write-Log "SECURITY: Refusing to delete path outside DriverStore" -Type "FAIL"
+                    Write-Log "  Raw path: $driverPath" -Type "FAIL"
+                    Write-Log "  Canonical: $canonicalPath" -Type "FAIL"
+                    Write-Log "  Expected prefix: $driverStoreBase" -Type "FAIL"
+                    throw "Invalid driver path - outside allowed directory"
+                }
+
+                # Step 4: Check if path exists before attempting deletion
+                if (-not (Test-Path $canonicalPath)) {
+                    Write-Log "Driver files not found at $canonicalPath (already removed)" -Type "WARNING"
+                }
+                else {
+                    # Step 5: REPARSE POINT PROTECTION - check if target or any parent is a junction/symlink
+                    $pathToCheck = $canonicalPath
+                    $reparsePointDetected = $false
+                    while ($pathToCheck -and $pathToCheck.Length -gt $normalizedBase.Length) {
+                        if (Test-Path $pathToCheck) {
+                            $item = Get-Item $pathToCheck -Force -ErrorAction SilentlyContinue
+                            if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                                Write-Log "SECURITY: Reparse point detected in path: $pathToCheck" -Type "FAIL"
+                                $reparsePointDetected = $true
+                                break
+                            }
+                        }
+                        $pathToCheck = Split-Path $pathToCheck -Parent
+                    }
+
+                    if ($reparsePointDetected) {
+                        throw "Invalid driver path - contains reparse point (junction/symlink)"
+                    }
+
+                    # Step 6: Safe to delete
+                    Remove-Item -Path $canonicalPath -Recurse -Force -ErrorAction Stop
+                    Write-Log "Removed driver files from $canonicalPath"
                 }
             }
             catch {
@@ -652,6 +724,75 @@ $buttonClickHandler = {
             }
         }
 
+        # SAFETY: Create backups BEFORE any driver mutations
+        # Strategy: Restore point (primary) + Driver export (fallback)
+        $hasRestorePoint = $false
+        $hasDriverBackup = $false
+        $driverBackupPath = $null
+
+        # Step 1: Try to create system restore point
+        Write-Log "Creating system restore point before driver removal..."
+        $restoreResult = New-WinConfigSafetyRestorePoint -Description "Before Intel SST Audio Driver Removal"
+        if ($restoreResult.Success) {
+            if ($restoreResult.Throttled) {
+                Write-Log "Restore point was throttled (recent restore point exists)" -Type "WARNING"
+                $hasRestorePoint = $true  # A recent one exists
+            } else {
+                Write-Log "Restore point created successfully"
+                $hasRestorePoint = $true
+            }
+        } else {
+            Write-Log "Could not create restore point: $($restoreResult.Error)" -Type "WARNING"
+        }
+
+        # Step 2: Export drivers as additional backup (always try, even if restore point succeeded)
+        $driverNames = $intelAudioDrivers | ForEach-Object { $_.Driver }
+        if ($driverNames.Count -gt 0) {
+            Write-Log "Exporting driver packages as backup..."
+            $exportResult = Export-WinConfigDriverBackup -DriverNames $driverNames
+            if ($exportResult.Success) {
+                Write-Log "Drivers exported to: $($exportResult.BackupPath)"
+                $hasDriverBackup = $true
+                $driverBackupPath = $exportResult.BackupPath
+            } else {
+                Write-Log "Driver export failed: $($exportResult.Error)" -Type "WARNING"
+            }
+        }
+
+        # Step 3: If neither backup method worked, require explicit acknowledgment
+        if (-not $hasRestorePoint -and -not $hasDriverBackup) {
+            Write-Log "NO ROLLBACK PATH AVAILABLE - both restore point and driver export failed" -Type "FAIL"
+            $proceedWithoutRollback = [System.Windows.Forms.MessageBox]::Show(
+                "WARNING: No rollback path available!`n`n" +
+                "- Restore point: $($restoreResult.Error)`n" +
+                "- Driver export: $($exportResult.Error)`n`n" +
+                "If something goes wrong, you may need to reinstall Windows or manually restore drivers.`n`n" +
+                "Proceed anyway? (NOT RECOMMENDED)",
+                "No Rollback Path - Data Loss Risk",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Exclamation
+            )
+            if ($proceedWithoutRollback -ne [System.Windows.Forms.DialogResult]::Yes) {
+                Write-Log "Operation cancelled - no rollback path available." -Type "WARNING"
+                return
+            }
+            Write-Log "User acknowledged proceeding without rollback path" -Type "WARNING"
+        } elseif ($hasDriverBackup -and -not $hasRestorePoint) {
+            # Only driver backup - inform user
+            [System.Windows.Forms.MessageBox]::Show(
+                "System restore point could not be created, but drivers have been exported to:`n$driverBackupPath`n`nYou can reinstall from this backup if needed.",
+                "Driver Backup Created",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            ) | Out-Null
+        }
+
+        # SAFETY: Final audit check before irreversible driver mutations
+        if (-not (Assert-AuditTrailHealthyForMutation)) {
+            Write-Log "Operation blocked - audit trail failure detected" -Type "FAIL"
+            return
+        }
+
         # Remove the drivers
         Remove-Driver -Drivers $intelAudioDrivers
 
@@ -664,6 +805,22 @@ $buttonClickHandler = {
         }
 
         Write-Log "Script execution completed. A system restart is recommended for changes to take full effect."
+
+        # SAFETY: Check for other logged-in users before reboot
+        $safetyCheck = Test-WinConfigSafeToReboot
+        if (-not $safetyCheck.Safe) {
+            $multiUserWarning = [System.Windows.Forms.MessageBox]::Show(
+                "WARNING: $($safetyCheck.Reason)`n`nRebooting now may cause data loss for other users.`n`nProceed anyway?",
+                "Multi-User Warning",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Exclamation
+            )
+            if ($multiUserWarning -ne [System.Windows.Forms.DialogResult]::Yes) {
+                Write-Log "Reboot cancelled due to other active sessions." -Type "WARNING"
+                return
+            }
+        }
+
         $restart = [System.Windows.Forms.MessageBox]::Show(
             "Do you want to restart now?",
             "Restart Required",
@@ -671,7 +828,12 @@ $buttonClickHandler = {
             [System.Windows.Forms.MessageBoxIcon]::Question
         )
         if ($restart -eq [System.Windows.Forms.DialogResult]::Yes) {
-            Restart-Computer -Force
+            # SAFETY: Final audit check before reboot
+            if (-not (Assert-AuditTrailHealthyForMutation)) {
+                Write-Log "Reboot blocked - audit trail failure detected" -Type "FAIL"
+                return
+            }
+            Restart-Computer
         }
     }
     catch {
@@ -820,32 +982,32 @@ $buttonHandlers = @{
         }
     }
     "Device Manager" = {
-        if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
-            Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+        if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+            Write-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
                 -Name "Open Device Manager" -Source "Button:DeviceManager" -MutatesSystem $false `
                 -Result "Success" -Summary "Launched devmgmt.msc"
         }
         Start-Process "devmgmt.msc"
     }
     "Task Manager" = {
-        if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
-            Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+        if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+            Write-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
                 -Name "Open Task Manager" -Source "Button:TaskManager" -MutatesSystem $false `
                 -Result "Success" -Summary "Launched taskmgr.exe"
         }
         Start-Process "taskmgr.exe"
     }
     "Control Panel" = {
-        if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
-            Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+        if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+            Write-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
                 -Name "Open Control Panel" -Source "Button:ControlPanel" -MutatesSystem $false `
                 -Result "Success" -Summary "Launched control.exe"
         }
         Start-Process "control.exe"
     }
     "Sound Panel" = {
-        if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
-            Record-WinConfigSessionOperation -Category "Audio" -OperationType "ExternalTool" `
+        if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+            Write-WinConfigSessionOperation -Category "Audio" -OperationType "ExternalTool" `
                 -Name "Open Sound Panel" -Source "Button:SoundPanel" -MutatesSystem $false `
                 -Result "Success" -Summary "Launched mmsys.cpl"
         }
@@ -973,7 +1135,16 @@ $buttonHandlers = @{
 </LayoutModificationTemplate>
 "@
 
-        [System.IO.FileInfo]$provisioning = "$($env:ProgramData)\provisioning\tasbar_layout.xml"
+        # EPHEMERAL: Use session temp runtime path (zero-footprint)
+        # NOTE: This XML file is referenced by a registry policy. The policy will break
+        # after session ends since the file is deleted. For persistent taskbar layout,
+        # the policy mechanism should be refactored.
+        $runtimePath = if (Get-Command Get-WinConfigRuntimePath -ErrorAction SilentlyContinue) {
+            Get-WinConfigRuntimePath
+        } else {
+            Join-Path $env:TEMP "WinConfig-runtime"
+        }
+        [System.IO.FileInfo]$provisioning = Join-Path $runtimePath "taskbar_layout.xml"
         if (!$provisioning.Directory.Exists) {
             $provisioning.Directory.Create()
         }
@@ -1209,8 +1380,8 @@ $buttonHandlers = @{
         "Remove Intel SST Audio Driver" = $buttonClickHandler
         "DISM Restore Health" = {
             # Record operation in session ledger (mutating system operation)
-            if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
-                Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+            if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+                Write-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
                     -Name "DISM Restore Health" -Source "Button:DISM" -MutatesSystem $true `
                     -Result "Success" -Summary "DISM launched in elevated window"
             }
@@ -1220,8 +1391,8 @@ $buttonHandlers = @{
         }
         "/sfc scannow" = {
             # Record operation in session ledger (mutating system operation)
-            if (Get-Command Record-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
-                Record-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
+            if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+                Write-WinConfigSessionOperation -Category "System" -OperationType "ExternalTool" `
                     -Name "SFC Scannow" -Source "Button:SFC" -MutatesSystem $true `
                     -Result "Success" -Summary "SFC launched in elevated window"
             }
@@ -2080,8 +2251,9 @@ $buttonHandlers = @{
                     $attemptDetail.TcpConfirmed = $true
                     $attemptDetail.FailureStage = "TLS"
 
-                    # Step 3: TLS handshake (REQUIRED)
-                    $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false, { return $true })
+                    # Step 3: TLS handshake (REQUIRED) - using standard validation
+                    # SECURITY: No cert bypass - warmup domain should have valid cert
+                    $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false)
                     $sslStream.AuthenticateAsClient($phase0Result.WarmupDomain)
                     $attemptDetail.HttpsConfirmed = $true
                     $attemptDetail.FailureStage = "NONE"
@@ -2230,7 +2402,13 @@ $buttonHandlers = @{
 
                 $tcpClient.EndConnect($connect)
 
-                # Perform TLS handshake
+                # SECURITY EXCEPTION: SSL Inspection Detection
+                # This callback INTENTIONALLY accepts all certificates to:
+                # 1. Retrieve the certificate for issuer inspection
+                # 2. Detect corporate proxy/firewall TLS interception (MITM)
+                # 3. Report when cert issuer doesn't match expected CAs
+                # This is DIAGNOSTIC ONLY - no data is sent, only cert metadata is inspected.
+                # DO NOT copy this pattern to other locations.
                 $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false, {
                     param($sender, $cert, $chain, $errors)
                     return $true  # Accept all certs for inspection detection
@@ -2518,53 +2696,107 @@ $buttonHandlers = @{
         Set-StrictMode -Version Latest
         $ErrorActionPreference = 'Stop'
 
-        $domainSuccess = $false
-        $directIPSuccess = $false
-        $domainError = ""
-        $directIPError = ""
+        # RESULT SEMANTICS (clear distinction between failure modes):
+        # - TcpOk: TCP socket connected successfully
+        # - TlsOk: TLS handshake completed (regardless of cert validation)
+        # - CertOk: Certificate validated successfully (CN/SAN match, chain trusted)
+        # - Error: Human-readable error message for the failure point
+
         $timeoutMs = 5000
 
         # Test 1: HTTPS with domain name (SNI)
+        $domainTcpOk = $false
+        $domainTlsOk = $false
+        $domainCertOk = $false
+        $domainError = ""
         try {
             $tcpClient = New-Object System.Net.Sockets.TcpClient
             $connect = $tcpClient.BeginConnect($Domain, 443, $null, $null)
             if ($connect.AsyncWaitHandle.WaitOne($timeoutMs, $false)) {
                 $tcpClient.EndConnect($connect)
+                $domainTcpOk = $true  # TCP connected
+
                 $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false)
-                $sslStream.AuthenticateAsClient($Domain)
-                $domainSuccess = $true
+                try {
+                    $sslStream.AuthenticateAsClient($Domain)
+                    $domainTlsOk = $true   # TLS handshake completed
+                    $domainCertOk = $true  # Cert validated (no exception)
+                }
+                catch [System.Security.Authentication.AuthenticationException] {
+                    # TLS started but cert failed
+                    $domainTlsOk = $true  # TLS handshake initiated
+                    $domainError = "Certificate error: $($_.Exception.Message)"
+                }
                 $sslStream.Close()
+            } else {
+                $domainError = "TCP connection timeout"
             }
             $tcpClient.Close()
         } catch {
-            $domainError = $_.Exception.Message
+            if (-not $domainTcpOk) {
+                $domainError = "TCP error: $($_.Exception.Message)"
+            } else {
+                $domainError = "TLS error: $($_.Exception.Message)"
+            }
         }
 
-        # Test 2: HTTPS to direct IP (no SNI)
+        # Test 2: HTTPS to direct IP (no SNI) - WITHOUT cert validation bypass
+        # SECURITY: We test TCP+TLS handshake without bypassing certificate validation.
+        # Certificate will fail (expected - IP won't match cert CN), but TLS handshake confirms connectivity.
+        $directIPTcpOk = $false
+        $directIPTlsOk = $false
+        $directIPCertOk = $false  # Expected to be false (IP won't match CN)
+        $directIPError = ""
         try {
             $tcpClient = New-Object System.Net.Sockets.TcpClient
             $connect = $tcpClient.BeginConnect($DirectIP, 443, $null, $null)
             if ($connect.AsyncWaitHandle.WaitOne($timeoutMs, $false)) {
                 $tcpClient.EndConnect($connect)
-                $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false, {
-                    param($s, $c, $ch, $e) return $true  # Accept any cert for this test
-                })
-                $sslStream.AuthenticateAsClient($DirectIP)
-                $directIPSuccess = $true
+                $directIPTcpOk = $true  # TCP connected
+
+                # Use standard SSL stream with default validation
+                $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false)
+                try {
+                    $sslStream.AuthenticateAsClient($DirectIP)
+                    $directIPTlsOk = $true   # TLS handshake completed
+                    $directIPCertOk = $true  # Cert validated (unexpected for IP test)
+                }
+                catch [System.Security.Authentication.AuthenticationException] {
+                    # Expected: certificate won't match IP address
+                    # But TLS handshake succeeded (we got far enough to check cert)
+                    $directIPTlsOk = $true
+                    # Not an error for this test - cert mismatch is expected
+                }
                 $sslStream.Close()
+            } else {
+                $directIPError = "TCP connection timeout"
             }
             $tcpClient.Close()
         } catch {
-            $directIPError = $_.Exception.Message
+            if (-not $directIPTcpOk) {
+                $directIPError = "TCP error: $($_.Exception.Message)"
+            } else {
+                $directIPError = "TLS error: $($_.Exception.Message)"
+            }
         }
 
         return @{
             Domain = $Domain
             DirectIP = $DirectIP
-            DomainSuccess = $domainSuccess
-            DirectIPSuccess = $directIPSuccess
+            # Domain test results (clear semantics)
+            DomainTcpOk = $domainTcpOk
+            DomainTlsOk = $domainTlsOk
+            DomainCertOk = $domainCertOk
             DomainError = $domainError
+            # Direct IP test results (clear semantics)
+            DirectIPTcpOk = $directIPTcpOk
+            DirectIPTlsOk = $directIPTlsOk
+            DirectIPCertOk = $directIPCertOk  # Expected false (IP won't match CN)
             DirectIPError = $directIPError
+            # Legacy compatibility (DomainSuccess = full success, DirectIPSuccess = TLS worked)
+            DomainSuccess = ($domainTcpOk -and $domainTlsOk -and $domainCertOk)
+            DirectIPSuccess = ($directIPTcpOk -and $directIPTlsOk)  # Cert mismatch expected, not failure
+            DirectIPCertMismatch = ($directIPTcpOk -and $directIPTlsOk -and -not $directIPCertOk)
             Type = "SNI"
             # This is purely educational - not a pass/fail
             Severity = "INFO"
@@ -3401,6 +3633,9 @@ foreach ($tabPage in $tabControl.TabPages) {
             # Ensure running as administrator
             if (-not (Assert-WinConfigIsAdmin)) { return }
 
+            # SAFETY: Block mutations if audit trail is broken
+            if (-not (Assert-AuditTrailHealthyForMutation)) { return }
+
             $regPaths = @(
                 'HKCU:\Software\Policies\Microsoft\Control Panel\International',
                 'HKLM:\Software\Policies\Microsoft\Control Panel\International'
@@ -3428,6 +3663,20 @@ foreach ($tabPage in $tabControl.TabPages) {
                 [System.Windows.Forms.MessageBoxIcon]::Information
             )
 
+            # SAFETY: Check for other logged-in users before reboot
+            $safetyCheck = Test-WinConfigSafeToReboot
+            if (-not $safetyCheck.Safe) {
+                $multiUserWarning = [System.Windows.Forms.MessageBox]::Show(
+                    "WARNING: $($safetyCheck.Reason)`n`nRebooting now may cause data loss for other users.`n`nProceed anyway?",
+                    "Multi-User Warning",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Exclamation
+                )
+                if ($multiUserWarning -ne [System.Windows.Forms.DialogResult]::Yes) {
+                    return
+                }
+            }
+
             $result = [System.Windows.Forms.MessageBox]::Show(
                 "A reboot is recommended for changes to take effect. Reboot now?",
                 "Reboot Required",
@@ -3435,13 +3684,18 @@ foreach ($tabPage in $tabControl.TabPages) {
                 [System.Windows.Forms.MessageBoxIcon]::Question
             )
             if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-                Restart-Computer -Force
+                # SAFETY: Final audit check before reboot
+                if (-not (Assert-AuditTrailHealthyForMutation)) { return }
+                Restart-Computer
             }
         })
         # EXEMPT-CONTRACT-001: Registry operations only, no diagnostic functions
         $gpoDisableButton.Add_Click({
             # Ensure running as administrator
             if (-not (Assert-WinConfigIsAdmin)) { return }
+
+            # SAFETY: Block mutations if audit trail is broken
+            if (-not (Assert-AuditTrailHealthyForMutation)) { return }
 
             $regPaths = @(
                 'HKCU:\Software\Policies\Microsoft\Control Panel\International',
@@ -3468,6 +3722,20 @@ foreach ($tabPage in $tabControl.TabPages) {
                 [System.Windows.Forms.MessageBoxIcon]::Information
             )
 
+            # SAFETY: Check for other logged-in users before reboot
+            $safetyCheck = Test-WinConfigSafeToReboot
+            if (-not $safetyCheck.Safe) {
+                $multiUserWarning = [System.Windows.Forms.MessageBox]::Show(
+                    "WARNING: $($safetyCheck.Reason)`n`nRebooting now may cause data loss for other users.`n`nProceed anyway?",
+                    "Multi-User Warning",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Exclamation
+                )
+                if ($multiUserWarning -ne [System.Windows.Forms.DialogResult]::Yes) {
+                    return
+                }
+            }
+
             $result = [System.Windows.Forms.MessageBox]::Show(
                 "A reboot is recommended for changes to take effect. Reboot now?",
                 "Reboot Required",
@@ -3475,7 +3743,9 @@ foreach ($tabPage in $tabControl.TabPages) {
                 [System.Windows.Forms.MessageBoxIcon]::Question
             )
             if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-                Restart-Computer -Force
+                # SAFETY: Final audit check before reboot
+                if (-not (Assert-AuditTrailHealthyForMutation)) { return }
+                Restart-Computer
             }
         })
         $flowLayoutPanel.Controls.Add($gpoEnableButton)
@@ -4356,9 +4626,9 @@ foreach ($tabPage in $tabControl.TabPages) {
         $diagHeadline = New-Headline "NO Support Tool Diagnostics"
         $diagFlow.Controls.Add($diagHeadline)
 
-        # Add description with session ID clarification
+        # Add description with run ID clarification
         $descLabel = New-Object System.Windows.Forms.Label
-        $descLabel.Text = "Read-only session information for support escalation. (Session ID is unique to this Support Tool session)"
+        $descLabel.Text = "Read-only diagnostic information for support escalation. (Run ID is unique to this Support Tool run)"
         $descLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
         $descLabel.ForeColor = [System.Drawing.Color]::Gray
         $descLabel.AutoSize = $true
@@ -4372,13 +4642,18 @@ foreach ($tabPage in $tabControl.TabPages) {
         $logFileDisplay = switch ($script:LogPathInfo.Status) {
             "Active"      { $script:LogPathInfo.Path }
             "Initialized" { "Initialized (no actions logged yet)" }
-            "Disabled"    { "Logging disabled for this session" }
-            default       { "Logging disabled for this session" }
+            "Disabled"    { "Logging disabled for this run" }
+            default       { "Logging disabled for this run" }
         }
 
+        # Get source commit for traceability display
+        $sourceCommitDisplay = if ($env:WINCONFIG_SOURCE_COMMIT) {
+            $env:WINCONFIG_SOURCE_COMMIT.Substring(0, 7)
+        } else { "unknown" }
+
         # Add diagnostic rows to TableLayoutPanel (Phase 1: no absolute positioning)
-        Add-DiagnosticRow -Table $diagTable -Label "Support Tool Session ID" -Value $script:SessionId
-        Add-DiagnosticRow -Table $diagTable -Label "NO Support Tool Version" -Value $AppVersion
+        Add-DiagnosticRow -Table $diagTable -Label "Support Tool Run ID" -Value $script:SessionId
+        Add-DiagnosticRow -Table $diagTable -Label "NO Support Tool Version" -Value "$AppVersion [$sourceCommitDisplay]"
         Add-DiagnosticRow -Table $diagTable -Label "Started" -Value $script:SessionStartTime
         Add-DiagnosticRow -Table $diagTable -Label "Device Name" -Value $machineInfo.DeviceName
         Add-DiagnosticRow -Table $diagTable -Label "Serial Number" -Value $machineInfo.SerialNumber
@@ -4405,7 +4680,7 @@ foreach ($tabPage in $tabControl.TabPages) {
         # Build Network Insights section if any network tests were run
         if ($networkActions.Count -gt 0) {
             $networkInsightsLabel = New-Object System.Windows.Forms.Label
-            $networkInsightsLabel.Text = "Network Insights (This Session):"
+            $networkInsightsLabel.Text = "Network Insights (This Run):"
             $networkInsightsLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
             $networkInsightsLabel.ForeColor = $tabColor
             $networkInsightsLabel.AutoSize = $true
@@ -4586,7 +4861,7 @@ foreach ($tabPage in $tabControl.TabPages) {
 
         # Add Session Actions Timeline section
         $actionsLabel = New-Object System.Windows.Forms.Label
-        $actionsLabel.Text = "Actions Executed This Session:"
+        $actionsLabel.Text = "Actions Executed This Run:"
         $actionsLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
         $actionsLabel.ForeColor = $tabColor
         $actionsLabel.AutoSize = $true
@@ -4632,8 +4907,8 @@ foreach ($tabPage in $tabControl.TabPages) {
             $clipLogFileDisplay = switch ($script:LogPathInfo.Status) {
                 "Active"      { $script:LogPathInfo.Path }
                 "Initialized" { "Initialized (no actions logged yet)" }
-                "Disabled"    { "Logging disabled for this session" }
-                default       { "Logging disabled for this session" }
+                "Disabled"    { "Logging disabled for this run" }
+                default       { "Logging disabled for this run" }
             }
 
             # Get session actions for clipboard
@@ -4732,12 +5007,49 @@ Network Insights (This Session):
                 $actionsText = $actionsText.TrimEnd("`n")
             }
 
+            # Get source commit for clipboard
+            $clipSourceCommit = if ($env:WINCONFIG_SOURCE_COMMIT) {
+                $env:WINCONFIG_SOURCE_COMMIT.Substring(0, 7)
+            } else { "unknown" }
+
+            # === Generate PPF (Problem Pattern Fingerprint) ===
+            $ppfText = ""
+            try {
+                $ppfFunction = Get-Command New-WinConfigProblemPatternFingerprint -ErrorAction SilentlyContinue
+                if (-not $ppfFunction) {
+                    $ppfFunction = Get-Command New-ProblemPatternFingerprint -ErrorAction SilentlyContinue
+                }
+
+                if ($ppfFunction) {
+                    # Get operations from ledger
+                    $ledgerOps = if (Get-Command Get-WinConfigLedgerOperations -ErrorAction SilentlyContinue) {
+                        @(Get-WinConfigLedgerOperations)
+                    } else { @() }
+
+                    $ppf = & $ppfFunction -Operations $ledgerOps
+                    if ($ppf) {
+                        $ppfText = @"
+
+Problem Pattern Fingerprint:
+  PPF ID:        $($ppf.Id)
+  OS Bucket:     $($ppf.OsBucket)
+  Network Class: $($ppf.NetworkClass)
+  Failures:      $($ppf.FailureCount)
+
+"@
+                    }
+                }
+            }
+            catch {
+                # PPF generation failed - non-fatal, continue without it
+            }
+
             $diagText = @"
 NO Support Tool Diagnostics
 ===========================
 
-Support Tool Session ID:  $($script:SessionId)
-NO Support Tool Version:  $AppVersion
+Support Tool Run ID:      $($script:SessionId)
+NO Support Tool Version:  $AppVersion [$clipSourceCommit]
 Started:                  $($script:SessionStartTime)
 
 Device Name:              $($clipMachineInfo.DeviceName)
@@ -4745,8 +5057,8 @@ Serial Number:            $($clipMachineInfo.SerialNumber)
 
 Log File:
   $clipLogFileDisplay
-$networkInsightsText
-Actions Executed This Session:
+$networkInsightsText$ppfText
+Actions Executed This Run:
 $actionsText
 "@
             [System.Windows.Forms.Clipboard]::SetText($diagText)
@@ -4881,7 +5193,14 @@ function Send-DiagnosticsPayloadCloudflare {
         [Parameter(Mandatory)] [string] $IngestUrl
     )
 
-    $pendingRoot = Join-Path $env:ProgramData "NoSupport\PendingDiagnostics"
+    # EPHEMERAL: Use session temp cache path (zero-footprint)
+    # NOTE: Spooled diagnostics are deleted on session exit. If upload fails,
+    # the data is lost. This is acceptable for a zero-footprint support tool.
+    $pendingRoot = if (Get-Command Get-WinConfigCachePath -ErrorAction SilentlyContinue) {
+        Join-Path (Get-WinConfigCachePath) "PendingDiagnostics"
+    } else {
+        Join-Path $env:TEMP "WinConfig-cache\PendingDiagnostics"
+    }
     Ensure-DiagnosticsDir $pendingRoot
 
     $spoolPath = Join-Path $pendingRoot "$SessionId.json"
@@ -4891,10 +5210,11 @@ function Send-DiagnosticsPayloadCloudflare {
         $JsonPayload | Out-File -LiteralPath $spoolPath -Encoding utf8 -Force
     }
 
-    # 2) Token guard
+    # 2) Token acquisition (zero-config via /ingest-token)
+    # SSOT: docs/SSOT_INGEST_AUTH.md - hard-fail if broker unavailable
     $token = Get-NoSupportIngestToken
     if (-not $token) {
-        return @{ Status="spooled_no_token"; SessionId=$SessionId; Path=$spoolPath }
+        return @{ Status="auth_broker_unavailable"; SessionId=$SessionId; AuthMethod="JWT (runtime)"; TokenSource="/ingest-token"; Error="Token broker unreachable" }
     }
 
     # 3) Compress
@@ -4921,7 +5241,7 @@ function Send-DiagnosticsPayloadCloudflare {
 
             # Success (2xx) - parse response to check status
             Remove-Item -LiteralPath $spoolPath -Force -ErrorAction SilentlyContinue
-            return @{ Status="uploaded"; SessionId=$SessionId; Http=201; Response=$responseText }
+            return @{ Status="uploaded"; SessionId=$SessionId; Http=201; Response=$responseText; AuthMethod="JWT (runtime)"; TokenSource="/ingest-token" }
         }
         catch [System.Net.WebException] {
             $webEx = $_.Exception
@@ -4930,15 +5250,16 @@ function Send-DiagnosticsPayloadCloudflare {
             if ($httpResp) {
                 $statusCode = [int]$httpResp.StatusCode
 
-                # 409 Conflict = duplicate, treat as success
+                # 409 Conflict = duplicate, treat as success (no retry, clean exit)
                 if ($statusCode -eq 409) {
+                    Write-Host "[Upload] Already uploaded: Session $SessionId (HTTP 409 - duplicate detected)" -ForegroundColor Cyan
                     Remove-Item -LiteralPath $spoolPath -Force -ErrorAction SilentlyContinue
-                    return @{ Status="duplicate"; SessionId=$SessionId; Http=409 }
+                    return @{ Status="duplicate"; SessionId=$SessionId; Http=409; AuthMethod="JWT (runtime)"; TokenSource="/ingest-token" }
                 }
 
                 # 400/401/403 = fatal, don't retry
                 if ($statusCode -in 400,401,403) {
-                    return @{ Status="fatal"; SessionId=$SessionId; Http=$statusCode; Path=$spoolPath }
+                    return @{ Status="fatal"; SessionId=$SessionId; Http=$statusCode; Path=$spoolPath; AuthMethod="JWT (runtime)"; TokenSource="/ingest-token" }
                 }
             }
 
@@ -4966,13 +5287,19 @@ function Send-DiagnosticsPayloadCloudflare {
 # Log shutdown when form closes
 # EXEMPT-CONTRACT-001: Shutdown logging, no Switch-DiagnosticResult usage
 $form.Add_FormClosing({
-    # Finalize session ledger (makes session immutable, generates markdown)
-    if (Get-Command Finalize-WinConfigSession -ErrorAction SilentlyContinue) {
-        Finalize-WinConfigSession | Out-Null
+    # Close session ledger (makes session immutable, generates markdown)
+    if (Get-Command Close-WinConfigSession -ErrorAction SilentlyContinue) {
+        Close-WinConfigSession | Out-Null
     }
 
     if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
         Write-WinConfigLog -Action "Shutdown" -Message "WinConfig application closed"
+    }
+
+    # EPHEMERAL CLEANUP: Remove session temp root (zero-footprint)
+    # This ensures no persistent artifacts remain after application exit
+    if (Get-Command Remove-WinConfigTempRoot -ErrorAction SilentlyContinue) {
+        Remove-WinConfigTempRoot
     }
 
     # Ephemeral diagnostics export (checkbox-gated, Cloudflare R2)
@@ -5086,6 +5413,36 @@ $form.Add_FormClosing({
                 }
             } else { @() }
 
+            # === Generate PPF for export ===
+            $exportPpf = $null
+            try {
+                $ppfFunction = Get-Command New-WinConfigProblemPatternFingerprint -ErrorAction SilentlyContinue
+                if (-not $ppfFunction) {
+                    $ppfFunction = Get-Command New-ProblemPatternFingerprint -ErrorAction SilentlyContinue
+                }
+
+                if ($ppfFunction) {
+                    $ledgerOps = if (Get-Command Get-WinConfigLedgerOperations -ErrorAction SilentlyContinue) {
+                        @(Get-WinConfigLedgerOperations)
+                    } else { @() }
+
+                    $ppfResult = & $ppfFunction -Operations $ledgerOps
+                    if ($ppfResult) {
+                        $exportPpf = @{
+                            id           = $ppfResult.Id
+                            schema       = $ppfResult.Schema
+                            failureCount = $ppfResult.FailureCount
+                            failures     = @($ppfResult.Failures)
+                            osBucket     = $ppfResult.OsBucket
+                            networkClass = $ppfResult.NetworkClass
+                        }
+                    }
+                }
+            }
+            catch {
+                # PPF generation failed - non-fatal, export without it
+            }
+
             $payload = @{
                 SchemaVersion = "1.0"
                 ExportedAt = (Get-Date).ToString("o")
@@ -5094,6 +5451,7 @@ $form.Add_FormClosing({
                 Iteration = $Iteration
                 SessionStartTime = $script:SessionStartTime
                 Actions = @($exportSessionActions)
+                ppf = $exportPpf
             }
 
             # === SCHEMA VALIDATION (fail-closed) ===
@@ -5119,38 +5477,59 @@ $form.Add_FormClosing({
             # === WRITE ATTEMPT (Cloudflare R2 only) ===
             $json = $payload | ConvertTo-Json -Depth 10
 
-            Send-DiagnosticsPayloadCloudflare `
+            # CONTRACT: Result MUST be captured and checked - DO NOT pipe to Out-Null
+            # Regression guard: .github/workflows/lint-export-result.yml
+            # History: Silent failure bug caused uploads to fail without user notification
+            $uploadResult = Send-DiagnosticsPayloadCloudflare `
                 -JsonPayload $json `
                 -SessionId   $script:SessionId `
-                -IngestUrl   $script:DiagnosticsIngestUrl | Out-Null
+                -IngestUrl   $script:DiagnosticsIngestUrl
 
-            Write-Host "[Analytics Export] Submitted (async)" -ForegroundColor Green
-            if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
-                Write-WinConfigLog -Action "AnalyticsExport" -Message "Submitted diagnostics export (async)"
-            }
+            # Check actual result status
+            $resultStatus = if ($uploadResult) { $uploadResult.Status } else { "unknown" }
+            $isSuccess = $resultStatus -in @("uploaded", "duplicate")
 
-            # Register submission in session timeline
-            $script:DiagnosticActions += [PSCustomObject]@{
-                ActionId  = [guid]::NewGuid().ToString().Substring(0,8).ToUpper()
-                Timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffffff")
-                Action    = "Analytics Export"
-                Detail    = "Submitted (async)"
-                Category  = "Diagnostics"
-                Result    = "PASS"
+            if ($isSuccess) {
+                # Silent success - log internally only (no console output)
+                if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
+                    Write-WinConfigLog -Action "AnalyticsExport" -Message "Export succeeded: $resultStatus"
+                }
+
+                # Register success in session timeline
+                $script:DiagnosticActions += [PSCustomObject]@{
+                    ActionId  = [guid]::NewGuid().ToString().Substring(0,8).ToUpper()
+                    Timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffffff")
+                    Action    = "Analytics Export"
+                    Detail    = "Uploaded ($resultStatus)"
+                    Category  = "Diagnostics"
+                    Result    = "PASS"
+                }
+            } else {
+                # Silent failure - log internally only (no console output)
+                $errorDetail = if ($uploadResult.Error) { $uploadResult.Error } else { $resultStatus }
+                if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
+                    Write-WinConfigLog -Action "AnalyticsExport" -Message "Export failed: $resultStatus - $errorDetail"
+                }
+                Register-ExportWarning -Summary "Analytics export failed: $errorDetail"
+
+                # Register failure in session timeline
+                $script:DiagnosticActions += [PSCustomObject]@{
+                    ActionId  = [guid]::NewGuid().ToString().Substring(0,8).ToUpper()
+                    Timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffffff")
+                    Action    = "Analytics Export"
+                    Detail    = "Failed: $resultStatus"
+                    Category  = "Diagnostics"
+                    Result    = "FAIL"
+                }
             }
 
         } catch {
-            # Visible failure - register WARN in session timeline
+            # Silent exception - log internally only (no console output)
             $errorMsg = $_.Exception.Message
-            Write-Host "[Analytics Export] FAILED: $errorMsg" -ForegroundColor Red
             if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
-                Write-WinConfigLog -Action "AnalyticsExport" -Message "FAILED to export diagnostics: $errorMsg"
+                Write-WinConfigLog -Action "AnalyticsExport" -Message "Export exception: $errorMsg"
             }
-            if ($errorMsg -match "path" -or $errorMsg -match "access" -or $errorMsg -match "network") {
-                Register-ExportWarning -Summary "Analytics export failed: ingest path not writable"
-            } else {
-                Register-ExportWarning -Summary "Analytics export failed: $errorMsg"
-            }
+            Register-ExportWarning -Summary "Analytics export exception: $errorMsg"
         }
     }
 })
