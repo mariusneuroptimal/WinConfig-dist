@@ -5443,6 +5443,9 @@ $form.Add_FormClosing({
                 # PPF generation failed - non-fatal, export without it
             }
 
+            # Get device identity for payload (same source as UI display)
+            $machineInfo = Get-WinConfigMachineInfo
+
             $payload = @{
                 SchemaVersion = "1.0"
                 ExportedAt = (Get-Date).ToString("o")
@@ -5452,6 +5455,10 @@ $form.Add_FormClosing({
                 SessionStartTime = $script:SessionStartTime
                 Actions = @($exportSessionActions)
                 ppf = $exportPpf
+                # Device identity - verbatim from Get-WinConfigMachineInfo
+                deviceName = $machineInfo.DeviceName
+                serialNumber = $machineInfo.SerialNumber
+                windowsVersion = $machineInfo.FormattedVersion
             }
 
             # === SCHEMA VALIDATION (fail-closed) ===
