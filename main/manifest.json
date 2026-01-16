@@ -1,10 +1,4 @@
 {
-  "branch": "main",
-  "event": "push",
-  "schema_version": "2.0",
-  "source_ref": "0e6ef6f6a1d7635ec4b746f70aa9ff4b4d7ff922",
-  "build_id": "21054781035-1",
-  "timestamp": "2026-01-16T03:39:39.5847266Z",
   "artifacts": [
     {
       "path": "Win11Config.ps1",
@@ -86,5 +80,11 @@
       "sha256": "b868f988a98f3cbddc7541b7737cf1ea4ac6a73df2a1305ef4638008eda103c5",
       "size": 18529
     }
-  ]
+  ],
+  "timestamp": "2026-01-16T03:46:19.0024296Z",
+  "source_ref": "edc3018f407bdda75a210c66b48474d128e9d774",
+  "branch": "main",
+  "schema_version": "2.0",
+  "build_id": "21054896678-1",
+  "event": "push"
 }

@@ -129,7 +129,7 @@ param(
 # ============================================================================
 
 # Bootstrap version - update when Bootstrap.ps1 changes
-$BootstrapVersion = "2.4.0"
+$BootstrapVersion = "2.5.0"
 
 # GitHub owner - HARDCODED TRUST ANCHOR (do not parameterize)
 $GitHubOwner = "mariusneuroptimal"
@@ -391,6 +391,7 @@ function Get-RawGitHubContent {
         - CDN fallback only triggers on confirmed rate-limit (X-RateLimit-Remaining: 0)
         - Other 403 errors (auth, forbidden) are NOT masked - they rethrow
         - Server errors (5xx) trigger CDN fallback with retry
+        - NoCdnFallback prevents ANY fallback (for control plane requests)
 
         Strips UTF-8 BOM if present for compatibility.
     #>
@@ -401,7 +402,10 @@ function Get-RawGitHubContent {
         [string]$Path,
         # Data-plane-only mode: bypasses API freshness guarantees.
         # Safe only when hash verification is enforced by caller.
-        [switch]$PreferCdn
+        [switch]$PreferCdn,
+        # Control-plane mode: NEVER fall back to CDN.
+        # Use for manifest.json and other critical files that MUST be fresh.
+        [switch]$NoCdnFallback
     )
 
     $ProgressPreference = 'SilentlyContinue'
@@ -525,6 +529,13 @@ function Get-RawGitHubContent {
             }
 
             if ($shouldFallback) {
+                # INVARIANT: NoCdnFallback prevents ANY CDN fallback
+                # Control plane requests (manifest, SOURCE_COMMIT) must be fresh
+                if ($NoCdnFallback) {
+                    Write-BufferedLog "    [BLOCKED] CDN fallback prevented (control plane request)" -Color "Red"
+                    throw "API unavailable ($fallbackReason) and CDN fallback disabled for $Path"
+                }
+
                 Write-BufferedLog "    [FALLBACK] API->CDN ($fallbackReason)" -Color "Yellow"
                 $rawContent = & $fetchFromCdn
                 return & $normalizeContent $rawContent
@@ -549,6 +560,10 @@ function Get-DistManifest {
     .DESCRIPTION
         Dist repo structure: main branch contains main/ and develop/ directories.
         Uses GitHub API to bypass CDN caching.
+
+        CRITICAL: This function MUST NOT use CDN fallback.
+        Manifest is control plane data - must be fresh from API.
+        If API is rate-limited, FAIL rather than risk stale manifest.
     #>
     param(
         [string]$Owner,
@@ -557,8 +572,37 @@ function Get-DistManifest {
     )
 
     # Dist repo uses single 'main' branch with environment directories
-    $manifestContent = Get-RawGitHubContent -Owner $Owner -Repo $Repo -Branch "main" -Path "$Environment/manifest.json"
+    # INVARIANT: Manifest is control plane - MUST be fresh, NO CDN fallback
+    $manifestContent = Get-RawGitHubContent -Owner $Owner -Repo $Repo -Branch "main" -Path "$Environment/manifest.json" -NoCdnFallback
     return $manifestContent | ConvertFrom-Json
+}
+
+function Get-SourceCommitPin {
+    <#
+    .SYNOPSIS
+        Fetches SOURCE_COMMIT.txt - the pinning reference for manifest verification.
+    .DESCRIPTION
+        SOURCE_COMMIT.txt is written by CI at publish time and contains the
+        exact commit SHA that was used to build the artifacts.
+
+        This provides a second reference point to detect CDN inconsistency:
+        - If manifest and SOURCE_COMMIT.txt disagree → CDN is serving stale data
+        - If both agree → data is internally consistent (may still be old, but safe)
+    #>
+    param(
+        [string]$Owner,
+        [string]$Repo,
+        [string]$Environment
+    )
+
+    try {
+        # INVARIANT: SOURCE_COMMIT is control plane - MUST be fresh, NO CDN fallback
+        $content = Get-RawGitHubContent -Owner $Owner -Repo $Repo -Branch "main" -Path "$Environment/SOURCE_COMMIT.txt" -NoCdnFallback
+        return $content.Trim()
+    } catch {
+        # SOURCE_COMMIT.txt may not exist in older builds
+        return $null
+    }
 }
 
 # ============================================================================
@@ -610,14 +654,16 @@ if ($Branch -notin $AllowedBranches) {
 
 Write-Status "Environment authorized." "OK"
 
-# --- Step 3: Fetch Manifest from Distribution Repo ---
+# --- Step 3: Fetch Manifest and Verify Pinning ---
 Start-Phase "Manifest Fetch"
 Write-BufferedLog ""
 Write-Status "Fetching manifest from distribution repository..." "INFO"
 
 try {
     $manifest = Get-DistManifest -Owner $GitHubOwner -Repo $DistRepoName -Environment $Branch
-    Write-Status "Manifest loaded (commit: $($manifest.commit.Substring(0, 7)))" "OK"
+    # Handle both v1.0 (commit) and v2.0 (source_ref) manifest formats
+    $manifestCommit = if ($manifest.source_ref) { $manifest.source_ref } else { $manifest.commit }
+    Write-Status "Manifest loaded (source: $($manifestCommit.Substring(0, 7)))" "OK"
 } catch {
     Write-Status "Failed to fetch manifest: $($_.Exception.Message)" "ERROR"
     Show-FailureDump
@@ -626,13 +672,52 @@ try {
     Write-Host "  - Distribution repository not yet set up" -ForegroundColor Gray
     Write-Host "  - Network connectivity issues" -ForegroundColor Gray
     Write-Host "  - Branch '$Branch' not published to dist repo" -ForegroundColor Gray
+    Write-Host "  - GitHub API rate limit (60/hr unauthenticated)" -ForegroundColor Gray
     exit 10  # Manifest fetch failed
 }
 
+# --- Step 3a: Verify Manifest Pinning (CDN Consistency Check) ---
+# INVARIANT: SOURCE_COMMIT.txt must match manifest.source_ref
+# This detects CDN serving stale data (manifest and pin file disagree)
+Write-Status "Verifying manifest pinning..." "INFO"
+
+$sourceCommitPin = Get-SourceCommitPin -Owner $GitHubOwner -Repo $DistRepoName -Environment $Branch
+
+if ($sourceCommitPin) {
+    if ($manifestCommit -ne $sourceCommitPin) {
+        Write-Status "MANIFEST PINNING MISMATCH DETECTED" "ERROR"
+        Show-FailureDump
+        Write-Host ""
+        Write-Host "CDN INCONSISTENCY:" -ForegroundColor Red
+        Write-Host "  Manifest source_ref: $manifestCommit" -ForegroundColor Yellow
+        Write-Host "  SOURCE_COMMIT.txt:   $sourceCommitPin" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "This indicates the CDN is serving inconsistent data." -ForegroundColor Gray
+        Write-Host "The dist repo was updated but CDN hasn't fully propagated." -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "ACTION: Wait 2-5 minutes for CDN propagation, then retry." -ForegroundColor Cyan
+        exit 10  # Manifest fetch failed (treat as manifest issue)
+    }
+    Write-Status "Manifest pinning verified (source: $($sourceCommitPin.Substring(0, 7)))" "OK"
+} else {
+    # SOURCE_COMMIT.txt doesn't exist - older dist build
+    # Warn but continue (backward compatibility during transition)
+    Write-Status "SOURCE_COMMIT.txt not found (older dist build - pinning not enforced)" "WARN"
+}
+
 # Build file manifest hashtable from JSON
+# Handle both v1.0 (files object) and v2.0 (artifacts array) formats
 $FileManifest = @{}
-foreach ($prop in $manifest.files.PSObject.Properties) {
-    $FileManifest[$prop.Name] = $prop.Value
+if ($manifest.artifacts) {
+    # v2.0 format: artifacts array with path, sha256, size
+    foreach ($artifact in $manifest.artifacts) {
+        $FileManifest[$artifact.path] = $artifact.sha256
+    }
+} else {
+    # v1.0 format: files object
+    foreach ($prop in $manifest.files.PSObject.Properties) {
+        $FileManifest[$prop.Name] = $prop.Value
+    }
 }
 
 Write-Status "Found $($FileManifest.Count) files in manifest" "INFO"
@@ -739,18 +824,16 @@ if (-not $allFilesValid) {
 
 Write-Status "All $filesVerified files verified and staged." "OK"
 
-# --- Step 6a: Fetch SOURCE_COMMIT.txt (traceability marker) ---
-# This file is not in the manifest - it's a build-time artifact for traceability
-try {
-    $sourceCommitContent = Get-RawGitHubContent -Owner $GitHubOwner -Repo $DistRepoName -Branch "main" -Path "$Branch/SOURCE_COMMIT.txt" -PreferCdn
+# --- Step 6a: Stage SOURCE_COMMIT.txt (traceability marker) ---
+# Reuse the already-fetched $sourceCommitPin from pinning verification (Step 3a)
+if ($sourceCommitPin) {
     $sourceCommitPath = Join-Path $stagingRoot "SOURCE_COMMIT.txt"
-    [System.IO.File]::WriteAllText($sourceCommitPath, $sourceCommitContent, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText($sourceCommitPath, $sourceCommitPin, [System.Text.UTF8Encoding]::new($false))
     Write-BufferedLog "  SOURCE_COMMIT.txt ... " -Color "Gray" -NoNewline
-    Write-BufferedLog "OK" -Color "Green"
-} catch {
-    # SOURCE_COMMIT.txt may not exist in older dist builds - warn but continue
+    Write-BufferedLog "OK (staged)" -Color "Green"
+} else {
     Write-BufferedLog "  SOURCE_COMMIT.txt ... " -Color "Gray" -NoNewline
-    Write-BufferedLog "NOT FOUND (older dist)" -Color "Yellow"
+    Write-BufferedLog "NOT AVAILABLE (older dist)" -Color "Yellow"
 }
 
 # --- Step 6b: Extract App Version from VERSION.psd1 ---
@@ -767,17 +850,10 @@ if (Test-Path $versionFilePath) {
     }
 }
 
-# --- Step 6b2: Verify SOURCE_COMMIT.txt (traceability guard) ---
-$sourceCommitFile = Join-Path $stagingRoot "SOURCE_COMMIT.txt"
-$sourceCommit = $null
-if (Test-Path $sourceCommitFile) {
-    $sourceCommit = (Get-Content $sourceCommitFile -Raw).Trim()
-    Write-Status "Source commit: $($sourceCommit.Substring(0, 7))" "OK"
-} else {
-    # SOURCE_COMMIT.txt missing - this means dist was built before the guard was added
-    # Warn but don't fail (backward compatibility during transition)
-    Write-Status "SOURCE_COMMIT.txt not found (dist may be stale)" "WARN"
-}
+# --- Step 6b2: Confirm SOURCE_COMMIT (already verified in Step 3a) ---
+# $sourceCommitPin was fetched and verified against manifest in Step 3a
+# Here we just use it for display and downstream env var
+$sourceCommit = $sourceCommitPin  # May be $null for older dist builds
 
 # Version summary - only in verbose mode
 if ($script:VerbosityLevel -ge 2) {
