@@ -5324,9 +5324,10 @@ $form.Add_FormClosing({
             $hostnamePattern = '\b[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}\b'
 
             # Forbidden key names (case-insensitive)
+            # NOTE: deviceName, serialNumber, windowsVersion are ALLOWED (intentionally in payload)
+            # See: tests/ExportPayloadContract.Tests.ps1 for guardrail ensuring no conflicts
             $forbiddenKeys = @('IPAddress', 'IP', 'IPv4', 'IPv6', 'Hostname', 'ComputerName', 'MachineName',
-                               'DeviceName', 'SerialNumber', 'MACAddress', 'MAC', 'Username', 'User',
-                               'ISP', 'ASN', 'Organization', 'Org')
+                               'MACAddress', 'MAC', 'Username', 'User', 'ISP', 'ASN', 'Organization', 'Org')
 
             if ($null -eq $Data) { return $null }
 
