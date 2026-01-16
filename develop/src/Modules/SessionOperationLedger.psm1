@@ -466,32 +466,11 @@ function Write-SessionOperation {
         [System.Threading.Monitor]::Exit($script:LedgerLock)
     }
 
-    # Bridge to existing Register-SessionAction for backward compatibility
-    if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-        $legacyCategory = switch ($Category) {
-            "Network"     { "Diagnostics" }
-            "System"      { "AdminChange" }
-            "Audio"       { "Diagnostics" }
-            "Bluetooth"   { "AdminChange" }
-            "Maintenance" { "Maintenance" }
-            default       { "Configuration" }
-        }
-        $legacyResult = switch ($Result) {
-            "Success" { "PASS" }
-            "Warning" { "WARN" }
-            "Failed"  { "FAIL" }
-            "Skipped" { "PENDING" }
-        }
-
-        Register-WinConfigSessionAction `
-            -Action $Name `
-            -Detail "$OperationType from $Source" `
-            -Category $legacyCategory `
-            -Result $legacyResult `
-            -Tier 0 `
-            -Summary $Summary `
-            -Evidence $Evidence
-    }
+    # NOTE: Backward-compatibility bridge to Register-SessionAction was REMOVED
+    # to prevent infinite recursion. The canonical bridge direction is:
+    #   Logger.psm1 (Register-SessionAction) → SessionOperationLedger.psm1 (Write-SessionOperation)
+    # This ensures PPF generation sees diagnostic results without circular calls.
+    # See: docs/RUNS-VIEW-ARCHITECTURE.md for bridge architecture documentation.
 
     return $operationId
 }
@@ -614,7 +593,6 @@ function Complete-SessionOperation {
     Assert-EvidenceIsPureData -Evidence $Evidence
 
     # Thread-safe operation update with explicit lock
-    $operationForLegacy = $null
     [System.Threading.Monitor]::Enter($script:LedgerLock)
     try {
         # Re-check finalization under lock (double-check pattern)
@@ -632,7 +610,6 @@ function Complete-SessionOperation {
                 $script:LedgerOperations[$i].ArtifactRefs = $ArtifactRefs
                 $script:LedgerOperations[$i].Evidence = $Evidence
                 $found = $true
-                $operationForLegacy = $script:LedgerOperations[$i]
                 break
             }
         }
@@ -648,32 +625,8 @@ function Complete-SessionOperation {
         [System.Threading.Monitor]::Exit($script:LedgerLock)
     }
 
-    # Bridge to legacy Register-SessionAction (outside lock - non-critical)
-    if ($operationForLegacy -and (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue)) {
-        $legacyCategory = switch ($operationForLegacy.Category) {
-            "Network"     { "Diagnostics" }
-            "System"      { "AdminChange" }
-            "Audio"       { "Diagnostics" }
-            "Bluetooth"   { "AdminChange" }
-            "Maintenance" { "Maintenance" }
-            default       { "Configuration" }
-        }
-        $legacyResult = switch ($Result) {
-            "Success" { "PASS" }
-            "Warning" { "WARN" }
-            "Failed"  { "FAIL" }
-            "Skipped" { "PENDING" }
-        }
-
-        Register-WinConfigSessionAction `
-            -Action $operationForLegacy.Name `
-            -Detail "$($operationForLegacy.OperationType) from $($operationForLegacy.Source) - Completed" `
-            -Category $legacyCategory `
-            -Result $legacyResult `
-            -Tier 0 `
-            -Summary $Summary `
-            -Evidence $Evidence
-    }
+    # NOTE: Backward-compatibility bridge to Register-SessionAction was REMOVED
+    # to prevent infinite recursion. See Write-SessionOperation for details.
 
     return $true
 }
