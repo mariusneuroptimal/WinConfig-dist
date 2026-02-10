@@ -118,11 +118,27 @@ param(
     [switch]$SelfCheck,     # Verify-only mode, don't launch
 
     [Parameter()]
-    [switch]$Trace          # Superset of -Verbose: adds timing + call-site info
+    [switch]$Trace,         # Superset of -Verbose: adds timing + call-site info
+
+    [Parameter()]
+    [Alias('ui-debug')]
+    [switch]$UIDebug        # UI Debug Mode: load debug UI, skip production code
 )
 
 # Note: -Verbose and -Debug are PowerShell common parameters (via CmdletBinding)
 # Use -Verbose for detailed output, -Trace for timing + call-site info
+
+# ============================================================================
+# UI DEBUG GATE (MUST RUN FIRST - BEFORE ANY MODULE LOADING)
+# ============================================================================
+$script:IsUIDebug =
+    $env:WINCONFIG_UI_DEBUG -eq "1" -or
+    $UIDebug
+
+if ($script:IsUIDebug) {
+    Write-Host "[UI DEBUG MODE ENABLED - PRODUCTION UI DISABLED]" -ForegroundColor Yellow
+}
+# ============================================================================
 
 # ============================================================================
 # CONFIGURATION - TRUST ANCHORS

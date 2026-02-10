@@ -276,6 +276,10 @@ function Register-SessionAction {
         Operator-readable summary of the outcome (e.g., "All domains reachable")
     .PARAMETER Evidence
         Optional structured evidence hashtable for machine-readable data
+    .PARAMETER ToolCategory
+        Tool domain for grouping (Bluetooth, Network, Audio, System, Maintenance).
+        Used by ledger for run grouping and export semantics. If not specified,
+        falls back to pattern-matching on Action name.
     .PARAMETER LogAction
         If $true (default), also writes to the JSONL log via Write-Log
     #>
@@ -292,7 +296,7 @@ function Register-SessionAction {
         [string]$Category = "Diagnostics",
 
         [Parameter(Mandatory = $false)]
-        [ValidateSet("PASS", "WARN", "FAIL", "PENDING", "NOT_RUN")]
+        [ValidateSet("PASS", "WARN", "FAIL", "PENDING", "NOT_RUN", "CANCELLED")]
         [string]$Result = "PENDING",
 
         [Parameter(Mandatory = $false)]
@@ -306,6 +310,10 @@ function Register-SessionAction {
         [hashtable]$Evidence = @{},
 
         [Parameter(Mandatory = $false)]
+        [ValidateSet("Bluetooth", "Network", "Audio", "System", "Maintenance", "Other", "")]
+        [string]$ToolCategory = "",
+
+        [Parameter(Mandatory = $false)]
         [bool]$LogAction = $true
     )
 
@@ -313,15 +321,16 @@ function Register-SessionAction {
     $actionId = [guid]::NewGuid().ToString("N").Substring(0, 8).ToUpper()
 
     $actionEntry = [PSCustomObject]@{
-        ActionId  = $actionId
-        Timestamp = Get-Date
-        Action    = $Action
-        Detail    = $Detail
-        Category  = $Category
-        Result    = $Result
-        Tier      = $Tier
-        Summary   = $Summary
-        Evidence  = $Evidence
+        ActionId     = $actionId
+        Timestamp    = Get-Date
+        Action       = $Action
+        Detail       = $Detail
+        Category     = $Category
+        ToolCategory = $ToolCategory  # Phase 5: explicit tool domain for grouping
+        Result       = $Result
+        Tier         = $Tier
+        Summary      = $Summary
+        Evidence     = $Evidence
     }
 
     $script:SessionActions += $actionEntry
@@ -342,24 +351,30 @@ function Register-SessionAction {
             try {
                 # Map session action result to ledger result
                 $ledgerResult = switch ($Result) {
-                    "PASS"    { "Success" }
-                    "WARN"    { "Warning" }
-                    "FAIL"    { "Failed" }
-                    "NOT_RUN" { "Skipped" }
-                    default   { "Success" }  # Safe default for unknown states
+                    "PASS"      { "Success" }
+                    "WARN"      { "Warning" }
+                    "FAIL"      { "Failed" }
+                    "NOT_RUN"   { "Skipped" }
+                    "CANCELLED" { "Skipped" }  # Cancelled = user-initiated skip
+                    default     { "Success" }  # Safe default for unknown states
                 }
 
-                # Map action name to ledger category (Network for most diagnostics)
-                $ledgerCategory = switch -Wildcard ($Action) {
-                    "*Network*"      { "Network" }
-                    "*DNS*"          { "Network" }
-                    "*TCP*"          { "Network" }
-                    "*HTTPS*"        { "Network" }
-                    "*Connectivity*" { "Network" }
-                    "*BT*"           { "Bluetooth" }
-                    "*Bluetooth*"    { "Bluetooth" }
-                    "*Audio*"        { "Audio" }
-                    default          { "Network" }  # Default to Network for diagnostics
+                # Phase 5: Use explicit ToolCategory if provided, else fall back to pattern matching
+                $ledgerCategory = if ($ToolCategory -and $ToolCategory -ne "") {
+                    $ToolCategory
+                } else {
+                    # Legacy fallback: pattern-match on Action name
+                    switch -Wildcard ($Action) {
+                        "*Network*"      { "Network" }
+                        "*DNS*"          { "Network" }
+                        "*TCP*"          { "Network" }
+                        "*HTTPS*"        { "Network" }
+                        "*Connectivity*" { "Network" }
+                        "*BT*"           { "Bluetooth" }
+                        "*Bluetooth*"    { "Bluetooth" }
+                        "*Audio*"        { "Audio" }
+                        default          { "Other" }  # Changed from Network to Other for clarity
+                    }
                 }
 
                 # Register to ledger with OperationType="Test"

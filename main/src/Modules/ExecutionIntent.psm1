@@ -139,16 +139,52 @@ function Invoke-WithExecutionIntent {
 function Test-IsDryRunMode {
     <#
     .SYNOPSIS
-        Returns true if running in dev/CI/test environment where mutations should be no-op.
+        Legacy adapter: returns true if dry-run mode is active.
     .DESCRIPTION
-        Dry-run mode is determined by WINCONFIG_ENV environment variable.
-        Valid dry-run values: dev, ci, test
+        ADAPTER SHIM — delegates to Resolve-DryRunIntent (DryRun.psm1), which is
+        the single truth source for dry-run resolution. This function exists only
+        for backward compatibility with legacy callers that predate the -DryRun switch.
+
+        If Resolve-DryRunIntent is not available (DryRun.psm1 not loaded), falls back
+        to inline resolution with the same precedence contract.
+
+        Precedence (enforced by Resolve-DryRunIntent):
+        1. Explicit -DryRun switch → DryRun (not reachable from this shim)
+        2. Legacy $env:WINCONFIG_ENV in (dev, ci, test) → DryRun
+        3. Legacy $env:WINCONFIG_ENV in (prod, production) → Live
+        4. ExecutionIntent = DIAGNOSTIC → DryRun
+        5. ExecutionIntent = SAFE_ACTION or ADMIN_ACTION → Live
+        6. Ambiguous → THROW (fail-closed)
     .OUTPUTS
         Boolean: $true if dry-run mode is active
     #>
     [CmdletBinding()]
     param()
-    return $env:WINCONFIG_ENV -in @('dev', 'ci', 'test')
+
+    # Delegate to the single truth source if available
+    if (Get-Command Resolve-DryRunIntent -ErrorAction SilentlyContinue) {
+        $resolution = Resolve-DryRunIntent
+        return $resolution.IsDryRun
+    }
+
+    # Fallback: inline resolution (same precedence contract, for bootstrap scenarios
+    # where DryRun.psm1 is not yet loaded)
+    if ($env:WINCONFIG_ENV -in @('dev', 'ci', 'test')) {
+        return $true
+    }
+    if ($env:WINCONFIG_ENV -in @('prod', 'production')) {
+        return $false
+    }
+
+    $intent = Get-ExecutionIntent
+    if ($intent -eq 'DIAGNOSTIC') {
+        return $true
+    }
+    if ($intent -in @('SAFE_ACTION', 'ADMIN_ACTION')) {
+        return $false
+    }
+
+    throw "FAIL-CLOSED: Cannot determine execution mode. `$env:WINCONFIG_ENV is not set to a recognized value ('dev', 'ci', 'test', 'prod', 'production') and no ExecutionIntent is active. Set the environment variable or use Invoke-WithExecutionIntent before calling Test-IsDryRunMode."
 }
 
 function Assert-NotRunningAsAdmin {

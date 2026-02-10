@@ -46,4 +46,12 @@ if ($Iteration -eq "production" -and $env:CI -ne "true") {
     # if ($isWritable) { throw "FATAL: VERSION.psd1 must be read-only in production" }
 }
 
-. "$PSScriptRoot\src\Win11Config.App.ps1"
+# === UI ENTRY POINT ROUTER ===
+# Debug mode loads isolated debug UI (no production code parsed)
+# Production mode loads real UI
+if ($script:IsUIDebug) {
+    . "$PSScriptRoot\src\Win11Config.App.Debug.ps1"
+}
+else {
+    . "$PSScriptRoot\src\Win11Config.App.ps1"
+}

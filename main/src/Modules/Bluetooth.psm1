@@ -1,3 +1,4 @@
+throw "PERF-001 TRIPWIRE: Bluetooth.psm1 imported unexpectedly"
 # Bluetooth.psm1 - Bluetooth audio diagnostics for WinConfig
 # Provides diagnostics, service control, and Kodi audio path analysis
 
@@ -67,6 +68,413 @@ function Test-IsTransportOrServiceNode {
     return $false
 }
 
+#region WinRT Bluetooth Enumeration (PERF-001 compliant - types loaded inside function)
+
+function Initialize-WinRTTypes {
+    <#
+    .SYNOPSIS
+        Loads WinRT types for Bluetooth enumeration. Called INSIDE functions, not at module scope.
+    .DESCRIPTION
+        PERF-001: This must NEVER be called at module import time.
+        It's designed to be called lazily when Bluetooth tab is first accessed.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($script:WinRTInitialized) { return $true }
+
+    try {
+        # Load WinRT interop assembly
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
+
+        # Helper to await WinRT async operations
+        $script:AwaitMethod = [WindowsRuntimeSystemExtensions].GetMember('GetAwaiter').
+            Where({ $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' },'First')
+
+        $script:WinRTInitialized = $true
+        return $true
+    }
+    catch {
+        $script:WinRTInitialized = $false
+        return $false
+    }
+}
+
+function Await-WinRTAsync {
+    <#
+    .SYNOPSIS
+        Awaits a WinRT IAsyncOperation and returns the result.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $AsyncOp,
+        [int]$TimeoutMs = 5000
+    )
+
+    try {
+        $awaiter = $script:AwaitMethod.Invoke($null, @($AsyncOp))
+        $start = [DateTime]::Now
+        while (-not $awaiter.IsCompleted) {
+            if (([DateTime]::Now - $start).TotalMilliseconds -gt $TimeoutMs) {
+                throw "WinRT async operation timed out after ${TimeoutMs}ms"
+            }
+            [System.Threading.Thread]::Sleep(50)
+        }
+        return $awaiter.GetResult()
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-BluetoothDevicesWinRT {
+    <#
+    .SYNOPSIS
+        Enumerates paired Bluetooth devices using WinRT APIs (transport truth).
+    .DESCRIPTION
+        Uses Windows.Devices.Enumeration.DeviceInformation.FindAllAsync to get
+        paired Bluetooth devices, then resolves connection status via
+        Windows.Devices.Bluetooth.BluetoothDevice.FromIdAsync.
+
+        This is the AUTHORITATIVE source for Bluetooth device presence.
+        Does NOT rely on audio endpoints or name patterns.
+
+        PERF-001: WinRT types are loaded inside this function, not at module scope.
+    .OUTPUTS
+        PSCustomObject[] with:
+        - Name: Device friendly name
+        - DeviceId: WinRT device ID
+        - Address: Bluetooth MAC address (if available)
+        - IsPaired: Always true (we query paired devices)
+        - IsConnected: Live connection status from BluetoothDevice
+        - ClassOfDevice: Major/minor class (Audio/Video detection)
+        - LastSeen: Last connection time (if available from properties)
+        - Presence: Connected | Remembered (NOT "Paired" - that's misleading)
+    #>
+    [CmdletBinding()]
+    param()
+
+    $devices = @()
+
+    try {
+        # Initialize WinRT (lazy, PERF-001 compliant)
+        if (-not (Initialize-WinRTTypes)) {
+            Write-Verbose "WinRT initialization failed, falling back to PnP"
+            return @()
+        }
+
+        # AQS query for paired Bluetooth devices
+        $btSelector = "System.Devices.Aep.ProtocolId:=""{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}"" AND System.Devices.Aep.IsPaired:=System.StructuredQueryType.Boolean#True"
+
+        # Request additional properties
+        $requestedProps = [System.Collections.Generic.List[string]]::new()
+        $requestedProps.Add("System.Devices.Aep.DeviceAddress")
+        $requestedProps.Add("System.Devices.Aep.IsConnected")
+        $requestedProps.Add("System.Devices.Aep.Bluetooth.Le.IsConnectable")
+        $requestedProps.Add("System.Devices.Aep.SignalStrength")
+
+        # Get DeviceInformation type
+        $deviceInfoType = [Type]::GetType("Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType=WindowsRuntime")
+
+        if (-not $deviceInfoType) {
+            # Fallback: try loading via Add-Type with WinRT reference
+            $null = [Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType=WindowsRuntime]
+            $deviceInfoType = [Windows.Devices.Enumeration.DeviceInformation]
+        }
+
+        # FindAllAsync with selector and properties
+        $findAllMethod = $deviceInfoType.GetMethod('FindAllAsync', @([string], [System.Collections.Generic.IEnumerable[string]]))
+        $asyncOp = $findAllMethod.Invoke($null, @($btSelector, $requestedProps))
+
+        $deviceInfoCollection = Await-WinRTAsync -AsyncOp $asyncOp -TimeoutMs 10000
+
+        if (-not $deviceInfoCollection) {
+            Write-Verbose "No devices returned from WinRT enumeration"
+            return @()
+        }
+
+        # Get BluetoothDevice type for connection status resolution
+        $btDeviceType = $null
+        try {
+            $null = [Windows.Devices.Bluetooth.BluetoothDevice, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
+            $btDeviceType = [Windows.Devices.Bluetooth.BluetoothDevice]
+        }
+        catch {
+            Write-Verbose "Could not load BluetoothDevice type"
+        }
+
+        foreach ($devInfo in $deviceInfoCollection) {
+            try {
+                $name = $devInfo.Name
+                $deviceId = $devInfo.Id
+
+                # Skip transport/service nodes
+                if (Test-IsTransportOrServiceNode -Name $name) { continue }
+                if ($name -match "^Microsoft|Enumerator|^Generic") { continue }
+
+                # Extract properties
+                $props = $devInfo.Properties
+                $address = $null
+                $isConnectedProp = $false
+                $signalStrength = $null
+
+                if ($props) {
+                    if ($props.ContainsKey("System.Devices.Aep.DeviceAddress")) {
+                        $address = $props["System.Devices.Aep.DeviceAddress"]
+                    }
+                    if ($props.ContainsKey("System.Devices.Aep.IsConnected")) {
+                        $isConnectedProp = $props["System.Devices.Aep.IsConnected"] -eq $true
+                    }
+                    if ($props.ContainsKey("System.Devices.Aep.SignalStrength")) {
+                        $signalStrength = $props["System.Devices.Aep.SignalStrength"]
+                    }
+                }
+
+                # Resolve live connection status via BluetoothDevice.FromIdAsync
+                $isConnected = $isConnectedProp
+                $classOfDevice = $null
+
+                if ($btDeviceType) {
+                    try {
+                        $fromIdMethod = $btDeviceType.GetMethod('FromIdAsync', @([string]))
+                        $btAsyncOp = $fromIdMethod.Invoke($null, @($deviceId))
+                        $btDevice = Await-WinRTAsync -AsyncOp $btAsyncOp -TimeoutMs 3000
+
+                        if ($btDevice) {
+                            # Connection status from BluetoothDevice is authoritative
+                            $connStatus = $btDevice.ConnectionStatus
+                            $isConnected = $connStatus -eq [Windows.Devices.Bluetooth.BluetoothConnectionStatus]::Connected
+
+                            # Class of Device (for audio detection)
+                            $cod = $btDevice.ClassOfDevice
+                            if ($cod) {
+                                $classOfDevice = @{
+                                    MajorClass = $cod.MajorClass.ToString()
+                                    MinorClass = $cod.MinorClass.ToString()
+                                    RawValue = $cod.RawValue
+                                }
+                            }
+                        }
+                    }
+                    catch {
+                        # Keep property-based connection status
+                    }
+                }
+
+                # Presence: Connected if live connection, otherwise Remembered (NOT "Paired")
+                # "Paired" is misleading - all these devices are paired, but that doesn't mean present
+                $presence = if ($isConnected) { "Connected" } else { "Remembered" }
+
+                # Detect if audio device from ClassOfDevice
+                $isAudioDevice = $false
+                if ($classOfDevice) {
+                    # Major class 4 = Audio/Video
+                    $isAudioDevice = $classOfDevice.MajorClass -eq "AudioVideoHandsfree" -or
+                                     $classOfDevice.MajorClass -eq "AudioVideoHeadphones" -or
+                                     $classOfDevice.MajorClass -eq "AudioVideoPortableAudio" -or
+                                     $classOfDevice.MajorClass -match "Audio"
+                }
+
+                # Fallback: detect by name patterns (known BT audio brands)
+                if (-not $isAudioDevice) {
+                    $isAudioDevice = $name -match "AirPods|Galaxy Buds|WH-1000|WF-1000|Jabra|Bose|JBL|Beats|Dime|Kanto|ORA|Soundcore|Skullcandy|Sennheiser|Sony|Headphone|Headset|Speaker|Earbuds"
+                }
+
+                $devices += [PSCustomObject]@{
+                    Name = $name
+                    DeviceId = $deviceId
+                    Address = $address
+                    IsPaired = $true
+                    IsConnected = $isConnected
+                    ClassOfDevice = $classOfDevice
+                    SignalStrength = $signalStrength
+                    IsAudioDevice = $isAudioDevice
+                    Presence = $presence
+                    Source = "WinRT"
+                }
+            }
+            catch {
+                # Skip problematic devices
+                continue
+            }
+        }
+    }
+    catch {
+        Write-Verbose "WinRT enumeration failed: $_"
+    }
+
+    return $devices
+}
+
+function Get-BluetoothDevicesEnriched {
+    <#
+    .SYNOPSIS
+        Returns Bluetooth devices with PnP enrichment (driver, PM, COM residue).
+    .DESCRIPTION
+        Combines WinRT enumeration (authoritative for pairing/connection) with
+        PnP properties (driver version, power management, COM ports).
+
+        This is the PRIMARY function for the Bluetooth dashboard.
+    .OUTPUTS
+        PSCustomObject[] with all WinRT properties plus:
+        - InstanceId: PnP instance ID
+        - DriverVersion: Driver version string
+        - PowerManagementEnabled: PM status
+        - GhostCOMPorts: Count of orphaned COM ports for this device
+        - Activity: Active | Idle | Inactive
+    #>
+    [CmdletBinding()]
+    param(
+        [switch]$IncludeNonAudio
+    )
+
+    # Get WinRT devices (authoritative for connection status)
+    $winrtDevices = Get-BluetoothDevicesWinRT
+
+    if (-not $winrtDevices -or $winrtDevices.Count -eq 0) {
+        # Fallback to PnP-only enumeration
+        return Get-BluetoothAudioDevices
+    }
+
+    # Get PnP devices for enrichment
+    $pnpDevices = @(Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue)
+    $pnpByName = @{}
+    foreach ($pnp in $pnpDevices) {
+        $key = $pnp.FriendlyName -replace '\s*(Stereo|Hands-Free|HFP|A2DP|Audio)$', ''
+        $key = $key.Trim()
+        if ($key -and -not $pnpByName.ContainsKey($key)) {
+            $pnpByName[$key] = $pnp
+        }
+    }
+
+    # Get COM ports for residue detection
+    $comPorts = @()
+    try {
+        if (Get-Command Get-BluetoothCOMPorts -ErrorAction SilentlyContinue) {
+            $comData = Get-BluetoothCOMPorts
+            if ($comData -and -not $comData.Error) {
+                $comPorts = $comData.GhostPorts
+            }
+        }
+    }
+    catch { }
+
+    # Get default playback for Activity detection
+    $defaultPlayback = $null
+    try {
+        # Try AudioDeviceCmdlets first (most accurate)
+        if (Get-Command Get-AudioDevice -ErrorAction SilentlyContinue) {
+            $defaultPlayback = Get-AudioDevice -Playback | Where-Object { $_.Default } | Select-Object -First 1
+        }
+    }
+    catch { }
+
+    if (-not $defaultPlayback) {
+        # Fallback to registry
+        try {
+            $regPath = "HKCU:\Software\Microsoft\Multimedia\Sound Mapper"
+            if (Test-Path $regPath) {
+                $playbackName = (Get-ItemProperty -Path $regPath -Name "Playback" -ErrorAction SilentlyContinue).Playback
+                if ($playbackName) {
+                    $defaultPlayback = [PSCustomObject]@{ Name = $playbackName }
+                }
+            }
+        }
+        catch { }
+    }
+
+    # Enrich WinRT devices with PnP data
+    $enriched = @()
+
+    foreach ($dev in $winrtDevices) {
+        # Filter to audio devices unless IncludeNonAudio
+        if (-not $IncludeNonAudio -and -not $dev.IsAudioDevice) {
+            continue
+        }
+
+        # Find matching PnP device
+        $pnp = $pnpByName[$dev.Name]
+        if (-not $pnp) {
+            # Try partial match
+            foreach ($key in $pnpByName.Keys) {
+                if ($dev.Name -like "*$key*" -or $key -like "*$($dev.Name)*") {
+                    $pnp = $pnpByName[$key]
+                    break
+                }
+            }
+        }
+
+        # Get driver info from PnP
+        $driverVersion = $null
+        $pmEnabled = $null
+        $instanceId = $null
+
+        if ($pnp) {
+            $instanceId = $pnp.InstanceId
+
+            try {
+                $driverInfo = Get-CimInstance -ClassName Win32_PnPSignedDriver -Filter "DeviceID='$($pnp.InstanceId -replace '\\','\\\\')'" -ErrorAction SilentlyContinue
+                if ($driverInfo) {
+                    $driverVersion = $driverInfo.DriverVersion
+                }
+            }
+            catch { }
+
+            # Power management check
+            try {
+                $pmStatus = Get-CimInstance -ClassName MSPower_DeviceEnable -Namespace root/WMI -ErrorAction SilentlyContinue |
+                    Where-Object { $_.InstanceName -match [regex]::Escape($pnp.InstanceId) }
+                if ($pmStatus) {
+                    $pmEnabled = $pmStatus.Enable
+                }
+            }
+            catch { }
+        }
+
+        # Count ghost COM ports for this device
+        $ghostCOMCount = 0
+        if ($comPorts -and $dev.Address) {
+            $ghostCOMCount = @($comPorts | Where-Object { $_.DeviceAddress -eq $dev.Address }).Count
+        }
+
+        # Determine Activity based on default playback
+        $activity = "Inactive"
+        if ($dev.IsConnected) {
+            $activity = "Idle"  # Connected but not routing
+
+            if ($defaultPlayback -and $defaultPlayback.Name) {
+                if ($defaultPlayback.Name -match [regex]::Escape($dev.Name) -or
+                    $dev.Name -match [regex]::Escape($defaultPlayback.Name)) {
+                    $activity = "Active"
+                }
+            }
+        }
+
+        $enriched += [PSCustomObject]@{
+            Name = $dev.Name
+            DeviceId = $dev.DeviceId
+            InstanceId = $instanceId
+            Address = $dev.Address
+            IsConnected = $dev.IsConnected
+            IsPaired = $dev.IsPaired
+            ClassOfDevice = $dev.ClassOfDevice
+            IsAudioDevice = $dev.IsAudioDevice
+            Presence = $dev.Presence
+            Activity = $activity
+            DriverVersion = $driverVersion
+            PowerManagement = $pmEnabled
+            GhostCOMCount = $ghostCOMCount
+            SignalStrength = $dev.SignalStrength
+            Source = "WinRT+PnP"
+        }
+    }
+
+    return $enriched
+}
+
+#endregion WinRT Bluetooth Enumeration
+
 function Get-BluetoothAdapterInfo {
     <#
     .SYNOPSIS
@@ -129,6 +537,16 @@ function Get-BluetoothAdapterInfo {
             Where-Object { $_.DeviceID -eq $btAdapter.InstanceId } |
             Select-Object -First 1
 
+        # Check power management setting ("Allow the computer to turn off this device to save power")
+        $powerMgmtEnabled = $null
+        try {
+            $powerSettings = Get-CimInstance -ClassName MSPower_DeviceEnable -Namespace root/WMI -ErrorAction SilentlyContinue |
+                Where-Object { $_.InstanceName -match [regex]::Escape($btAdapter.InstanceId.Replace('\', '\\')) }
+            if ($powerSettings) {
+                $powerMgmtEnabled = $powerSettings.Enable
+            }
+        } catch { }
+
         return @{
             Present = $true
             Enabled = $btAdapter.Status -eq 'OK'
@@ -141,6 +559,7 @@ function Get-BluetoothAdapterInfo {
                 Manufacturer = $driverInfo.Manufacturer
                 ProviderName = $driverInfo.DriverProviderName
             }
+            PowerManagementEnabled = $powerMgmtEnabled  # $true, $false, or $null
         }
     }
     catch {
@@ -240,66 +659,84 @@ function Get-BluetoothPairedAudioDevices {
 function Get-BluetoothAudioDevices {
     <#
     .SYNOPSIS
-        Returns a list of user-recognizable Bluetooth audio devices (not transport nodes).
+        Returns Bluetooth audio devices using transport-first detection.
     .DESCRIPTION
-        Enumerates Bluetooth audio devices suitable for display in the UI. Excludes
-        transport/profile nodes (A2DP/AVRCP/HFP "Transport") and service nodes.
-        Returns user-friendly device names like "AirPods Pro", "Dime 3", etc.
+        TRANSPORT TRUTH FIRST: Enumerates from Bluetooth PnP devices, NOT audio endpoints.
+        This prevents false positives (internal speakers shown as BT) and false negatives
+        (real BT devices hidden because not routing audio).
+
+        Detection model:
+        1. Start from Bluetooth transport devices (Class Bluetooth, BTHENUM)
+        2. Filter to devices with audio service UUIDs (A2DP/HFP/HSP)
+        3. Correlate audio endpoints TO those devices (not the reverse)
+        4. Hard-exclude internal audio (HDAUDIO, INTELAUDIO, SWD\MMDEVAPI)
+
+        Uses a two-axis state model:
+        - Presence: Connected | Paired | Remembered | Ghost
+        - Activity: Active (audio route) | Idle (connected, no route) | Inactive
+
+        CRITICAL: A device must satisfy transport proof to be listed.
+        Audio capability alone is NOT sufficient.
     .OUTPUTS
         PSCustomObject[] with properties:
         - Name: User-friendly device name
         - InstanceId: PnP device instance ID
         - Status: PnP status (OK, Error, Unknown)
-        - ConnectionState: Connected, Paired, Disconnected, or Unknown (best-effort)
+        - Presence: Connected | Paired | Remembered | Ghost
+        - Activity: Active | Idle | Inactive
         - IsAudioDevice: $true (all returned devices are audio)
         - DeviceKind: Headphones, Earbuds, Speaker, or Unknown
-        - SupportsA2DP: $true/$false/$null (best-effort)
-        - SupportsHFP: $true/$false/$null (best-effort)
-        - IsDefaultPlayback: $true/$false/$null (best-effort)
+        - SupportsA2DP: $true/$false/$null
+        - SupportsHFP: $true/$false/$null
+        - IsDefaultPlayback: $true/$false/$null
         - Notes: Array of detection notes
     #>
     [CmdletBinding()]
     param()
 
     $devices = @()
-    $notes = @("Filtered: transport nodes excluded", "Best-effort connection inference")
 
     try {
-        # Get current default playback device name for comparison
+        # === STEP 1: Get default playback for activity detection ===
         $defaultPlaybackName = $null
         try {
             $regPath = "HKCU:\Software\Microsoft\Multimedia\Sound Mapper"
             if (Test-Path $regPath) {
                 $defaultPlaybackName = (Get-ItemProperty -Path $regPath -Name "Playback" -ErrorAction SilentlyContinue).Playback
             }
-        }
-        catch { }
+        } catch { }
 
-        # Get all Bluetooth devices from Class Bluetooth
-        $btDevices = Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue
+        # === STEP 2: TRANSPORT TRUTH - Enumerate Bluetooth devices first ===
+        # Source of truth: Class Bluetooth (PnP), not audio endpoints
+        $btDevices = @(Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue)
 
-        # Get audio endpoints that appear to be Bluetooth (for profile detection)
-        $btAudioEndpoints = Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.FriendlyName -match "Bluetooth|BT|Hands-Free|Headset|Speaker|Headphone|AirPods|Buds|WH-|WF-|Jabra|Bose|Sony|JBL|Beats|Dime|Kanto|ORA" -or
-                $_.InstanceId -match "BTHENUM|BTH"
-            }
+        # === STEP 3: Get BTHENUM audio endpoints (transport-verified) ===
+        # CRITICAL: Only endpoints with BTHENUM enumerator are Bluetooth transport
+        # Do NOT filter by name patterns - names lie (Surface Omnisonic matches "Speaker")
+        $btAudioEndpoints = @(Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue | Where-Object {
+            # Transport gate: MUST have BTHENUM in InstanceId
+            $_.InstanceId -match 'BTHENUM'
+        })
 
-        # Build a map of base device names to their audio capabilities
+        # === STEP 4: Build profile map from VERIFIED Bluetooth endpoints only ===
         $deviceProfiles = @{}
         foreach ($endpoint in $btAudioEndpoints) {
-            # Extract base device name (remove profile indicators)
+            # Extract base device name (remove profile suffixes)
             $baseName = $endpoint.FriendlyName -replace '\s*(Stereo|Hands-Free AG Audio|Hands-Free|HFP|A2DP|Audio)$', '' -replace '\s+$', ''
+            $baseName = $baseName.Trim()
+
+            if (-not $baseName) { continue }
 
             if (-not $deviceProfiles.ContainsKey($baseName)) {
                 $deviceProfiles[$baseName] = @{
                     HasA2DP = $false
                     HasHFP = $false
                     Endpoints = @()
+                    HasActiveEndpoint = $false
                 }
             }
 
-            # Detect profiles
+            # Detect profiles from endpoint names
             if ($endpoint.FriendlyName -match "Stereo|A2DP") {
                 $deviceProfiles[$baseName].HasA2DP = $true
             }
@@ -307,169 +744,178 @@ function Get-BluetoothAudioDevices {
                 $deviceProfiles[$baseName].HasHFP = $true
             }
 
+            # Track if any endpoint is active (Status = OK)
+            if ($endpoint.Status -eq 'OK') {
+                $deviceProfiles[$baseName].HasActiveEndpoint = $true
+            }
+
             $deviceProfiles[$baseName].Endpoints += $endpoint
         }
 
-        # Find parent/user-facing Bluetooth devices (not transport nodes)
+        # === STEP 5: Process Bluetooth class devices ===
         $seenDevices = @{}
 
         foreach ($dev in $btDevices) {
-            # Skip transport/service nodes
+            # Skip transport/service nodes (A2DP Transport, AVRCP, etc.)
             if (Test-IsTransportOrServiceNode -Name $dev.FriendlyName) {
                 continue
             }
 
-            # Skip enumerators and system devices
-            if ($dev.FriendlyName -match "^Microsoft Bluetooth|Enumerator") {
+            # Skip system/enumerator devices
+            if ($dev.FriendlyName -match "^Microsoft Bluetooth|Enumerator|Generic|Radio") {
                 continue
             }
 
-            # Check if this looks like an audio device
+            # === TRANSPORT GATE: Verify this is a real Bluetooth device ===
+            # Must have BTHENUM or BTH in InstanceId, or be in Class Bluetooth
+            $hasBluetoothTransport = $dev.InstanceId -match 'BTHENUM|BTH\\' -or $dev.Class -eq 'Bluetooth'
+
+            # Hard exclusions: Never show internal/native audio as Bluetooth
+            $isExcluded = $dev.InstanceId -match 'HDAUDIO|INTELAUDIO|SWD\\MMDEVAPI|USB\\VID_|PCI\\'
+            if ($isExcluded) { continue }
+
+            # Extract base name for profile lookup
+            $baseName = $dev.FriendlyName -replace '\s*(Stereo|Hands-Free AG Audio|Hands-Free|HFP|A2DP|Audio)$', '' -replace '\s+$', ''
+            $baseName = $baseName.Trim()
+
+            # Check if device has audio profiles (from BTHENUM endpoints)
+            $profiles = $deviceProfiles[$baseName]
+            $hasAudioProfiles = $profiles -and ($profiles.HasA2DP -or $profiles.HasHFP -or $profiles.Endpoints.Count -gt 0)
+
+            # Device is audio if it has BTHENUM audio endpoints OR matches known audio device patterns
+            # BUT only if it passes the transport gate
             $isAudioDevice = $false
             $deviceKind = "Unknown"
 
-            # Check by name patterns (common audio brands/models)
-            if ($dev.FriendlyName -match "AirPods|Buds|WH-|WF-|Jabra|Bose|Sony|JBL|Beats|Headphone|Headset|Earbuds|Dime|Kanto|ORA|Speaker|Soundbar|Echo|HomePod|Pill|Flip|Charge|Xtreme|Boom") {
-                $isAudioDevice = $true
-
-                # Classify device kind
-                if ($dev.FriendlyName -match "AirPods|Buds|Earbuds|WF-") {
-                    $deviceKind = "Earbuds"
-                }
-                elseif ($dev.FriendlyName -match "Headphone|Headset|WH-|Jabra|Over-Ear") {
-                    $deviceKind = "Headphones"
-                }
-                elseif ($dev.FriendlyName -match "Speaker|Soundbar|Echo|HomePod|Pill|Flip|Charge|Xtreme|Boom|Kanto|ORA|Dime") {
-                    $deviceKind = "Speaker"
-                }
-            }
-
-            # Also check if device has audio endpoints
-            $baseName = $dev.FriendlyName -replace '\s*(Stereo|Hands-Free AG Audio|Hands-Free|HFP|A2DP|Audio)$', '' -replace '\s+$', ''
-            if ($deviceProfiles.ContainsKey($baseName)) {
+            if ($hasAudioProfiles) {
                 $isAudioDevice = $true
             }
-
-            # Skip non-audio devices
-            if (-not $isAudioDevice) {
-                continue
+            elseif ($hasBluetoothTransport) {
+                # Check known audio brand/model patterns (only for transport-verified devices)
+                # These are Bluetooth-specific brands that don't make internal speakers
+                if ($dev.FriendlyName -match "AirPods|Galaxy Buds|WH-1000|WF-1000|Jabra|Bose (QC|NC|Sport)|JBL (Flip|Charge|Xtreme|Tune|Live)|Beats|Dime|Kanto|ORA|Soundcore|Anker|Tozo|Skullcandy|Sennheiser (Momentum|HD 4|CX)|Bang & Olufsen|B&O|Marshall (Major|Minor|Emberton)|Sony (WH-|WF-|SRS-)|Echo Buds") {
+                    $isAudioDevice = $true
+                }
             }
 
-            # Avoid duplicates (same base name)
-            $normalizedName = $baseName.Trim()
-            if ($seenDevices.ContainsKey($normalizedName)) {
-                continue
+            if (-not $isAudioDevice) { continue }
+
+            # Classify device kind (for UI icons)
+            if ($dev.FriendlyName -match "AirPods|Buds|Earbuds|WF-|Tozo|Echo Buds") {
+                $deviceKind = "Earbuds"
             }
+            elseif ($dev.FriendlyName -match "Headphone|Headset|WH-|Jabra|Over-Ear|Momentum|HD 4") {
+                $deviceKind = "Headphones"
+            }
+            elseif ($dev.FriendlyName -match "Flip|Charge|Xtreme|Boom|Kanto|ORA|Dime|Emberton|SRS-|Soundbar|Pill") {
+                $deviceKind = "Speaker"
+            }
+
+            # Avoid duplicates
+            $normalizedName = $baseName
+            if ($seenDevices.ContainsKey($normalizedName)) { continue }
             $seenDevices[$normalizedName] = $true
 
-            # Determine connection state (best-effort)
-            $connectionState = "Unknown"
-            if ($dev.Status -eq 'OK' -and $dev.Present) {
-                # Device is present and OK - at least paired
-                # Check if any of its audio endpoints are active
-                $profiles = $deviceProfiles[$baseName]
-                $hasActiveEndpoint = $false
-                if ($profiles -and $profiles.Endpoints) {
-                    foreach ($ep in $profiles.Endpoints) {
-                        if ($ep.Status -eq 'OK') {
-                            $hasActiveEndpoint = $true
-                            break
-                        }
-                    }
-                }
+            # === TWO-AXIS STATE MODEL ===
+            # Presence: Connected (BT stack reports present) | Paired | Remembered | Ghost
+            # Activity: Active (audio routing) | Idle (connected, no route) | Inactive
 
-                if ($hasActiveEndpoint) {
-                    $connectionState = "Connected"
-                }
-                else {
-                    $connectionState = "Paired"
-                }
+            $presence = "Remembered"  # Default until proven present
+            $activity = "Inactive"
+
+            # Presence detection: Use PnP Present flag + active endpoints
+            # BT devices with Present=True AND active endpoint = Connected
+            # BT devices with Present=True but no endpoint = Paired (connected at stack, not routing)
+            # BT devices with Present=False = Remembered (cache only)
+            $hasActiveEndpoint = $profiles -and $profiles.HasActiveEndpoint
+
+            if ($dev.Present -and $hasActiveEndpoint) {
+                $presence = "Connected"
             }
             elseif ($dev.Present) {
-                $connectionState = "Paired"
+                # Device is present at Bluetooth stack but not routing audio
+                $presence = "Paired"
             }
             else {
-                $connectionState = "Disconnected"
+                $presence = "Remembered"
             }
 
-            # Check A2DP/HFP support
-            $supportsA2DP = $null
-            $supportsHFP = $null
-            if ($deviceProfiles.ContainsKey($baseName)) {
-                $supportsA2DP = $deviceProfiles[$baseName].HasA2DP
-                $supportsHFP = $deviceProfiles[$baseName].HasHFP
+            # A2DP/HFP support
+            $supportsA2DP = if ($profiles) { $profiles.HasA2DP } else { $null }
+            $supportsHFP = if ($profiles) { $profiles.HasHFP } else { $null }
+
+            # Check if default playback (for Activity)
+            $isDefaultPlayback = $false
+            if ($defaultPlaybackName -and $normalizedName) {
+                $isDefaultPlayback = $defaultPlaybackName -match [regex]::Escape($normalizedName)
             }
 
-            # Check if default playback
-            $isDefaultPlayback = $null
-            if ($defaultPlaybackName) {
-                # Case-insensitive match - check if default device name contains this device name
-                if ($defaultPlaybackName -match [regex]::Escape($normalizedName)) {
-                    $isDefaultPlayback = $true
-                }
-                else {
-                    $isDefaultPlayback = $false
-                }
+            # Activity: Based on presence and audio routing
+            if ($presence -eq "Connected") {
+                $activity = if ($isDefaultPlayback) { "Active" } else { "Idle" }
+            }
+            elseif ($presence -eq "Paired") {
+                $activity = "Idle"  # Connected at stack, not routing
+            }
+            else {
+                $activity = "Inactive"  # Not present
             }
 
             $devices += [PSCustomObject]@{
                 Name = $normalizedName
                 InstanceId = $dev.InstanceId
                 Status = $dev.Status
-                ConnectionState = $connectionState
+                Presence = $presence
+                Activity = $activity
                 IsAudioDevice = $true
                 DeviceKind = $deviceKind
                 SupportsA2DP = $supportsA2DP
                 SupportsHFP = $supportsHFP
                 IsDefaultPlayback = $isDefaultPlayback
-                Notes = $notes
+                Notes = @("Transport-verified", "Two-axis state")
             }
         }
 
-        # Also add devices found only via audio endpoints (in case BT class didn't catch them)
+        # === STEP 6: Add devices found via BTHENUM endpoints not in Class Bluetooth ===
+        # Some BT audio devices only appear as audio endpoints, not in Bluetooth class
+        # But they MUST have BTHENUM transport proof
         foreach ($baseName in $deviceProfiles.Keys) {
             $normalizedName = $baseName.Trim()
-            if ($seenDevices.ContainsKey($normalizedName)) {
-                continue
-            }
-
-            # Skip transport nodes
-            if (Test-IsTransportOrServiceNode -Name $normalizedName) {
-                continue
-            }
+            if ($seenDevices.ContainsKey($normalizedName)) { continue }
+            if (Test-IsTransportOrServiceNode -Name $normalizedName) { continue }
 
             $profiles = $deviceProfiles[$baseName]
             $primaryEndpoint = $profiles.Endpoints | Where-Object { $_.Status -eq 'OK' } | Select-Object -First 1
             if (-not $primaryEndpoint) {
                 $primaryEndpoint = $profiles.Endpoints | Select-Object -First 1
             }
-
             if (-not $primaryEndpoint) { continue }
 
-            # Determine device kind
+            # TRANSPORT GATE: Already verified in Step 3 (only BTHENUM endpoints in $deviceProfiles)
+
+            # Classify device kind
             $deviceKind = "Unknown"
             if ($normalizedName -match "AirPods|Buds|Earbuds|WF-") {
                 $deviceKind = "Earbuds"
             }
-            elseif ($normalizedName -match "Headphone|Headset|WH-|Jabra|Over-Ear") {
+            elseif ($normalizedName -match "Headphone|Headset|WH-|Jabra") {
                 $deviceKind = "Headphones"
             }
-            elseif ($normalizedName -match "Speaker|Soundbar|Echo|HomePod|Pill|Flip|Charge|Xtreme|Boom|Kanto|ORA|Dime") {
+            elseif ($normalizedName -match "Flip|Charge|Xtreme|Boom|Kanto|ORA|Dime|Speaker") {
                 $deviceKind = "Speaker"
             }
 
-            # Connection state from endpoint
-            $connectionState = if ($primaryEndpoint.Status -eq 'OK') { "Connected" } else { "Paired" }
+            # Presence/Activity
+            $presence = if ($primaryEndpoint.Status -eq 'OK') { "Connected" } else { "Remembered" }
 
-            # Check if default playback
-            $isDefaultPlayback = $null
-            if ($defaultPlaybackName) {
-                if ($defaultPlaybackName -match [regex]::Escape($normalizedName)) {
-                    $isDefaultPlayback = $true
-                }
-                else {
-                    $isDefaultPlayback = $false
-                }
+            $isDefaultPlayback = $false
+            if ($defaultPlaybackName -and $normalizedName) {
+                $isDefaultPlayback = $defaultPlaybackName -match [regex]::Escape($normalizedName)
+            }
+
+            $activity = "Inactive"
+            if ($presence -eq "Connected") {
+                $activity = if ($isDefaultPlayback) { "Active" } else { "Idle" }
             }
 
             $seenDevices[$normalizedName] = $true
@@ -478,13 +924,14 @@ function Get-BluetoothAudioDevices {
                 Name = $normalizedName
                 InstanceId = $primaryEndpoint.InstanceId
                 Status = $primaryEndpoint.Status
-                ConnectionState = $connectionState
+                Presence = $presence
+                Activity = $activity
                 IsAudioDevice = $true
                 DeviceKind = $deviceKind
                 SupportsA2DP = $profiles.HasA2DP
                 SupportsHFP = $profiles.HasHFP
                 IsDefaultPlayback = $isDefaultPlayback
-                Notes = $notes
+                Notes = @("BTHENUM endpoint", "Two-axis state")
             }
         }
     }
@@ -863,15 +1310,30 @@ function Get-BluetoothEventLogHints {
     <#
     .SYNOPSIS
         Collects recent Bluetooth-related event log entries (last 60 minutes).
+        Returns both summary stats and a timeline of classified events.
     #>
     [CmdletBinding()]
     param()
 
     $cutoffTime = (Get-Date).AddMinutes(-60)
     $hints = @()
+    $timeline = @()  # NirSoft-inspired: timestamped event timeline
     $logsAccessible = @{
         BthUSB = $false
         System = $false
+    }
+
+    # Helper to classify event type
+    function Get-EventType {
+        param([string]$Message, [string]$Level)
+        if ($Message -match "connect(?:ed|ion).*establish|paired|link.*up") { return "Connected" }
+        if ($Message -match "disconnect|removed|lost|link.*down") { return "Disconnected" }
+        if ($Message -match "hands.?free|HFP|SCO.*connect|call.*mode") { return "Profile: HFP" }
+        if ($Message -match "A2DP|stereo|media.*audio") { return "Profile: A2DP" }
+        if ($Message -match "reset|restart") { return "Adapter Reset" }
+        if ($Level -eq "Error") { return "Error" }
+        if ($Level -eq "Warning") { return "Warning" }
+        return "Info"
     }
 
     # BthUSB operational log - may be disabled or not present on some systems (normal)
@@ -882,7 +1344,11 @@ function Get-BluetoothEventLogHints {
         $logsAccessible.BthUSB = $true
 
         foreach ($evt in $btEvents) {
-            if ($evt.LevelDisplayName -in @("Error", "Warning") -or $evt.Message -match "disconnect|removed|failed|reset") {
+            $eventType = Get-EventType -Message $evt.Message -Level $evt.LevelDisplayName
+            $isRelevant = $evt.LevelDisplayName -in @("Error", "Warning") -or
+                          $evt.Message -match "disconnect|removed|failed|reset|connect|HFP|A2DP|hands.?free"
+
+            if ($isRelevant) {
                 $msgSnippet = if ($evt.Message.Length -gt 200) { $evt.Message.Substring(0, 200) + "..." } else { $evt.Message }
                 $hints += @{
                     Source = "BthUSB"
@@ -890,6 +1356,15 @@ function Get-BluetoothEventLogHints {
                     Level = $evt.LevelDisplayName
                     Id = $evt.Id
                     Message = $msgSnippet
+                }
+
+                # Add to timeline
+                $timeline += @{
+                    Time = $evt.TimeCreated
+                    Type = $eventType
+                    Device = ""  # BthUSB events don't always have device name
+                    Source = "Driver"
+                    Summary = $msgSnippet.Substring(0, [Math]::Min(80, $msgSnippet.Length))
                 }
             }
         }
@@ -911,7 +1386,11 @@ function Get-BluetoothEventLogHints {
         $logsAccessible.System = $true
 
         foreach ($evt in $sysEvents) {
-            if ($evt.LevelDisplayName -in @("Error", "Warning")) {
+            $eventType = Get-EventType -Message $evt.Message -Level $evt.LevelDisplayName
+            $isRelevant = $evt.LevelDisplayName -in @("Error", "Warning") -or
+                          $evt.Message -match "disconnect|connect|endpoint"
+
+            if ($isRelevant) {
                 $msgSnippet = if ($evt.Message.Length -gt 200) { $evt.Message.Substring(0, 200) + "..." } else { $evt.Message }
                 $hints += @{
                     Source = "System"
@@ -921,6 +1400,15 @@ function Get-BluetoothEventLogHints {
                     ProviderName = $evt.ProviderName
                     Message = $msgSnippet
                 }
+
+                # Add to timeline
+                $timeline += @{
+                    Time = $evt.TimeCreated
+                    Type = $eventType
+                    Device = ""
+                    Source = if ($evt.ProviderName) { $evt.ProviderName } else { "System" }
+                    Summary = $msgSnippet.Substring(0, [Math]::Min(80, $msgSnippet.Length))
+                }
             }
         }
     }
@@ -929,15 +1417,22 @@ function Get-BluetoothEventLogHints {
         $logsAccessible.System = $false
     }
 
+    # Sort timeline by time descending (most recent first)
+    $timeline = $timeline | Sort-Object Time -Descending
+
+    # Count specific event types
     $disconnectCount = ($hints | Where-Object { $_.Message -match "disconnect|removed|lost" }).Count
+    $profileSwitchCount = ($timeline | Where-Object { $_.Type -match "^Profile:" }).Count
 
     return @{
         Count = $hints.Count
         HasErrors = ($hints | Where-Object { $_.Level -eq "Error" }).Count -gt 0
         HasWarnings = ($hints | Where-Object { $_.Level -eq "Warning" }).Count -gt 0
         DisconnectEvents = $disconnectCount
+        ProfileSwitches = $profileSwitchCount
         FrequentDisconnects = $disconnectCount -ge 3
         LogsAccessible = $logsAccessible
+        Timeline = $timeline  # NirSoft-inspired: full event timeline
         Hints = $hints | Sort-Object Time -Descending | Select-Object -First 10
     }
 }
@@ -1754,13 +2249,11 @@ function Invoke-BluetoothServiceReset {
     # === P0: Dry-run mode (only after intent is valid) ===
     if (Test-IsDryRunMode) {
         Write-Warning "[DRY-RUN] Invoke-BluetoothServiceReset would execute"
-        return @{
-            Success = $true
-            DryRun = $true
-            Changed = $false
-            TerminalState = "ResetCompleted"
-            Message = "Dry-run mode - no changes made"
-        }
+        return New-DryRunRefusal `
+            -ToolId "bluetooth-service-restart" `
+            -ToolName "Invoke-BluetoothServiceReset" `
+            -FailureCode "LEGACY_DRYRUN_ADAPTER" `
+            -FailureReason "Legacy tool does not support structured Dry Run yet. Use the UI Dry Run button for plan-based execution."
     }
 
     $result = @{
@@ -1868,13 +2361,11 @@ function Invoke-BluetoothEndpointCleanup {
     # === P0: Dry-run mode (only after intent is valid) ===
     if (Test-IsDryRunMode) {
         Write-Warning "[DRY-RUN] Invoke-BluetoothEndpointCleanup would execute"
-        return @{
-            Success = $true
-            DryRun = $true
-            Changed = $false
-            TerminalState = "CleanupCompleted"
-            Message = "Dry-run mode - no changes made"
-        }
+        return New-DryRunRefusal `
+            -ToolId "bluetooth-diagnostics" `
+            -ToolName "Invoke-BluetoothEndpointCleanup" `
+            -FailureCode "LEGACY_DRYRUN_ADAPTER" `
+            -FailureReason "Legacy tool does not support structured Dry Run yet. Use the UI Dry Run button for plan-based execution."
     }
 
     $result = @{
@@ -2019,13 +2510,11 @@ function Invoke-BluetoothAdapterReset {
     # === P0: Dry-run mode (only after intent is valid) ===
     if (Test-IsDryRunMode) {
         Write-Warning "[DRY-RUN] Invoke-BluetoothAdapterReset would execute"
-        return @{
-            Success = $true
-            DryRun = $true
-            Changed = $false
-            TerminalState = "ResetCompleted"
-            Message = "Dry-run mode - no changes made"
-        }
+        return New-DryRunRefusal `
+            -ToolId "bluetooth-driver-reinstall" `
+            -ToolName "Invoke-BluetoothAdapterReset" `
+            -FailureCode "LEGACY_DRYRUN_ADAPTER" `
+            -FailureReason "Legacy tool does not support structured Dry Run yet. Use the UI Dry Run button for plan-based execution."
     }
 
     $result = @{
@@ -2167,13 +2656,11 @@ function Invoke-BluetoothAudioDeviceDisable {
     # === P0: Dry-run mode (only after intent is valid) ===
     if (Test-IsDryRunMode) {
         Write-Warning "[DRY-RUN] Invoke-BluetoothAudioDeviceDisable would execute on '$Name'"
-        return @{
-            Success = $true
-            DryRun = $true
-            Changed = $false
-            TerminalState = "DisableCompleted"
-            Message = "Dry-run mode - no changes made"
-        }
+        return New-DryRunRefusal `
+            -ToolId "bluetooth-diagnostics" `
+            -ToolName "Invoke-BluetoothAudioDeviceDisable" `
+            -FailureCode "LEGACY_DRYRUN_ADAPTER" `
+            -FailureReason "Legacy tool does not support structured Dry Run yet. Use the UI Dry Run button for plan-based execution."
     }
 
     $result = @{
@@ -2291,13 +2778,11 @@ function Invoke-BluetoothAudioDeviceRemove {
     # === P0: Dry-run mode (only after intent is valid) ===
     if (Test-IsDryRunMode) {
         Write-Warning "[DRY-RUN] Invoke-BluetoothAudioDeviceRemove would execute on '$Name'"
-        return @{
-            Success = $true
-            DryRun = $true
-            Changed = $false
-            TerminalState = "RemoveCompleted"
-            Message = "Dry-run mode - no changes made"
-        }
+        return New-DryRunRefusal `
+            -ToolId "bluetooth-diagnostics" `
+            -ToolName "Invoke-BluetoothAudioDeviceRemove" `
+            -FailureCode "LEGACY_DRYRUN_ADAPTER" `
+            -FailureReason "Legacy tool does not support structured Dry Run yet. Use the UI Dry Run button for plan-based execution."
     }
 
     $result = @{
@@ -2379,6 +2864,367 @@ function Invoke-BluetoothAudioDeviceRemove {
 
 #endregion
 
+#region Bluetooth COM Port Detection
+
+function Get-BluetoothCOMPorts {
+    <#
+    .SYNOPSIS
+        Enumerates Bluetooth-associated COM ports, including ghost/orphaned entries.
+    .DESCRIPTION
+        Returns all COM ports where Enumerator = Bluetooth OR FriendlyName indicates
+        Bluetooth serial (SPP) connection. This exposes "state accretion" - the
+        accumulation of orphaned COM port registrations that degrade Bluetooth reliability.
+
+        Ghost COM ports are non-present devices still registered in Windows, often
+        causing pairing failures and connectivity issues.
+    .OUTPUTS
+        Array of objects with: COMPort, DeviceName, InstanceId, Status (Present/Ghost),
+        Driver, AssociatedDevice, IsGhost
+    #>
+    [CmdletBinding()]
+    param()
+
+    $result = @{
+        COMPorts = @()
+        GhostCount = 0
+        PresentCount = 0
+        Error = $null
+    }
+
+    try {
+        # Get all COM/LPT ports including non-present (ghost) devices
+        # -PresentOnly:$false includes devices that are registered but not currently present
+        $allPorts = @()
+
+        # Method 1: Get-PnpDevice with Ports class
+        try {
+            # Present devices
+            $presentPorts = Get-PnpDevice -Class Ports -Status OK -ErrorAction SilentlyContinue
+            # All devices (including non-present) - requires different approach
+            $allPortDevices = Get-PnpDevice -Class Ports -ErrorAction SilentlyContinue
+            $allPorts += $allPortDevices
+        } catch { }
+
+        # Method 2: Query registry for additional ghost ports that PnpDevice might miss
+        try {
+            $serialCommKey = "HKLM:\SYSTEM\CurrentControlSet\Enum"
+            $btEnumPath = Join-Path $serialCommKey "BTHENUM"
+            if (Test-Path $btEnumPath) {
+                $btDevices = Get-ChildItem -Path $btEnumPath -Recurse -ErrorAction SilentlyContinue |
+                    Where-Object { $_.PSChildName -match "^\d+$" -or $_.GetValueNames() -contains "FriendlyName" }
+            }
+        } catch { }
+
+        # Filter for Bluetooth-associated COM ports
+        $btCOMPorts = @()
+
+        foreach ($port in $allPorts) {
+            $isBluetooth = $false
+            $friendlyName = $port.FriendlyName
+            $instanceId = $port.InstanceId
+
+            # Check 1: Enumerator is Bluetooth (BTHENUM)
+            if ($instanceId -match "^BTHENUM\\") {
+                $isBluetooth = $true
+            }
+
+            # Check 2: FriendlyName indicates Bluetooth serial
+            if ($friendlyName -match "Standard Serial over Bluetooth|Bluetooth Serial|SPP|Bluetooth.*COM") {
+                $isBluetooth = $true
+            }
+
+            # Check 3: Instance ID contains Bluetooth-related GUID or pattern
+            if ($instanceId -match "BTHENUM|RFCOMM|SerialPort") {
+                $isBluetooth = $true
+            }
+
+            if (-not $isBluetooth) { continue }
+
+            # Extract COM port number from FriendlyName (e.g., "Standard Serial over Bluetooth link (COM7)")
+            $comNumber = $null
+            if ($friendlyName -match '\((COM\d+)\)') {
+                $comNumber = $Matches[1]
+            } elseif ($friendlyName -match '(COM\d+)') {
+                $comNumber = $Matches[1]
+            }
+
+            # Determine presence status
+            $isPresent = $port.Status -eq 'OK'
+            $isGhost = -not $isPresent
+
+            # Try to resolve associated Bluetooth device name from InstanceId
+            # BTHENUM format: BTHENUM\{guid}_LOCALMFG&xxxx\{address_stuff}
+            $associatedDevice = $null
+            if ($instanceId -match "BTHENUM\\.*\\([0-9A-Fa-f]{12})") {
+                $btAddress = $Matches[1]
+                # Format as XX:XX:XX:XX:XX:XX for display
+                $formattedAddr = ($btAddress -replace '(.{2})', '$1:').TrimEnd(':')
+                $associatedDevice = "BT: $formattedAddr"
+
+                # Try to find the actual device name from paired devices
+                try {
+                    $pairedDevices = Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue |
+                        Where-Object { $_.InstanceId -match $btAddress }
+                    if ($pairedDevices) {
+                        $associatedDevice = ($pairedDevices | Select-Object -First 1).FriendlyName
+                    }
+                } catch { }
+            }
+
+            # Get driver info
+            $driverVersion = $null
+            try {
+                $driverInfo = Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DeviceID -eq $instanceId } |
+                    Select-Object -First 1
+                if ($driverInfo) {
+                    $driverVersion = $driverInfo.DriverVersion
+                }
+            } catch { }
+
+            # Clean device name for display
+            $displayName = $friendlyName
+            if ($displayName -match "^Standard Serial over Bluetooth link") {
+                $displayName = if ($associatedDevice) { "$associatedDevice SPP" } else { "BT Serial Port" }
+            }
+
+            $btCOMPorts += [PSCustomObject]@{
+                COMPort = $comNumber
+                DeviceName = $displayName
+                FriendlyName = $friendlyName
+                InstanceId = $instanceId
+                Status = if ($isPresent) { "Present" } else { "Ghost" }
+                IsGhost = $isGhost
+                IsPresent = $isPresent
+                Driver = $driverVersion
+                AssociatedDevice = $associatedDevice
+                PnpStatus = $port.Status
+            }
+
+            if ($isGhost) {
+                $result.GhostCount++
+            } else {
+                $result.PresentCount++
+            }
+        }
+
+        # Sort: Present first, then by COM port number
+        $result.COMPorts = $btCOMPorts | Sort-Object @{Expression={$_.IsGhost}}, @{Expression={
+            if ($_.COMPort -match '\d+') { [int]($_.COMPort -replace '\D') } else { 999 }
+        }}
+
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
+
+    return $result
+}
+
+function Invoke-RevealHiddenBluetoothDevices {
+    <#
+    .SYNOPSIS
+        Opens Device Manager with hidden (non-present) devices visible.
+    .DESCRIPTION
+        Sets DEVMGR_SHOW_NONPRESENT_DEVICES=1 and launches devmgmt.msc.
+        This is a SAFE read-only action that reveals ghost devices for manual inspection.
+        Does not modify or delete anything.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $result = @{
+        Success = $false
+        Message = ""
+        Details = @()
+    }
+
+    try {
+        # Set environment variable to show non-present devices
+        $env:DEVMGR_SHOW_NONPRESENT_DEVICES = "1"
+        $result.Details += "Set DEVMGR_SHOW_NONPRESENT_DEVICES=1"
+
+        # Launch Device Manager
+        Start-Process "devmgmt.msc" -ErrorAction Stop
+        $result.Details += "Launched Device Manager"
+
+        $result.Success = $true
+        $result.Message = "Device Manager opened with hidden devices visible. Look for grayed-out entries under 'Ports (COM & LPT)' and 'Bluetooth'."
+        $result.Details += "To see ghost devices: View > Show hidden devices (if not already checked)"
+        $result.Details += "Ghost devices appear grayed out"
+
+    } catch {
+        $result.Message = "Failed to open Device Manager: $($_.Exception.Message)"
+        $result.Details += $_.Exception.Message
+    }
+
+    return $result
+}
+
+function Invoke-BluetoothGhostCOMCleanup {
+    <#
+    .SYNOPSIS
+        Removes ghost (non-present) Bluetooth COM port registrations.
+    .DESCRIPTION
+        GUARDED DESTRUCTIVE ACTION - Removes orphaned Bluetooth serial device
+        registrations that Windows retains after device removal.
+
+        Preconditions enforced:
+        - Admin privileges required
+        - No active Bluetooth probe running
+        - Only removes: Non-present devices, Bluetooth-enumerated, Serial/SPP class
+
+        Never touches:
+        - Present/active devices
+        - USB CDC devices
+        - Physical COM hardware
+        - Non-Bluetooth serial ports
+    .PARAMETER Force
+        Skip confirmation prompt (still requires admin).
+    .PARAMETER WhatIf
+        Preview which devices would be removed without making changes.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [switch]$Force,
+        [switch]$WhatIf
+    )
+
+    $result = @{
+        Success = $false
+        RemovedCount = 0
+        SkippedCount = 0
+        FailedCount = 0
+        Message = ""
+        Details = @()
+        RemovedDevices = @()
+        FailedDevices = @()
+    }
+
+    # Precondition 1: Admin check
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        $result.Message = "This operation requires administrator privileges"
+        $result.Details += "Run as Administrator to remove ghost COM ports"
+        return $result
+    }
+
+    # Precondition 2: No active probe
+    if ($script:ProbeInProgress) {
+        $result.Message = "Cannot remove devices while Bluetooth probe is running"
+        $result.Details += "Wait for probe to complete or cancel it first"
+        return $result
+    }
+
+    # Get Bluetooth COM ports
+    $btPorts = Get-BluetoothCOMPorts
+
+    if ($btPorts.Error) {
+        $result.Message = "Failed to enumerate COM ports: $($btPorts.Error)"
+        return $result
+    }
+
+    # Filter to only ghost/non-present devices
+    $ghostPorts = $btPorts.COMPorts | Where-Object { $_.IsGhost -eq $true }
+
+    if ($ghostPorts.Count -eq 0) {
+        $result.Success = $true
+        $result.Message = "No ghost Bluetooth COM ports found"
+        return $result
+    }
+
+    $result.Details += "Found $($ghostPorts.Count) ghost Bluetooth COM port(s)"
+
+    if ($WhatIf) {
+        # Return canonical WinConfig.DryRunResult with structured plan steps
+        $steps = @()
+        foreach ($port in $ghostPorts) {
+            $steps += (New-DryRunStep -Verb WOULD_DELETE -Target "ghost COM port: $($port.COMPort)" -Detail $port.DeviceName).Summary
+        }
+        return [PSCustomObject]@{
+            PSTypeName    = 'WinConfig.DryRunResult'
+            OperationId   = $null
+            ToolId        = 'bluetooth-diagnostics'
+            Executed      = $false
+            Outcome       = 'Skipped'
+            FailureCode   = $null
+            FailureReason = $null
+            Summary       = "[DRY RUN] Would remove $($ghostPorts.Count) ghost COM port(s)"
+            Plan          = @{ Steps = $steps; AffectedResources = @($ghostPorts | ForEach-Object { "COMPort:$($_.COMPort)" }) }
+            SideEffects   = @()
+        }
+    }
+
+    # Process each ghost device
+    foreach ($port in $ghostPorts) {
+        $deviceDesc = "$($port.COMPort) - $($port.DeviceName)"
+        $result.Details += "Processing: $deviceDesc"
+
+        # Safety: Verify it's still a ghost (not reconnected since enumeration)
+        try {
+            $currentStatus = Get-PnpDevice -InstanceId $port.InstanceId -ErrorAction SilentlyContinue
+            if ($currentStatus -and $currentStatus.Status -eq 'OK') {
+                $result.Details += "SKIPPED: $deviceDesc (device now present)"
+                $result.SkippedCount++
+                continue
+            }
+        } catch { }
+
+        # Safety: Verify it's Bluetooth-enumerated
+        if ($port.InstanceId -notmatch "^BTHENUM\\") {
+            $result.Details += "SKIPPED: $deviceDesc (not BTHENUM)"
+            $result.SkippedCount++
+            continue
+        }
+
+        # Attempt removal
+        try {
+            # Try pnputil first (works best for ghost devices)
+            $pnpResult = pnputil /remove-device $port.InstanceId 2>&1
+            $pnpResultStr = $pnpResult -join "`n"
+
+            if ($LASTEXITCODE -eq 0 -or $pnpResultStr -match "successfully|removed") {
+                $result.Details += "REMOVED: $deviceDesc"
+                $result.RemovedCount++
+                $result.RemovedDevices += $deviceDesc
+            } else {
+                # Fallback to Remove-PnpDevice
+                try {
+                    Remove-PnpDevice -InstanceId $port.InstanceId -Confirm:$false -ErrorAction Stop
+                    $result.Details += "REMOVED: $deviceDesc (via Remove-PnpDevice)"
+                    $result.RemovedCount++
+                    $result.RemovedDevices += $deviceDesc
+                } catch {
+                    $result.Details += "FAILED: $deviceDesc - $($_.Exception.Message)"
+                    $result.FailedCount++
+                    $result.FailedDevices += $deviceDesc
+                }
+            }
+        } catch {
+            $result.Details += "FAILED: $deviceDesc - $($_.Exception.Message)"
+            $result.FailedCount++
+            $result.FailedDevices += $deviceDesc
+        }
+    }
+
+    # Summary
+    if ($result.RemovedCount -gt 0) {
+        $result.Success = $true
+        $result.Message = "Removed $($result.RemovedCount) ghost COM port(s)"
+        if ($result.FailedCount -gt 0) {
+            $result.Message += " ($($result.FailedCount) failed)"
+        }
+    } elseif ($result.SkippedCount -gt 0 -and $result.FailedCount -eq 0) {
+        $result.Success = $true
+        $result.Message = "No removable ghost COM ports (all skipped for safety)"
+    } else {
+        $result.Message = "Failed to remove ghost COM ports"
+    }
+
+    return $result
+}
+
+#endregion
+
 # Export public functions
 Export-ModuleMember -Function @(
     'Get-BluetoothDiagnostics',
@@ -2398,5 +3244,17 @@ Export-ModuleMember -Function @(
     'Get-AudioSampleRates',
     'Get-PowerPlanInfo',
     'Test-HFPHijackRisk',
-    'Test-BufferUnderrunRisk'
+    'Test-BufferUnderrunRisk',
+    # Tools tab individual checks (Phase 4)
+    'Get-BluetoothAdapterInfo',
+    'Get-BluetoothServiceStates',
+    'Get-BluetoothPairedAudioDevices',
+    # Dashboard snapshot helpers
+    'Get-DefaultPlaybackDevice',
+    'Get-KodiAudioSettings',
+    'Get-BluetoothEventLogHints',
+    # Bluetooth COM port detection (state accretion)
+    'Get-BluetoothCOMPorts',
+    'Invoke-RevealHiddenBluetoothDevices',
+    'Invoke-BluetoothGhostCOMCleanup'
 )

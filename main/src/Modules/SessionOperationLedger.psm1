@@ -74,6 +74,19 @@ $script:LedgerWriteFailureCount = 0
 $script:LedgerLastWriteError = $null
 
 # =============================================================================
+# PHASE 5: RUN SEMANTICS (Ledger-level only)
+# =============================================================================
+# A "run" is a contiguous investigation bounded by tool execution.
+# - Starts: when first tool executes
+# - Ends: when no tools are running AND user exports/exits
+# This enables unambiguous exports and future pattern correlation.
+
+$script:RunState = "Idle"                 # Idle | Active | Completed | Aborted
+$script:RunStartedAt = $null              # UTC timestamp of first tool execution
+$script:RunEndedAt = $null                # UTC timestamp when run completed
+$script:ActiveToolCount = [ref]0          # Atomic counter for in-flight tools
+
+# =============================================================================
 # VALIDATION HELPERS
 # =============================================================================
 
@@ -173,6 +186,154 @@ function Assert-EvidenceIsPureData {
 
     foreach ($key in $Evidence.Keys) {
         Test-ValueIsPure -Value $Evidence[$key] -Path $key
+    }
+}
+
+# =============================================================================
+# PHASE 5: RUN BOUNDARY MANAGEMENT
+# =============================================================================
+# These functions manage run lifecycle without UI involvement.
+# Invariant: A run is unambiguous - it has exactly one start and one end.
+
+function Start-RunIfIdle {
+    <#
+    .SYNOPSIS
+        Initializes run metadata on first tool execution.
+    .DESCRIPTION
+        Called internally when a tool starts. If run is Idle, transitions to Active.
+        Thread-safe via $script:LedgerLock (caller must hold lock).
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($script:RunState -eq "Idle") {
+        $script:RunState = "Active"
+        $script:RunStartedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $script:RunEndedAt = $null
+    }
+}
+
+function Register-ToolStart {
+    <#
+    .SYNOPSIS
+        Increments active tool count and starts run if needed.
+    .DESCRIPTION
+        Called when an async tool begins execution.
+        Thread-safe: uses Interlocked.Increment.
+    #>
+    [CmdletBinding()]
+    param()
+
+    [System.Threading.Monitor]::Enter($script:LedgerLock)
+    try {
+        # GUARDRAIL E-A1: Tool execution outside run boundary
+        # Prevents "ghost tools" corrupting run semantics
+        if ($script:RunState -eq "Completed") {
+            throw "GUARDRAIL A1: Tool execution attempted after run completion"
+        }
+
+        Start-RunIfIdle
+        [System.Threading.Interlocked]::Increment($script:ActiveToolCount) | Out-Null
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($script:LedgerLock)
+    }
+}
+
+function Register-ToolEnd {
+    <#
+    .SYNOPSIS
+        Decrements active tool count and checks for run completion.
+    .DESCRIPTION
+        Called when an async tool completes (success, fail, or cancel).
+        If count reaches zero, run transitions to Completed.
+        Thread-safe: uses Interlocked.Decrement.
+    #>
+    [CmdletBinding()]
+    param()
+
+    [System.Threading.Monitor]::Enter($script:LedgerLock)
+    try {
+        $newCount = [System.Threading.Interlocked]::Decrement($script:ActiveToolCount)
+
+        # Run completes when no tools are active
+        if ($newCount -le 0 -and $script:RunState -eq "Active") {
+            $script:RunState = "Completed"
+            $script:RunEndedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        }
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($script:LedgerLock)
+    }
+}
+
+function Get-RunMetadata {
+    <#
+    .SYNOPSIS
+        Returns current run metadata for export.
+    .DESCRIPTION
+        Returns a hashtable with RunId, State, StartedAt, EndedAt.
+        RunId is the SessionId (one run per session for now).
+    #>
+    [CmdletBinding()]
+    param()
+
+    return @{
+        RunId       = $script:LedgerSessionId
+        RunState    = $script:RunState
+        StartedAt   = $script:RunStartedAt
+        EndedAt     = $script:RunEndedAt
+        ActiveTools = $script:ActiveToolCount.Value
+    }
+}
+
+function Test-RunActive {
+    <#
+    .SYNOPSIS
+        Returns $true if a run is currently active (tools in flight).
+    #>
+    [CmdletBinding()]
+    param()
+
+    return $script:RunState -eq "Active"
+}
+
+function Test-RunCompleted {
+    <#
+    .SYNOPSIS
+        Returns $true if a run has completed (ready for export).
+    #>
+    [CmdletBinding()]
+    param()
+
+    return $script:RunState -eq "Completed"
+}
+
+function Complete-RunForExport {
+    <#
+    .SYNOPSIS
+        Forces run completion for export (if not already completed).
+    .DESCRIPTION
+        Called before export to ensure run has explicit end boundary.
+        If run is Active with no tools running, marks as Completed.
+        If run is Idle (nothing executed), marks as Aborted.
+    #>
+    [CmdletBinding()]
+    param()
+
+    [System.Threading.Monitor]::Enter($script:LedgerLock)
+    try {
+        if ($script:RunState -eq "Active" -and $script:ActiveToolCount.Value -le 0) {
+            $script:RunState = "Completed"
+            $script:RunEndedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        }
+        elseif ($script:RunState -eq "Idle") {
+            $script:RunState = "Aborted"
+            $script:RunEndedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        }
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($script:LedgerLock)
     }
 }
 
@@ -301,6 +462,12 @@ function Initialize-SessionLedger {
     $script:LedgerOperationCounter.Value = 0
     $script:LedgerSessionFinalized = $false
 
+    # Phase 5: Reset run state
+    $script:RunState = "Idle"
+    $script:RunStartedAt = $null
+    $script:RunEndedAt = $null
+    $script:ActiveToolCount.Value = 0
+
     # Store version and iteration
     $script:LedgerAppVersion = $Version
     $script:LedgerIteration = $Iteration
@@ -388,6 +555,12 @@ function Write-SessionOperation {
         Array of relative paths to associated artifacts
     .PARAMETER Evidence
         Optional hashtable of structured evidence data (pure data only, no scriptblocks)
+    .PARAMETER Executed
+        Boolean indicating if the operation was actually executed (true) or was a dry run (false).
+        Defaults to $true for backward compatibility. Dry runs MUST set this to $false.
+    .PARAMETER Plan
+        Optional hashtable describing the execution plan. Required for dry runs.
+        Contains: Steps, AffectedResources, RequiresAdmin, etc.
     #>
     [CmdletBinding()]
     param(
@@ -419,7 +592,13 @@ function Write-SessionOperation {
         [string[]]$ArtifactRefs = @(),
 
         [Parameter(Mandatory = $false)]
-        [hashtable]$Evidence = @{}
+        [hashtable]$Evidence = @{},
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Executed = $true,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$Plan = $null
     )
 
     # Guards - throw on violation
@@ -450,10 +629,12 @@ function Write-SessionOperation {
             Name          = $Name
             Source        = $Source
             MutatesSystem = $MutatesSystem
+            Executed      = $Executed      # DRY RUN: $false for dry runs, $true for actual execution
             Result        = $Result
             Summary       = $Summary
             ArtifactRefs  = $ArtifactRefs
             Evidence      = $Evidence
+            Plan          = $Plan          # DRY RUN: Execution plan (required for dry runs)
         }
 
         # Append to in-memory list (List<T>.Add is O(1) amortized)
@@ -531,10 +712,12 @@ function Start-SessionOperation {
             Name          = $Name
             Source        = $Source
             MutatesSystem = $MutatesSystem
+            Executed      = $true  # Pending operations are assumed to execute; updated on completion if dry run
             Result        = $script:OperationResult.Pending
             Summary       = ""
             ArtifactRefs  = @()
             Evidence      = @{}
+            Plan          = $null  # Set on completion for dry runs
         }
 
         # Append to in-memory list
@@ -567,6 +750,11 @@ function Complete-SessionOperation {
         Array of relative paths to associated artifacts
     .PARAMETER Evidence
         Optional hashtable of structured evidence data (pure data only)
+    .PARAMETER Executed
+        Boolean indicating if the operation was actually executed (true) or was a dry run (false).
+        Defaults to $true for backward compatibility.
+    .PARAMETER Plan
+        Optional hashtable describing the execution plan. Required for dry runs.
     #>
     [CmdletBinding()]
     param(
@@ -584,7 +772,13 @@ function Complete-SessionOperation {
         [string[]]$ArtifactRefs = @(),
 
         [Parameter(Mandatory = $false)]
-        [hashtable]$Evidence = @{}
+        [hashtable]$Evidence = @{},
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Executed = $true,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$Plan = $null
     )
 
     # Guards
@@ -609,6 +803,10 @@ function Complete-SessionOperation {
                 $script:LedgerOperations[$i].Summary = $Summary
                 $script:LedgerOperations[$i].ArtifactRefs = $ArtifactRefs
                 $script:LedgerOperations[$i].Evidence = $Evidence
+                $script:LedgerOperations[$i].Executed = $Executed
+                if ($null -ne $Plan) {
+                    $script:LedgerOperations[$i].Plan = $Plan
+                }
                 $found = $true
                 break
             }
@@ -702,7 +900,10 @@ function Close-Session {
         }
     }
 
-    # Update session.json with finalization info and PPF (outside lock - non-critical)
+    # Phase 5: Ensure run has explicit end boundary before export
+    Complete-RunForExport
+
+    # Update session.json with finalization info, PPF, and run metadata (outside lock - non-critical)
     $sessionJsonPath = Join-Path $script:LedgerSessionDir "session.json"
     if (Test-Path $sessionJsonPath) {
         try {
@@ -710,6 +911,15 @@ function Close-Session {
             $sessionMeta | Add-Member -NotePropertyName "FinalizedAtUtc" -NotePropertyValue ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")) -Force
             $sessionMeta | Add-Member -NotePropertyName "Status" -NotePropertyValue "Finalized" -Force
             $sessionMeta | Add-Member -NotePropertyName "OperationCount" -NotePropertyValue $script:LedgerOperations.Count -Force
+
+            # Phase 5: Add run metadata as first-class data
+            $runObject = [ordered]@{
+                runId     = $script:LedgerSessionId
+                state     = $script:RunState
+                startedAt = $script:RunStartedAt
+                endedAt   = $script:RunEndedAt
+            }
+            $sessionMeta | Add-Member -NotePropertyName "run" -NotePropertyValue $runObject -Force
 
             # Add PPF as first-class data (not embedded in logs)
             if ($ppfResult) {
@@ -895,6 +1105,10 @@ function ConvertTo-SessionMarkdown {
     [void]$sb.AppendLine("| **Version** | $($script:LedgerAppVersion) |")
     [void]$sb.AppendLine("| **Iteration** | $($script:LedgerIteration) |")
     [void]$sb.AppendLine("| **Generated** | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') |")
+    # Phase 5: Run boundary metadata
+    [void]$sb.AppendLine("| **Run State** | $($script:RunState) |")
+    if ($script:RunStartedAt) { [void]$sb.AppendLine("| **Run Started** | $($script:RunStartedAt) |") }
+    if ($script:RunEndedAt) { [void]$sb.AppendLine("| **Run Ended** | $($script:RunEndedAt) |") }
     [void]$sb.AppendLine("")
 
     # Summary stats
@@ -905,6 +1119,8 @@ function ConvertTo-SessionMarkdown {
         Failed    = ($script:LedgerOperations | Where-Object { $_.Result -eq "Failed" }).Count
         Skipped   = ($script:LedgerOperations | Where-Object { $_.Result -eq "Skipped" }).Count
         Mutations = ($script:LedgerOperations | Where-Object { $_.MutatesSystem -eq $true }).Count
+        DryRuns   = ($script:LedgerOperations | Where-Object { $_.Executed -eq $false }).Count
+        Executed  = ($script:LedgerOperations | Where-Object { $_.Executed -eq $true }).Count
     }
 
     [void]$sb.AppendLine("## Summary")
@@ -917,6 +1133,8 @@ function ConvertTo-SessionMarkdown {
     [void]$sb.AppendLine("| Failed | $($stats.Failed) |")
     [void]$sb.AppendLine("| Skipped | $($stats.Skipped) |")
     [void]$sb.AppendLine("| System Mutations | $($stats.Mutations) |")
+    [void]$sb.AppendLine("| Executed | $($stats.Executed) |")
+    [void]$sb.AppendLine("| Dry Runs | $($stats.DryRuns) |")
     [void]$sb.AppendLine("")
 
     # Failures section (at top for visibility)
@@ -968,11 +1186,37 @@ function ConvertTo-SessionMarkdown {
         [void]$sb.AppendLine("")
     }
 
+    # Dry Runs section (if any)
+    $dryRuns = $script:LedgerOperations | Where-Object { $_.Executed -eq $false }
+    if ($dryRuns.Count -gt 0) {
+        [void]$sb.AppendLine("## Dry Runs")
+        [void]$sb.AppendLine("")
+        [void]$sb.AppendLine("The following operations were dry runs (no system changes made):")
+        [void]$sb.AppendLine("")
+        foreach ($dr in $dryRuns) {
+            [void]$sb.AppendLine("### $($dr.OperationId): $($dr.Name) [DRY RUN]")
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("- **Category**: $($dr.Category)")
+            [void]$sb.AppendLine("- **Would Mutate System**: $($dr.MutatesSystem)")
+            [void]$sb.AppendLine("- **Summary**: $($dr.Summary)")
+            if ($dr.Plan) {
+                [void]$sb.AppendLine("- **Planned Steps**:")
+                foreach ($step in $dr.Plan.Steps) {
+                    [void]$sb.AppendLine("  1. $step")
+                }
+                if ($dr.Plan.AffectedResources -and $dr.Plan.AffectedResources.Count -gt 0) {
+                    [void]$sb.AppendLine("- **Affected Resources**: $($dr.Plan.AffectedResources -join ', ')")
+                }
+            }
+            [void]$sb.AppendLine("")
+        }
+    }
+
     # Operations timeline (chronological)
     [void]$sb.AppendLine("## Operations Timeline")
     [void]$sb.AppendLine("")
-    [void]$sb.AppendLine("| ID | Time (UTC) | Category | Name | Result | Summary |")
-    [void]$sb.AppendLine("|----|------------|----------|------|--------|---------|")
+    [void]$sb.AppendLine("| ID | Time (UTC) | Category | Name | Result | Executed | Summary |")
+    [void]$sb.AppendLine("|----|------------|----------|------|--------|----------|---------|")
 
     foreach ($op in $script:LedgerOperations | Sort-Object { $_.OperationId }) {
         $timeStr = if ($op.TimestampUtc) { $op.TimestampUtc.Substring(11, 8) } else { "N/A" }
@@ -985,7 +1229,8 @@ function ConvertTo-SessionMarkdown {
             default   { "?" }
         }
         $mutateFlag = if ($op.MutatesSystem) { " [M]" } else { "" }
-        [void]$sb.AppendLine("| $($op.OperationId) | $timeStr | $($op.Category)$mutateFlag | $($op.Name) | $resultStr | $($op.Summary) |")
+        $execFlag = if ($op.Executed -eq $false) { "DRY" } else { "YES" }
+        [void]$sb.AppendLine("| $($op.OperationId) | $timeStr | $($op.Category)$mutateFlag | $($op.Name) | $resultStr | $execFlag | $($op.Summary) |")
     }
     [void]$sb.AppendLine("")
 
@@ -1085,6 +1330,286 @@ function Get-LedgerLastWriteError {
 }
 
 # =============================================================================
+# PHASE 6: PATTERN CORRELATION
+# =============================================================================
+# Deterministic pattern detection from run ledger.
+# No ML, no heuristics - just rules + structure.
+# Enables: noise compression, failure elevation, mixed-state detection.
+
+function Get-RunPatterns {
+    <#
+    .SYNOPSIS
+        Analyzes run ledger and returns grouped, ordered pattern objects.
+    .DESCRIPTION
+        Phase 6.1: Deterministic correlation of tool results.
+
+        Returns structured patterns for:
+        - Failures grouped by ToolCategory
+        - Redundant PASS clusters (collapsible)
+        - Mixed states (PASS + FAIL in same domain)
+        - Repeated results (same tool, same outcome)
+
+        This is replayable, testable, auditable - not probabilistic.
+    .OUTPUTS
+        PSCustomObject with pattern groups and compression hints.
+    .EXAMPLE
+        $patterns = Get-RunPatterns
+        $patterns.FailuresByCategory  # Failures grouped by Bluetooth, Network, etc.
+        $patterns.PassClusters        # PASS results that can be collapsed
+        $patterns.MixedDomains        # Domains with both PASS and FAIL
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:LedgerInitialized) {
+        return $null
+    }
+
+    $ops = $script:LedgerOperations
+
+    # === PATTERN UNIT: Group by ToolCategory + Name + Result ===
+    # Each pattern unit = (ToolCategory, ToolName, Result, Count, Summaries)
+    $patternUnits = @{}
+    foreach ($op in $ops) {
+        # Extract ToolCategory from Evidence if available, else use Category
+        $toolCat = if ($op.Evidence -and $op.Evidence.ToolCategory) {
+            $op.Evidence.ToolCategory
+        } else {
+            $op.Category  # Fallback to operation category (Network, Bluetooth, etc.)
+        }
+
+        $key = "$toolCat|$($op.Name)|$($op.Result)"
+        if (-not $patternUnits.ContainsKey($key)) {
+            $patternUnits[$key] = @{
+                ToolCategory = $toolCat
+                ToolName     = $op.Name
+                Result       = $op.Result
+                Count        = 0
+                Summaries    = [System.Collections.Generic.List[string]]::new()
+                OperationIds = [System.Collections.Generic.List[string]]::new()
+            }
+        }
+        $patternUnits[$key].Count++
+        if ($op.Summary) { $patternUnits[$key].Summaries.Add($op.Summary) }
+        $patternUnits[$key].OperationIds.Add($op.OperationId)
+    }
+
+    # === FAILURES BY CATEGORY ===
+    # Group failures for elevation (first failure per category is most important)
+    $failuresByCategory = @{}
+    foreach ($unit in $patternUnits.Values) {
+        if ($unit.Result -eq "Failed") {
+            $cat = $unit.ToolCategory
+            if (-not $failuresByCategory.ContainsKey($cat)) {
+                $failuresByCategory[$cat] = [System.Collections.Generic.List[object]]::new()
+            }
+            $failuresByCategory[$cat].Add([PSCustomObject]@{
+                ToolName     = $unit.ToolName
+                Count        = $unit.Count
+                Summaries    = $unit.Summaries.ToArray()
+                OperationIds = $unit.OperationIds.ToArray()
+            })
+        }
+    }
+
+    # === PASS CLUSTERS (Collapsible) ===
+    # Multiple PASS results in same category = noise, can be collapsed
+    $passClusters = @{}
+    foreach ($unit in $patternUnits.Values) {
+        if ($unit.Result -eq "Success") {
+            $cat = $unit.ToolCategory
+            if (-not $passClusters.ContainsKey($cat)) {
+                $passClusters[$cat] = @{
+                    Tools = [System.Collections.Generic.List[string]]::new()
+                    Count = 0
+                }
+            }
+            $passClusters[$cat].Tools.Add($unit.ToolName)
+            $passClusters[$cat].Count += $unit.Count
+        }
+    }
+    # Convert to collapsible hints (categories with 2+ PASS tools)
+    $collapsiblePass = @{}
+    foreach ($cat in $passClusters.Keys) {
+        if ($passClusters[$cat].Count -ge 2) {
+            $collapsiblePass[$cat] = [PSCustomObject]@{
+                ToolCount   = $passClusters[$cat].Tools.Count
+                TotalPasses = $passClusters[$cat].Count
+                Tools       = $passClusters[$cat].Tools.ToArray()
+                Collapsible = $true
+            }
+        }
+    }
+
+    # === MIXED DOMAINS ===
+    # Categories with both PASS and FAIL = investigation needed
+    $resultsByCategory = @{}
+    foreach ($unit in $patternUnits.Values) {
+        $cat = $unit.ToolCategory
+        if (-not $resultsByCategory.ContainsKey($cat)) {
+            $resultsByCategory[$cat] = @{
+                HasPass    = $false
+                HasFail    = $false
+                HasWarn    = $false
+                Results    = [System.Collections.Generic.List[string]]::new()
+            }
+        }
+        if ($unit.Result -eq "Success") { $resultsByCategory[$cat].HasPass = $true }
+        if ($unit.Result -eq "Failed") { $resultsByCategory[$cat].HasFail = $true }
+        if ($unit.Result -eq "Warning") { $resultsByCategory[$cat].HasWarn = $true }
+        if (-not $resultsByCategory[$cat].Results.Contains($unit.Result)) {
+            $resultsByCategory[$cat].Results.Add($unit.Result)
+        }
+    }
+    $mixedDomains = @{}
+    foreach ($cat in $resultsByCategory.Keys) {
+        $r = $resultsByCategory[$cat]
+        if ($r.HasPass -and ($r.HasFail -or $r.HasWarn)) {
+            $mixedDomains[$cat] = [PSCustomObject]@{
+                HasPass    = $r.HasPass
+                HasFail    = $r.HasFail
+                HasWarn    = $r.HasWarn
+                Results    = $r.Results.ToArray()
+                Severity   = if ($r.HasFail) { "High" } else { "Medium" }
+            }
+        }
+    }
+
+    # === REPEATED RESULTS ===
+    # Same tool executed multiple times with same result
+    $repeatedResults = @()
+    foreach ($unit in $patternUnits.Values) {
+        if ($unit.Count -gt 1) {
+            $repeatedResults += [PSCustomObject]@{
+                ToolCategory = $unit.ToolCategory
+                ToolName     = $unit.ToolName
+                Result       = $unit.Result
+                Count        = $unit.Count
+                Summaries    = $unit.Summaries.ToArray()
+            }
+        }
+    }
+
+    # === DOMINANT FAILURE VECTOR ===
+    # Category with most failures = primary investigation target
+    $dominantFailure = $null
+    $maxFailures = 0
+    foreach ($cat in $failuresByCategory.Keys) {
+        $totalFails = ($failuresByCategory[$cat] | Measure-Object -Property Count -Sum).Sum
+        if ($totalFails -gt $maxFailures) {
+            $maxFailures = $totalFails
+            $dominantFailure = [PSCustomObject]@{
+                Category     = $cat
+                FailureCount = $totalFails
+                Tools        = $failuresByCategory[$cat]
+            }
+        }
+    }
+
+    # === SUMMARY STATS ===
+    $totalOps = $ops.Count
+    $failCount = ($ops | Where-Object { $_.Result -eq "Failed" }).Count
+    $warnCount = ($ops | Where-Object { $_.Result -eq "Warning" }).Count
+    $passCount = ($ops | Where-Object { $_.Result -eq "Success" }).Count
+    $skipCount = ($ops | Where-Object { $_.Result -eq "Skipped" }).Count
+
+    # === BUILD ORDERED RULES (Declarative facts with explicit priority) ===
+    # Priority order: 1=highest urgency, 5=lowest
+    # Each rule emits facts only, no conclusions or recommendations
+    $rules = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    # Priority 1: DominantFailure (primary investigation target)
+    if ($dominantFailure) {
+        $rules.Add([PSCustomObject]@{
+            Rule         = "DominantFailure"
+            Priority     = 1
+            Category     = $dominantFailure.Category
+            FailureCount = $dominantFailure.FailureCount
+            Tools        = @($dominantFailure.Tools | ForEach-Object { $_.ToolName })
+        })
+    }
+
+    # Priority 2: FailuresByCategory (all failure facts)
+    foreach ($cat in $failuresByCategory.Keys) {
+        $failures = $failuresByCategory[$cat]
+        $rules.Add([PSCustomObject]@{
+            Rule         = "FailuresByCategory"
+            Priority     = 2
+            Category     = $cat
+            FailureCount = ($failures | Measure-Object -Property Count -Sum).Sum
+            Tools        = @($failures | ForEach-Object { $_.ToolName })
+            Summaries    = @($failures | ForEach-Object { $_.Summaries } | Select-Object -First 3)
+        })
+    }
+
+    # Priority 3: MixedDomains (domains needing investigation)
+    foreach ($cat in $mixedDomains.Keys) {
+        $mixed = $mixedDomains[$cat]
+        $rules.Add([PSCustomObject]@{
+            Rule      = "MixedDomains"
+            Priority  = 3
+            Category  = $cat
+            PassCount = ($patternUnits.Values | Where-Object { $_.ToolCategory -eq $cat -and $_.Result -eq "Success" } | Measure-Object -Property Count -Sum).Sum
+            FailCount = ($patternUnits.Values | Where-Object { $_.ToolCategory -eq $cat -and $_.Result -eq "Failed" } | Measure-Object -Property Count -Sum).Sum
+            WarnCount = ($patternUnits.Values | Where-Object { $_.ToolCategory -eq $cat -and $_.Result -eq "Warning" } | Measure-Object -Property Count -Sum).Sum
+            Results   = $mixed.Results
+        })
+    }
+
+    # Priority 4: RepeatedResults (same tool, same outcome, multiple times)
+    foreach ($repeated in $repeatedResults) {
+        $rules.Add([PSCustomObject]@{
+            Rule         = "RepeatedResults"
+            Priority     = 4
+            Category     = $repeated.ToolCategory
+            ToolName     = $repeated.ToolName
+            Result       = $repeated.Result
+            Count        = $repeated.Count
+        })
+    }
+
+    # Priority 5: PassClusters (collapsible noise)
+    foreach ($cat in $collapsiblePass.Keys) {
+        $cluster = $collapsiblePass[$cat]
+        $rules.Add([PSCustomObject]@{
+            Rule        = "PassClusters"
+            Priority    = 5
+            Category    = $cat
+            ToolCount   = $cluster.ToolCount
+            TotalPasses = $cluster.TotalPasses
+            Tools       = $cluster.Tools
+        })
+    }
+
+    # Sort by priority (stable, deterministic)
+    $sortedRules = $rules | Sort-Object -Property Priority, Category
+
+    return [PSCustomObject]@{
+        # Run reference
+        RunId           = $script:LedgerSessionId
+        RunState        = $script:RunState
+
+        # Summary counts (facts)
+        TotalOperations = $totalOps
+        FailureCount    = $failCount
+        WarningCount    = $warnCount
+        PassCount       = $passCount
+        SkippedCount    = $skipCount
+
+        # Ordered rules (declarative facts with explicit priority)
+        # Consumers iterate in order: Priority 1 first, Priority 5 last
+        Rules           = @($sortedRules)
+
+        # Legacy accessors (for backward compatibility)
+        FailuresByCategory = $failuresByCategory
+        PassClusters       = $collapsiblePass
+        MixedDomains       = $mixedDomains
+        RepeatedResults    = $repeatedResults
+        DominantFailure    = $dominantFailure
+    }
+}
+
+# =============================================================================
 # MODULE EXPORTS
 # =============================================================================
 
@@ -1101,5 +1626,14 @@ Export-ModuleMember -Function @(
     'Test-LedgerInitialized',
     'Test-LedgerFinalized',
     'Get-LedgerWriteFailureCount',
-    'Get-LedgerLastWriteError'
+    'Get-LedgerLastWriteError',
+    # Phase 5: Run boundary management
+    'Register-ToolStart',
+    'Register-ToolEnd',
+    'Get-RunMetadata',
+    'Test-RunActive',
+    'Test-RunCompleted',
+    'Complete-RunForExport',
+    # Phase 6: Pattern correlation
+    'Get-RunPatterns'
 )

@@ -8,6 +8,7 @@
         "src/Win11Config.App.ps1"
         "src/VERSION.psd1"
         "src/RUNTIME_DEPENDENCIES.psd1"
+        "src/Manifest/WinConfig.Tools.psd1"   # Tool registry with Dry Run declarations
     )
 
     # Modules that MUST load successfully - bootstrap fails if any missing/corrupt
@@ -29,6 +30,8 @@
         "src/Modules/ActionTiers.psm1"        # Tier recommendations
         "src/Modules/SessionOperationLedger.psm1"  # Operation tracking for PPF
         "src/Modules/PpfFingerprint.psm1"     # Problem Pattern Fingerprinting
+        "src/Modules/DryRun.psm1"             # Dry Run infrastructure for tool preview
+        "src/Modules/ToolAsync.psm1"          # Async tool execution with Dry Run support
     )
 
     # Documentation of invariants (for governance reference)
