@@ -62,13 +62,28 @@ foreach ($spec in $script:ManifestResult.Required) {
     if ($spec.Prefix) { $importArgs.Prefix = $spec.Prefix }
     Write-Host "[TRACE] Importing REQ: $($spec.ModuleName) from $($spec.Path)" -ForegroundColor Cyan
     Import-RequiredModule @importArgs
-    Write-Host "[TRACE]   OK" -ForegroundColor Green
+
+    # Check module persistence immediately after import
+    $modCheck = Get-Module -Name $spec.ModuleName -ErrorAction SilentlyContinue
+    if ($modCheck) {
+        Write-Host "[TRACE]   OK (module loaded, path=$($modCheck.Path))" -ForegroundColor Green
+    } else {
+        Write-Host "[TRACE]   WARN: Import succeeded but Get-Module '$($spec.ModuleName)' returns null!" -ForegroundColor Red
+        # Try direct Import-Module from script scope as fallback test
+        Write-Host "[TRACE]   Trying direct Import-Module from script scope..." -ForegroundColor Yellow
+        Import-Module -Name $spec.Path -Force -Global -ErrorAction Stop -DisableNameChecking
+        $modCheck2 = Get-Module -Name $spec.ModuleName -ErrorAction SilentlyContinue
+        Write-Host "[TRACE]   Direct import result: $(if($modCheck2){'LOADED'}else{'STILL MISSING'})" -ForegroundColor Yellow
+    }
 
     # GlobalForce: second import for WinForms runspace visibility
     if ($spec.GlobalForce) {
         Import-Module $spec.Path -Force -Global
     }
 }
+
+# Snapshot loaded modules after all required imports
+Write-Host "[TRACE] After REQ imports: $(Get-Module | Select-Object -ExpandProperty Name | Sort-Object)" -ForegroundColor Magenta
 
 # --- Import optional modules (graceful degradation) ---
 $script:OptionalLoaded = @{}
@@ -79,7 +94,7 @@ foreach ($spec in $script:ManifestResult.Optional) {
     $script:OptionalLoaded[$spec.ModuleName] = $loaded
 }
 
-Write-Host "[TRACE] Loaded modules: $(Get-Module | Select-Object -ExpandProperty Name | Sort-Object)" -ForegroundColor Magenta
+Write-Host "[TRACE] After ALL imports: $(Get-Module | Select-Object -ExpandProperty Name | Sort-Object)" -ForegroundColor Magenta
 Write-Host "[TRACE] Initialize-WinConfigPaths exists: $(!!$(Get-Command Initialize-WinConfigPaths -EA SilentlyContinue))" -ForegroundColor Magenta
 
 # --- POST-IMPORT HOOKS (app-level initialization) ---
