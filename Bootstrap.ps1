@@ -899,7 +899,8 @@ if (Test-Path $runtimeDepsPath) {
 
         # Assert all RequiredModules exist in staging AND are in manifest
         if ($runtimeDeps.RequiredModules) {
-            foreach ($reqModule in $runtimeDeps.RequiredModules) {
+            foreach ($entry in $runtimeDeps.RequiredModules) {
+                $reqModule = if ($entry -is [hashtable]) { $entry.Path } else { $entry }
                 $modulePath = Join-Path $stagingRoot ($reqModule -replace '/', '\')
                 $depsCount++
 
@@ -920,7 +921,8 @@ if (Test-Path $runtimeDepsPath) {
 
         # Warn on missing optional modules
         if ($runtimeDeps.OptionalModules) {
-            foreach ($optModule in $runtimeDeps.OptionalModules) {
+            foreach ($entry in $runtimeDeps.OptionalModules) {
+                $optModule = if ($entry -is [hashtable]) { $entry.Path } else { $entry }
                 $modulePath = Join-Path $stagingRoot ($optModule -replace '/', '\')
 
                 if (-not (Test-Path $modulePath)) {
@@ -965,7 +967,8 @@ if ($SimulateProd) {
 
     # Import all required modules to verify they load
     if ($runtimeDeps.RequiredModules) {
-        foreach ($reqModule in $runtimeDeps.RequiredModules) {
+        foreach ($entry in $runtimeDeps.RequiredModules) {
+            $reqModule = if ($entry -is [hashtable]) { $entry.Path } else { $entry }
             $modulePath = Join-Path $stagingRoot ($reqModule -replace '/', '\')
             Write-Host "  [IMPORT] $reqModule ... " -NoNewline
 
@@ -989,7 +992,8 @@ if ($SimulateProd) {
 
     # Import optional modules (warn on failure)
     if ($runtimeDeps.OptionalModules) {
-        foreach ($optModule in $runtimeDeps.OptionalModules) {
+        foreach ($entry in $runtimeDeps.OptionalModules) {
+            $optModule = if ($entry -is [hashtable]) { $entry.Path } else { $entry }
             $modulePath = Join-Path $stagingRoot ($optModule -replace '/', '\')
 
             if (Test-Path $modulePath) {
