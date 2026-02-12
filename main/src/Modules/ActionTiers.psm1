@@ -5,7 +5,7 @@
 # Import DiagnosticResult type constants
 $script:DiagnosticsTypesPath = Join-Path $PSScriptRoot "DiagnosticTypes.psm1"
 if (Test-Path $script:DiagnosticsTypesPath) {
-    Import-Module $script:DiagnosticsTypesPath -Force -ErrorAction SilentlyContinue
+    Import-Module $script:DiagnosticsTypesPath -Force -ErrorAction SilentlyContinue -Global
 }
 
 <#

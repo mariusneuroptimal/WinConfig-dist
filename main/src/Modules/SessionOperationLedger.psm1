@@ -38,7 +38,7 @@ if ($MyInvocation.InvocationName -like "*.psm1" -or $MyInvocation.InvocationName
 # Import Paths module for ephemeral temp root
 $script:PathsModulePath = Join-Path $PSScriptRoot "Paths.psm1"
 if (Test-Path $script:PathsModulePath) {
-    Import-Module $script:PathsModulePath -Force -ErrorAction SilentlyContinue
+    Import-Module $script:PathsModulePath -Force -ErrorAction SilentlyContinue -Global
 }
 
 # =============================================================================

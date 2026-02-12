@@ -48,42 +48,17 @@ $script:ManifestResult = Resolve-RuntimeManifest `
     -ManifestPath (Join-Path $PSScriptRoot "RUNTIME_DEPENDENCIES.psd1") `
     -SourceRoot $PSScriptRoot
 
-# --- DEBUG: Trace manifest resolution ---
-Write-Host "[TRACE] ManifestResult type: $($script:ManifestResult.GetType().FullName)" -ForegroundColor Magenta
-Write-Host "[TRACE] Required count: $($script:ManifestResult.Required.Count)" -ForegroundColor Magenta
-Write-Host "[TRACE] Optional count: $($script:ManifestResult.Optional.Count)" -ForegroundColor Magenta
-foreach ($s in $script:ManifestResult.Required) {
-    Write-Host "[TRACE]   REQ: $($s.Path)" -ForegroundColor Magenta
-}
-
 # --- Import required modules (fail-closed) ---
 foreach ($spec in $script:ManifestResult.Required) {
     $importArgs = @{ Path = $spec.Path }
     if ($spec.Prefix) { $importArgs.Prefix = $spec.Prefix }
-    Write-Host "[TRACE] Importing REQ: $($spec.ModuleName) from $($spec.Path)" -ForegroundColor Cyan
     Import-RequiredModule @importArgs
-
-    # Check module persistence immediately after import
-    $modCheck = Get-Module -Name $spec.ModuleName -ErrorAction SilentlyContinue
-    if ($modCheck) {
-        Write-Host "[TRACE]   OK (module loaded, path=$($modCheck.Path))" -ForegroundColor Green
-    } else {
-        Write-Host "[TRACE]   WARN: Import succeeded but Get-Module '$($spec.ModuleName)' returns null!" -ForegroundColor Red
-        # Try direct Import-Module from script scope as fallback test
-        Write-Host "[TRACE]   Trying direct Import-Module from script scope..." -ForegroundColor Yellow
-        Import-Module -Name $spec.Path -Force -Global -ErrorAction Stop -DisableNameChecking
-        $modCheck2 = Get-Module -Name $spec.ModuleName -ErrorAction SilentlyContinue
-        Write-Host "[TRACE]   Direct import result: $(if($modCheck2){'LOADED'}else{'STILL MISSING'})" -ForegroundColor Yellow
-    }
 
     # GlobalForce: second import for WinForms runspace visibility
     if ($spec.GlobalForce) {
         Import-Module $spec.Path -Force -Global
     }
 }
-
-# Snapshot loaded modules after all required imports
-Write-Host "[TRACE] After REQ imports: $(Get-Module | Select-Object -ExpandProperty Name | Sort-Object)" -ForegroundColor Magenta
 
 # --- Import optional modules (graceful degradation) ---
 $script:OptionalLoaded = @{}
@@ -93,9 +68,6 @@ foreach ($spec in $script:ManifestResult.Optional) {
     $loaded = Import-OptionalModule @importArgs
     $script:OptionalLoaded[$spec.ModuleName] = $loaded
 }
-
-Write-Host "[TRACE] After ALL imports: $(Get-Module | Select-Object -ExpandProperty Name | Sort-Object)" -ForegroundColor Magenta
-Write-Host "[TRACE] Initialize-WinConfigPaths exists: $(!!$(Get-Command Initialize-WinConfigPaths -EA SilentlyContinue))" -ForegroundColor Magenta
 
 # --- POST-IMPORT HOOKS (app-level initialization) ---
 
