@@ -35,87 +35,68 @@ try {
 }
 
 # ============================================================================
-# MODULE LOADING - Using ModuleLoader helpers
+# MODULE LOADING - Manifest-driven (RUNTIME_DEPENDENCIES.psd1)
 # ============================================================================
-# Bootstrap preloads ModuleLoader.psm1 - verify functions are available
-# Raw Import-Module is banned in this file - use helpers instead
-if (-not (Get-Command 'Import-RequiredModule' -ErrorAction SilentlyContinue)) {
-    throw "FATAL: ModuleLoader not loaded. Import-RequiredModule function missing. Run via Bootstrap.ps1."
-}
-if (-not (Get-Command 'Import-OptionalModule' -ErrorAction SilentlyContinue)) {
-    throw "FATAL: ModuleLoader not loaded. Import-OptionalModule function missing. Run via Bootstrap.ps1."
+# Bootstrap preloads ModuleLoader.psm1 - verify it's available
+if (-not (Get-Command 'Import-RuntimeManifest' -ErrorAction SilentlyContinue)) {
+    throw "FATAL: ModuleLoader not loaded. Import-RuntimeManifest function missing. Run via Bootstrap.ps1."
 }
 
-# REQUIRED MODULES - Application fails without these
-# Order matters: dependencies must load before dependents
+# Load all modules declared in RUNTIME_DEPENDENCIES.psd1
+# Manifest is single source of truth for: which modules, load order, prefixes, deferred status
+$script:ManifestResult = Import-RuntimeManifest `
+    -ManifestPath (Join-Path $PSScriptRoot "RUNTIME_DEPENDENCIES.psd1") `
+    -SourceRoot $PSScriptRoot
 
-# Paths MUST load first - provides ephemeral temp root for zero-footprint operation
-Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\Paths.psm1")
+# --- POST-IMPORT HOOKS (app-level initialization) ---
+
+# Paths: initialize ephemeral temp root
 Initialize-WinConfigPaths | Out-Null
 
-# ExecutionIntent provides non-mutating diagnostic contract
-Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\ExecutionIntent.psm1")
-
-# DiagnosticTypes - typed result constants and Switch-DiagnosticResult helper
-Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\DiagnosticTypes.psm1")
-# Ensure DiagnosticTypes functions available in UI runspace (WinForms event handlers)
-# CRITICAL: Use -Global to avoid removing the already-imported global module
-Import-Module (Join-Path $PSScriptRoot 'Modules\DiagnosticTypes.psm1') -Force -Global
-
-# Console module for diagnostic output formatting
-Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\Console.psm1") -Prefix WinConfig
-
-# OPTIONAL MODULES - Graceful degradation if missing
-
-# Logger for JSONL session logging (prefixed to avoid collision with local Write-Log functions)
-if (Import-OptionalModule -Path (Join-Path $PSScriptRoot "Logging\Logger.psm1") -Prefix WinConfig) {
+# Logger: initialize JSONL session logging (if loaded)
+if ($script:ManifestResult.Optional['Logger']) {
     Initialize-WinConfigLogger -Version $AppVersion -Iteration $Iteration
     Write-WinConfigLog -Action "Startup" -Message "WinConfig application initialized"
-
-    # Log ephemeral temp root ONCE at startup (for support verification)
     $tempRoot = Get-WinConfigTempRoot
     Write-WinConfigLog -Action "Startup" -Message "Session temp root: $tempRoot"
 }
 
-# SessionOperationLedger for session-scoped operation recording (prefixed)
-if (Import-OptionalModule -Path (Join-Path $PSScriptRoot "Modules\SessionOperationLedger.psm1") -Prefix WinConfig) {
+# SessionOperationLedger: initialize session ledger (if loaded)
+if ($script:ManifestResult.Optional['SessionOperationLedger']) {
     Initialize-WinConfigSessionLedger -Version $AppVersion -Iteration $Iteration
 }
 
-# PpfFingerprint for problem pattern fingerprinting (prefixed)
-$null = Import-OptionalModule -Path (Join-Path $PSScriptRoot "Modules\PpfFingerprint.psm1") -Prefix WinConfig
-
-# ActionTiers for context-aware recommendations
-$null = Import-OptionalModule -Path (Join-Path $PSScriptRoot "Modules\ActionTiers.psm1") -Prefix WinConfig
-
-# ToolAsync for Phase 4 async tool execution (lightweight, loads at startup)
-$null = Import-OptionalModule -Path (Join-Path $PSScriptRoot "Modules\ToolAsync.psm1") -Prefix WinConfig
-
-# StagingAssertions for Phase 11 tripwires (fails hard on debug artifacts)
-Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\StagingAssertions.psm1")
-
 # ============================================================================
 # DEFERRED MODULE LOADING - Performance optimization (PERF-001)
-# These modules are NOT loaded at startup. They load on first use.
-# Rule: No code from these modules executes before their tab/button is activated.
+# Deferred modules are declared in manifest (Deferred=$true).
+# They are NOT loaded at startup. They load on first use.
 # ============================================================================
 
-# Bluetooth module - deferred until Bluetooth tab is selected
-$script:BluetoothModulePath = Join-Path $PSScriptRoot "Modules\Bluetooth.psm1"
 $script:BluetoothModuleLoaded = $false
 
 function Ensure-BluetoothModule {
     <#
     .SYNOPSIS
-        Lazy-loads the Bluetooth module on first use.
+        Lazy-loads the Bluetooth module on first use (PERF-001).
     .DESCRIPTION
-        PERF-001: Bluetooth.psm1 (2400+ lines) is only needed when user
-        accesses the Bluetooth tab (~10% of sessions). Deferring saves ~100ms startup.
+        Bluetooth.psm1 (2400+ lines) is only needed when user accesses
+        the Bluetooth tab (~10% of sessions). Deferring saves ~100ms startup.
+        Module path and prefix are declared in RUNTIME_DEPENDENCIES.psd1 (Deferred=$true).
     #>
     if (-not $script:BluetoothModuleLoaded) {
-        if (Test-Path $script:BluetoothModulePath) {
-            $null = Import-OptionalModule -Path $script:BluetoothModulePath -Prefix WinConfig
-            $script:BluetoothModuleLoaded = $true
+        foreach ($entry in $script:ManifestResult.Deferred) {
+            $name = [System.IO.Path]::GetFileNameWithoutExtension($entry.Path)
+            if ($name -eq 'Bluetooth') {
+                $localRel = ($entry.Path -replace '^src/', '') -replace '/', '\'
+                $fullPath = Join-Path $PSScriptRoot $localRel
+                if (Test-Path $fullPath) {
+                    $importArgs = @{ Path = $fullPath }
+                    if ($entry.Prefix) { $importArgs.Prefix = $entry.Prefix }
+                    $null = Import-OptionalModule @importArgs
+                    $script:BluetoothModuleLoaded = $true
+                }
+                break
+            }
         }
     }
 }
@@ -593,20 +574,8 @@ function Update-DiagActionsDisplay {
     }
 }
 
-# Import shared modules (Phase 2C) - REQUIRED, fail-closed
-# Using ModuleLoader helpers (loaded at top of file)
-try {
-    Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\Env.psm1")
-    Import-RequiredModule -Path (Join-Path $PSScriptRoot "Modules\Paths.psm1")
-} catch {
-    [System.Windows.Forms.MessageBox]::Show(
-        "WinConfig failed to load a required module.`n`n$($_.Exception.Message)",
-        "Startup Error",
-        [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]::Error
-    ) | Out-Null
-    return
-}
+# Phase 2C: Env and Paths already loaded by manifest-driven loader (top of file)
+# No redundant re-import needed.
 
 # Configure GitHub authentication (optional - only needed for some features)
 # Backward compatibility: alias GITHUB_TOKEN to WINCONFIG_GITHUB_TOKEN

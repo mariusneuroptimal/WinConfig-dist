@@ -1,6 +1,7 @@
 @{
     # Schema version for forward compatibility
-    SchemaVersion = "1.0.0"
+    # 2.0.0: Module entries are hashtables with Path + metadata (Prefix, Deferred, GlobalForce)
+    SchemaVersion = "2.0.0"
 
     # Core files - always required, not modules (entry points and data)
     CoreFiles = @(
@@ -11,35 +12,48 @@
         "src/Manifest/WinConfig.Tools.psd1"   # Tool registry with Dry Run declarations
     )
 
-    # Modules that MUST load successfully - bootstrap fails if any missing/corrupt
-    # Order matters: dependencies must be listed before dependents
+    # Modules that MUST load successfully - application fails without these
+    # Order IS load order. Dependencies must be listed before dependents.
     RequiredModules = @(
-        "src/Modules/ModuleLoader.psm1"       # Execution-critical: loads other modules
-        "src/Modules/ExecutionIntent.psm1"    # Safety gate: mutation guards
-        "src/Modules/Console.psm1"            # Required UI: diagnostic output formatting
-        "src/Modules/Env.psm1"                # System info: admin check, machine info
-        "src/Modules/Paths.psm1"              # Directory constants
-        "src/Modules/DiagnosticTypes.psm1"    # Type system: closed enum constants, Switch-DiagnosticResult
-        "src/Modules/UiAction.psm1"           # CONTRACT-001: self-bootstrapping delegate wrappers
+        @{ Path = "src/Modules/ModuleLoader.psm1" }          # Bootstrap-preloaded, verified only
+        @{ Path = "src/Modules/Paths.psm1" }                 # MUST load first: ephemeral temp root
+        @{ Path = "src/Modules/ExecutionIntent.psm1" }       # Safety gate: mutation guards
+        @{ Path = "src/Modules/DiagnosticTypes.psm1"         # Type system: closed enum constants
+           GlobalForce = $true }                              # Double-import for WinForms runspace
+        @{ Path = "src/Modules/Console.psm1"                 # Diagnostic output formatting
+           Prefix = "WinConfig" }
+        @{ Path = "src/Modules/Env.psm1" }                   # System info: admin check, machine info
+        @{ Path = "src/Modules/UiAction.psm1" }              # CONTRACT-001: delegate wrappers
+        @{ Path = "src/Modules/StagingAssertions.psm1" }     # Phase 11 tripwires
     )
 
     # Modules that gracefully degrade if missing - warning only
+    # Order IS load order. Deferred modules are NOT loaded at startup.
     OptionalModules = @(
-        "src/Logging/Logger.psm1"             # JSONL session logging
-        "src/Modules/Bluetooth.psm1"          # BT audio diagnostics
-        "src/Modules/ActionTiers.psm1"        # Tier recommendations
-        "src/Modules/SessionOperationLedger.psm1"  # Operation tracking for PPF
-        "src/Modules/PpfFingerprint.psm1"     # Problem Pattern Fingerprinting
-        "src/Modules/DryRun.psm1"             # Dry Run infrastructure for tool preview
-        "src/Modules/ToolAsync.psm1"          # Async tool execution with Dry Run support
+        @{ Path = "src/Logging/Logger.psm1"                  # JSONL session logging
+           Prefix = "WinConfig" }
+        @{ Path = "src/Modules/SessionOperationLedger.psm1"  # Operation tracking for PPF
+           Prefix = "WinConfig" }
+        @{ Path = "src/Modules/PpfFingerprint.psm1"          # Problem Pattern Fingerprinting
+           Prefix = "WinConfig" }
+        @{ Path = "src/Modules/ActionTiers.psm1"             # Tier recommendations
+           Prefix = "WinConfig" }
+        @{ Path = "src/Modules/ToolAsync.psm1"               # Async tool execution
+           Prefix = "WinConfig" }
+        @{ Path = "src/Modules/DryRun.psm1"                  # Dry Run infrastructure
+           Prefix = "WinConfig" }
+        @{ Path = "src/Modules/Bluetooth.psm1"               # BT audio diagnostics (PERF-001)
+           Prefix = "WinConfig"
+           Deferred = $true }                                 # Lazy-loaded on first Bluetooth tab use
     )
 
     # Documentation of invariants (for governance reference)
-    # These are checked programmatically by Update-BootstrapManifest.ps1
+    # Enforced by: RuntimeDependencies.Completeness.Tests.ps1, publish-dist.yml
     Invariants = @(
         "Every RequiredModule MUST exist in Bootstrap.ps1 FileManifests"
         "Every manifest file MUST be in CoreFiles, RequiredModules, or OptionalModules"
         "No module may appear in both RequiredModules and OptionalModules"
         "CoreFiles are not Import-Module targets"
+        "Manifest order IS load order"
     )
 }

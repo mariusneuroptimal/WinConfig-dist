@@ -148,6 +148,103 @@ function Import-OptionalModule {
     }
 }
 
+function Import-RuntimeManifest {
+    <#
+    .SYNOPSIS
+        Manifest-driven module loader. Reads RUNTIME_DEPENDENCIES.psd1 and imports all declared modules.
+
+    .DESCRIPTION
+        Single entry point for loading all application modules from the manifest.
+        Replaces hardcoded Import-RequiredModule/Import-OptionalModule calls in App.ps1.
+
+        - RequiredModules: loaded in manifest order, throw on failure
+        - OptionalModules: loaded in manifest order, warn on failure
+        - Deferred modules (Deferred=$true): skipped, returned for lazy-loading
+        - ModuleLoader.psm1 itself: skipped (bootstrap-preloaded)
+        - GlobalForce modules: get a second Import-Module -Force -Global pass
+
+    .PARAMETER ManifestPath
+        Full path to RUNTIME_DEPENDENCIES.psd1
+
+    .PARAMETER SourceRoot
+        Root directory for resolving relative module paths (typically $PSScriptRoot from App.ps1)
+
+    .OUTPUTS
+        [hashtable] with keys:
+            Required  - [string[]] paths of loaded required modules
+            Optional  - [hashtable] keyed by module name, value = $true/$false
+            Deferred  - [hashtable[]] manifest entries for modules marked Deferred=$true
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ManifestPath,
+
+        [Parameter(Mandatory)]
+        [string]$SourceRoot
+    )
+
+    if (-not (Test-Path $ManifestPath)) {
+        throw "FATAL: RUNTIME_DEPENDENCIES.psd1 not found: $ManifestPath"
+    }
+
+    $deps = Import-PowerShellDataFile $ManifestPath
+
+    $result = @{
+        Required = [System.Collections.Generic.List[string]]::new()
+        Optional = @{}
+        Deferred = @()
+    }
+
+    # --- Required modules (fail-closed) ---
+    foreach ($entry in $deps.RequiredModules) {
+        $relPath = $entry.Path
+        $moduleName = [System.IO.Path]::GetFileNameWithoutExtension($relPath)
+
+        # ModuleLoader is bootstrap-preloaded — verify, don't re-import
+        if ($moduleName -eq 'ModuleLoader') { continue }
+
+        # Resolve to absolute path: manifest uses forward-slash repo-relative paths
+        # Strip leading "src/" since SourceRoot is already the src directory
+        $localRel = ($relPath -replace '^src/', '') -replace '/', '\'
+        $fullPath = Join-Path $SourceRoot $localRel
+
+        $importArgs = @{ Path = $fullPath }
+        if ($entry.Prefix) { $importArgs.Prefix = $entry.Prefix }
+
+        Import-RequiredModule @importArgs
+        $result.Required.Add($fullPath)
+
+        # GlobalForce: second import for WinForms runspace visibility
+        if ($entry.GlobalForce) {
+            Import-Module $fullPath -Force -Global
+        }
+    }
+
+    # --- Optional modules (graceful degradation) ---
+    foreach ($entry in $deps.OptionalModules) {
+        $relPath = $entry.Path
+        $moduleName = [System.IO.Path]::GetFileNameWithoutExtension($relPath)
+
+        # Deferred modules are not loaded at startup
+        if ($entry.Deferred) {
+            $result.Deferred += @($entry)
+            continue
+        }
+
+        $localRel = ($relPath -replace '^src/', '') -replace '/', '\'
+        $fullPath = Join-Path $SourceRoot $localRel
+
+        $importArgs = @{ Path = $fullPath }
+        if ($entry.Prefix) { $importArgs.Prefix = $entry.Prefix }
+
+        $loaded = Import-OptionalModule @importArgs
+        $result.Optional[$moduleName] = $loaded
+    }
+
+    return $result
+}
+
 function Test-ModuleLoaded {
     <#
     .SYNOPSIS
@@ -177,5 +274,6 @@ function Test-ModuleLoaded {
 Export-ModuleMember -Function @(
     'Import-RequiredModule'
     'Import-OptionalModule'
+    'Import-RuntimeManifest'
     'Test-ModuleLoaded'
 )
