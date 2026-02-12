@@ -38,15 +38,36 @@ try {
 # MODULE LOADING - Manifest-driven (RUNTIME_DEPENDENCIES.psd1)
 # ============================================================================
 # Bootstrap preloads ModuleLoader.psm1 - verify it's available
-if (-not (Get-Command 'Import-RuntimeManifest' -ErrorAction SilentlyContinue)) {
-    throw "FATAL: ModuleLoader not loaded. Import-RuntimeManifest function missing. Run via Bootstrap.ps1."
+if (-not (Get-Command 'Resolve-RuntimeManifest' -ErrorAction SilentlyContinue)) {
+    throw "FATAL: ModuleLoader not loaded. Resolve-RuntimeManifest function missing. Run via Bootstrap.ps1."
 }
 
-# Load all modules declared in RUNTIME_DEPENDENCIES.psd1
-# Manifest is single source of truth for: which modules, load order, prefixes, deferred status
-$script:ManifestResult = Import-RuntimeManifest `
+# Resolve manifest → import specs (paths, prefixes, deferred flags)
+# Actual imports happen in THIS scope to preserve -Global module visibility
+$script:ManifestResult = Resolve-RuntimeManifest `
     -ManifestPath (Join-Path $PSScriptRoot "RUNTIME_DEPENDENCIES.psd1") `
     -SourceRoot $PSScriptRoot
+
+# --- Import required modules (fail-closed) ---
+foreach ($spec in $script:ManifestResult.Required) {
+    $importArgs = @{ Path = $spec.Path }
+    if ($spec.Prefix) { $importArgs.Prefix = $spec.Prefix }
+    Import-RequiredModule @importArgs
+
+    # GlobalForce: second import for WinForms runspace visibility
+    if ($spec.GlobalForce) {
+        Import-Module $spec.Path -Force -Global
+    }
+}
+
+# --- Import optional modules (graceful degradation) ---
+$script:OptionalLoaded = @{}
+foreach ($spec in $script:ManifestResult.Optional) {
+    $importArgs = @{ Path = $spec.Path }
+    if ($spec.Prefix) { $importArgs.Prefix = $spec.Prefix }
+    $loaded = Import-OptionalModule @importArgs
+    $script:OptionalLoaded[$spec.ModuleName] = $loaded
+}
 
 # --- POST-IMPORT HOOKS (app-level initialization) ---
 
@@ -54,7 +75,7 @@ $script:ManifestResult = Import-RuntimeManifest `
 Initialize-WinConfigPaths | Out-Null
 
 # Logger: initialize JSONL session logging (if loaded)
-if ($script:ManifestResult.Optional['Logger']) {
+if ($script:OptionalLoaded['Logger']) {
     Initialize-WinConfigLogger -Version $AppVersion -Iteration $Iteration
     Write-WinConfigLog -Action "Startup" -Message "WinConfig application initialized"
     $tempRoot = Get-WinConfigTempRoot
@@ -62,7 +83,7 @@ if ($script:ManifestResult.Optional['Logger']) {
 }
 
 # SessionOperationLedger: initialize session ledger (if loaded)
-if ($script:ManifestResult.Optional['SessionOperationLedger']) {
+if ($script:OptionalLoaded['SessionOperationLedger']) {
     Initialize-WinConfigSessionLedger -Version $AppVersion -Iteration $Iteration
 }
 

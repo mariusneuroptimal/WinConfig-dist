@@ -148,20 +148,21 @@ function Import-OptionalModule {
     }
 }
 
-function Import-RuntimeManifest {
+function Resolve-RuntimeManifest {
     <#
     .SYNOPSIS
-        Manifest-driven module loader. Reads RUNTIME_DEPENDENCIES.psd1 and imports all declared modules.
+        Reads RUNTIME_DEPENDENCIES.psd1 and resolves all module paths to absolute paths.
 
     .DESCRIPTION
-        Single entry point for loading all application modules from the manifest.
-        Replaces hardcoded Import-RequiredModule/Import-OptionalModule calls in App.ps1.
+        Parses the manifest and resolves relative paths to absolute paths against SourceRoot.
+        Returns structured import specs for the caller to execute.
 
-        - RequiredModules: loaded in manifest order, throw on failure
-        - OptionalModules: loaded in manifest order, warn on failure
-        - Deferred modules (Deferred=$true): skipped, returned for lazy-loading
-        - ModuleLoader.psm1 itself: skipped (bootstrap-preloaded)
-        - GlobalForce modules: get a second Import-Module -Force -Global pass
+        IMPORTANT: This function does NOT call Import-Module. The caller must iterate
+        the returned specs and call Import-RequiredModule/Import-OptionalModule directly.
+        This preserves correct PowerShell scope for -Global module imports.
+
+        - ModuleLoader.psm1 itself: filtered out (bootstrap-preloaded)
+        - Deferred modules (Deferred=$true): separated for lazy-loading
 
     .PARAMETER ManifestPath
         Full path to RUNTIME_DEPENDENCIES.psd1
@@ -171,8 +172,8 @@ function Import-RuntimeManifest {
 
     .OUTPUTS
         [hashtable] with keys:
-            Required  - [string[]] paths of loaded required modules
-            Optional  - [hashtable] keyed by module name, value = $true/$false
+            Required  - [hashtable[]] resolved import specs (Path, Prefix, GlobalForce)
+            Optional  - [hashtable[]] resolved import specs (Path, Prefix, ModuleName)
             Deferred  - [hashtable[]] manifest entries for modules marked Deferred=$true
     #>
     [CmdletBinding()]
@@ -191,17 +192,17 @@ function Import-RuntimeManifest {
     $deps = Import-PowerShellDataFile $ManifestPath
 
     $result = @{
-        Required = [System.Collections.Generic.List[string]]::new()
-        Optional = @{}
+        Required = @()
+        Optional = @()
         Deferred = @()
     }
 
-    # --- Required modules (fail-closed) ---
+    # --- Required modules: resolve paths ---
     foreach ($entry in $deps.RequiredModules) {
         $relPath = $entry.Path
         $moduleName = [System.IO.Path]::GetFileNameWithoutExtension($relPath)
 
-        # ModuleLoader is bootstrap-preloaded — verify, don't re-import
+        # ModuleLoader is bootstrap-preloaded — skip
         if ($moduleName -eq 'ModuleLoader') { continue }
 
         # Resolve to absolute path: manifest uses forward-slash repo-relative paths
@@ -209,19 +210,14 @@ function Import-RuntimeManifest {
         $localRel = ($relPath -replace '^src/', '') -replace '/', '\'
         $fullPath = Join-Path $SourceRoot $localRel
 
-        $importArgs = @{ Path = $fullPath }
-        if ($entry.Prefix) { $importArgs.Prefix = $entry.Prefix }
+        $spec = @{ Path = $fullPath; ModuleName = $moduleName }
+        if ($entry.Prefix) { $spec.Prefix = $entry.Prefix }
+        if ($entry.GlobalForce) { $spec.GlobalForce = $true }
 
-        Import-RequiredModule @importArgs
-        $result.Required.Add($fullPath)
-
-        # GlobalForce: second import for WinForms runspace visibility
-        if ($entry.GlobalForce) {
-            Import-Module $fullPath -Force -Global
-        }
+        $result.Required += @($spec)
     }
 
-    # --- Optional modules (graceful degradation) ---
+    # --- Optional modules: resolve paths, separate deferred ---
     foreach ($entry in $deps.OptionalModules) {
         $relPath = $entry.Path
         $moduleName = [System.IO.Path]::GetFileNameWithoutExtension($relPath)
@@ -235,11 +231,10 @@ function Import-RuntimeManifest {
         $localRel = ($relPath -replace '^src/', '') -replace '/', '\'
         $fullPath = Join-Path $SourceRoot $localRel
 
-        $importArgs = @{ Path = $fullPath }
-        if ($entry.Prefix) { $importArgs.Prefix = $entry.Prefix }
+        $spec = @{ Path = $fullPath; ModuleName = $moduleName }
+        if ($entry.Prefix) { $spec.Prefix = $entry.Prefix }
 
-        $loaded = Import-OptionalModule @importArgs
-        $result.Optional[$moduleName] = $loaded
+        $result.Optional += @($spec)
     }
 
     return $result
@@ -274,6 +269,6 @@ function Test-ModuleLoaded {
 Export-ModuleMember -Function @(
     'Import-RequiredModule'
     'Import-OptionalModule'
-    'Import-RuntimeManifest'
+    'Resolve-RuntimeManifest'
     'Test-ModuleLoaded'
 )
