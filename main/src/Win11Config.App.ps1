@@ -48,11 +48,21 @@ $script:ManifestResult = Resolve-RuntimeManifest `
     -ManifestPath (Join-Path $PSScriptRoot "RUNTIME_DEPENDENCIES.psd1") `
     -SourceRoot $PSScriptRoot
 
+# --- DEBUG: Trace manifest resolution ---
+Write-Host "[TRACE] ManifestResult type: $($script:ManifestResult.GetType().FullName)" -ForegroundColor Magenta
+Write-Host "[TRACE] Required count: $($script:ManifestResult.Required.Count)" -ForegroundColor Magenta
+Write-Host "[TRACE] Optional count: $($script:ManifestResult.Optional.Count)" -ForegroundColor Magenta
+foreach ($s in $script:ManifestResult.Required) {
+    Write-Host "[TRACE]   REQ: $($s.Path)" -ForegroundColor Magenta
+}
+
 # --- Import required modules (fail-closed) ---
 foreach ($spec in $script:ManifestResult.Required) {
     $importArgs = @{ Path = $spec.Path }
     if ($spec.Prefix) { $importArgs.Prefix = $spec.Prefix }
+    Write-Host "[TRACE] Importing REQ: $($spec.ModuleName) from $($spec.Path)" -ForegroundColor Cyan
     Import-RequiredModule @importArgs
+    Write-Host "[TRACE]   OK" -ForegroundColor Green
 
     # GlobalForce: second import for WinForms runspace visibility
     if ($spec.GlobalForce) {
@@ -68,6 +78,9 @@ foreach ($spec in $script:ManifestResult.Optional) {
     $loaded = Import-OptionalModule @importArgs
     $script:OptionalLoaded[$spec.ModuleName] = $loaded
 }
+
+Write-Host "[TRACE] Loaded modules: $(Get-Module | Select-Object -ExpandProperty Name | Sort-Object)" -ForegroundColor Magenta
+Write-Host "[TRACE] Initialize-WinConfigPaths exists: $(!!$(Get-Command Initialize-WinConfigPaths -EA SilentlyContinue))" -ForegroundColor Magenta
 
 # --- POST-IMPORT HOOKS (app-level initialization) ---
 
