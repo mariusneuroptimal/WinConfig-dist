@@ -10,6 +10,7 @@
         "src/VERSION.psd1"
         "src/RUNTIME_DEPENDENCIES.psd1"
         "src/Manifest/WinConfig.Tools.psd1"   # Tool registry with Dry Run declarations
+        "src/Manifest/WinConfig.Parity.psd1"  # Category-tool parity assertions
     )
 
     # Modules that MUST load successfully - application fails without these
