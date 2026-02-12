@@ -1,4 +1,6 @@
 {
+  "timestamp": "2026-02-12T21:39:37.8095200Z",
+  "branch": "main",
   "schema_version": "2.0",
   "artifacts": [
     {
@@ -28,8 +30,8 @@
     },
     {
       "path": "src/Manifest/WinConfig.Parity.psd1",
-      "sha256": "42b128fdf2040c8d728d32f41bcd426ceebaa6c4f0fface254a8964e07b30b63",
-      "size": 7433
+      "sha256": "642abb468ee571d001601d3a9aeafcc09ef3c067a0ff3a7ec428acd9b53cd3b8",
+      "size": 8094
     },
     {
       "path": "src/Modules/ModuleLoader.psm1",
@@ -107,9 +109,7 @@
       "size": 123112
     }
   ],
-  "build_id": "21965030178-1",
-  "branch": "main",
-  "event": "push",
-  "source_ref": "7c782e09f316c06e51831357a58f1c732f91f190",
-  "timestamp": "2026-02-12T21:31:58.2803512Z"
+  "build_id": "21965253993-1",
+  "source_ref": "afad81143d23575aea968a1673fcc548bdc9cb1d",
+  "event": "push"
 }

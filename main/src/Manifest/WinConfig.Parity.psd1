@@ -19,14 +19,14 @@
     # Categories in display order (SSOT)
     Categories = @(
         "Network"
+        "Updates"
+        "NO Shortcuts"
+        "Disk"
+        "System"
         "Bluetooth"
         "Audio"
-        "System"
         "zAmp"
         "Zengar UI"
-        "Updates"
-        "Disk"
-        "NO Shortcuts"
     )
 
     # Tools per category (SSOT)
@@ -34,6 +34,8 @@
         "Network" = @(
             "Run Network Test"
             "Domain, IP && Ports Test"
+            "Network Reset"
+            "Flush DNS Cache"
             "Open Speedtest.net"
         )
         "Bluetooth" = @(
@@ -42,10 +44,12 @@
             "Check Services"
             "List Paired"
             "Power Settings"
+            "Restart Bluetooth Service"
             "Bluetooth Settings"
         )
         "Audio" = @(
             "Remove Intel SST Audio Driver"
+            "Restart Audio Service"
             "Sound Panel"
         )
         "System" = @(
@@ -98,6 +102,14 @@
             Description = "Domain resolution and port checks"
             Group = "Diagnostics"
         }
+        "Network Reset" = @{
+            Description = "Reset network adapter stack"
+            Group = "Actions"
+        }
+        "Flush DNS Cache" = @{
+            Description = "Clear DNS resolver cache"
+            Group = "Actions"
+        }
         "Open Speedtest.net" = @{
             Description = "Launch browser speed test"
             Group = "External"
@@ -124,6 +136,10 @@
             Description = "Review power management"
             Group = "Diagnostics"
         }
+        "Restart Bluetooth Service" = @{
+            Description = "Restart Bluetooth support service"
+            Group = "Actions"
+        }
         "Bluetooth Settings" = @{
             Description = "Open Windows BT settings"
             Group = "Settings"
@@ -132,6 +148,10 @@
         # Audio tools
         "Remove Intel SST Audio Driver" = @{
             Description = "Uninstall problematic SST driver"
+            Group = "Actions"
+        }
+        "Restart Audio Service" = @{
+            Description = "Restart Windows Audio service"
             Group = "Actions"
         }
         "Sound Panel" = @{
