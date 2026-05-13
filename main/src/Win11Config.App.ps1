@@ -644,8 +644,20 @@ $form.StartPosition = "CenterScreen"
 $form.BackColor = $backgroundColor
 $form.Font = New-Object System.Drawing.Font("Segoe UI", 12)
 $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
-# UI-REWORK: Use MinimumSize only; form will grow with content at different DPI
-$form.MinimumSize = New-Object System.Drawing.Size(900, 600)
+# DPI-SAFE MIN SIZE: AutoScaleMode::Dpi alone doesn't scale MinimumSize when set
+# in code (design baseline = current DPI → ratio 1.0, no scaling). Fonts however
+# render in points and grow with DPI naturally, so on high-DPI displays like
+# Surface Pro 10 (2880x1920 @ 200%) the form ends up at 900 physical px wide
+# with full-size fonts inside → severe clipping. Read system DPI directly and
+# scale the design-time minimum (900x600 logical) to physical pixels.
+$script:DesignMinWidth = 900
+$script:DesignMinHeight = 600
+$tmpGraphics = [System.Drawing.Graphics]::FromHwnd([System.IntPtr]::Zero)
+$script:DpiScale = $tmpGraphics.DpiX / 96.0
+$tmpGraphics.Dispose()
+$scaledMinWidth = [int]([Math]::Round($script:DesignMinWidth * $script:DpiScale))
+$scaledMinHeight = [int]([Math]::Round($script:DesignMinHeight * $script:DpiScale))
+$form.MinimumSize = New-Object System.Drawing.Size($scaledMinWidth, $scaledMinHeight)
 $form.Size = $form.MinimumSize  # Start at minimum, grow as needed
 
 # Create tab control
@@ -6000,10 +6012,14 @@ No system changes were made.
         $splitContainer = New-Object System.Windows.Forms.SplitContainer
         $splitContainer.Dock = [System.Windows.Forms.DockStyle]::Fill
         $splitContainer.Orientation = [System.Windows.Forms.Orientation]::Vertical
+        # Initial SplitterDistance is a baseline; recomputed from button widths after
+        # category buttons are created so it adapts to current font/DPI scaling.
         $splitContainer.SplitterDistance = 140
         $splitContainer.SplitterWidth = 4
         $splitContainer.FixedPanel = [System.Windows.Forms.FixedPanel]::Panel1
-        $splitContainer.IsSplitterFixed = $true
+        # Allow manual drag as fallback when text scaling exceeds what AutoScaleMode::Dpi handles.
+        $splitContainer.IsSplitterFixed = $false
+        $splitContainer.Panel1MinSize = 100
         $splitContainer.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
         $tabPage.Controls.Add($splitContainer)
 
@@ -6268,10 +6284,12 @@ No system changes were made.
             $btn.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
             $btn.Font = New-Object System.Drawing.Font("Segoe UI", 10)
             $btn.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
-            $btn.AutoSize = $false
-            $btn.Width = 110
-            $btn.Height = 32
-            $btn.Padding = New-Object System.Windows.Forms.Padding(4, 0, 0, 0)
+            # AutoSize so text never wraps inside the button when Windows text-size
+            # accessibility scaling enlarges fonts beyond what fixed width can hold.
+            $btn.AutoSize = $true
+            $btn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btn.MinimumSize = New-Object System.Drawing.Size(110, 32)
+            $btn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
             $btn.Cursor = [System.Windows.Forms.Cursors]::Hand
             $btn.Tag = $CategoryName
             $btnPanel.Controls.Add($btn)
@@ -7720,6 +7738,22 @@ No system changes were made.
                 }
             }.GetNewClosure())
         }
+
+        # === DISPLAY-SAFE: Size category pane to fit widest button at current font/DPI ===
+        # AutoScaleMode::Dpi does not respond to Windows text-size accessibility scaling,
+        # so we measure actual rendered text width and size the pane accordingly. Without
+        # this, the fixed SplitterDistance can clip category names like "Bluetooth" when
+        # text scaling exceeds 100%.
+        $maxBtnTextWidth = 0
+        foreach ($catName in $script:Categories) {
+            $btn = $script:CategoryListButtons[$catName]
+            $textSize = [System.Windows.Forms.TextRenderer]::MeasureText($btn.Text, $btn.Font)
+            if ($textSize.Width -gt $maxBtnTextWidth) { $maxBtnTextWidth = $textSize.Width }
+        }
+        # Reserve: button padding (20) + badge (~18) + panel padding (16) + scrollbar (20)
+        # Floor scales with DPI so the pane never collapses below ~140 logical px.
+        $splitFloor = [int]([Math]::Round(140 * $script:DpiScale))
+        $splitContainer.SplitterDistance = [Math]::Max($splitFloor, $maxBtnTextWidth + 74)
 
         # === STEP 5: Wire Escape key on tool buttons to return to category list ===
         foreach ($catName in $script:Categories) {
