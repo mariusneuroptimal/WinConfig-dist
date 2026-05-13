@@ -1,130 +1,130 @@
 {
-  "build_id": "25804369849-1",
-  "source_ref": "96287d22a9c0f3dd2510a7e718506f3e029a7897",
-  "timestamp": "2026-05-13T14:07:27.8014363Z",
-  "branch": "main",
   "event": "push",
+  "branch": "main",
+  "schema_version": "2.0",
+  "source_ref": "09d9fd036384e09bde9d30cac580b7d172b9303f",
   "artifacts": [
     {
+      "size": 2001,
       "sha256": "d1278321cdcd5c0759d3dfa773e964cda8d254ccdfd7f08dce12f878d317fff9",
-      "path": "Win11Config.ps1",
-      "size": 2001
+      "path": "Win11Config.ps1"
     },
     {
-      "sha256": "d28cd2370a9d70489a142d1133c619c04ec2ec47f7305777efe2b5bbe709ad65",
-      "path": "src/Win11Config.App.ps1",
-      "size": 440554
+      "size": 441496,
+      "sha256": "b0fe4d5b24f595c9218d8157cb7454d8cfc31377a5659f302a50af6b2d9a4589",
+      "path": "src/Win11Config.App.ps1"
     },
     {
+      "size": 330,
       "sha256": "ff6ee1fdba00afd4e7713d356ed92d752ac386a4528909aa02e29e5c68778622",
-      "path": "src/VERSION.psd1",
-      "size": 330
+      "path": "src/VERSION.psd1"
     },
     {
+      "size": 3770,
       "sha256": "9c6ce9a397fb180a47ceea4d72cb2d0b10689dcc368e4c8b9c87317fa2a0ca0e",
-      "path": "src/RUNTIME_DEPENDENCIES.psd1",
-      "size": 3770
+      "path": "src/RUNTIME_DEPENDENCIES.psd1"
     },
     {
+      "size": 12182,
       "sha256": "f3a5f309d3d767943da3e8f997cbeb8777d710991a32f6b3be3ca682273cddf2",
-      "path": "src/Manifest/WinConfig.Tools.psd1",
-      "size": 12182
+      "path": "src/Manifest/WinConfig.Tools.psd1"
     },
     {
+      "size": 8094,
       "sha256": "642abb468ee571d001601d3a9aeafcc09ef3c067a0ff3a7ec428acd9b53cd3b8",
-      "path": "src/Manifest/WinConfig.Parity.psd1",
-      "size": 8094
+      "path": "src/Manifest/WinConfig.Parity.psd1"
     },
     {
+      "size": 3686,
       "sha256": "8672726bc5875f632328dca7a679dec8eef825de835bc3e93255c14edada53dc",
-      "path": "scripts/Invoke-DiagnosticConsole.ps1",
-      "size": 3686
+      "path": "scripts/Invoke-DiagnosticConsole.ps1"
     },
     {
+      "size": 530,
       "sha256": "bc9477a5664430cb0ba3b2c6bfe2f802ed64f56c11fb15a3e8b5102e93b2ef79",
-      "path": "scripts/Run-DISMRestoreHealth.ps1",
-      "size": 530
+      "path": "scripts/Run-DISMRestoreHealth.ps1"
     },
     {
+      "size": 487,
       "sha256": "5beaeb279faa19fcad4a2f8558b5cb308694b798a62f8977e04dcbf645784f54",
-      "path": "scripts/Run-SFCScannow.ps1",
-      "size": 487
+      "path": "scripts/Run-SFCScannow.ps1"
     },
     {
+      "size": 8424,
       "sha256": "dbc7db80ccb5820e5315cad0aa82f257ccc97b00fc872846fe35af4a6351d20d",
-      "path": "src/Modules/ModuleLoader.psm1",
-      "size": 8424
+      "path": "src/Modules/ModuleLoader.psm1"
     },
     {
+      "size": 14749,
       "sha256": "4b479d70c53bcfbfdbae19d9656f0827a4d1500c70513372b77ac24358818a25",
-      "path": "src/Modules/Paths.psm1",
-      "size": 14749
+      "path": "src/Modules/Paths.psm1"
     },
     {
+      "size": 8062,
       "sha256": "ba958ffccaa47df72d693f9bf20a2aca550322a5ec0129ae0709c61108f0e12f",
-      "path": "src/Modules/ExecutionIntent.psm1",
-      "size": 8062
+      "path": "src/Modules/ExecutionIntent.psm1"
     },
     {
+      "size": 15513,
       "sha256": "e72022251c07915668bd2bb367865d2904fc25e5b87d7368fa50897ba023b88f",
-      "path": "src/Modules/DiagnosticTypes.psm1",
-      "size": 15513
+      "path": "src/Modules/DiagnosticTypes.psm1"
     },
     {
+      "size": 12828,
       "sha256": "d45b808a8afa33d4132350636cb4f6d0fee1c2a05900064fa4691ecc838d325d",
-      "path": "src/Modules/Console.psm1",
-      "size": 12828
+      "path": "src/Modules/Console.psm1"
     },
     {
+      "size": 18109,
       "sha256": "24d1476a7c25757d22ee0f8b631b3d82db16125874fb56006974988dee8f9fe9",
-      "path": "src/Modules/Env.psm1",
-      "size": 18109
+      "path": "src/Modules/Env.psm1"
     },
     {
+      "size": 4172,
       "sha256": "26865143416cd647870da49fd8bf7ca5f61e461b8d78b877d681ac02981af3e6",
-      "path": "src/Modules/UiAction.psm1",
-      "size": 4172
+      "path": "src/Modules/UiAction.psm1"
     },
     {
+      "size": 7632,
       "sha256": "ccb0a065790789d2e3433dac8a58f8191e6a2efa610eede33aab3ac58484c4d1",
-      "path": "src/Modules/StagingAssertions.psm1",
-      "size": 7632
+      "path": "src/Modules/StagingAssertions.psm1"
     },
     {
+      "size": 25004,
       "sha256": "b6ae9a66bfe1ab6c7b47c448551965309c8f9b93ce56bf669133d522130d7017",
-      "path": "src/Logging/Logger.psm1",
-      "size": 25004
+      "path": "src/Logging/Logger.psm1"
     },
     {
+      "size": 60753,
       "sha256": "d656e2cd85b5f340fc4606e9d2628c0a0ae3151266a9085e52126929ca687ad4",
-      "path": "src/Modules/SessionOperationLedger.psm1",
-      "size": 60753
+      "path": "src/Modules/SessionOperationLedger.psm1"
     },
     {
+      "size": 18529,
       "sha256": "b868f988a98f3cbddc7541b7737cf1ea4ac6a73df2a1305ef4638008eda103c5",
-      "path": "src/Modules/PpfFingerprint.psm1",
-      "size": 18529
+      "path": "src/Modules/PpfFingerprint.psm1"
     },
     {
+      "size": 13842,
       "sha256": "965b977bfab8abc518a88e8dcf1670a5cc33cc035b1b0a7c20681e033a5c42f7",
-      "path": "src/Modules/ActionTiers.psm1",
-      "size": 13842
+      "path": "src/Modules/ActionTiers.psm1"
     },
     {
+      "size": 18562,
       "sha256": "b768d62ae93b9fbca36cb9671bc640c5dcbe40f1dd1c8cdb6c1f725fc995bc80",
-      "path": "src/Modules/ToolAsync.psm1",
-      "size": 18562
+      "path": "src/Modules/ToolAsync.psm1"
     },
     {
+      "size": 45255,
       "sha256": "e0de7f3fa4bc587b50b4bb151d25a790d9fd77d0aed83ba4d367788234196312",
-      "path": "src/Modules/DryRun.psm1",
-      "size": 45255
+      "path": "src/Modules/DryRun.psm1"
     },
     {
+      "size": 123112,
       "sha256": "ba87721f30c39aac643afc22cdaef726095bb9be88ad123627a95f85006ef63a",
-      "path": "src/Modules/Bluetooth.psm1",
-      "size": 123112
+      "path": "src/Modules/Bluetooth.psm1"
     }
   ],
-  "schema_version": "2.0"
+  "build_id": "25806938026-1",
+  "timestamp": "2026-05-13T14:52:38.5997839Z"
 }

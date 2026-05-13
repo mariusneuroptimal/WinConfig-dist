@@ -6405,10 +6405,22 @@ No system changes were made.
             $workspace.Dock = [System.Windows.Forms.DockStyle]::Fill
             $workspace.Orientation = [System.Windows.Forms.Orientation]::Vertical
             $workspace.FixedPanel = [System.Windows.Forms.FixedPanel]::Panel2  # Fix actions rail width
+            $workspace.SplitterWidth = 3
+            # SCAFFOLDING (required before setting Panel*MinSize):
+            # A SplitContainer's default Size is 150x100. Setting Panel2MinSize beyond
+            # ~(Width - default SplitterDistance) raises:
+            #   "SplitterDistance must be between Panel1MinSize and Width - Panel2MinSize"
+            # because the setter cascades into a SplitterDistance re-clamp. At 200% DPI
+            # our Panel2MinSize would be 280 > 150 and throw on first dashboard build.
+            # Bump Size and SplitterDistance to safe values that satisfy the constraint;
+            # Dock=Fill (set above) reflows the container once it's parented, and
+            # FixedPanel=Panel2 preserves the chosen actions-rail width across resizes.
+            $btnRailWidth = [int]([Math]::Round(140 * $script:DpiScale))
+            $workspace.Size = New-Object System.Drawing.Size(2000, 1000)
+            $workspace.SplitterDistance = 2000 - $btnRailWidth - $workspace.SplitterWidth
             # DPI-scaled so the actions rail stays usable at higher scaling (Surface Pro at 200% etc.)
             $workspace.Panel1MinSize = [int]([Math]::Round(50 * $script:DpiScale))
-            $workspace.Panel2MinSize = [int]([Math]::Round(140 * $script:DpiScale))
-            $workspace.SplitterWidth = 3
+            $workspace.Panel2MinSize = $btnRailWidth
             $workspace.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
 
             # Left pane (primary): Devices list + COM ports
