@@ -11,6 +11,12 @@
         "src/RUNTIME_DEPENDENCIES.psd1"
         "src/Manifest/WinConfig.Tools.psd1"   # Tool registry with Dry Run declarations
         "src/Manifest/WinConfig.Parity.psd1"  # Category-tool parity assertions
+        # Auxiliary scripts launched via Start-Process from button handlers.
+        # Without these in the manifest the bootstrap doesn't stage them, so
+        # DISM Restore Health and /sfc scannow silently no-op on bootstrap installs.
+        "scripts/Invoke-DiagnosticConsole.ps1"  # Elevated console wrapper (imports Console.psm1)
+        "scripts/Run-DISMRestoreHealth.ps1"     # DISM /Online /Cleanup-Image /RestoreHealth payload
+        "scripts/Run-SFCScannow.ps1"            # sfc /scannow payload
     )
 
     # Modules that MUST load successfully - application fails without these
