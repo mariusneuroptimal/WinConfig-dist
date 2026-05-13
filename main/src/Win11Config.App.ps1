@@ -6405,8 +6405,9 @@ No system changes were made.
             $workspace.Dock = [System.Windows.Forms.DockStyle]::Fill
             $workspace.Orientation = [System.Windows.Forms.Orientation]::Vertical
             $workspace.FixedPanel = [System.Windows.Forms.FixedPanel]::Panel2  # Fix actions rail width
-            $workspace.Panel1MinSize = 50   # Allow resize flexibility
-            $workspace.Panel2MinSize = 140  # Actions panel needs ~140px for buttons
+            # DPI-scaled so the actions rail stays usable at higher scaling (Surface Pro at 200% etc.)
+            $workspace.Panel1MinSize = [int]([Math]::Round(50 * $script:DpiScale))
+            $workspace.Panel2MinSize = [int]([Math]::Round(140 * $script:DpiScale))
             $workspace.SplitterWidth = 3
             $workspace.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
 
@@ -6421,8 +6422,9 @@ No system changes were made.
             $devicesHeader.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
             $devicesHeader.ForeColor = $tabColor
             $devicesHeader.Dock = [System.Windows.Forms.DockStyle]::Top
-            $devicesHeader.AutoSize = $false
-            $devicesHeader.Height = 25
+            # AutoSize so the row height tracks the font (clips at fixed 25 px on high-DPI/text-scaled systems).
+            $devicesHeader.AutoSize = $true
+            $devicesHeader.Padding = New-Object System.Windows.Forms.Padding(0, 2, 0, 2)
             $script:BTToolTip.SetToolTip($devicesHeader, "Bluetooth audio devices with two-axis state model:`n`nPresence: Connected | Paired | Remembered | Ghost`nActivity: Active (audio route) | Idle | Inactive`n`nRemembered = registry-only (not currently present)`nGhost = non-present with driver/COM residue`n`nDevices are never labeled 'Paired' unless a live bond exists.")
             $devicesPanel.Controls.Add($devicesHeader)
 
@@ -6433,7 +6435,8 @@ No system changes were made.
             $expertCheck.ForeColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
             $expertCheck.AutoSize = $true
             $expertCheck.Dock = [System.Windows.Forms.DockStyle]::Top
-            $expertCheck.Height = 18
+            # Drop fixed Height=18: AutoSize already determines the natural row height; the explicit
+            # height was clipping the checkbox + label at higher font scaling.
             $expertCheck.Padding = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
             $script:BTToolTip.SetToolTip($expertCheck, "Reveals cached/remembered devices and technical details.`n`nDefault: Only connected (present) devices`nExpert: + Remembered + Ghost + Instance IDs`n`nUse for investigating stale device residue.")
             $expertCheck.Add_CheckedChanged({
@@ -6456,10 +6459,11 @@ No system changes were made.
             $devicesList.GridLines = $true
             $devicesList.Font = New-Object System.Drawing.Font("Segoe UI", 9)
             $devicesList.ShowItemToolTips = $true
-            [void]$devicesList.Columns.Add("Device", 150)
-            [void]$devicesList.Columns.Add("Presence", 85)
-            [void]$devicesList.Columns.Add("Activity", 65)
-            [void]$devicesList.Columns.Add("Notes", 80)
+            # DPI-scaled column widths so text isn't truncated at >100% scaling.
+            [void]$devicesList.Columns.Add("Device",   [int]([Math]::Round(150 * $script:DpiScale)))
+            [void]$devicesList.Columns.Add("Presence", [int]([Math]::Round( 85 * $script:DpiScale)))
+            [void]$devicesList.Columns.Add("Activity", [int]([Math]::Round( 65 * $script:DpiScale)))
+            [void]$devicesList.Columns.Add("Notes",    [int]([Math]::Round( 80 * $script:DpiScale)))
             $devicesList.Tag = "devices-list"
             $devicesPanel.Controls.Add($devicesList)
             $script:BTDevicesList = $devicesList
@@ -6467,7 +6471,7 @@ No system changes were made.
             # Cached devices footer (below grid, not inside it - scan efficiency rule)
             $cachedFooter = New-Object System.Windows.Forms.Label
             $cachedFooter.Dock = [System.Windows.Forms.DockStyle]::Bottom
-            $cachedFooter.Height = 18
+            $cachedFooter.AutoSize = $true
             $cachedFooter.Text = ""
             $cachedFooter.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
             $cachedFooter.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 120)
@@ -6487,7 +6491,8 @@ No system changes were made.
             # COM Ports panel (compact, collapsible, bottom - hidden by default, shown if ghosts exist)
             $comPortsPanel = New-Object System.Windows.Forms.Panel
             $comPortsPanel.Dock = [System.Windows.Forms.DockStyle]::Bottom
-            $comPortsPanel.Height = 75
+            # DPI-scaled height so the embedded ListView + header don't get vertically clipped at >100% scaling.
+            $comPortsPanel.Height = [int]([Math]::Round(75 * $script:DpiScale))
             $comPortsPanel.BackColor = [System.Drawing.Color]::FromArgb(255, 253, 245)  # Subtle warm tint
             $comPortsPanel.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
             $comPortsPanel.Visible = $false  # Hidden until ghost ports detected
@@ -6497,8 +6502,7 @@ No system changes were made.
             $comPortsHeader.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
             $comPortsHeader.ForeColor = [System.Drawing.Color]::FromArgb(140, 110, 20)
             $comPortsHeader.Dock = [System.Windows.Forms.DockStyle]::Top
-            $comPortsHeader.AutoSize = $false
-            $comPortsHeader.Height = 18
+            $comPortsHeader.AutoSize = $true
             $comPortsHeader.Padding = New-Object System.Windows.Forms.Padding(4, 2, 0, 0)
             $script:BTToolTip.SetToolTip($comPortsHeader, "Ghost Bluetooth COM ports detected.`nThese are orphaned serial device registrations that accumulate over time.`nHigh counts often cause pairing and connectivity failures.")
             $comPortsPanel.Controls.Add($comPortsHeader)
@@ -6514,10 +6518,11 @@ No system changes were made.
             $comPortsList.Font = New-Object System.Drawing.Font("Segoe UI", 8)
             $comPortsList.ShowItemToolTips = $true
             $comPortsList.HeaderStyle = [System.Windows.Forms.ColumnHeaderStyle]::Nonclickable
-            [void]$comPortsList.Columns.Add("COM", 45)
-            [void]$comPortsList.Columns.Add("Device", 100)
-            [void]$comPortsList.Columns.Add("Status", 50)
-            [void]$comPortsList.Columns.Add("Notes", 60)
+            # DPI-scaled to keep the COM port row legible at higher scaling.
+            [void]$comPortsList.Columns.Add("COM",    [int]([Math]::Round( 45 * $script:DpiScale)))
+            [void]$comPortsList.Columns.Add("Device", [int]([Math]::Round(100 * $script:DpiScale)))
+            [void]$comPortsList.Columns.Add("Status", [int]([Math]::Round( 50 * $script:DpiScale)))
+            [void]$comPortsList.Columns.Add("Notes",  [int]([Math]::Round( 60 * $script:DpiScale)))
             $comPortsList.Tag = "com-ports-list"
             $comPortsPanel.Controls.Add($comPortsList)
             $script:BTCOMPortsList = $comPortsList
@@ -6652,7 +6657,35 @@ No system changes were made.
             $btnTier1.Tag = "action"
             $btnTier1.Font = New-Object System.Drawing.Font("Segoe UI", 8)
             $script:BTToolTip.SetToolTip($btnTier1, "Restarts Bluetooth Support Service and related audio services.`nFirst escalation step - fixes most service-related issues.")
-            # TODO: Wire to actual handler when available
+            $btnTier1.Add_Click({
+                try {
+                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+                    if (-not $isAdmin) {
+                        [System.Windows.Forms.MessageBox]::Show("Restarting Bluetooth services requires administrator privileges.`n`nPlease restart WinConfig as Administrator.", "Admin Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+                        return
+                    }
+                    if (-not (Get-Command Invoke-WinConfigBluetoothServiceReset -ErrorAction SilentlyContinue)) {
+                        [System.Windows.Forms.MessageBox]::Show("Bluetooth module is not loaded yet. Wait for the dashboard to finish populating and try again.", "Not Ready", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+                        return
+                    }
+                    $result = Invoke-WithExecutionIntent -Intent 'ADMIN_ACTION' -Script {
+                        Invoke-WinConfigBluetoothServiceReset
+                    }
+                    $icon = if ($result.Success) { [System.Windows.Forms.MessageBoxIcon]::Information } else { [System.Windows.Forms.MessageBoxIcon]::Warning }
+                    $msg = if ($result.Message) { $result.Message } else { "Restart complete." }
+                    if ($result.ServicesRestarted -and $result.ServicesRestarted.Count -gt 0) {
+                        $msg += "`n`nRestarted: " + ($result.ServicesRestarted -join ", ")
+                    }
+                    [System.Windows.Forms.MessageBox]::Show($msg, "Restart Bluetooth Services", [System.Windows.Forms.MessageBoxButtons]::OK, $icon) | Out-Null
+                    if ($script:UpdateBluetoothDashboardFn) {
+                        $script:BluetoothDashboardLoaded = $false
+                        . $script:UpdateBluetoothDashboardFn
+                        $script:BluetoothDashboardLoaded = $true
+                    }
+                } catch {
+                    [System.Windows.Forms.MessageBox]::Show("Failed to restart Bluetooth services: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+                }
+            }.GetNewClosure())
             $recoverySection.Container.Controls.Add($btnTier1)
 
             # Tier 2: Remove stale audio endpoints
@@ -6660,6 +6693,38 @@ No system changes were made.
             $btnTier2.Tag = "action"
             $btnTier2.Font = New-Object System.Drawing.Font("Segoe UI", 8)
             $script:BTToolTip.SetToolTip($btnTier2, "Removes orphaned or stale Bluetooth audio endpoints from the system.`nUse when ghost devices appear or audio routing is confused.")
+            $btnTier2.Add_Click({
+                try {
+                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+                    if (-not $isAdmin) {
+                        [System.Windows.Forms.MessageBox]::Show("Cleaning stale Bluetooth audio endpoints requires administrator privileges.`n`nPlease restart WinConfig as Administrator.", "Admin Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+                        return
+                    }
+                    if (-not (Get-Command Invoke-WinConfigBluetoothEndpointCleanup -ErrorAction SilentlyContinue)) {
+                        [System.Windows.Forms.MessageBox]::Show("Bluetooth module is not loaded yet. Wait for the dashboard to finish populating and try again.", "Not Ready", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+                        return
+                    }
+                    $confirmMsg = "Remove disconnected/stale Bluetooth audio endpoints?`n`nThis will not touch the current default playback device or any Bluetooth device that is currently connected. Re-pairing may be required for some removed devices."
+                    $confirmResult = [System.Windows.Forms.MessageBox]::Show($confirmMsg, "Clean Stale Bluetooth Audio Endpoints", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+                    if ($confirmResult -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+                    $result = Invoke-WithExecutionIntent -Intent 'ADMIN_ACTION' -Script {
+                        Invoke-WinConfigBluetoothEndpointCleanup
+                    }
+                    $icon = if ($result.Success) { [System.Windows.Forms.MessageBoxIcon]::Information } else { [System.Windows.Forms.MessageBoxIcon]::Warning }
+                    $msg = if ($result.Message) { $result.Message } else { "Cleanup complete." }
+                    if ($result.RemovedDevices -and $result.RemovedDevices.Count -gt 0) {
+                        $msg += "`n`nRemoved $($result.RemovedDevices.Count) endpoint(s)."
+                    }
+                    [System.Windows.Forms.MessageBox]::Show($msg, "Clean Stale Endpoints", [System.Windows.Forms.MessageBoxButtons]::OK, $icon) | Out-Null
+                    if ($script:UpdateBluetoothDashboardFn) {
+                        $script:BluetoothDashboardLoaded = $false
+                        . $script:UpdateBluetoothDashboardFn
+                        $script:BluetoothDashboardLoaded = $true
+                    }
+                } catch {
+                    [System.Windows.Forms.MessageBox]::Show("Failed to clean stale endpoints: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+                }
+            }.GetNewClosure())
             $recoverySection.Container.Controls.Add($btnTier2)
 
             # Tier 2.5: Remove ghost COM ports (GUARDED)
@@ -6724,6 +6789,39 @@ No system changes were made.
             $btnTier3.Font = New-Object System.Drawing.Font("Segoe UI", 8)
             $btnTier3.ForeColor = [System.Drawing.Color]::FromArgb(180, 50, 50)
             $script:BTToolTip.SetToolTip($btnTier3, "Disables and re-enables the Bluetooth adapter hardware.`nLast resort - will disconnect all Bluetooth devices temporarily.")
+            $btnTier3.Add_Click({
+                try {
+                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+                    if (-not $isAdmin) {
+                        [System.Windows.Forms.MessageBox]::Show("Resetting the Bluetooth adapter requires administrator privileges.`n`nPlease restart WinConfig as Administrator.", "Admin Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+                        return
+                    }
+                    if (-not (Get-Command Invoke-WinConfigBluetoothAdapterReset -ErrorAction SilentlyContinue)) {
+                        [System.Windows.Forms.MessageBox]::Show("Bluetooth module is not loaded yet. Wait for the dashboard to finish populating and try again.", "Not Ready", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+                        return
+                    }
+                    $confirmMsg = "Disable and re-enable the Bluetooth adapter hardware?`n`nALL paired Bluetooth devices will disconnect for several seconds. Some devices may require manual reconnect. A reboot may be needed if the adapter fails to come back online.`n`nThis is a last-resort action. Use only after lighter recovery steps have failed."
+                    $confirmResult = [System.Windows.Forms.MessageBox]::Show($confirmMsg, "Reset Bluetooth Adapter", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                    if ($confirmResult -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+                    $result = Invoke-WithExecutionIntent -Intent 'ADMIN_ACTION' -Script {
+                        Invoke-WinConfigBluetoothAdapterReset
+                    }
+                    $icon = if ($result.Success) { [System.Windows.Forms.MessageBoxIcon]::Information } else { [System.Windows.Forms.MessageBoxIcon]::Warning }
+                    $msg = if ($result.Message) { $result.Message } else { "Adapter reset complete." }
+                    if ($result.RebootRequired) {
+                        $msg += "`n`nREBOOT REQUIRED: The adapter did not come back online cleanly. Restart Windows to recover Bluetooth functionality."
+                        $icon = [System.Windows.Forms.MessageBoxIcon]::Warning
+                    }
+                    [System.Windows.Forms.MessageBox]::Show($msg, "Reset Bluetooth Adapter", [System.Windows.Forms.MessageBoxButtons]::OK, $icon) | Out-Null
+                    if ($script:UpdateBluetoothDashboardFn) {
+                        $script:BluetoothDashboardLoaded = $false
+                        . $script:UpdateBluetoothDashboardFn
+                        $script:BluetoothDashboardLoaded = $true
+                    }
+                } catch {
+                    [System.Windows.Forms.MessageBox]::Show("Failed to reset Bluetooth adapter: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+                }
+            }.GetNewClosure())
             $recoverySection.Container.Controls.Add($btnTier3)
 
             $actionsPanel.Controls.Add($recoverySection.Container)
@@ -6746,7 +6844,7 @@ No system changes were made.
                 $btn = New-Button $actionName
                 $btn.Tag = "action"
                 $btn.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-                $btn.MinimumSize = New-Object System.Drawing.Size(80, 24)
+                $btn.MinimumSize = New-Object System.Drawing.Size([int]([Math]::Round(80 * $script:DpiScale)), [int]([Math]::Round(24 * $script:DpiScale)))
                 if ($buttonHandlers.ContainsKey($actionName)) {
                     $btn.Add_Click($buttonHandlers[$actionName])
                     # Note: Not added to ToolButtonRegistry (dashboard context, not Tools tab)
@@ -6771,10 +6869,12 @@ No system changes were made.
             $timelineList.GridLines = $false
             $timelineList.Font = New-Object System.Drawing.Font("Consolas", 7)
             $timelineList.ShowItemToolTips = $true
-            $timelineList.Width = 180
-            $timelineList.Height = 120
-            [void]$timelineList.Columns.Add("Time", 50)
-            [void]$timelineList.Columns.Add("Event", 120)
+            # DPI-scaled size + columns. At fixed 180x120 px the columns already summed to 170 (clipping
+            # at 100%) and the whole list was unusable at higher scaling.
+            $timelineList.Width  = [int]([Math]::Round(180 * $script:DpiScale))
+            $timelineList.Height = [int]([Math]::Round(120 * $script:DpiScale))
+            [void]$timelineList.Columns.Add("Time",  [int]([Math]::Round( 50 * $script:DpiScale)))
+            [void]$timelineList.Columns.Add("Event", [int]([Math]::Round(120 * $script:DpiScale)))
             $timelineList.Tag = "timeline-list"
             $timelineSection.Container.Controls.Add($timelineList)
             $script:BTTimelineList = $timelineList
@@ -6788,7 +6888,8 @@ No system changes were made.
 
             $detailsLabel = New-Object System.Windows.Forms.Label
             $detailsLabel.AutoSize = $true
-            $detailsLabel.MaximumSize = New-Object System.Drawing.Size(200, 0)
+            # DPI-scaled wrap cap; at fixed 200 the label was forcing wraps inside a 140-200 px rail.
+            $detailsLabel.MaximumSize = New-Object System.Drawing.Size([int]([Math]::Round(200 * $script:DpiScale)), 0)
             $detailsLabel.Font = New-Object System.Drawing.Font("Consolas", 8)
             $detailsLabel.ForeColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
             $detailsLabel.Text = "(Expand for verbose info)"
@@ -6804,7 +6905,8 @@ No system changes were made.
             # === CONDITIONAL KODI PANEL (Row 3 - only visible if Kodi detected) ===
             $kodiPanel = New-Object System.Windows.Forms.Panel
             $kodiPanel.Dock = [System.Windows.Forms.DockStyle]::Bottom
-            $kodiPanel.Height = 28
+            # DPI-scaled so the single-line label + padding doesn't get vertically clipped at >100% scaling.
+            $kodiPanel.Height = [int]([Math]::Round(28 * $script:DpiScale))
             $kodiPanel.BackColor = [System.Drawing.Color]::FromArgb(255, 252, 245)  # Warm highlight
             $kodiPanel.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
             $kodiPanel.Visible = $false  # Hidden by default - shown only if Kodi detected
