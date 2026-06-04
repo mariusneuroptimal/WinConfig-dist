@@ -3806,7 +3806,7 @@ $buttonHandlers = @{
             # GUARD: Verify Console module is available for diagnostic output
             if (-not (Get-Command Initialize-WinConfigGuiDiagnosticBox -ErrorAction SilentlyContinue)) {
                 [System.Windows.Forms.MessageBox]::Show(
-                    "Bluetooth Diagnostics cannot start: Console module failed to load.`n`nThe Initialize-WinConfigGuiDiagnosticBox function is not available.",
+                    "Bluetooth Diagnostics cannot start: Console module failed to load.",
                     "Module Load Error",
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Error
@@ -3814,7 +3814,7 @@ $buttonHandlers = @{
                 return
             }
 
-            # Locate probe module: env var override → bundled copy → sibling-repo (dev only)
+            # Locate probe module: env var override -> bundled copy -> sibling-repo (dev only)
             if (-not (Get-Command Invoke-BluetoothDiagnosticsAndRecord -ErrorAction SilentlyContinue)) {
                 $btModulePath = $env:WINCONFIG_BT_MODULE_PATH
                 if (-not $btModulePath) {
@@ -3822,7 +3822,7 @@ $buttonHandlers = @{
                 }
                 if (-not (Test-Path $btModulePath)) {
                     $winConfigRoot = Split-Path -Parent $PSScriptRoot
-                    $reposRoot    = Split-Path -Parent $winConfigRoot
+                    $reposRoot     = Split-Path -Parent $winConfigRoot
                     $btModulePath  = Join-Path $reposRoot "winconfig-bluetooth\src\Modules\Bluetooth.psm1"
                 }
                 if (Test-Path $btModulePath) {
@@ -3850,189 +3850,286 @@ $buttonHandlers = @{
                 return
             }
 
-            # Output form with status panel at bottom
-            $btOutputForm = New-Object System.Windows.Forms.Form
-            $btOutputForm.Text = "Bluetooth Diagnostics"
-            $btOutputForm.Size = New-Object System.Drawing.Size(700, 520)
-            $btOutputForm.StartPosition = "CenterScreen"
+            # Resolve module path string for Start-Job (cannot pass loaded module across runspace boundary)
+            $script:BtRec_ModulePath = if ($env:WINCONFIG_BT_MODULE_PATH) {
+                $env:WINCONFIG_BT_MODULE_PATH
+            } else {
+                Join-Path $PSScriptRoot "Modules\BluetoothProbe.psm1"
+            }
+            if (-not (Test-Path $script:BtRec_ModulePath)) {
+                $winConfigRoot = Split-Path -Parent $PSScriptRoot
+                $script:BtRec_ModulePath = Join-Path (Split-Path -Parent $winConfigRoot) "winconfig-bluetooth\src\Modules\Bluetooth.psm1"
+            }
 
-            # Bottom status panel (add before Fill control so docking respects it)
+            # ── Recording state (shared across all event-handler closures) ─────────
+            $script:BtRec_DiagRun    = $null
+            $script:BtRec_Start      = $null
+            $script:BtRec_ElapsedTmr = $null
+            $script:BtRec_SnapCount  = 0
+
+            # ── Build form ────────────────────────────────────────────────────────
+            $btForm = New-Object System.Windows.Forms.Form
+            $btForm.Text = "Bluetooth Flight Recorder"
+            $btForm.Size = New-Object System.Drawing.Size(700, 580)
+            $btForm.StartPosition = "CenterScreen"
+            $btForm.FormBorderStyle = "FixedDialog"
+            $btForm.MaximizeBox = $false
+
+            # Bottom status bar - add first so Fill respects it
             $btStatusPanel = New-Object System.Windows.Forms.Panel
             $btStatusPanel.Dock = [System.Windows.Forms.DockStyle]::Bottom
-            $btStatusPanel.Height = 90
-            $btStatusPanel.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 6)
+            $btStatusPanel.Height = 80
             $btStatusPanel.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
-            $btOutputForm.Controls.Add($btStatusPanel)
+            $btStatusPanel.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 6)
+            $btForm.Controls.Add($btStatusPanel)
 
-            $btLocalPathLabel = New-Object System.Windows.Forms.Label
-            $btLocalPathLabel.Text = "Local package: -"
-            $btLocalPathLabel.AutoSize = $false
-            $btLocalPathLabel.Width = 660
-            $btLocalPathLabel.Height = 18
-            $btLocalPathLabel.Location = New-Object System.Drawing.Point(8, 6)
-            $btLocalPathLabel.Font = New-Object System.Drawing.Font("Consolas", 8)
-            $btLocalPathLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
-            $btStatusPanel.Controls.Add($btLocalPathLabel)
+            $btElapsedLabel = New-Object System.Windows.Forms.Label
+            $btElapsedLabel.Text = "Initializing..."
+            $btElapsedLabel.AutoSize = $false
+            $btElapsedLabel.Width = 500
+            $btElapsedLabel.Height = 18
+            $btElapsedLabel.Location = New-Object System.Drawing.Point(8, 6)
+            $btElapsedLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+            $btElapsedLabel.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
+            $btStatusPanel.Controls.Add($btElapsedLabel)
 
             $btUploadLabel = New-Object System.Windows.Forms.Label
             $btUploadLabel.Text = "Upload: -"
             $btUploadLabel.AutoSize = $false
-            $btUploadLabel.Width = 480
+            $btUploadLabel.Width = 660
             $btUploadLabel.Height = 18
             $btUploadLabel.Location = New-Object System.Drawing.Point(8, 28)
             $btUploadLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
             $btUploadLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
             $btStatusPanel.Controls.Add($btUploadLabel)
 
+            $btStopBtn = New-Object System.Windows.Forms.Button
+            $btStopBtn.Text = "Stop && Upload"
+            $btStopBtn.Size = New-Object System.Drawing.Size(130, 28)
+            $btStopBtn.Location = New-Object System.Drawing.Point(8, 48)
+            $btStopBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btStopBtn.Enabled = $false
+            $btStatusPanel.Controls.Add($btStopBtn)
+
             $btOpenFolderBtn = New-Object System.Windows.Forms.Button
             $btOpenFolderBtn.Text = "Open Folder"
-            $btOpenFolderBtn.Location = New-Object System.Drawing.Point(8, 54)
-            $btOpenFolderBtn.AutoSize = $true
-            $btOpenFolderBtn.Enabled = $false
+            $btOpenFolderBtn.Size = New-Object System.Drawing.Size(100, 28)
+            $btOpenFolderBtn.Location = New-Object System.Drawing.Point(148, 48)
             $btOpenFolderBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-            $btOpenFolderBtn.Add_Click({
-                param($sender, $e)
-                if ($sender.Tag) { Start-Process explorer.exe $sender.Tag }
-            })
+            $btOpenFolderBtn.Enabled = $false
+            $btOpenFolderBtn.Add_Click({ if ($btOpenFolderBtn.Tag) { Start-Process explorer.exe $btOpenFolderBtn.Tag } })
             $btStatusPanel.Controls.Add($btOpenFolderBtn)
 
-            # Main diagnostic output (fills remaining space)
+            # Top instruction banner - add before Fill
+            $btBanner = New-Object System.Windows.Forms.Panel
+            $btBanner.Dock = [System.Windows.Forms.DockStyle]::Top
+            $btBanner.Height = 56
+            $btBanner.BackColor = [System.Drawing.Color]::FromArgb(30, 50, 80)
+            $btForm.Controls.Add($btBanner)
+
+            $btBannerLabel = New-Object System.Windows.Forms.Label
+            $btBannerLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 210, 255)
+            $btBannerLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+            $btBannerLabel.TextAlign = "MiddleLeft"
+            $btBannerLabel.Padding = New-Object System.Windows.Forms.Padding(12, 0, 0, 0)
+            $btBannerLabel.Text = "Step 1 of 3 - Taking Bluetooth baseline snapshot, please wait..."
+            $btBanner.Controls.Add($btBannerLabel)
+
+            # Console output (fills remaining space)
             $btOutputBox = New-Object System.Windows.Forms.RichTextBox
             $btOutputBox.Multiline = $true
             $btOutputBox.ScrollBars = "Vertical"
             $btOutputBox.Dock = [System.Windows.Forms.DockStyle]::Fill
             Initialize-WinConfigGuiDiagnosticBox -Box $btOutputBox
-            $btOutputForm.Controls.Add($btOutputBox)
-            $btOutputForm.Show()
-            $btOutputForm.Refresh()
+            $btForm.Controls.Add($btOutputBox)
+
+            $btForm.Show()
+            $btForm.Refresh()
 
             function Write-BtLog {
                 param([string]$Message, [string]$Level = "INFO")
                 Write-WinConfigGuiDiagnostic -Level $Level -Message $Message -Box $btOutputBox -NoPrefix
-                $btOutputForm.Refresh()
+                $btForm.Refresh()
             }
 
-            # Create diagnostic run folder (if DiagnosticsPackage module loaded)
-            $btDiagRun = $null
+            # ── Create diagnostic run folder ───────────────────────────────────────
             if (Get-Command New-WinConfigDiagnosticRun -ErrorAction SilentlyContinue) {
                 try {
-                    $btDiagRun = New-WinConfigDiagnosticRun -ToolId 'bluetooth-diagnostics'
-                    Write-BtLog "Run ID: $($btDiagRun.RunId)"
-                    # Write manifest before probe so it persists even on probe failure
-                    Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name "manifest.json" -Data @{
-                        RunId          = $btDiagRun.RunId
-                        ToolId         = 'bluetooth-diagnostics'
-                        StartedAtUtc   = $btDiagRun.StartedAtUtc
-                        PackageVersion = '1.0'
-                    }
-                } catch {
-                    Write-BtLog "Diagnostic run init failed: $($_.Exception.Message)" -Level "WARN"
-                    $btDiagRun = $null
-                }
+                    $script:BtRec_DiagRun = New-WinConfigDiagnosticRun -ToolId 'bluetooth-diagnostics'
+                } catch { }
             }
 
-            Write-BtLog "Initializing Bluetooth probe..."
+            $btRunId = if ($script:BtRec_DiagRun) { $script:BtRec_DiagRun.RunId } else { [guid]::NewGuid().ToString("N").Substring(0,12).ToUpper() }
+            Write-BtLog "Run ID: $btRunId" -Level "DIM"
+            Write-BtLog "Step 1 of 3: Taking Bluetooth baseline snapshot (5-10 seconds)..." -Level "STEP"
 
-            $btProbeResult = $null
-            try {
-                $btProbeResult = Invoke-BluetoothDiagnosticsAndRecord `
-                    -RecordAction {
-                        param([hashtable]$entry)
-                        if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                            Register-WinConfigSessionAction @entry
+            # ── Phase 1: Baseline (background job + timer poll so UI stays live) ───
+            $btBaselineJob = Start-Job -ScriptBlock {
+                param($mp)
+                Import-Module $mp -Force -ErrorAction Stop
+                Invoke-BluetoothDiagnosticsAndRecord -RecordAction {} -TimeoutSeconds 60
+            } -ArgumentList $script:BtRec_ModulePath
+
+            $btBaselinePollTmr = New-Object System.Windows.Forms.Timer
+            $btBaselinePollTmr.Interval = 500
+            $btBaselinePollTmr.Add_Tick({
+                if ($btBaselineJob.State -notin @('Running','NotStarted')) {
+                    $btBaselinePollTmr.Stop()
+                    $btBaselinePollTmr.Dispose()
+
+                    $baselineResult = $null
+                    try {
+                        $baselineResult = Receive-Job $btBaselineJob -ErrorAction SilentlyContinue
+                        Remove-Job $btBaselineJob -Force -ErrorAction SilentlyContinue
+                    } catch {
+                        Remove-Job $btBaselineJob -Force -ErrorAction SilentlyContinue
+                    }
+
+                    if ($baselineResult) {
+                        $vStr  = if ($baselineResult.VerdictStatus) { $baselineResult.VerdictStatus } else { "N/A" }
+                        $level = switch ($baselineResult.Status) {
+                            "Success"        { if ($baselineResult.VerdictStatus -eq "READY") { "OK" } else { "WARN" } }
+                            "PartialSuccess" { "WARN" }
+                            default          { "WARN" }
                         }
-                    } `
-                    -TimeoutSeconds 60
-            } catch {
-                Write-BtLog "Probe exception: $($_.Exception.Message)" -Level "FAIL"
-                if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                    Register-WinConfigSessionAction -Action "Bluetooth Diagnostics Complete" `
-                        -Category "Bluetooth" -Result "FAIL" -Tier 5 `
-                        -Summary "Probe exception" -Evidence @{}
-                }
-            }
-
-            # Write probe result artifact
-            if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
-                try {
-                    $resultData = if ($btProbeResult) { $btProbeResult } else { @{ Status = 'ProbeException' } }
-                    Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name "probe-result.json" -Data $resultData
-                } catch {
-                    Write-BtLog "Artifact write failed: $($_.Exception.Message)" -Level "WARN"
-                }
-            }
-
-            if ($btProbeResult) {
-                $verdictLabel = if ($null -ne $btProbeResult.VerdictStatus) { $btProbeResult.VerdictStatus } else { "N/A" }
-                $statusLine = "Status: $($btProbeResult.Status)  |  Verdict: $verdictLabel  |  Findings: $($btProbeResult.FindingCount)  |  Duration: $($btProbeResult.DurationMs)ms"
-
-                $btLogLevel = switch ($btProbeResult.Status) {
-                    "Success"        { if ($btProbeResult.VerdictStatus -eq "READY") { "OK" } else { "WARN" } }
-                    "PartialSuccess" { "WARN" }
-                    "NoAdapter"      { "WARN" }
-                    default          { "ERROR" }
-                }
-                Write-BtLog $statusLine -Level $btLogLevel
-
-                if ($btProbeResult.Error) {
-                    Write-BtLog "Error: $($btProbeResult.Error)" -Level "FAIL"
-                }
-
-                if ($btProbeResult.Status -in @("Failed", "Timeout")) {
-                    [System.Windows.Forms.MessageBox]::Show(
-                        "Bluetooth diagnostics failed: $($btProbeResult.Status)`n`n$($btProbeResult.Error)",
-                        "Diagnostics Failed",
-                        [System.Windows.Forms.MessageBoxButtons]::OK,
-                        [System.Windows.Forms.MessageBoxIcon]::Error
-                    ) | Out-Null
-                }
-            }
-
-            # Package the run folder into a ZIP
-            $btZipPath = $null
-            if ($btDiagRun -and (Get-Command Compress-WinConfigDiagnosticRun -ErrorAction SilentlyContinue)) {
-                try {
-                    Write-BtLog "Packaging diagnostic artifacts..."
-                    $pkg = Compress-WinConfigDiagnosticRun -RunFolder $btDiagRun.RunFolder -ExportsRoot $btDiagRun.ExportsRoot
-                    $btZipPath = $pkg.ZipPath
-                    $sizeKb = [Math]::Round($pkg.SizeBytes / 1024, 1)
-                    Write-BtLog "Package ready: $btZipPath ($sizeKb KB)"
-                    $btLocalPathLabel.Text = "Local: $btZipPath"
-                    $btOpenFolderBtn.Tag = Split-Path $btZipPath -Parent
-                    $btOpenFolderBtn.Enabled = $true
-                } catch {
-                    Write-BtLog "Packaging failed: $($_.Exception.Message)" -Level "WARN"
-                    $btLocalPathLabel.Text = "Local: packaging failed"
-                }
-            }
-
-            # Upload
-            if ($btZipPath -and (Get-Command Get-WinConfigDiagnosticsUploadConfig -ErrorAction SilentlyContinue)) {
-                $uploadConfig = Get-WinConfigDiagnosticsUploadConfig
-                if ($uploadConfig.Enabled) {
-                    Write-BtLog "Uploading to $($uploadConfig.Provider): $($uploadConfig.DestinationPath)"
-                    $btUploadLabel.Text = "Upload: Sending..."
-                    $btOutputForm.Refresh()
-                    $uploadResult = Send-WinConfigDiagnosticPackage `
-                        -PackagePath $btZipPath `
-                        -Config $uploadConfig `
-                        -Metadata @{ RunId = $btDiagRun.RunId }
-                    if ($uploadResult.Status -eq 'Uploaded') {
-                        Write-BtLog "Uploaded ($($uploadResult.Provider)): $($uploadResult.RemotePath)" -Level "OK"
-                        $dest = if ($uploadResult.Provider -eq 'R2') { "R2: $($uploadResult.RemotePath)" } else { $uploadResult.RemotePath }
-                        $btUploadLabel.Text = "Upload: Completed - $dest"
+                        Write-BtLog "Baseline: $($baselineResult.Status)  Verdict=$vStr  Findings=$($baselineResult.FindingCount)" -Level $level
+                        if ($script:BtRec_DiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
+                            try { Add-WinConfigDiagnosticArtifact -RunFolder $script:BtRec_DiagRun.RunFolder -Name "baseline.json" -Data $baselineResult } catch { }
+                        }
                     } else {
-                        Write-BtLog "Upload failed: $($uploadResult.Error)" -Level "WARN"
-                        $btUploadLabel.Text = "Upload: Failed - $($uploadResult.Error)"
+                        Write-BtLog "Baseline complete (adapter may be unavailable on this machine)" -Level "WARN"
                     }
-                }
-            } elseif (-not $btZipPath) {
-                $btUploadLabel.Text = "Upload: Skipped - no package produced"
-            }
 
-            if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) {
-                Update-ResultsDiagnosticsView
-            }
+                    # ── Transition to Phase 2: Recording ─────────────────────────
+                    $script:BtRec_Start     = Get-Date
+                    $script:BtRec_SnapCount = 1
+
+                    $btBanner.BackColor     = [System.Drawing.Color]::FromArgb(20, 65, 25)
+                    $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(160, 240, 160)
+                    $btBannerLabel.Text     = "Step 2 of 3 - Recording.  Launch NeurOptimal, reproduce the issue, then click Stop && Upload."
+
+                    Write-BtLog ""
+                    Write-BtLog "Step 2 of 3: Recording in progress" -Level "STEP"
+                    Write-BtLog "  - NeurOptimal can be launched now (it does not need to be running yet)" -Level "INFO"
+                    Write-BtLog "  - Start a session and reproduce the Bluetooth issue" -Level "INFO"
+                    Write-BtLog "  - Try pairing / unpairing / streaming audio until the problem occurs" -Level "INFO"
+                    Write-BtLog "  - Click  Stop && Upload  when done - takes about 10 seconds" -Level "INFO"
+                    Write-BtLog ""
+
+                    $btStopBtn.Enabled = $true
+
+                    # Elapsed display timer (every second)
+                    $script:BtRec_ElapsedTmr = New-Object System.Windows.Forms.Timer
+                    $script:BtRec_ElapsedTmr.Interval = 1000
+                    $script:BtRec_ElapsedTmr.Add_Tick({
+                        if ($script:BtRec_Start) {
+                            $e = [datetime]::Now - $script:BtRec_Start
+                            $btElapsedLabel.Text = "Recording  {0:mm\:ss}  (snapshot {1} captured at baseline)" -f $e, $script:BtRec_SnapCount
+                        }
+                    })
+                    $script:BtRec_ElapsedTmr.Start()
+                }
+            })
+            $btBaselinePollTmr.Start()
+
+            # ── Phase 3: Stop & Upload ─────────────────────────────────────────────
+            $btStopBtn.Add_Click({
+                $btStopBtn.Enabled = $false
+                if ($script:BtRec_ElapsedTmr) { $script:BtRec_ElapsedTmr.Stop(); $script:BtRec_ElapsedTmr.Dispose() }
+
+                $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(60, 40, 10)
+                $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 200, 100)
+                $btBannerLabel.Text      = "Step 3 of 3 - Taking final snapshot, packaging and uploading..."
+                $btElapsedLabel.Text     = "Packaging..."
+
+                Write-BtLog ""
+                Write-BtLog "Step 3 of 3: Stopping recorder - taking final snapshot..." -Level "STEP"
+
+                $btFinalJob = Start-Job -ScriptBlock {
+                    param($mp)
+                    Import-Module $mp -Force -ErrorAction SilentlyContinue
+                    Invoke-BluetoothDiagnosticsAndRecord -RecordAction {
+                        param([hashtable]$e)
+                        try { if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) { Register-WinConfigSessionAction @e } } catch {}
+                    } -TimeoutSeconds 60
+                } -ArgumentList $script:BtRec_ModulePath
+
+                $btFinalPollTmr = New-Object System.Windows.Forms.Timer
+                $btFinalPollTmr.Interval = 500
+                $btFinalPollTmr.Add_Tick({
+                    if ($btFinalJob.State -notin @('Running','NotStarted')) {
+                        $btFinalPollTmr.Stop()
+                        $btFinalPollTmr.Dispose()
+
+                        $finalResult = $null
+                        try {
+                            $finalResult = Receive-Job $btFinalJob -ErrorAction SilentlyContinue
+                            Remove-Job $btFinalJob -Force -ErrorAction SilentlyContinue
+                        } catch {
+                            Remove-Job $btFinalJob -Force -ErrorAction SilentlyContinue
+                        }
+
+                        if ($finalResult) {
+                            $vStr  = if ($finalResult.VerdictStatus) { $finalResult.VerdictStatus } else { "N/A" }
+                            $level = switch ($finalResult.Status) {
+                                "Success"        { if ($finalResult.VerdictStatus -eq "READY") { "OK" } else { "WARN" } }
+                                "PartialSuccess" { "WARN" }
+                                default          { "WARN" }
+                            }
+                            Write-BtLog "Final: $($finalResult.Status)  Verdict=$vStr  Findings=$($finalResult.FindingCount)" -Level $level
+                            if ($script:BtRec_DiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
+                                try { Add-WinConfigDiagnosticArtifact -RunFolder $script:BtRec_DiagRun.RunFolder -Name "final.json" -Data $finalResult } catch { }
+                            }
+                        }
+
+                        # Package
+                        $btZipPath = $null
+                        if ($script:BtRec_DiagRun -and (Get-Command Compress-WinConfigDiagnosticRun -ErrorAction SilentlyContinue)) {
+                            try {
+                                Write-BtLog "Packaging diagnostic artifacts..."
+                                $pkg      = Compress-WinConfigDiagnosticRun -RunFolder $script:BtRec_DiagRun.RunFolder -ExportsRoot $script:BtRec_DiagRun.ExportsRoot
+                                $btZipPath = $pkg.ZipPath
+                                $sizeKb   = [Math]::Round($pkg.SizeBytes / 1024, 1)
+                                Write-BtLog "Package ready: $btZipPath ($sizeKb KB)"
+                                $btOpenFolderBtn.Tag     = Split-Path $btZipPath -Parent
+                                $btOpenFolderBtn.Enabled = $true
+                            } catch {
+                                Write-BtLog "Packaging failed: $($_.Exception.Message)" -Level "WARN"
+                            }
+                        }
+
+                        # Upload
+                        if ($btZipPath -and (Get-Command Get-WinConfigDiagnosticsUploadConfig -ErrorAction SilentlyContinue)) {
+                            $uploadConfig = Get-WinConfigDiagnosticsUploadConfig
+                            Write-BtLog "Uploading to $($uploadConfig.Provider)..."
+                            $btUploadLabel.Text = "Upload: Sending..."
+                            $btForm.Refresh()
+                            $runIdForMeta = if ($script:BtRec_DiagRun) { $script:BtRec_DiagRun.RunId } else { "" }
+                            $uploadResult = Send-WinConfigDiagnosticPackage -PackagePath $btZipPath -Config $uploadConfig -Metadata @{ RunId = $runIdForMeta }
+                            if ($uploadResult.Status -eq 'Uploaded') {
+                                Write-BtLog "Uploaded ($($uploadResult.Provider)): $($uploadResult.RemotePath)" -Level "OK"
+                                $dest = if ($uploadResult.Provider -eq 'R2') { "R2: $($uploadResult.RemotePath)" } else { $uploadResult.RemotePath }
+                                $btUploadLabel.Text = "Upload: Completed - $dest"
+                            } else {
+                                Write-BtLog "Upload failed: $($uploadResult.Error)" -Level "WARN"
+                                $btUploadLabel.Text = "Upload: Failed - $($uploadResult.Error)"
+                            }
+                        }
+
+                        $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(20, 65, 25)
+                        $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(160, 240, 160)
+                        $btBannerLabel.Text      = "Done - diagnostic package uploaded. You may close this window."
+                        $btElapsedLabel.Text     = "Complete."
+                        $btStopBtn.Text          = "Close"
+                        $btStopBtn.Enabled       = $true
+                        $btStopBtn.Add_Click({ $btForm.Close() })
+
+                        if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
+                    }
+                })
+                $btFinalPollTmr.Start()
+            })
         }
 
 "Delete old backups" = {
