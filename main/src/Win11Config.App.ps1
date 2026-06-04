@@ -3842,7 +3842,7 @@ $buttonHandlers = @{
 
             if (-not (Get-Command Invoke-BluetoothDiagnosticsAndRecord -ErrorAction SilentlyContinue)) {
                 [System.Windows.Forms.MessageBox]::Show(
-                    "Bluetooth probe module not found. This is unexpected for a bootstrap install — please re-run the bootstrap command to repair.",
+                    "Bluetooth probe module not found. This is unexpected for a bootstrap install - please re-run the bootstrap command to repair.",
                     "Probe Not Available",
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -4018,11 +4018,12 @@ $buttonHandlers = @{
                         -Config $uploadConfig `
                         -Metadata @{ RunId = $btDiagRun.RunId }
                     if ($uploadResult.Status -eq 'Uploaded') {
-                        Write-BtLog "Uploaded: $($uploadResult.RemotePath)" -Level "SUCCESS"
-                        $btUploadLabel.Text = "Upload: Completed — $($uploadResult.RemotePath)"
+                        Write-BtLog "Uploaded ($($uploadResult.Provider)): $($uploadResult.RemotePath)" -Level "SUCCESS"
+                        $dest = if ($uploadResult.Provider -eq 'R2') { "R2: $($uploadResult.RemotePath)" } else { $uploadResult.RemotePath }
+                        $btUploadLabel.Text = "Upload: Completed — $dest"
                     } else {
                         Write-BtLog "Upload failed: $($uploadResult.Error)" -Level "WARN"
-                        $btUploadLabel.Text = "Upload: Failed — local copy retained at temp path"
+                        $btUploadLabel.Text = "Upload: Failed — $($uploadResult.Error)"
                     }
                 }
             } elseif (-not $btZipPath) {

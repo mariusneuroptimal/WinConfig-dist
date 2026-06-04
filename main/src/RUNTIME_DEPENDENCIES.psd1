@@ -11,6 +11,7 @@
         "src/RUNTIME_DEPENDENCIES.psd1"
         "src/Manifest/WinConfig.Tools.psd1"   # Tool registry with Dry Run declarations
         "src/Manifest/WinConfig.Parity.psd1"  # Category-tool parity assertions
+        "src/Config/WinConfig.DiagnosticsConfig.psd1"  # Upload config (credentials injected at publish time)
         # Auxiliary scripts launched via Start-Process from button handlers.
         # Without these in the manifest the bootstrap doesn't stage them, so
         # DISM Restore Health and /sfc scannow silently no-op on bootstrap installs.
