@@ -3865,7 +3865,7 @@ $buttonHandlers = @{
             $btOutputForm.Controls.Add($btStatusPanel)
 
             $btLocalPathLabel = New-Object System.Windows.Forms.Label
-            $btLocalPathLabel.Text = "Local package: —"
+            $btLocalPathLabel.Text = "Local package: -"
             $btLocalPathLabel.AutoSize = $false
             $btLocalPathLabel.Width = 660
             $btLocalPathLabel.Height = 18
@@ -3875,7 +3875,7 @@ $buttonHandlers = @{
             $btStatusPanel.Controls.Add($btLocalPathLabel)
 
             $btUploadLabel = New-Object System.Windows.Forms.Label
-            $btUploadLabel.Text = "Upload: —"
+            $btUploadLabel.Text = "Upload: -"
             $btUploadLabel.AutoSize = $false
             $btUploadLabel.Width = 480
             $btUploadLabel.Height = 18
@@ -4020,14 +4020,14 @@ $buttonHandlers = @{
                     if ($uploadResult.Status -eq 'Uploaded') {
                         Write-BtLog "Uploaded ($($uploadResult.Provider)): $($uploadResult.RemotePath)" -Level "SUCCESS"
                         $dest = if ($uploadResult.Provider -eq 'R2') { "R2: $($uploadResult.RemotePath)" } else { $uploadResult.RemotePath }
-                        $btUploadLabel.Text = "Upload: Completed — $dest"
+                        $btUploadLabel.Text = "Upload: Completed - $dest"
                     } else {
                         Write-BtLog "Upload failed: $($uploadResult.Error)" -Level "WARN"
-                        $btUploadLabel.Text = "Upload: Failed — $($uploadResult.Error)"
+                        $btUploadLabel.Text = "Upload: Failed - $($uploadResult.Error)"
                     }
                 }
             } elseif (-not $btZipPath) {
-                $btUploadLabel.Text = "Upload: Skipped — no package produced"
+                $btUploadLabel.Text = "Upload: Skipped - no package produced"
             }
 
             if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) {
