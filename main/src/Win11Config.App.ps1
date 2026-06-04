@@ -3814,10 +3814,13 @@ $buttonHandlers = @{
                 return
             }
 
-            # Locate probe module: env var override, then sibling-repo default
+            # Locate probe module: env var override → bundled copy → sibling-repo (dev only)
             if (-not (Get-Command Invoke-BluetoothDiagnosticsAndRecord -ErrorAction SilentlyContinue)) {
                 $btModulePath = $env:WINCONFIG_BT_MODULE_PATH
                 if (-not $btModulePath) {
+                    $btModulePath = Join-Path $PSScriptRoot "Modules\BluetoothProbe.psm1"
+                }
+                if (-not (Test-Path $btModulePath)) {
                     $winConfigRoot = Split-Path -Parent $PSScriptRoot
                     $reposRoot    = Split-Path -Parent $winConfigRoot
                     $btModulePath  = Join-Path $reposRoot "winconfig-bluetooth\src\Modules\Bluetooth.psm1"
@@ -3839,7 +3842,7 @@ $buttonHandlers = @{
 
             if (-not (Get-Command Invoke-BluetoothDiagnosticsAndRecord -ErrorAction SilentlyContinue)) {
                 [System.Windows.Forms.MessageBox]::Show(
-                    "Bluetooth probe module not found.`n`nExpected sibling repo layout: ..\winconfig-bluetooth\src\Modules\Bluetooth.psm1`nOr set WINCONFIG_BT_MODULE_PATH to override.",
+                    "Bluetooth probe module not found. This is unexpected for a bootstrap install — please re-run the bootstrap command to repair.",
                     "Probe Not Available",
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -4021,8 +4024,6 @@ $buttonHandlers = @{
                         Write-BtLog "Upload failed: $($uploadResult.Error)" -Level "WARN"
                         $btUploadLabel.Text = "Upload: Failed — local copy retained at temp path"
                     }
-                } else {
-                    $btUploadLabel.Text = "Upload: Not configured (set WINCONFIG_DIAGNOSTICS_DEST to enable)"
                 }
             } elseif (-not $btZipPath) {
                 $btUploadLabel.Text = "Upload: Skipped — no package produced"

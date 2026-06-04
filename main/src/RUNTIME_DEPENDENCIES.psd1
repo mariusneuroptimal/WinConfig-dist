@@ -51,6 +51,7 @@
            Prefix = "WinConfig" }
         @{ Path = "src/Modules/DiagnosticsPackage.psm1" }   # Diagnostic run folder + ZIP packaging
         @{ Path = "src/Modules/DiagnosticsUpload.psm1" }    # Diagnostic package upload (LocalFolder provider)
+        @{ Path = "src/Modules/BluetoothProbe.psm1" }       # Bluetooth diagnostics probe (bundled from winconfig-bluetooth)
     )
 
     # Documentation of invariants (for governance reference)

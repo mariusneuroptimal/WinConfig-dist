@@ -22,17 +22,13 @@ function Get-WinConfigDiagnosticsUploadConfig {
     param()
 
     $dest = $env:WINCONFIG_DIAGNOSTICS_DEST
-    if ($dest) {
-        return @{
-            Enabled         = $true
-            Provider        = 'LocalFolder'
-            DestinationPath = $dest
-        }
+    if (-not $dest) {
+        $dest = Join-Path $env:USERPROFILE "Documents\WinConfigDiagnostics"
     }
     return @{
-        Enabled         = $false
+        Enabled         = $true
         Provider        = 'LocalFolder'
-        DestinationPath = ''
+        DestinationPath = $dest
     }
 }
 
