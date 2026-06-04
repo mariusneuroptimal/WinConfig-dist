@@ -3944,7 +3944,7 @@ $buttonHandlers = @{
                     } `
                     -TimeoutSeconds 60
             } catch {
-                Write-BtLog "Probe exception: $($_.Exception.Message)" -Level "ERROR"
+                Write-BtLog "Probe exception: $($_.Exception.Message)" -Level "FAIL"
                 if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
                     Register-WinConfigSessionAction -Action "Bluetooth Diagnostics Complete" `
                         -Category "Bluetooth" -Result "FAIL" -Tier 5 `
@@ -3967,7 +3967,7 @@ $buttonHandlers = @{
                 $statusLine = "Status: $($btProbeResult.Status)  |  Verdict: $verdictLabel  |  Findings: $($btProbeResult.FindingCount)  |  Duration: $($btProbeResult.DurationMs)ms"
 
                 $btLogLevel = switch ($btProbeResult.Status) {
-                    "Success"        { if ($btProbeResult.VerdictStatus -eq "READY") { "SUCCESS" } else { "WARN" } }
+                    "Success"        { if ($btProbeResult.VerdictStatus -eq "READY") { "OK" } else { "WARN" } }
                     "PartialSuccess" { "WARN" }
                     "NoAdapter"      { "WARN" }
                     default          { "ERROR" }
@@ -3975,7 +3975,7 @@ $buttonHandlers = @{
                 Write-BtLog $statusLine -Level $btLogLevel
 
                 if ($btProbeResult.Error) {
-                    Write-BtLog "Error: $($btProbeResult.Error)" -Level "ERROR"
+                    Write-BtLog "Error: $($btProbeResult.Error)" -Level "FAIL"
                 }
 
                 if ($btProbeResult.Status -in @("Failed", "Timeout")) {
