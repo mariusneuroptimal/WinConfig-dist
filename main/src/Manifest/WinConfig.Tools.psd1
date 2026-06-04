@@ -68,39 +68,6 @@
     # Each tool must declare all fields explicitly - no defaults
     tools = @(
         # =========================================================================
-        # BLUETOOTH TOOLS
-        # =========================================================================
-        @{
-            Id             = "bluetooth-diagnostics"
-            Name           = "Bluetooth Diagnostics"
-            Category       = "Bluetooth"
-            ToolCategory   = "Bluetooth"
-            MutatesSystem  = $false
-            SupportsDryRun = $false  # Read-only diagnostic
-            Description    = "Gathers Bluetooth adapter and device information"
-        }
-        @{
-            Id             = "bluetooth-service-restart"
-            Name           = "Restart Bluetooth Service"
-            Category       = "Bluetooth"
-            ToolCategory   = "Bluetooth"
-            MutatesSystem  = $true
-            SupportsDryRun = $true   # REQUIRED: Mutates service state
-            Description    = "Restarts the Bluetooth Support Service"
-            RequiresAdmin  = $true
-        }
-        @{
-            Id             = "bluetooth-driver-reinstall"
-            Name           = "Reinstall Bluetooth Driver"
-            Category       = "Bluetooth"
-            ToolCategory   = "Bluetooth"
-            MutatesSystem  = $true
-            SupportsDryRun = $true   # REQUIRED: High-blast driver removal
-            Description    = "Removes and reinstalls the Bluetooth adapter driver"
-            RequiresAdmin  = $true
-        }
-
-        # =========================================================================
         # NETWORK TOOLS
         # =========================================================================
         @{
@@ -193,6 +160,15 @@
         # =========================================================================
         # AUDIO TOOLS
         # =========================================================================
+        @{
+            Id             = "bluetooth-diagnostics"
+            Name           = "Run Bluetooth Diagnostics"
+            Category       = "Bluetooth"
+            ToolCategory   = "Bluetooth"
+            MutatesSystem  = $false
+            SupportsDryRun = $false  # Read-only diagnostic
+            Description    = "Runs Bluetooth probe and records findings via analytics callback"
+        }
         @{
             Id             = "audio-diagnostics"
             Name           = "Audio Diagnostics"

@@ -89,10 +89,10 @@ function New-DryRunPlan {
     .OUTPUTS
         PSCustomObject: The plan object
     .EXAMPLE
-        $plan = New-DryRunPlan -ToolId "bluetooth-service-restart" `
-            -ToolName "Restart Bluetooth Service" `
-            -Steps @("Stop bthserv service", "Wait for service stop", "Start bthserv service") `
-            -AffectedResources @("Service:bthserv") `
+        $plan = New-DryRunPlan -ToolId "audio-service-restart" `
+            -ToolName "Restart Audio Service" `
+            -Steps @("Stop Audiosrv service", "Wait for service stop", "Start Audiosrv service") `
+            -AffectedResources @("Service:Audiosrv") `
             -RequiresAdmin $true `
             -Reversible $true
     #>
@@ -381,13 +381,13 @@ function Invoke-DryRunGuarded {
     .OUTPUTS
         PSCustomObject: Ledger entry with operation result
     .EXAMPLE
-        Invoke-DryRunGuarded -ToolId "bluetooth-service-restart" -DryRun -PlanScript {
-            New-DryRunPlan -ToolId "bluetooth-service-restart" -ToolName "Restart Bluetooth" `
+        Invoke-DryRunGuarded -ToolId "audio-service-restart" -DryRun -PlanScript {
+            New-DryRunPlan -ToolId "audio-service-restart" -ToolName "Restart Audio" `
                 -Steps @("Stop service", "Start service") `
-                -AffectedResources @("Service:bthserv") -RequiresAdmin $true
+                -AffectedResources @("Service:Audiosrv") -RequiresAdmin $true
         } -ExecuteScript {
             param($Plan)
-            Restart-Service -Name bthserv
+            Restart-Service -Name Audiosrv
         }
     #>
     [CmdletBinding()]
@@ -851,7 +851,7 @@ function Assert-MutationGuarded {
         A WinConfig.ExecutionContext object created by the guarded entrypoint.
         Must include: ExecutionIntent, IsDryRun, DryRunSource
     .EXAMPLE
-        Assert-MutationGuarded -ToolId "bluetooth-service-restart" -ToolName "Restart Bluetooth" `
+        Assert-MutationGuarded -ToolId "audio-service-restart" -ToolName "Restart Audio" `
             -ExecutionContext $ctx
     #>
     [CmdletBinding()]
@@ -1097,15 +1097,6 @@ function Invoke-DryRunContractAudit {
         $missingPlanGenerators = @("(cannot scan: App.ps1 not found)")
     }
 
-    # --- Count legacy refusal adapters (New-DryRunRefusal calls in Bluetooth.psm1) ---
-    $refusalCount = 0
-    $btModulePath = Join-Path $PSScriptRoot "Bluetooth.psm1"
-    if (Test-Path $btModulePath) {
-        $btContent = Get-Content $btModulePath -Raw
-        $refusalMatches = [regex]::Matches($btContent, 'New-DryRunRefusal')
-        $refusalCount = $refusalMatches.Count
-    }
-
     # --- Guarded commands ---
     $guardedCmds = $script:DryRunGuardedCommands
 
@@ -1164,11 +1155,6 @@ function Invoke-DryRunContractAudit {
             Write-Host "    MISSING: $m" -ForegroundColor Red
         }
     }
-    Write-Host ""
-
-    # Section 4: Legacy adapters
-    Write-Host "REFUSAL ADAPTERS" -ForegroundColor Yellow
-    Write-Host "  New-DryRunRefusal calls (Bluetooth.psm1): $refusalCount"
     Write-Host ""
 
     # Section 5: Guarded commands

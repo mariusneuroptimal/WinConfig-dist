@@ -93,34 +93,6 @@ if ($script:OptionalLoaded['SessionOperationLedger']) {
 # They are NOT loaded at startup. They load on first use.
 # ============================================================================
 
-$script:BluetoothModuleLoaded = $false
-
-function Ensure-BluetoothModule {
-    <#
-    .SYNOPSIS
-        Lazy-loads the Bluetooth module on first use (PERF-001).
-    .DESCRIPTION
-        Bluetooth.psm1 (2400+ lines) is only needed when user accesses
-        the Bluetooth tab (~10% of sessions). Deferring saves ~100ms startup.
-        Module path and prefix are declared in RUNTIME_DEPENDENCIES.psd1 (Deferred=$true).
-    #>
-    if (-not $script:BluetoothModuleLoaded) {
-        foreach ($entry in $script:ManifestResult.Deferred) {
-            $name = [System.IO.Path]::GetFileNameWithoutExtension($entry.Path)
-            if ($name -eq 'Bluetooth') {
-                $localRel = ($entry.Path -replace '^src/', '') -replace '/', '\'
-                $fullPath = Join-Path $PSScriptRoot $localRel
-                if (Test-Path $fullPath) {
-                    $importArgs = @{ Path = $fullPath }
-                    if ($entry.Prefix) { $importArgs.Prefix = $entry.Prefix }
-                    $null = Import-OptionalModule @importArgs
-                    $script:BluetoothModuleLoaded = $true
-                }
-                break
-            }
-        }
-    }
-}
 
 # Network.Diagnostics module - NOT loaded in prod (only used by tests)
 # Tests import it directly when needed. No runtime dependency.
@@ -3805,28 +3777,6 @@ $buttonHandlers = @{
         # =========================================================================
         # SERVICE RESTART TOOLS (Mutating - Dry Run supported)
         # =========================================================================
-        "Restart Bluetooth Service" = {
-            $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-            if (-not $isAdmin) {
-                [System.Windows.Forms.MessageBox]::Show("Restarting services requires Administrator privileges.`n`nPlease restart WinConfig as Administrator.", "Elevation Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-                return
-            }
-
-            try {
-                Restart-Service -Name "bthserv" -Force -ErrorAction Stop
-                if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                    Register-WinConfigSessionAction -Action "Bluetooth Service Restart" -Detail "bthserv restarted" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "PASS" -Tier 1 -Summary "Service restarted"
-                }
-                if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
-                [System.Windows.Forms.MessageBox]::Show("Bluetooth Support Service has been restarted.", "Success", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-            } catch {
-                if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                    Register-WinConfigSessionAction -Action "Bluetooth Service Restart" -Detail "Restart failed: $($_.Exception.Message)" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "FAIL" -Tier 2 -Summary "Service restart failed"
-                }
-                [System.Windows.Forms.MessageBox]::Show("Failed to restart Bluetooth service: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-            }
-        }
-
         "Restart Audio Service" = {
             $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
             if (-not $isAdmin) {
@@ -3846,6 +3796,240 @@ $buttonHandlers = @{
                     Register-WinConfigSessionAction -Action "Audio Service Restart" -Detail "Restart failed: $($_.Exception.Message)" -Category "AdminChange" -ToolCategory "Audio" -Result "FAIL" -Tier 2 -Summary "Service restart failed"
                 }
                 [System.Windows.Forms.MessageBox]::Show("Failed to restart Audio service: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            }
+        }
+
+        # =========================================================================
+        # BLUETOOTH DIAGNOSTICS TOOL (Read-only - no dry run needed)
+        # =========================================================================
+        "Run Bluetooth Diagnostics" = {
+            # GUARD: Verify Console module is available for diagnostic output
+            if (-not (Get-Command Initialize-WinConfigGuiDiagnosticBox -ErrorAction SilentlyContinue)) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Bluetooth Diagnostics cannot start: Console module failed to load.`n`nThe Initialize-WinConfigGuiDiagnosticBox function is not available.",
+                    "Module Load Error",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                ) | Out-Null
+                return
+            }
+
+            # Locate probe module: env var override, then sibling-repo default
+            if (-not (Get-Command Invoke-BluetoothDiagnosticsAndRecord -ErrorAction SilentlyContinue)) {
+                $btModulePath = $env:WINCONFIG_BT_MODULE_PATH
+                if (-not $btModulePath) {
+                    $winConfigRoot = Split-Path -Parent $PSScriptRoot
+                    $reposRoot    = Split-Path -Parent $winConfigRoot
+                    $btModulePath  = Join-Path $reposRoot "winconfig-bluetooth\src\Modules\Bluetooth.psm1"
+                }
+                if (Test-Path $btModulePath) {
+                    try {
+                        Import-Module $btModulePath -Force -Global -ErrorAction Stop
+                    } catch {
+                        [System.Windows.Forms.MessageBox]::Show(
+                            "Failed to load Bluetooth probe module:`n$($_.Exception.Message)",
+                            "Module Load Error",
+                            [System.Windows.Forms.MessageBoxButtons]::OK,
+                            [System.Windows.Forms.MessageBoxIcon]::Error
+                        ) | Out-Null
+                        return
+                    }
+                }
+            }
+
+            if (-not (Get-Command Invoke-BluetoothDiagnosticsAndRecord -ErrorAction SilentlyContinue)) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Bluetooth probe module not found.`n`nExpected sibling repo layout: ..\winconfig-bluetooth\src\Modules\Bluetooth.psm1`nOr set WINCONFIG_BT_MODULE_PATH to override.",
+                    "Probe Not Available",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning
+                ) | Out-Null
+                return
+            }
+
+            # Output form with status panel at bottom
+            $btOutputForm = New-Object System.Windows.Forms.Form
+            $btOutputForm.Text = "Bluetooth Diagnostics"
+            $btOutputForm.Size = New-Object System.Drawing.Size(700, 520)
+            $btOutputForm.StartPosition = "CenterScreen"
+
+            # Bottom status panel (add before Fill control so docking respects it)
+            $btStatusPanel = New-Object System.Windows.Forms.Panel
+            $btStatusPanel.Dock = [System.Windows.Forms.DockStyle]::Bottom
+            $btStatusPanel.Height = 90
+            $btStatusPanel.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 6)
+            $btStatusPanel.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
+            $btOutputForm.Controls.Add($btStatusPanel)
+
+            $btLocalPathLabel = New-Object System.Windows.Forms.Label
+            $btLocalPathLabel.Text = "Local package: —"
+            $btLocalPathLabel.AutoSize = $false
+            $btLocalPathLabel.Width = 660
+            $btLocalPathLabel.Height = 18
+            $btLocalPathLabel.Location = New-Object System.Drawing.Point(8, 6)
+            $btLocalPathLabel.Font = New-Object System.Drawing.Font("Consolas", 8)
+            $btLocalPathLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
+            $btStatusPanel.Controls.Add($btLocalPathLabel)
+
+            $btUploadLabel = New-Object System.Windows.Forms.Label
+            $btUploadLabel.Text = "Upload: —"
+            $btUploadLabel.AutoSize = $false
+            $btUploadLabel.Width = 480
+            $btUploadLabel.Height = 18
+            $btUploadLabel.Location = New-Object System.Drawing.Point(8, 28)
+            $btUploadLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+            $btUploadLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
+            $btStatusPanel.Controls.Add($btUploadLabel)
+
+            $btOpenFolderBtn = New-Object System.Windows.Forms.Button
+            $btOpenFolderBtn.Text = "Open Folder"
+            $btOpenFolderBtn.Location = New-Object System.Drawing.Point(8, 54)
+            $btOpenFolderBtn.AutoSize = $true
+            $btOpenFolderBtn.Enabled = $false
+            $btOpenFolderBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btOpenFolderBtn.Add_Click({
+                param($sender, $e)
+                if ($sender.Tag) { Start-Process explorer.exe $sender.Tag }
+            })
+            $btStatusPanel.Controls.Add($btOpenFolderBtn)
+
+            # Main diagnostic output (fills remaining space)
+            $btOutputBox = New-Object System.Windows.Forms.RichTextBox
+            $btOutputBox.Multiline = $true
+            $btOutputBox.ScrollBars = "Vertical"
+            $btOutputBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+            Initialize-WinConfigGuiDiagnosticBox -Box $btOutputBox
+            $btOutputForm.Controls.Add($btOutputBox)
+            $btOutputForm.Show()
+            $btOutputForm.Refresh()
+
+            function Write-BtLog {
+                param([string]$Message, [string]$Level = "INFO")
+                Write-WinConfigGuiDiagnostic -Level $Level -Message $Message -Box $btOutputBox -NoPrefix
+                $btOutputForm.Refresh()
+            }
+
+            # Create diagnostic run folder (if DiagnosticsPackage module loaded)
+            $btDiagRun = $null
+            if (Get-Command New-WinConfigDiagnosticRun -ErrorAction SilentlyContinue) {
+                try {
+                    $btDiagRun = New-WinConfigDiagnosticRun -ToolId 'bluetooth-diagnostics'
+                    Write-BtLog "Run ID: $($btDiagRun.RunId)"
+                    # Write manifest before probe so it persists even on probe failure
+                    Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name "manifest.json" -Data @{
+                        RunId          = $btDiagRun.RunId
+                        ToolId         = 'bluetooth-diagnostics'
+                        StartedAtUtc   = $btDiagRun.StartedAtUtc
+                        PackageVersion = '1.0'
+                    }
+                } catch {
+                    Write-BtLog "Diagnostic run init failed: $($_.Exception.Message)" -Level "WARN"
+                    $btDiagRun = $null
+                }
+            }
+
+            Write-BtLog "Initializing Bluetooth probe..."
+
+            $btProbeResult = $null
+            try {
+                $btProbeResult = Invoke-BluetoothDiagnosticsAndRecord `
+                    -RecordAction {
+                        param([hashtable]$entry)
+                        if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                            Register-WinConfigSessionAction @entry
+                        }
+                    } `
+                    -TimeoutSeconds 60
+            } catch {
+                Write-BtLog "Probe exception: $($_.Exception.Message)" -Level "ERROR"
+                if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                    Register-WinConfigSessionAction -Action "Bluetooth Diagnostics Complete" `
+                        -Category "Bluetooth" -Result "FAIL" -Tier 5 `
+                        -Summary "Probe exception" -Evidence @{}
+                }
+            }
+
+            # Write probe result artifact
+            if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
+                try {
+                    $resultData = if ($btProbeResult) { $btProbeResult } else { @{ Status = 'ProbeException' } }
+                    Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name "probe-result.json" -Data $resultData
+                } catch {
+                    Write-BtLog "Artifact write failed: $($_.Exception.Message)" -Level "WARN"
+                }
+            }
+
+            if ($btProbeResult) {
+                $verdictLabel = if ($null -ne $btProbeResult.VerdictStatus) { $btProbeResult.VerdictStatus } else { "N/A" }
+                $statusLine = "Status: $($btProbeResult.Status)  |  Verdict: $verdictLabel  |  Findings: $($btProbeResult.FindingCount)  |  Duration: $($btProbeResult.DurationMs)ms"
+
+                $btLogLevel = switch ($btProbeResult.Status) {
+                    "Success"        { if ($btProbeResult.VerdictStatus -eq "READY") { "SUCCESS" } else { "WARN" } }
+                    "PartialSuccess" { "WARN" }
+                    "NoAdapter"      { "WARN" }
+                    default          { "ERROR" }
+                }
+                Write-BtLog $statusLine -Level $btLogLevel
+
+                if ($btProbeResult.Error) {
+                    Write-BtLog "Error: $($btProbeResult.Error)" -Level "ERROR"
+                }
+
+                if ($btProbeResult.Status -in @("Failed", "Timeout")) {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "Bluetooth diagnostics failed: $($btProbeResult.Status)`n`n$($btProbeResult.Error)",
+                        "Diagnostics Failed",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Error
+                    ) | Out-Null
+                }
+            }
+
+            # Package the run folder into a ZIP
+            $btZipPath = $null
+            if ($btDiagRun -and (Get-Command Compress-WinConfigDiagnosticRun -ErrorAction SilentlyContinue)) {
+                try {
+                    Write-BtLog "Packaging diagnostic artifacts..."
+                    $pkg = Compress-WinConfigDiagnosticRun -RunFolder $btDiagRun.RunFolder -ExportsRoot $btDiagRun.ExportsRoot
+                    $btZipPath = $pkg.ZipPath
+                    $sizeKb = [Math]::Round($pkg.SizeBytes / 1024, 1)
+                    Write-BtLog "Package ready: $btZipPath ($sizeKb KB)"
+                    $btLocalPathLabel.Text = "Local: $btZipPath"
+                    $btOpenFolderBtn.Tag = Split-Path $btZipPath -Parent
+                    $btOpenFolderBtn.Enabled = $true
+                } catch {
+                    Write-BtLog "Packaging failed: $($_.Exception.Message)" -Level "WARN"
+                    $btLocalPathLabel.Text = "Local: packaging failed"
+                }
+            }
+
+            # Upload
+            if ($btZipPath -and (Get-Command Get-WinConfigDiagnosticsUploadConfig -ErrorAction SilentlyContinue)) {
+                $uploadConfig = Get-WinConfigDiagnosticsUploadConfig
+                if ($uploadConfig.Enabled) {
+                    Write-BtLog "Uploading to $($uploadConfig.Provider): $($uploadConfig.DestinationPath)"
+                    $btUploadLabel.Text = "Upload: Sending..."
+                    $btOutputForm.Refresh()
+                    $uploadResult = Send-WinConfigDiagnosticPackage `
+                        -PackagePath $btZipPath `
+                        -Config $uploadConfig `
+                        -Metadata @{ RunId = $btDiagRun.RunId }
+                    if ($uploadResult.Status -eq 'Uploaded') {
+                        Write-BtLog "Uploaded: $($uploadResult.RemotePath)" -Level "SUCCESS"
+                        $btUploadLabel.Text = "Upload: Completed — $($uploadResult.RemotePath)"
+                    } else {
+                        Write-BtLog "Upload failed: $($uploadResult.Error)" -Level "WARN"
+                        $btUploadLabel.Text = "Upload: Failed — local copy retained at temp path"
+                    }
+                } else {
+                    $btUploadLabel.Text = "Upload: Not configured (set WINCONFIG_DIAGNOSTICS_DEST to enable)"
+                }
+            } elseif (-not $btZipPath) {
+                $btUploadLabel.Text = "Upload: Skipped — no package produced"
+            }
+
+            if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) {
+                Update-ResultsDiagnosticsView
             }
         }
 
@@ -4276,425 +4460,6 @@ $buttonHandlers = @{
 
     $outputForm.ShowDialog() | Out-Null
 }
-# ===== PHASE 7: BLUETOOTH PRESET =====
-# =============================================================================
-# PRESET INVARIANT (LOCKED - Do not modify without explicit approval):
-#   A preset is SYNTACTIC SUGAR ONLY - a named ordered list of tool invocations.
-#   It MUST:
-#     - Invoke existing tool buttons (PerformClick)
-#     - Let each tool register its own result
-#     - Support cancellation (cancel current + skip remaining)
-#   It MUST NOT:
-#     - Have its own result or ToolCategory
-#     - Skip tool registration
-#     - Short-circuit failures (unless cancelled)
-#     - Contain special logic beyond sequencing
-#   If "Smart BT Check" is ever proposed: the answer is NO.
-# =============================================================================
-"BT Quick Check" = {
-    $presetBtn = $this
-    $actionRow = $presetBtn.Parent
-
-    # Detect context: Dashboard (simple Panel) vs Tools tab (FlowLayoutPanel with status/cancel)
-    $isDashboardContext = -not ($actionRow.Controls | Where-Object { $_.Tag -eq "status" })
-
-    if ($isDashboardContext) {
-        # === DASHBOARD CONTEXT: Run probe and refresh dashboard ===
-        $presetBtn.Enabled = $false
-        $originalText = $presetBtn.Text
-        $presetBtn.Text = "Running..."
-
-        try {
-            Ensure-BluetoothModule
-
-            # Run the Bluetooth probe if available
-            if (Get-Command Invoke-WinConfigBluetoothProbe -ErrorAction SilentlyContinue) {
-                $probeResult = & 'Invoke-WinConfigBluetoothProbe'
-                $script:LastBluetoothProbeResult = $probeResult
-
-                # Update details label with probe summary
-                if ($script:BTDetailsLabel -and $probeResult) {
-                    $summaryParts = @()
-                    if ($probeResult.Result) { $summaryParts += "Probe: $($probeResult.Result)" }
-                    if ($probeResult.Issues -and $probeResult.Issues.Count -gt 0) {
-                        $summaryParts += "Issues: $($probeResult.Issues.Count)"
-                    }
-                    if ($summaryParts.Count -gt 0) {
-                        $script:BTDetailsLabel.Text = $summaryParts -join " | "
-                    }
-                }
-            }
-
-            # Refresh the dashboard data
-            if ($script:UpdateBluetoothDashboardFn) {
-                & $script:UpdateBluetoothDashboardFn
-            }
-        } catch {
-            if ($script:BTDetailsLabel) {
-                $script:BTDetailsLabel.Text = "Probe failed: $($_.Exception.Message)"
-            }
-        } finally {
-            $presetBtn.Text = $originalText
-            $presetBtn.Enabled = $true
-        }
-        return
-    }
-
-    # === TOOLS TAB CONTEXT: Sequential tool execution ===
-    $statusLabel = $actionRow.Controls | Where-Object { $_.Tag -eq "status" } | Select-Object -First 1
-    $cancelBtn = $actionRow.Controls | Where-Object { $_.Tag -eq "cancel" } | Select-Object -First 1
-
-    if (-not $statusLabel -or -not $cancelBtn) {
-        [System.Windows.Forms.MessageBox]::Show("UI structure error: status controls not found", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-        return
-    }
-
-    # Find the 4 diagnostic tool buttons in the same category panel
-    $categoryPanel = $presetBtn.Parent.Parent  # actionRow -> FlowLayoutPanel -> categoryPanel
-    $toolButtons = @()
-    foreach ($control in $categoryPanel.Controls) {
-        if ($control -is [System.Windows.Forms.FlowLayoutPanel]) {
-            foreach ($actionRowControl in $control.Controls) {
-                if ($actionRowControl -is [System.Windows.Forms.Button] -and $actionRowControl.Tag -eq "action") {
-                    $btnText = $actionRowControl.Text
-                    if ($btnText -in @("Check Adapter", "Check Services", "List Paired", "Power Settings")) {
-                        $toolButtons += $actionRowControl
-                    }
-                }
-            }
-        }
-    }
-
-    if ($toolButtons.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("No diagnostic tools found in panel", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-        return
-    }
-
-    # Show preset running status
-    $presetBtn.Enabled = $false
-    $statusLabel.Text = "Running 0/$($toolButtons.Count)..."
-    $statusLabel.Visible = $true
-    $cancelBtn.Visible = $true
-    $cancelBtn.Enabled = $true
-
-    # Cancellation flag for preset
-    $script:PresetCancelled = $false
-    $script:PresetToolButtons = $toolButtons
-    $script:PresetStatusLabel = $statusLabel
-    $script:PresetBtn = $presetBtn
-    $script:PresetCancelBtn = $cancelBtn
-
-    # Wire cancel button for preset
-    $cancelBtn.Tag = "preset-cancel"
-    $cancelBtn.Add_Click({
-        param($sender, $e)
-        if ($sender.Tag -eq "preset-cancel") {
-            $script:PresetCancelled = $true
-            $sender.Enabled = $false
-            $script:PresetStatusLabel.Text = "Cancelling..."
-        }
-    }.GetNewClosure())
-
-    $presetTimer = New-Object System.Windows.Forms.Timer
-    $presetTimer.Interval = 100  # Check every 100ms
-    $presetTimer.Tag = @{ WaitingForTool = $false; CurrentIndex = 0 }
-
-    $presetTimer.Add_Tick({
-        param($sender, $e)
-
-        $state = $sender.Tag
-        $buttons = $script:PresetToolButtons
-
-        # Guard: if buttons not defined, stop timer
-        if (-not $buttons -or $buttons.Count -eq 0) {
-            $sender.Stop()
-            $sender.Dispose()
-            return
-        }
-
-        $total = $buttons.Count
-
-        # Check for cancellation
-        if ($script:PresetCancelled) {
-            # If a tool is running, let it finish (it will handle its own cancellation)
-            # Then stop the preset
-            if ($state.WaitingForTool) {
-                $currentBtn = $buttons[$state.CurrentIndex]
-                if ($currentBtn -and -not $currentBtn.Enabled) {
-                    # Tool still running - wait for it
-                    return
-                }
-            }
-            # Preset cancelled - clean up
-            $sender.Stop()
-            $sender.Dispose()
-            if ($script:PresetStatusLabel) { $script:PresetStatusLabel.Visible = $false }
-            if ($script:PresetCancelBtn) { $script:PresetCancelBtn.Visible = $false }
-            if ($script:PresetBtn) { $script:PresetBtn.Enabled = $true }
-            return
-        }
-
-        # Check if current tool is still running (button disabled = running)
-        if ($state.WaitingForTool) {
-            $currentBtn = $buttons[$state.CurrentIndex]
-            if (-not $currentBtn) { return }  # Guard against null button
-            if ($currentBtn.Enabled) {
-                # Tool finished, move to next
-                $state.WaitingForTool = $false
-                $state.CurrentIndex++
-                if ($script:PresetStatusLabel) { $script:PresetStatusLabel.Text = "Running $($state.CurrentIndex)/$total..." }
-            }
-            return
-        }
-
-        # Start next tool or finish
-        if ($state.CurrentIndex -lt $total) {
-            $nextBtn = $buttons[$state.CurrentIndex]
-            if (-not $nextBtn) { return }  # Guard against null button
-            $state.WaitingForTool = $true
-            # Programmatically click the tool button
-            $nextBtn.PerformClick()
-        } else {
-            # All tools done
-            $sender.Stop()
-            $sender.Dispose()
-            if ($script:PresetStatusLabel) { $script:PresetStatusLabel.Visible = $false }
-            if ($script:PresetCancelBtn) { $script:PresetCancelBtn.Visible = $false }
-            if ($script:PresetBtn) { $script:PresetBtn.Enabled = $true }
-        }
-    })
-
-    $presetTimer.Start()
-}
-# ===== BLUETOOTH INDIVIDUAL TOOLS (Phase 4/5) =====
-# PERF-001: These handlers use string invocation to prevent symbol resolution at parse time.
-# Each tool runs async with explicit ToolCategory for ledger grouping
-# Summaries follow Phase 5 contract: noun-first, deterministic, no prose
-"Check Adapter" = {
-    $actionBtn = $this
-    $actionRow = $actionBtn.Parent
-    $statusLabel = $actionRow.Controls | Where-Object { $_.Tag -eq "status" } | Select-Object -First 1
-    $cancelBtn = $actionRow.Controls | Where-Object { $_.Tag -eq "cancel" } | Select-Object -First 1
-
-    if (-not $statusLabel -or -not $cancelBtn) {
-        [System.Windows.Forms.MessageBox]::Show("UI structure error: status controls not found", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-        return
-    }
-
-    Ensure-BluetoothModule
-
-    $work = {
-        $adapter = & 'Get-WinConfigBluetoothAdapterInfo'
-        if ($adapter.Present) {
-            $status = if ($adapter.Enabled) { "PASS" } else { "WARN" }
-            $name = $adapter.FriendlyName
-            $driver = if ($adapter.DriverInfo.Version) { "(v$($adapter.DriverInfo.Version))" } else { "" }
-            # Phase 5: noun-first summary
-            @{
-                Result = $status
-                Summary = "Adapter: $name $driver".Trim()
-                Evidence = $adapter
-            }
-        } else {
-            @{
-                Result = "FAIL"
-                Summary = "Adapter: not found"
-                Evidence = $adapter
-            }
-        }
-    }
-
-    if (Get-Command Invoke-WinConfigToolActionAsync -ErrorAction SilentlyContinue) {
-        Invoke-WinConfigToolActionAsync -ActionName "Check Adapter" -Category "Diagnostics" -ToolCategory "Bluetooth" `
-            -ActionButton $actionBtn -StatusLabel $statusLabel -CancelButton $cancelBtn -Work $work
-    } else {
-        # Sync fallback
-        $actionBtn.Enabled = $false
-        $statusLabel.Text = "Checking..."
-        $statusLabel.Visible = $true
-        try {
-            $adapter = & 'Get-WinConfigBluetoothAdapterInfo'
-            $result = if ($adapter.Present -and $adapter.Enabled) { "PASS" } elseif ($adapter.Present) { "WARN" } else { "FAIL" }
-            $summary = if ($adapter.Present) { "Adapter: $($adapter.FriendlyName)" } else { "Adapter: not found" }
-            if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                Register-WinConfigSessionAction -Action "Check Adapter" -Detail "Checked Bluetooth adapter" -Category "Diagnostics" -ToolCategory "Bluetooth" -Result $result -Tier 0 -Summary $summary -Evidence $adapter
-            }
-            if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
-        } finally {
-            $actionBtn.Enabled = $true
-            $statusLabel.Visible = $false
-        }
-    }
-}
-"Check Services" = {
-    $actionBtn = $this
-    $actionRow = $actionBtn.Parent
-    $statusLabel = $actionRow.Controls | Where-Object { $_.Tag -eq "status" } | Select-Object -First 1
-    $cancelBtn = $actionRow.Controls | Where-Object { $_.Tag -eq "cancel" } | Select-Object -First 1
-
-    if (-not $statusLabel -or -not $cancelBtn) {
-        [System.Windows.Forms.MessageBox]::Show("UI structure error: status controls not found", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-        return
-    }
-
-    Ensure-BluetoothModule
-
-    $work = {
-        $services = & 'Get-WinConfigBluetoothServiceStates'
-        $btSupport = $services["bthserv"]
-        $btGateway = $services["BTAGService"]
-
-        $allRunning = $btSupport.Running -and $btGateway.Running
-        $anyRunning = $btSupport.Running -or $btGateway.Running
-
-        $status = if ($allRunning) { "PASS" } elseif ($anyRunning) { "WARN" } else { "FAIL" }
-
-        $parts = @()
-        if ($btSupport.Running) { $parts += "bthserv OK" } else { $parts += "bthserv $($btSupport.Status)" }
-        if ($btGateway.Running) { $parts += "BTAG OK" } else { $parts += "BTAG $($btGateway.Status)" }
-
-        # Phase 5: noun-first summary
-        @{
-            Result = $status
-            Summary = "Services: $($parts -join ', ')"
-            Evidence = $services
-        }
-    }
-
-    if (Get-Command Invoke-WinConfigToolActionAsync -ErrorAction SilentlyContinue) {
-        Invoke-WinConfigToolActionAsync -ActionName "Check Services" -Category "Diagnostics" -ToolCategory "Bluetooth" `
-            -ActionButton $actionBtn -StatusLabel $statusLabel -CancelButton $cancelBtn -Work $work
-    } else {
-        $actionBtn.Enabled = $false
-        $statusLabel.Text = "Checking..."
-        $statusLabel.Visible = $true
-        try {
-            $services = & 'Get-WinConfigBluetoothServiceStates'
-            $btSupport = $services["bthserv"]
-            $allRunning = $btSupport.Running
-            $result = if ($allRunning) { "PASS" } else { "WARN" }
-            $summary = if ($btSupport.Running) { "Services: bthserv OK" } else { "Services: bthserv $($btSupport.Status)" }
-            if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                Register-WinConfigSessionAction -Action "Check Services" -Detail "Checked Bluetooth services" -Category "Diagnostics" -ToolCategory "Bluetooth" -Result $result -Tier 0 -Summary $summary -Evidence $services
-            }
-            if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
-        } finally {
-            $actionBtn.Enabled = $true
-            $statusLabel.Visible = $false
-        }
-    }
-}
-"List Paired" = {
-    $actionBtn = $this
-    $actionRow = $actionBtn.Parent
-    $statusLabel = $actionRow.Controls | Where-Object { $_.Tag -eq "status" } | Select-Object -First 1
-    $cancelBtn = $actionRow.Controls | Where-Object { $_.Tag -eq "cancel" } | Select-Object -First 1
-
-    if (-not $statusLabel -or -not $cancelBtn) {
-        [System.Windows.Forms.MessageBox]::Show("UI structure error: status controls not found", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-        return
-    }
-
-    Ensure-BluetoothModule
-
-    $work = {
-        $devices = & 'Get-WinConfigBluetoothPairedAudioDevices'
-        $count = @($devices).Count
-        $connected = @($devices | Where-Object { $_.IsConnected }).Count
-
-        $status = if ($connected -gt 0) { "PASS" } elseif ($count -gt 0) { "WARN" } else { "PASS" }  # No devices is OK
-        # Phase 5: noun-first summary
-        $summary = if ($count -eq 0) { "Paired devices: none" } else { "Paired devices: $connected/$count connected" }
-
-        @{
-            Result = $status
-            Summary = $summary
-            Evidence = $devices
-        }
-    }
-
-    if (Get-Command Invoke-WinConfigToolActionAsync -ErrorAction SilentlyContinue) {
-        Invoke-WinConfigToolActionAsync -ActionName "List Paired" -Category "Diagnostics" -ToolCategory "Bluetooth" `
-            -ActionButton $actionBtn -StatusLabel $statusLabel -CancelButton $cancelBtn -Work $work
-    } else {
-        $actionBtn.Enabled = $false
-        $statusLabel.Text = "Scanning..."
-        $statusLabel.Visible = $true
-        try {
-            $devices = & 'Get-WinConfigBluetoothPairedAudioDevices'
-            $count = @($devices).Count
-            $summary = if ($count -eq 0) { "Paired devices: none" } else { "Paired devices: $count" }
-            if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                Register-WinConfigSessionAction -Action "List Paired" -Detail "Listed paired Bluetooth devices" -Category "Diagnostics" -ToolCategory "Bluetooth" -Result "PASS" -Tier 0 -Summary $summary -Evidence $devices
-            }
-            if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
-        } finally {
-            $actionBtn.Enabled = $true
-            $statusLabel.Visible = $false
-        }
-    }
-}
-"Power Settings" = {
-    $actionBtn = $this
-    $actionRow = $actionBtn.Parent
-    $statusLabel = $actionRow.Controls | Where-Object { $_.Tag -eq "status" } | Select-Object -First 1
-    $cancelBtn = $actionRow.Controls | Where-Object { $_.Tag -eq "cancel" } | Select-Object -First 1
-
-    if (-not $statusLabel -or -not $cancelBtn) {
-        [System.Windows.Forms.MessageBox]::Show("UI structure error: status controls not found", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-        return
-    }
-
-    Ensure-BluetoothModule
-
-    $work = {
-        $power = & 'Get-WinConfigPowerPlanInfo'
-
-        # High Performance or Ultimate = PASS, Balanced = WARN, Power Saver = FAIL
-        $status = switch -Wildcard ($power.ActivePlan) {
-            "*High*" { "PASS" }
-            "*Ultimate*" { "PASS" }
-            "*Balanced*" { "WARN" }
-            "*Power*" { "FAIL" }
-            default { "WARN" }
-        }
-
-        # Phase 5: noun-first summary
-        @{
-            Result = $status
-            Summary = "Power plan: $($power.ActivePlan)"
-            Evidence = $power
-        }
-    }
-
-    if (Get-Command Invoke-WinConfigToolActionAsync -ErrorAction SilentlyContinue) {
-        Invoke-WinConfigToolActionAsync -ActionName "Power Settings" -Category "Diagnostics" -ToolCategory "Bluetooth" `
-            -ActionButton $actionBtn -StatusLabel $statusLabel -CancelButton $cancelBtn -Work $work
-    } else {
-        $actionBtn.Enabled = $false
-        $statusLabel.Text = "Checking..."
-        $statusLabel.Visible = $true
-        try {
-            $power = & 'Get-WinConfigPowerPlanInfo'
-            $summary = "Power plan: $($power.ActivePlan)"
-            if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                Register-WinConfigSessionAction -Action "Power Settings" -Detail "Checked power plan" -Category "Diagnostics" -ToolCategory "Bluetooth" -Result "PASS" -Tier 0 -Summary $summary -Evidence $power
-            }
-            if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
-        } finally {
-            $actionBtn.Enabled = $true
-            $statusLabel.Visible = $false
-        }
-    }
-}
-"Bluetooth Settings" = {
-    # Opens Windows Bluetooth settings - Phase 5: noun-first summary
-    Start-Process "ms-settings:bluetooth"
-    if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-        Register-WinConfigSessionAction -Action "Bluetooth Settings" -Detail "Opened Windows Bluetooth settings" -Category "Diagnostics" -ToolCategory "Bluetooth" -Result "PASS" -Tier 0 -Summary "Settings: opened"
-    }
-    if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
-}
 }
 
 # FINAL: 2-tab structure (Tools → Details)
@@ -4713,7 +4478,6 @@ foreach ($tabName in $tabPages) {
 # PERF-001: Lazy loading flags for expensive tabs
 # The UI must render before expensive work (module loads, CIM queries) begins
 $script:DiagnosticsTabInitialized = $false
-$script:BluetoothTabInitialized = $false
 $script:ToolsTabInitialized = $false  # UI-REWORK: Tools tab lazy load
 
 # Populate tab pages
@@ -4779,8 +4543,8 @@ foreach ($tabPage in $tabControl.TabPages) {
             "NO Shortcuts",
             "Disk",
             "System",
-            "Bluetooth",
             "Audio",
+            "Bluetooth",
             "zAmp",
             "Zengar UI"
         )
@@ -5022,62 +4786,6 @@ foreach ($tabPage in $tabControl.TabPages) {
                 # =========================================================================
                 # SERVICE RESTART TOOLS
                 # =========================================================================
-                "bluetooth-service-restart" = {
-                    # === PLAN PHASE: Check service state ===
-                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-                    if (-not $isAdmin) {
-                        return New-DryRunPlan `
-                            -ToolId "bluetooth-service-restart" `
-                            -ToolName "Restart Bluetooth Service" `
-                            -Steps @("PLAN FAILED: Cannot proceed") `
-                            -AffectedResources @("Unknown - planning aborted") `
-                            -RequiresAdmin $true `
-                            -Reversible $true `
-                            -EstimatedImpact "Unknown" `
-                            -Preconditions @("Admin: FAILED") `
-                            -Evidence @{
-                                PlanFailed = $true
-                                FailureReason = "Administrator privileges are required to restart services."
-                                Preconditions = @{ IsAdmin = $false }
-                                Findings = @{}
-                            }
-                    }
-
-                    # === READ-ONLY DISCOVERY: Check Bluetooth service state ===
-                    $serviceInfo = @{}
-                    try {
-                        $svc = Get-Service -Name "bthserv" -ErrorAction Stop
-                        $serviceInfo = @{
-                            Name = $svc.Name
-                            DisplayName = $svc.DisplayName
-                            Status = $svc.Status.ToString()
-                            StartType = $svc.StartType.ToString()
-                        }
-                    } catch {
-                        $serviceInfo = @{ Name = "bthserv"; Status = "NotFound"; Error = $_.Exception.Message }
-                    }
-
-                    $actions = @(
-                        (New-DryRunStep -Verb WOULD_RESTART -Target "service: bthserv" -Detail "Bluetooth Support Service").Summary,
-                        (New-DryRunStep -Verb WOULD_EXEC -Target "service state verification").Summary
-                    )
-
-                    New-DryRunPlan `
-                        -ToolId "bluetooth-service-restart" `
-                        -ToolName "Restart Bluetooth Service" `
-                        -Steps $actions `
-                        -AffectedResources @("Service:bthserv", "Service:BluetoothUserService") `
-                        -RequiresAdmin $true `
-                        -Reversible $true `
-                        -EstimatedImpact "Low" `
-                        -Preconditions @("Admin: $isAdmin", "Service: $($serviceInfo.Status)") `
-                        -Evidence @{
-                            Preconditions = @{ IsAdmin = $isAdmin }
-                            Findings = @{ Service = $serviceInfo }
-                        }
-                }
-
                 "audio-service-restart" = {
                     # === PLAN PHASE: Check audio service state ===
                     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -5330,87 +5038,6 @@ foreach ($tabPage in $tabControl.TabPages) {
                                 TotalSizeMB = $sizeInMB
                                 SampleItems = $binItems
                             }
-                        }
-                }
-
-                "bluetooth-driver-reinstall" = {
-                    # === PLAN PHASE: Check for active Bluetooth adapter ===
-                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-                    if (-not $isAdmin) {
-                        return New-DryRunPlan `
-                            -ToolId "bluetooth-driver-reinstall" `
-                            -ToolName "Reinstall Bluetooth Driver" `
-                            -Steps @("PLAN FAILED: Cannot proceed") `
-                            -AffectedResources @("Unknown - planning aborted") `
-                            -RequiresAdmin $true `
-                            -Reversible $true `
-                            -EstimatedImpact "Unknown" `
-                            -Preconditions @("Admin: FAILED") `
-                            -Evidence @{
-                                PlanFailed    = $true
-                                FailureReason = "Administrator privileges are required to reinstall drivers."
-                                Preconditions = @{ IsAdmin = $false }
-                                Findings      = @{}
-                            }
-                    }
-
-                    # === READ-ONLY DISCOVERY: Find active Bluetooth adapter ===
-                    $adapterInfo = @{}
-                    $adapterFound = $false
-                    try {
-                        $adapters = Get-PnpDevice -Class Bluetooth -ErrorAction Stop |
-                            Where-Object { $_.Status -eq 'OK' -and $_.FriendlyName -notmatch 'Enumerator|Transport' }
-                        $adapter = $adapters | Select-Object -First 1
-                        if ($adapter) {
-                            $adapterFound = $true
-                            $adapterInfo = @{
-                                InstanceId   = $adapter.InstanceId
-                                FriendlyName = $adapter.FriendlyName
-                                Status       = $adapter.Status
-                                Class        = $adapter.Class
-                            }
-                        }
-                    } catch {
-                        $adapterInfo = @{ Error = $_.Exception.Message }
-                    }
-
-                    if (-not $adapterFound) {
-                        return New-DryRunPlan `
-                            -ToolId "bluetooth-driver-reinstall" `
-                            -ToolName "Reinstall Bluetooth Driver" `
-                            -Steps @("PLAN FAILED: No active Bluetooth adapter found") `
-                            -AffectedResources @("Unknown - no adapter detected") `
-                            -RequiresAdmin $true `
-                            -Reversible $true `
-                            -EstimatedImpact "Unknown" `
-                            -Preconditions @("Admin: $isAdmin", "Adapter: NOT FOUND") `
-                            -Evidence @{
-                                PlanFailed    = $true
-                                FailureReason = "No active Bluetooth adapter detected."
-                                Preconditions = @{ IsAdmin = $isAdmin; AdapterFound = $false }
-                                Findings      = $adapterInfo
-                            }
-                    }
-
-                    $actions = @(
-                        (New-DryRunStep -Verb WOULD_DISABLE -Target "Bluetooth adapter: $($adapterInfo.FriendlyName)" -Detail "InstanceId: $($adapterInfo.InstanceId)").Summary,
-                        (New-DryRunStep -Verb WOULD_ENABLE -Target "Bluetooth adapter: $($adapterInfo.FriendlyName)" -Detail "Re-enable after 2-second wait").Summary,
-                        (New-DryRunStep -Verb WOULD_EXEC -Target "adapter state verification" -Detail "Confirm adapter returned to OK status").Summary
-                    )
-
-                    New-DryRunPlan `
-                        -ToolId "bluetooth-driver-reinstall" `
-                        -ToolName "Reinstall Bluetooth Driver" `
-                        -Steps $actions `
-                        -AffectedResources @("PnpDevice:$($adapterInfo.InstanceId)", "All paired Bluetooth devices") `
-                        -RequiresAdmin $true `
-                        -Reversible $true `
-                        -EstimatedImpact "Medium" `
-                        -Preconditions @("Admin: $isAdmin", "Adapter: $($adapterInfo.FriendlyName)") `
-                        -Evidence @{
-                            Preconditions = @{ IsAdmin = $isAdmin; AdapterFound = $true }
-                            Findings      = @{ Adapter = $adapterInfo }
                         }
                 }
 
@@ -5908,20 +5535,6 @@ No system changes were made.
                 SupportsDryRun = $true
                 MutatesSystem = $true
             }
-            # Bluetooth tools
-            "BT Quick Check"           = @{ Description = "Run all Bluetooth checks"; Group = "Preset" }
-            "Check Adapter"            = @{ Description = "Verify Bluetooth adapter status"; Group = "Diagnostics" }
-            "Check Services"           = @{ Description = "Check Bluetooth service state"; Group = "Diagnostics" }
-            "List Paired"              = @{ Description = "Show paired devices"; Group = "Diagnostics" }
-            "Power Settings"           = @{ Description = "Review power management"; Group = "Diagnostics" }
-            "Bluetooth Settings"       = @{ Description = "Open Windows BT settings"; Group = "Settings" }
-            "Restart Bluetooth Service" = @{
-                Description = "Restart bthserv service"
-                Group = "Actions"
-                ToolId = "bluetooth-service-restart"
-                SupportsDryRun = $true
-                MutatesSystem = $true
-            }
             # Audio tools
             "Remove Intel SST Audio Driver" = @{
                 Description = "Uninstall problematic SST driver"
@@ -5938,6 +5551,13 @@ No system changes were made.
                 MutatesSystem = $true
             }
             "Sound Panel"              = @{ Description = "Open sound control panel"; Group = "Settings" }
+            "Run Bluetooth Diagnostics" = @{
+                Description = "Run Bluetooth probe and record findings"
+                Group = "Diagnostics"
+                ToolId = "bluetooth-diagnostics"
+                SupportsDryRun = $false
+                MutatesSystem = $false
+            }
             # Maintenance tools
             "DISM Restore Health"      = @{ Description = "Repair Windows component store"; Group = "Repair" }
             "/sfc scannow"             = @{ Description = "Scan and repair system files"; Group = "Repair" }
@@ -5986,8 +5606,8 @@ No system changes were made.
         # Category → Tool mappings (uses $script:Categories as keys)
         $script:CategoryTools = [ordered]@{
             "Network"      = @("Run Network Test", "Domain, IP && Ports Test", "Network Reset", "Flush DNS Cache", "Open Speedtest.net")
-            "Bluetooth"    = @("BT Quick Check", "Check Adapter", "Check Services", "List Paired", "Power Settings", "Restart Bluetooth Service", "Bluetooth Settings")
-            "Audio"        = @("Remove Intel SST Audio Driver", "Restart Audio Service", "Sound Panel")
+            "Audio"        = @("Remove Intel SST Audio Driver", "Restart Audio Service", "Sound Panel", "Run Bluetooth Diagnostics")
+            "Bluetooth"    = @("Run Bluetooth Diagnostics")
             "System"       = @("Copy System Info", "Copy Device Name", "Copy Serial Number", "Device Manager", "Task Manager", "Control Panel")
             "zAmp"         = @("Uninstall zAmp Drivers")
             "Zengar UI"    = @("Apply Win 11 Start Menu", "Apply branding colors", "Pin Taskbar Icons", "Apply Win Update Icon")
@@ -6311,1375 +5931,6 @@ No system changes were made.
             return @{ Panel = $btnPanel; Button = $btn }
         }
 
-        # =============================================================================
-        # BLUETOOTH DASHBOARD - Compressed hierarchy layout
-        # Row 1: Bluetooth Snapshot (single wide card - Radio | Route | Health)
-        # Row 2: Devices (primary) | Actions (slim rail ~180px)
-        # Row 3: Kodi panel (conditional - only if detected)
-        # =============================================================================
-        function New-BluetoothDashboard {
-            # Root container: TableLayoutPanel with 2 rows (Kodi row added dynamically)
-            # STATUS STRIP design: 48px compact header, no border, horizontal flow
-            $root = New-Object System.Windows.Forms.TableLayoutPanel
-            $root.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $root.RowCount = 2
-            $root.ColumnCount = 1
-            [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 48)))   # Status strip (compact)
-            [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))   # Workspace row
-            $root.Padding = New-Object System.Windows.Forms.Padding(5)
-
-            # Create shared ToolTip component for Bluetooth dashboard
-            $script:BTToolTip = New-Object System.Windows.Forms.ToolTip
-            $script:BTToolTip.AutoPopDelay = 15000
-            $script:BTToolTip.InitialDelay = 400
-            $script:BTToolTip.ReshowDelay = 200
-            $script:BTToolTip.ShowAlways = $true
-
-            # === ROW 1: Bluetooth Status Strip (compact, no border, horizontal) ===
-            $statusStrip = New-Object System.Windows.Forms.Panel
-            $statusStrip.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $statusStrip.BackColor = [System.Drawing.Color]::FromArgb(248, 249, 250)  # Subtle gray, no border
-            $statusStrip.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
-
-            $stripFlow = New-Object System.Windows.Forms.FlowLayoutPanel
-            $stripFlow.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $stripFlow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
-            $stripFlow.WrapContents = $false
-            $stripFlow.Padding = New-Object System.Windows.Forms.Padding(8, 12, 8, 8)
-
-            # Radio segment
-            $radioLine = New-Object System.Windows.Forms.Label
-            $radioLine.Text = "Radio: ..."
-            $radioLine.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-            $radioLine.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
-            $radioLine.AutoSize = $true
-            $radioLine.Margin = New-Object System.Windows.Forms.Padding(0, 0, 20, 0)
-            $radioLine.Tag = "radio-line"
-            $stripFlow.Controls.Add($radioLine)
-            $script:BTRadioLine = $radioLine
-
-            # Separator
-            $sep1 = New-Object System.Windows.Forms.Label
-            $sep1.Text = "|"
-            $sep1.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-            $sep1.ForeColor = [System.Drawing.Color]::FromArgb(180, 180, 180)
-            $sep1.AutoSize = $true
-            $sep1.Margin = New-Object System.Windows.Forms.Padding(0, 0, 20, 0)
-            $stripFlow.Controls.Add($sep1)
-
-            # Route segment
-            $routeLine = New-Object System.Windows.Forms.Label
-            $routeLine.Text = "Route: ..."
-            $routeLine.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-            $routeLine.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
-            $routeLine.AutoSize = $true
-            $routeLine.Margin = New-Object System.Windows.Forms.Padding(0, 0, 20, 0)
-            $routeLine.Tag = "route-line"
-            $stripFlow.Controls.Add($routeLine)
-            $script:BTRouteLine = $routeLine
-
-            # Separator
-            $sep2 = New-Object System.Windows.Forms.Label
-            $sep2.Text = "|"
-            $sep2.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-            $sep2.ForeColor = [System.Drawing.Color]::FromArgb(180, 180, 180)
-            $sep2.AutoSize = $true
-            $sep2.Margin = New-Object System.Windows.Forms.Padding(0, 0, 20, 0)
-            $stripFlow.Controls.Add($sep2)
-
-            # Health segment
-            $healthLine = New-Object System.Windows.Forms.Label
-            $healthLine.Text = "Health: ..."
-            $healthLine.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-            $healthLine.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
-            $healthLine.AutoSize = $true
-            $healthLine.Tag = "health-line"
-            $stripFlow.Controls.Add($healthLine)
-            $script:BTHealthLine = $healthLine
-
-            $statusStrip.Controls.Add($stripFlow)
-            $root.Controls.Add($statusStrip, 0, 0)
-
-            # === ROW 2: Workspace (Devices primary | Actions slim rail) ===
-            $workspace = New-Object System.Windows.Forms.SplitContainer
-            $workspace.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $workspace.Orientation = [System.Windows.Forms.Orientation]::Vertical
-            $workspace.FixedPanel = [System.Windows.Forms.FixedPanel]::Panel2  # Fix actions rail width
-            $workspace.SplitterWidth = 3
-            # SCAFFOLDING (required before setting Panel*MinSize):
-            # A SplitContainer's default Size is 150x100. Setting Panel2MinSize beyond
-            # ~(Width - default SplitterDistance) raises:
-            #   "SplitterDistance must be between Panel1MinSize and Width - Panel2MinSize"
-            # because the setter cascades into a SplitterDistance re-clamp. At 200% DPI
-            # our Panel2MinSize would be 280 > 150 and throw on first dashboard build.
-            # Bump Size and SplitterDistance to safe values that satisfy the constraint;
-            # Dock=Fill (set above) reflows the container once it's parented, and
-            # FixedPanel=Panel2 preserves the chosen actions-rail width across resizes.
-            $btnRailWidth = [int]([Math]::Round(140 * $script:DpiScale))
-            $workspace.Size = New-Object System.Drawing.Size(2000, 1000)
-            $workspace.SplitterDistance = 2000 - $btnRailWidth - $workspace.SplitterWidth
-            # DPI-scaled so the actions rail stays usable at higher scaling (Surface Pro at 200% etc.)
-            $workspace.Panel1MinSize = [int]([Math]::Round(50 * $script:DpiScale))
-            $workspace.Panel2MinSize = $btnRailWidth
-            $workspace.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
-
-            # Left pane (primary): Devices list + COM ports
-            $devicesPanel = New-Object System.Windows.Forms.Panel
-            $devicesPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $devicesPanel.Padding = New-Object System.Windows.Forms.Padding(0)
-            $devicesPanel.BackColor = [System.Drawing.Color]::White
-
-            $devicesHeader = New-Object System.Windows.Forms.Label
-            $devicesHeader.Text = "Bluetooth Audio Devices"
-            $devicesHeader.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-            $devicesHeader.ForeColor = $tabColor
-            $devicesHeader.Dock = [System.Windows.Forms.DockStyle]::Top
-            # AutoSize so the row height tracks the font (clips at fixed 25 px on high-DPI/text-scaled systems).
-            $devicesHeader.AutoSize = $true
-            $devicesHeader.Padding = New-Object System.Windows.Forms.Padding(0, 2, 0, 2)
-            $script:BTToolTip.SetToolTip($devicesHeader, "Bluetooth audio devices with two-axis state model:`n`nPresence: Connected | Paired | Remembered | Ghost`nActivity: Active (audio route) | Idle | Inactive`n`nRemembered = registry-only (not currently present)`nGhost = non-present with driver/COM residue`n`nDevices are never labeled 'Paired' unless a live bond exists.")
-            $devicesPanel.Controls.Add($devicesHeader)
-
-            # Expert View checkbox (NirSoft-inspired raw view)
-            $expertCheck = New-Object System.Windows.Forms.CheckBox
-            $expertCheck.Text = "Expert View"
-            $expertCheck.Font = New-Object System.Drawing.Font("Segoe UI", 7)
-            $expertCheck.ForeColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
-            $expertCheck.AutoSize = $true
-            $expertCheck.Dock = [System.Windows.Forms.DockStyle]::Top
-            # Drop fixed Height=18: AutoSize already determines the natural row height; the explicit
-            # height was clipping the checkbox + label at higher font scaling.
-            $expertCheck.Padding = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
-            $script:BTToolTip.SetToolTip($expertCheck, "Reveals cached/remembered devices and technical details.`n`nDefault: Only connected (present) devices`nExpert: + Remembered + Ghost + Instance IDs`n`nUse for investigating stale device residue.")
-            $expertCheck.Add_CheckedChanged({
-                $script:BTExpertViewEnabled = $this.Checked
-                if ($script:UpdateBluetoothDashboardFn) {
-                    $script:BluetoothDashboardLoaded = $false
-                    . $script:UpdateBluetoothDashboardFn
-                    $script:BluetoothDashboardLoaded = $true
-                }
-            })
-            $devicesPanel.Controls.Add($expertCheck)
-            $script:BTExpertViewCheck = $expertCheck
-            $script:BTExpertViewEnabled = $false
-
-            # Devices ListView (primary - fills available space)
-            $devicesList = New-Object System.Windows.Forms.ListView
-            $devicesList.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $devicesList.View = [System.Windows.Forms.View]::Details
-            $devicesList.FullRowSelect = $true
-            $devicesList.GridLines = $true
-            $devicesList.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-            $devicesList.ShowItemToolTips = $true
-            # DPI-scaled column widths so text isn't truncated at >100% scaling.
-            [void]$devicesList.Columns.Add("Device",   [int]([Math]::Round(150 * $script:DpiScale)))
-            [void]$devicesList.Columns.Add("Presence", [int]([Math]::Round( 85 * $script:DpiScale)))
-            [void]$devicesList.Columns.Add("Activity", [int]([Math]::Round( 65 * $script:DpiScale)))
-            [void]$devicesList.Columns.Add("Notes",    [int]([Math]::Round( 80 * $script:DpiScale)))
-            $devicesList.Tag = "devices-list"
-            $devicesPanel.Controls.Add($devicesList)
-            $script:BTDevicesList = $devicesList
-
-            # Cached devices footer (below grid, not inside it - scan efficiency rule)
-            $cachedFooter = New-Object System.Windows.Forms.Label
-            $cachedFooter.Dock = [System.Windows.Forms.DockStyle]::Bottom
-            $cachedFooter.AutoSize = $true
-            $cachedFooter.Text = ""
-            $cachedFooter.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
-            $cachedFooter.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 120)
-            $cachedFooter.Padding = New-Object System.Windows.Forms.Padding(4, 2, 0, 0)
-            $cachedFooter.Visible = $false
-            $cachedFooter.Cursor = [System.Windows.Forms.Cursors]::Hand
-            $cachedFooter.Add_Click({
-                # Toggle Expert View when clicking the footer
-                if ($script:BTExpertViewCheck) {
-                    $script:BTExpertViewCheck.Checked = $true
-                }
-            })
-            $script:BTToolTip.SetToolTip($cachedFooter, "Click to enable Expert View and show cached devices.")
-            $devicesPanel.Controls.Add($cachedFooter)
-            $script:BTCachedFooter = $cachedFooter
-
-            # COM Ports panel (compact, collapsible, bottom - hidden by default, shown if ghosts exist)
-            $comPortsPanel = New-Object System.Windows.Forms.Panel
-            $comPortsPanel.Dock = [System.Windows.Forms.DockStyle]::Bottom
-            # DPI-scaled height so the embedded ListView + header don't get vertically clipped at >100% scaling.
-            $comPortsPanel.Height = [int]([Math]::Round(75 * $script:DpiScale))
-            $comPortsPanel.BackColor = [System.Drawing.Color]::FromArgb(255, 253, 245)  # Subtle warm tint
-            $comPortsPanel.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-            $comPortsPanel.Visible = $false  # Hidden until ghost ports detected
-
-            $comPortsHeader = New-Object System.Windows.Forms.Label
-            $comPortsHeader.Text = "$([char]0x26A0) Bluetooth COM Ports"
-            $comPortsHeader.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
-            $comPortsHeader.ForeColor = [System.Drawing.Color]::FromArgb(140, 110, 20)
-            $comPortsHeader.Dock = [System.Windows.Forms.DockStyle]::Top
-            $comPortsHeader.AutoSize = $true
-            $comPortsHeader.Padding = New-Object System.Windows.Forms.Padding(4, 2, 0, 0)
-            $script:BTToolTip.SetToolTip($comPortsHeader, "Ghost Bluetooth COM ports detected.`nThese are orphaned serial device registrations that accumulate over time.`nHigh counts often cause pairing and connectivity failures.")
-            $comPortsPanel.Controls.Add($comPortsHeader)
-            $script:BTCOMPortsHeader = $comPortsHeader
-            $script:BTCOMPortsPanel = $comPortsPanel
-
-            # COM Ports ListView (compact single-line display)
-            $comPortsList = New-Object System.Windows.Forms.ListView
-            $comPortsList.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $comPortsList.View = [System.Windows.Forms.View]::Details
-            $comPortsList.FullRowSelect = $true
-            $comPortsList.GridLines = $false
-            $comPortsList.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-            $comPortsList.ShowItemToolTips = $true
-            $comPortsList.HeaderStyle = [System.Windows.Forms.ColumnHeaderStyle]::Nonclickable
-            # DPI-scaled to keep the COM port row legible at higher scaling.
-            [void]$comPortsList.Columns.Add("COM",    [int]([Math]::Round( 45 * $script:DpiScale)))
-            [void]$comPortsList.Columns.Add("Device", [int]([Math]::Round(100 * $script:DpiScale)))
-            [void]$comPortsList.Columns.Add("Status", [int]([Math]::Round( 50 * $script:DpiScale)))
-            [void]$comPortsList.Columns.Add("Notes",  [int]([Math]::Round( 60 * $script:DpiScale)))
-            $comPortsList.Tag = "com-ports-list"
-            $comPortsPanel.Controls.Add($comPortsList)
-            $script:BTCOMPortsList = $comPortsList
-
-            $devicesPanel.Controls.Add($comPortsPanel)
-
-            $workspace.Panel1.Controls.Add($devicesPanel)
-
-            # Right pane: Quick Actions / Recovery (collapsed by default)
-            # NO SCROLLBAR - all primary actions visible in default window size
-            $actionsPanel = New-Object System.Windows.Forms.FlowLayoutPanel
-            $actionsPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $actionsPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
-            $actionsPanel.WrapContents = $false
-            $actionsPanel.AutoScroll = $false  # NO scroll - layout must fit
-            $actionsPanel.Padding = New-Object System.Windows.Forms.Padding(6, 4, 6, 4)
-            $actionsPanel.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
-
-            # Helper for collapsible section
-            function New-CollapsibleSection {
-                param([string]$Title, [string]$Tag, [bool]$StartCollapsed = $true)
-
-                $header = New-Object System.Windows.Forms.Label
-                $arrow = if ($StartCollapsed) { [char]0x25B6 } else { [char]0x25BC }
-                $header.Text = "$arrow $Title"
-                $header.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
-                $header.ForeColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
-                $header.AutoSize = $true
-                $header.Margin = New-Object System.Windows.Forms.Padding(0, 10, 0, 4)
-                $header.Cursor = [System.Windows.Forms.Cursors]::Hand
-
-                $container = New-Object System.Windows.Forms.FlowLayoutPanel
-                $container.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
-                $container.WrapContents = $false
-                $container.AutoSize = $true
-                $container.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-                $container.Margin = New-Object System.Windows.Forms.Padding(12, 0, 0, 0)
-                $container.Tag = $Tag
-                $container.Visible = -not $StartCollapsed
-
-                # Store container reference directly in header's Tag for the click handler
-                $header.Tag = @{ Title = $Title; Container = $container }
-
-                # Wire toggle - use direct reference from Tag
-                $header.Add_Click({
-                    param($sender, $e)
-                    $tagData = $sender.Tag
-                    $cont = $tagData.Container
-                    $titleText = $tagData.Title
-                    if ($cont) {
-                        $cont.Visible = -not $cont.Visible
-                        if ($cont.Visible) {
-                            $sender.Text = [char]0x25BC + " " + $titleText
-                        } else {
-                            $sender.Text = [char]0x25B6 + " " + $titleText
-                        }
-                    }
-                })
-
-                return @{ Header = $header; Container = $container }
-            }
-
-            # === QUICK ACTIONS (always visible) ===
-            $actionsHeader = New-Object System.Windows.Forms.Label
-            $actionsHeader.Text = "Quick Actions"
-            $actionsHeader.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-            $actionsHeader.ForeColor = $tabColor
-            $actionsHeader.AutoSize = $true
-            $actionsHeader.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
-            $actionsPanel.Controls.Add($actionsHeader)
-
-            # Refresh Data (non-destructive)
-            $btnRefresh = New-Button "Refresh Data"
-            $btnRefresh.Tag = "action"
-            $btnRefresh.Add_Click({
-                if ($script:UpdateBluetoothDashboardFn) {
-                    $script:BluetoothDashboardLoaded = $false
-                    . $script:UpdateBluetoothDashboardFn
-                    $script:BluetoothDashboardLoaded = $true
-                }
-            })
-            $script:BTToolTip.SetToolTip($btnRefresh, "Re-collects current Bluetooth state without making changes.`nSafe to run at any time.")
-            $actionsPanel.Controls.Add($btnRefresh)
-
-            # Run Quick Check (runs the suite)
-            $btnQuickCheck = New-Button "Quick Check"
-            $btnQuickCheck.Tag = "action"
-            if ($buttonHandlers.ContainsKey("BT Quick Check")) {
-                $btnQuickCheck.Add_Click($buttonHandlers["BT Quick Check"])
-                # Note: Not added to ToolButtonRegistry (dashboard context, not Tools tab)
-            }
-            $script:BTToolTip.SetToolTip($btnQuickCheck, "Runs additional diagnostics to detect routing issues, power problems, and audio instability.`nMay take several seconds.")
-            $actionsPanel.Controls.Add($btnQuickCheck)
-
-            # Bluetooth Settings
-            $btnSettings = New-Button "BT Settings"
-            $btnSettings.Tag = "action"
-            if ($buttonHandlers.ContainsKey("Bluetooth Settings")) {
-                $btnSettings.Add_Click($buttonHandlers["Bluetooth Settings"])
-                # Note: Not added to ToolButtonRegistry (dashboard context, not Tools tab)
-            }
-            $script:BTToolTip.SetToolTip($btnSettings, "Opens Windows Bluetooth & devices settings.`nUse to pair new devices or manage existing connections.")
-            $actionsPanel.Controls.Add($btnSettings)
-
-            # === RECOVERY (collapsible, tiered resets) ===
-            $recoverySection = New-CollapsibleSection -Title "Recovery" -Tag "recovery-container" -StartCollapsed $true
-            $script:BTToolTip.SetToolTip($recoverySection.Header, "Escalation actions that modify system state.`nUse only after identifying a fault above.")
-            $actionsPanel.Controls.Add($recoverySection.Header)
-
-            # Tier 0: Reveal Hidden (SAFE - read-only)
-            $btnRevealHidden = New-Button "Reveal Hidden"
-            $btnRevealHidden.Tag = "action"
-            $btnRevealHidden.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-            $btnRevealHidden.ForeColor = [System.Drawing.Color]::FromArgb(60, 100, 140)  # Blue tint - safe action
-            $script:BTToolTip.SetToolTip($btnRevealHidden, "Opens Device Manager with hidden devices visible.`nSafe read-only action - does not modify anything.`nLook for grayed-out ghost devices under Ports and Bluetooth.")
-            $btnRevealHidden.Add_Click({
-                try {
-                    if (Get-Command Invoke-WinConfigRevealHiddenBluetoothDevices -ErrorAction SilentlyContinue) {
-                        $result = & 'Invoke-WinConfigRevealHiddenBluetoothDevices'
-                        if (-not $result.Success) {
-                            [System.Windows.Forms.MessageBox]::Show($result.Message, "Reveal Hidden Devices", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-                        }
-                    }
-                } catch {
-                    [System.Windows.Forms.MessageBox]::Show("Failed to open Device Manager: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-                }
-            }.GetNewClosure())
-            $recoverySection.Container.Controls.Add($btnRevealHidden)
-
-            # Tier 1: Restart services
-            $btnTier1 = New-Button "Restart Services"
-            $btnTier1.Tag = "action"
-            $btnTier1.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-            $script:BTToolTip.SetToolTip($btnTier1, "Restarts Bluetooth Support Service and related audio services.`nFirst escalation step - fixes most service-related issues.")
-            $btnTier1.Add_Click({
-                try {
-                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-                    if (-not $isAdmin) {
-                        [System.Windows.Forms.MessageBox]::Show("Restarting Bluetooth services requires administrator privileges.`n`nPlease restart WinConfig as Administrator.", "Admin Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
-                        return
-                    }
-                    if (-not (Get-Command Invoke-WinConfigBluetoothServiceReset -ErrorAction SilentlyContinue)) {
-                        [System.Windows.Forms.MessageBox]::Show("Bluetooth module is not loaded yet. Wait for the dashboard to finish populating and try again.", "Not Ready", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
-                        return
-                    }
-                    $result = Invoke-WithExecutionIntent -Intent 'ADMIN_ACTION' -Script {
-                        Invoke-WinConfigBluetoothServiceReset
-                    }
-                    $icon = if ($result.Success) { [System.Windows.Forms.MessageBoxIcon]::Information } else { [System.Windows.Forms.MessageBoxIcon]::Warning }
-                    $msg = if ($result.Message) { $result.Message } else { "Restart complete." }
-                    if ($result.ServicesRestarted -and $result.ServicesRestarted.Count -gt 0) {
-                        $msg += "`n`nRestarted: " + ($result.ServicesRestarted -join ", ")
-                    }
-                    [System.Windows.Forms.MessageBox]::Show($msg, "Restart Bluetooth Services", [System.Windows.Forms.MessageBoxButtons]::OK, $icon) | Out-Null
-                    if ($script:UpdateBluetoothDashboardFn) {
-                        $script:BluetoothDashboardLoaded = $false
-                        . $script:UpdateBluetoothDashboardFn
-                        $script:BluetoothDashboardLoaded = $true
-                    }
-                } catch {
-                    [System.Windows.Forms.MessageBox]::Show("Failed to restart Bluetooth services: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-                }
-            }.GetNewClosure())
-            $recoverySection.Container.Controls.Add($btnTier1)
-
-            # Tier 2: Remove stale audio endpoints
-            $btnTier2 = New-Button "Clean Stale"
-            $btnTier2.Tag = "action"
-            $btnTier2.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-            $script:BTToolTip.SetToolTip($btnTier2, "Removes orphaned or stale Bluetooth audio endpoints from the system.`nUse when ghost devices appear or audio routing is confused.")
-            $btnTier2.Add_Click({
-                try {
-                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-                    if (-not $isAdmin) {
-                        [System.Windows.Forms.MessageBox]::Show("Cleaning stale Bluetooth audio endpoints requires administrator privileges.`n`nPlease restart WinConfig as Administrator.", "Admin Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
-                        return
-                    }
-                    if (-not (Get-Command Invoke-WinConfigBluetoothEndpointCleanup -ErrorAction SilentlyContinue)) {
-                        [System.Windows.Forms.MessageBox]::Show("Bluetooth module is not loaded yet. Wait for the dashboard to finish populating and try again.", "Not Ready", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
-                        return
-                    }
-                    $confirmMsg = "Remove disconnected/stale Bluetooth audio endpoints?`n`nThis will not touch the current default playback device or any Bluetooth device that is currently connected. Re-pairing may be required for some removed devices."
-                    $confirmResult = [System.Windows.Forms.MessageBox]::Show($confirmMsg, "Clean Stale Bluetooth Audio Endpoints", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
-                    if ($confirmResult -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-                    $result = Invoke-WithExecutionIntent -Intent 'ADMIN_ACTION' -Script {
-                        Invoke-WinConfigBluetoothEndpointCleanup
-                    }
-                    $icon = if ($result.Success) { [System.Windows.Forms.MessageBoxIcon]::Information } else { [System.Windows.Forms.MessageBoxIcon]::Warning }
-                    $msg = if ($result.Message) { $result.Message } else { "Cleanup complete." }
-                    if ($result.RemovedDevices -and $result.RemovedDevices.Count -gt 0) {
-                        $msg += "`n`nRemoved $($result.RemovedDevices.Count) endpoint(s)."
-                    }
-                    [System.Windows.Forms.MessageBox]::Show($msg, "Clean Stale Endpoints", [System.Windows.Forms.MessageBoxButtons]::OK, $icon) | Out-Null
-                    if ($script:UpdateBluetoothDashboardFn) {
-                        $script:BluetoothDashboardLoaded = $false
-                        . $script:UpdateBluetoothDashboardFn
-                        $script:BluetoothDashboardLoaded = $true
-                    }
-                } catch {
-                    [System.Windows.Forms.MessageBox]::Show("Failed to clean stale endpoints: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-                }
-            }.GetNewClosure())
-            $recoverySection.Container.Controls.Add($btnTier2)
-
-            # Tier 2.5: Remove ghost COM ports (GUARDED)
-            $btnRemoveGhostCOM = New-Button "Remove Ghost COM"
-            $btnRemoveGhostCOM.Tag = "action"
-            $btnRemoveGhostCOM.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-            $btnRemoveGhostCOM.ForeColor = [System.Drawing.Color]::FromArgb(180, 120, 20)  # Amber - moderate risk
-            $script:BTToolTip.SetToolTip($btnRemoveGhostCOM, "Removes hidden Bluetooth serial device registrations.`nTargets only: non-present, Bluetooth-enumerated, SPP class.`nRequires admin. Often fixes pairing failures in heavily-used systems.")
-            $btnRemoveGhostCOM.Add_Click({
-                try {
-                    # Precondition checks
-                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-                    if (-not $isAdmin) {
-                        [System.Windows.Forms.MessageBox]::Show("This operation requires administrator privileges.`n`nPlease restart WinConfig as Administrator.", "Admin Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-                        return
-                    }
-
-                    # Get current ghost count
-                    $ghostCount = 0
-                    if (Get-Command Get-WinConfigBluetoothCOMPorts -ErrorAction SilentlyContinue) {
-                        $ports = & 'Get-WinConfigBluetoothCOMPorts'
-                        $ghostCount = $ports.GhostCount
-                    }
-
-                    if ($ghostCount -eq 0) {
-                        [System.Windows.Forms.MessageBox]::Show("No ghost Bluetooth COM ports found.", "Nothing to Remove", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-                        return
-                    }
-
-                    # Confirmation dialog
-                    $confirmMsg = "Remove $ghostCount ghost Bluetooth COM port(s)?`n`nThis removes hidden Bluetooth serial device registrations that Windows retains after device removal.`n`nThis is often required in environments with frequent pairing/unpairing."
-                    $confirmResult = [System.Windows.Forms.MessageBox]::Show($confirmMsg, "Confirm Ghost COM Removal", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
-
-                    if ($confirmResult -ne [System.Windows.Forms.DialogResult]::Yes) {
-                        return
-                    }
-
-                    # Execute removal
-                    if (Get-Command Invoke-WinConfigBluetoothGhostCOMCleanup -ErrorAction SilentlyContinue) {
-                        $result = & 'Invoke-WinConfigBluetoothGhostCOMCleanup'
-                        if ($result.Success) {
-                            [System.Windows.Forms.MessageBox]::Show($result.Message, "Ghost COM Cleanup", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-                            # Refresh dashboard
-                            if ($script:UpdateBluetoothDashboardFn) {
-                                $script:BluetoothDashboardLoaded = $false
-                                . $script:UpdateBluetoothDashboardFn
-                                $script:BluetoothDashboardLoaded = $true
-                            }
-                        } else {
-                            [System.Windows.Forms.MessageBox]::Show($result.Message, "Ghost COM Cleanup", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-                        }
-                    }
-                } catch {
-                    [System.Windows.Forms.MessageBox]::Show("Failed to remove ghost COM ports: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-                }
-            }.GetNewClosure())
-            $recoverySection.Container.Controls.Add($btnRemoveGhostCOM)
-
-            # Tier 3: Reset adapter (DESTRUCTIVE)
-            $btnTier3 = New-Button "Reset Adapter"
-            $btnTier3.Tag = "action"
-            $btnTier3.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-            $btnTier3.ForeColor = [System.Drawing.Color]::FromArgb(180, 50, 50)
-            $script:BTToolTip.SetToolTip($btnTier3, "Disables and re-enables the Bluetooth adapter hardware.`nLast resort - will disconnect all Bluetooth devices temporarily.")
-            $btnTier3.Add_Click({
-                try {
-                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-                    if (-not $isAdmin) {
-                        [System.Windows.Forms.MessageBox]::Show("Resetting the Bluetooth adapter requires administrator privileges.`n`nPlease restart WinConfig as Administrator.", "Admin Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
-                        return
-                    }
-                    if (-not (Get-Command Invoke-WinConfigBluetoothAdapterReset -ErrorAction SilentlyContinue)) {
-                        [System.Windows.Forms.MessageBox]::Show("Bluetooth module is not loaded yet. Wait for the dashboard to finish populating and try again.", "Not Ready", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
-                        return
-                    }
-                    $confirmMsg = "Disable and re-enable the Bluetooth adapter hardware?`n`nALL paired Bluetooth devices will disconnect for several seconds. Some devices may require manual reconnect. A reboot may be needed if the adapter fails to come back online.`n`nThis is a last-resort action. Use only after lighter recovery steps have failed."
-                    $confirmResult = [System.Windows.Forms.MessageBox]::Show($confirmMsg, "Reset Bluetooth Adapter", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
-                    if ($confirmResult -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-                    $result = Invoke-WithExecutionIntent -Intent 'ADMIN_ACTION' -Script {
-                        Invoke-WinConfigBluetoothAdapterReset
-                    }
-                    $icon = if ($result.Success) { [System.Windows.Forms.MessageBoxIcon]::Information } else { [System.Windows.Forms.MessageBoxIcon]::Warning }
-                    $msg = if ($result.Message) { $result.Message } else { "Adapter reset complete." }
-                    if ($result.RebootRequired) {
-                        $msg += "`n`nREBOOT REQUIRED: The adapter did not come back online cleanly. Restart Windows to recover Bluetooth functionality."
-                        $icon = [System.Windows.Forms.MessageBoxIcon]::Warning
-                    }
-                    [System.Windows.Forms.MessageBox]::Show($msg, "Reset Bluetooth Adapter", [System.Windows.Forms.MessageBoxButtons]::OK, $icon) | Out-Null
-                    if ($script:UpdateBluetoothDashboardFn) {
-                        $script:BluetoothDashboardLoaded = $false
-                        . $script:UpdateBluetoothDashboardFn
-                        $script:BluetoothDashboardLoaded = $true
-                    }
-                } catch {
-                    [System.Windows.Forms.MessageBox]::Show("Failed to reset Bluetooth adapter: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-                }
-            }.GetNewClosure())
-            $recoverySection.Container.Controls.Add($btnTier3)
-
-            $actionsPanel.Controls.Add($recoverySection.Container)
-
-            # === RE-RUN CHECKS (collapsible, individual diagnostics) ===
-            $checksSection = New-CollapsibleSection -Title "Re-run checks" -Tag "checks-container" -StartCollapsed $true
-            $script:BTToolTip.SetToolTip($checksSection.Header, "Run individual diagnostic checks for detailed investigation.")
-            $actionsPanel.Controls.Add($checksSection.Header)
-
-            # Tooltips for individual check buttons
-            $checkTooltips = @{
-                "Check Adapter" = "Retrieves Bluetooth adapter hardware and driver information."
-                "Check Services" = "Checks status of Bluetooth and audio services."
-                "List Paired" = "Enumerates all paired Bluetooth devices."
-                "Power Settings" = "Checks power management settings that may cause disconnects."
-            }
-
-            $subActions = @("Check Adapter", "Check Services", "List Paired", "Power Settings")
-            foreach ($actionName in $subActions) {
-                $btn = New-Button $actionName
-                $btn.Tag = "action"
-                $btn.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-                $btn.MinimumSize = New-Object System.Drawing.Size([int]([Math]::Round(80 * $script:DpiScale)), [int]([Math]::Round(24 * $script:DpiScale)))
-                if ($buttonHandlers.ContainsKey($actionName)) {
-                    $btn.Add_Click($buttonHandlers[$actionName])
-                    # Note: Not added to ToolButtonRegistry (dashboard context, not Tools tab)
-                }
-                if ($checkTooltips.ContainsKey($actionName)) {
-                    $script:BTToolTip.SetToolTip($btn, $checkTooltips[$actionName])
-                }
-                $checksSection.Container.Controls.Add($btn)
-            }
-
-            $actionsPanel.Controls.Add($checksSection.Container)
-
-            # === TIMELINE (collapsible, NirSoft-inspired event history) ===
-            $timelineSection = New-CollapsibleSection -Title "Timeline (60m)" -Tag "timeline-container" -StartCollapsed $true
-            $script:BTToolTip.SetToolTip($timelineSection.Header, "Bluetooth event history for the last 60 minutes. Shows connects, disconnects, profile switches, and errors.")
-            $script:BTTimelineHeader = $timelineSection.Header  # Store reference for badge updates
-            $actionsPanel.Controls.Add($timelineSection.Header)
-
-            $timelineList = New-Object System.Windows.Forms.ListView
-            $timelineList.View = [System.Windows.Forms.View]::Details
-            $timelineList.FullRowSelect = $true
-            $timelineList.GridLines = $false
-            $timelineList.Font = New-Object System.Drawing.Font("Consolas", 7)
-            $timelineList.ShowItemToolTips = $true
-            # DPI-scaled size + columns. At fixed 180x120 px the columns already summed to 170 (clipping
-            # at 100%) and the whole list was unusable at higher scaling.
-            $timelineList.Width  = [int]([Math]::Round(180 * $script:DpiScale))
-            $timelineList.Height = [int]([Math]::Round(120 * $script:DpiScale))
-            [void]$timelineList.Columns.Add("Time",  [int]([Math]::Round( 50 * $script:DpiScale)))
-            [void]$timelineList.Columns.Add("Event", [int]([Math]::Round(120 * $script:DpiScale)))
-            $timelineList.Tag = "timeline-list"
-            $timelineSection.Container.Controls.Add($timelineList)
-            $script:BTTimelineList = $timelineList
-
-            $actionsPanel.Controls.Add($timelineSection.Container)
-
-            # === DETAILS (collapsible, for verbose/noise info) ===
-            $detailsSection = New-CollapsibleSection -Title "Details" -Tag "details-container" -StartCollapsed $true
-            $script:BTToolTip.SetToolTip($detailsSection.Header, "Verbose technical information for advanced troubleshooting.`nIncludes service details, adapter instance IDs, and driver information.")
-            $actionsPanel.Controls.Add($detailsSection.Header)
-
-            $detailsLabel = New-Object System.Windows.Forms.Label
-            $detailsLabel.AutoSize = $true
-            # DPI-scaled wrap cap; at fixed 200 the label was forcing wraps inside a 140-200 px rail.
-            $detailsLabel.MaximumSize = New-Object System.Drawing.Size([int]([Math]::Round(200 * $script:DpiScale)), 0)
-            $detailsLabel.Font = New-Object System.Drawing.Font("Consolas", 8)
-            $detailsLabel.ForeColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
-            $detailsLabel.Text = "(Expand for verbose info)"
-            $detailsLabel.Tag = "details-content"
-            $detailsSection.Container.Controls.Add($detailsLabel)
-
-            $actionsPanel.Controls.Add($detailsSection.Container)
-            $script:BTDetailsLabel = $detailsLabel
-
-            $workspace.Panel2.Controls.Add($actionsPanel)
-            $root.Controls.Add($workspace, 0, 1)
-
-            # === CONDITIONAL KODI PANEL (Row 3 - only visible if Kodi detected) ===
-            $kodiPanel = New-Object System.Windows.Forms.Panel
-            $kodiPanel.Dock = [System.Windows.Forms.DockStyle]::Bottom
-            # DPI-scaled so the single-line label + padding doesn't get vertically clipped at >100% scaling.
-            $kodiPanel.Height = [int]([Math]::Round(28 * $script:DpiScale))
-            $kodiPanel.BackColor = [System.Drawing.Color]::FromArgb(255, 252, 245)  # Warm highlight
-            $kodiPanel.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-            $kodiPanel.Visible = $false  # Hidden by default - shown only if Kodi detected
-            $kodiPanel.Padding = New-Object System.Windows.Forms.Padding(8, 4, 8, 4)
-
-            $kodiLine = New-Object System.Windows.Forms.Label
-            $kodiLine.Text = "Kodi: Checking..."
-            $kodiLine.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-            $kodiLine.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
-            $kodiLine.AutoSize = $true
-            $kodiLine.Dock = [System.Windows.Forms.DockStyle]::Left
-            $kodiPanel.Controls.Add($kodiLine)
-
-            $root.Controls.Add($kodiPanel)
-            $script:BTKodiPanel = $kodiPanel
-            $script:BTKodiLine = $kodiLine
-
-            return $root
-        }
-
-        # =============================================================================
-        # BLUETOOTH DATA BINDING - Populates dashboard tiles and devices list
-        # UX Rules:
-        # - No placeholder noise ("Module not loaded", "No issues detected")
-        # - Show factual metrics, not reassurance
-        # - Empty state = actionable hint or silent dash
-        # - Track availability + error for failed checks
-        # =============================================================================
-        $script:BTModuleError = $null  # Store module load error (one place only)
-        $script:LastBluetoothProbeResult = $null  # Set by probe/quick-check execution
-
-        # Script-scoped function for Bluetooth dashboard refresh (accessible from event handlers)
-        $script:UpdateBluetoothDashboardFn = {
-            if (-not $script:BTRadioLine) { return }
-
-            # Step 1: Ensure Bluetooth module is loaded, track error
-            $script:BTModuleError = $null
-            try {
-                Ensure-BluetoothModule
-                if (-not $script:BluetoothModuleLoaded) {
-                    $script:BTModuleError = "Module import failed"
-                }
-            } catch {
-                $script:BTModuleError = $_.Exception.Message
-            }
-
-            # Fetch event hints once (used by Health tile and Timeline)
-            $eventHints = $null
-            if (-not $script:BTModuleError) {
-                try {
-                    if (Get-Command Get-WinConfigBluetoothEventLogHints -ErrorAction SilentlyContinue) {
-                        $eventHints = & 'Get-WinConfigBluetoothEventLogHints'
-                    }
-                } catch { }
-            }
-
-            # Fetch COM port data early (used by Health line state residue and COM ports list)
-            $comPortsData = $null
-            $ghostCOMCount = 0
-            if (-not $script:BTModuleError) {
-                try {
-                    if (Get-Command Get-WinConfigBluetoothCOMPorts -ErrorAction SilentlyContinue) {
-                        $comPortsData = & 'Get-WinConfigBluetoothCOMPorts'
-                        if (-not $comPortsData.Error) {
-                            $ghostCOMCount = $comPortsData.GhostCount
-                        }
-                    }
-                } catch { }
-            }
-
-            # Fetch playback data early (used by Route line and Kodi conditional visibility)
-            $playbackData = $null
-            if (-not $script:BTModuleError) {
-                try {
-                    if (Get-Command Get-WinConfigDefaultPlaybackDevice -ErrorAction SilentlyContinue) {
-                        $playbackData = & 'Get-WinConfigDefaultPlaybackDevice'
-                    }
-                } catch { }
-            }
-
-            # Helper to update snapshot line (neutral colors only - no green)
-            function Set-SnapshotLine {
-                param(
-                    [System.Windows.Forms.Label]$Label,
-                    [string]$Text,
-                    [string]$Severity = "Normal",
-                    [string]$Tooltip = ""
-                )
-                if ($Label) {
-                    $Label.Text = $Text
-                    switch ($Severity) {
-                        "WARN" { $Label.ForeColor = [System.Drawing.Color]::FromArgb(180, 120, 20) }
-                        "FAIL" { $Label.ForeColor = [System.Drawing.Color]::FromArgb(180, 50, 50) }
-                        default { $Label.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60) }
-                    }
-                    if ($Tooltip -and $script:BTToolTip) {
-                        $script:BTToolTip.SetToolTip($Label, $Tooltip)
-                    }
-                }
-            }
-
-            # If module failed to load, show error with explicit neutral copy (never use "-")
-            if ($script:BTModuleError) {
-                Set-SnapshotLine -Label $script:BTRadioLine -Text "Radio: Module load failed" -Severity "FAIL" -Tooltip "Bluetooth diagnostic module could not be loaded."
-                Set-SnapshotLine -Label $script:BTRouteLine -Text "Route: Unknown" -Severity "FAIL"
-                Set-SnapshotLine -Label $script:BTHealthLine -Text "Health: Unknown" -Severity "FAIL"
-                return
-            }
-
-            # === SNAPSHOT LINE 1: Radio - compact format: Brand | PM ===
-            # Driver details moved to tooltip (not core scan signal)
-            try {
-                if (Get-Command Get-WinConfigBluetoothAdapterInfo -ErrorAction SilentlyContinue) {
-                    $adapter = & 'Get-WinConfigBluetoothAdapterInfo'
-                    if ($adapter.Present) {
-                        $severity = if ($adapter.Enabled) { "Normal" } else { "WARN" }
-
-                        # Abbreviate adapter name for scan speed
-                        # "Intel(R) Wireless Bluetooth(R)" → "Intel"
-                        # "Realtek Bluetooth Adapter" → "Realtek"
-                        $shortName = $adapter.FriendlyName -replace '\(R\)', '' -replace 'Wireless ', '' -replace ' Bluetooth.*', '' -replace ' Adapter.*', ''
-                        $shortName = $shortName.Trim()
-                        if ($shortName.Length -gt 15) { $shortName = $shortName.Substring(0, 12) + "..." }
-
-                        $radioText = "Radio: $shortName"
-                        $radioTip = "Adapter: $($adapter.FriendlyName)"
-
-                        # Driver status in tooltip only (not core signal)
-                        $driverOK = $adapter.DriverInfo -and $adapter.DriverInfo.Version
-                        if ($driverOK) {
-                            $radioTip += "`nDriver: $($adapter.DriverInfo.Version) (OK)"
-                        } else {
-                            $severity = "WARN"
-                            $radioTip += "`nDriver: Unknown (could not verify)"
-                        }
-
-                        # PM status in strip (this IS a core signal)
-                        if ($adapter.PowerManagementEnabled -eq $true) {
-                            $severity = "WARN"
-                            $radioText += " | PM: ON"
-                            $radioTip += "`n`nPM enabled - Windows may suspend radio. Can cause disconnects."
-                        } elseif ($adapter.PowerManagementEnabled -eq $false) {
-                            $radioText += " | PM: OFF"
-                            $radioTip += "`n`nPM disabled - radio will stay active."
-                        }
-                        # If PM is $null, don't show (couldn't detect)
-
-                        Set-SnapshotLine -Label $script:BTRadioLine -Text $radioText -Severity $severity -Tooltip $radioTip
-                    } else {
-                        Set-SnapshotLine -Label $script:BTRadioLine `
-                            -Text "Radio: Not found" `
-                            -Severity "FAIL" `
-                            -Tooltip "No Bluetooth adapter detected.`nCheck: hardware switch, BIOS, Device Manager."
-                    }
-                } else {
-                    Set-SnapshotLine -Label $script:BTRadioLine -Text "Radio: ..." -Tooltip "Loading..."
-                }
-            } catch {
-                Set-SnapshotLine -Label $script:BTRadioLine -Text "Radio: Error" -Severity "FAIL"
-            }
-
-            # === SNAPSHOT LINE 2: Route - current audio output + BT mode ===
-            # Uses $playbackData fetched earlier (shared with Kodi visibility check)
-            try {
-                if ($playbackData) {
-                    $severity = "Normal"
-                    $routeText = "Route: "
-                    $routeTip = ""
-
-                    if ($playbackData.IsBluetooth) {
-                        if ($playbackData.IsHFP) {
-                            $routeText += "HFP $([char]0x2192) $($playbackData.RegistryDevice)"
-                            $severity = "WARN"
-                            $routeTip = "Hands-free profile active. Audio quality degraded to mono 8-16 kHz. Triggered by apps using microphone (Teams, Zoom, Discord)."
-                        } else {
-                            $routeText += "A2DP $([char]0x2192) $($playbackData.RegistryDevice)"
-                            $routeTip = "High-quality stereo profile. If HFP activates, audio degrades to mono 8-16 kHz."
-                        }
-                    } else {
-                        # No Bluetooth audio active - say so clearly
-                        $routeText += "No active BT audio"
-                        $routeTip = "Audio routed to non-Bluetooth device."
-                        if ($playbackData.RegistryDevice) {
-                            $routeTip += " Current default: $($playbackData.RegistryDevice)"
-                        }
-                    }
-
-                    Set-SnapshotLine -Label $script:BTRouteLine -Text $routeText -Severity $severity -Tooltip $routeTip
-                } else {
-                    Set-SnapshotLine -Label $script:BTRouteLine -Text "Route: Unknown" -Tooltip "Could not detect audio routing."
-                }
-            } catch {
-                Set-SnapshotLine -Label $script:BTRouteLine -Text "Route: Check failed" -Severity "FAIL"
-            }
-
-            # === CONDITIONAL KODI PANEL - only show if Kodi detected AND Bluetooth audio active ===
-            # Spec: Footer bar should only appear when both conditions met (scan efficiency rule)
-            try {
-                $btAudioActive = $playbackData -and $playbackData.IsBluetooth
-                if ($script:BTKodiPanel -and $btAudioActive -and (Get-Command Get-WinConfigKodiAudioSettings -ErrorAction SilentlyContinue)) {
-                    $kodi = & 'Get-WinConfigKodiAudioSettings'
-                    if ($kodi.Found -and -not $kodi.Error) {
-                        # Kodi detected AND Bluetooth audio active - show panel with settings
-                        $script:BTKodiPanel.Visible = $true
-                        $mode = if ($kodi.IsWASAPI) { "WASAPI" } elseif ($kodi.IsDirectSound) { "DirectSound" } else { "Default" }
-                        $pt = if ($kodi.PassthroughEnabled) { "PT: ON" } else { "PT: Off" }
-                        $severity = if ($kodi.PassthroughEnabled) { "WARN" } else { "Normal" }
-
-                        $kodiText = "Kodi: $mode, $pt"
-                        if ($kodi.SampleRate) { $kodiText += " ($($kodi.SampleRate)Hz)" }
-
-                        $kodiTip = if ($kodi.IsWASAPI) {
-                            "WASAPI mode targets a specific audio device. May bypass Windows default routing."
-                        } else {
-                            "DirectSound follows Windows default. Recommended for Bluetooth."
-                        }
-                        if ($kodi.PassthroughEnabled) {
-                            $kodiTip += "`nPassthrough enabled. Bluetooth does not support bitstream passthrough - Kodi will decode audio internally."
-                        } else {
-                            $kodiTip += "`nPassthrough disabled. Kodi decodes audio internally. Recommended for Bluetooth to avoid format negotiation failures."
-                        }
-
-                        Set-SnapshotLine -Label $script:BTKodiLine -Text $kodiText -Severity $severity -Tooltip $kodiTip
-                    } else {
-                        # Kodi not found - hide panel
-                        $script:BTKodiPanel.Visible = $false
-                    }
-                } elseif ($script:BTKodiPanel) {
-                    # Either no BT audio active or Kodi check not available - hide panel
-                    $script:BTKodiPanel.Visible = $false
-                }
-            } catch {
-                if ($script:BTKodiPanel) { $script:BTKodiPanel.Visible = $false }
-            }
-
-            # === SNAPSHOT LINE 3: Health - answers "Is Bluetooth usable right now?" ===
-            # STATUS STRIP RULE: 3 tokens only (Radio | Route | Health)
-            # Residue, Drops, Probe → tooltip only (not visible in strip)
-            try {
-                $severity = "Normal"
-                $healthText = "Health: OK"
-                $healthTipParts = @()
-
-                # Check services (primary health signal)
-                $servicesOK = $true
-                $stoppedCount = 0
-                if (Get-Command Get-WinConfigBluetoothServiceStates -ErrorAction SilentlyContinue) {
-                    $services = & 'Get-WinConfigBluetoothServiceStates'
-                    foreach ($svcName in @("bthserv", "Audiosrv", "AudioEndpointBuilder")) {
-                        if ($services[$svcName] -and -not $services[$svcName].Running) {
-                            $stoppedCount++
-                        }
-                    }
-                    if ($stoppedCount -gt 0) {
-                        $healthText = "Health: $stoppedCount svc down"
-                        $severity = "FAIL"
-                        $servicesOK = $false
-                        $healthTipParts += "Core services stopped. Use Recovery > Restart Services."
-                    }
-                }
-
-                # State residue: ghost COM accumulation (tooltip only, affects severity)
-                $script:BTResidueLevel = "Low"
-                $script:BTGhostCOMCount = $ghostCOMCount
-                if ($ghostCOMCount -gt 0) {
-                    if ($ghostCOMCount -ge 8) {
-                        $script:BTResidueLevel = "High"
-                        if ($severity -ne "FAIL") { $severity = "WARN" }
-                        $healthTipParts += "Residue: High ($ghostCOMCount ghost COM ports)"
-                    } elseif ($ghostCOMCount -ge 3) {
-                        $script:BTResidueLevel = "Med"
-                        $healthTipParts += "Residue: Medium ($ghostCOMCount ghost COM ports)"
-                    } else {
-                        $healthTipParts += "Residue: Low ($ghostCOMCount ghost COM ports)"
-                    }
-                } else {
-                    $healthTipParts += "Residue: None"
-                }
-
-                # Disconnects (tooltip only, affects severity)
-                $dc = 0
-                if ($eventHints) {
-                    $dc = if ($eventHints.DisconnectEvents) { $eventHints.DisconnectEvents } else { 0 }
-                    if ($eventHints.FrequentDisconnects -and $severity -ne "FAIL") {
-                        $severity = "WARN"
-                    }
-                }
-                $healthTipParts += "Drops: $dc (last 24h)"
-
-                # Probe result (tooltip only)
-                if ($script:LastBluetoothProbeResult) {
-                    switch ($script:LastBluetoothProbeResult.Result) {
-                        "PASS" { $healthTipParts += "Last probe: PASS" }
-                        "FAIL" { $healthTipParts += "Last probe: FAIL - see Details" }
-                    }
-                }
-
-                # Add timestamp for PERF-001 visual proof
-                $script:BTHealthTimestamp = Get-Date
-                $healthTipParts += "Updated: $(Get-Date -Format 'HH:mm:ss')"
-
-                $healthTip = $healthTipParts -join "`n"
-                Set-SnapshotLine -Label $script:BTHealthLine -Text $healthText -Severity $severity -Tooltip $healthTip
-            } catch {
-                Set-SnapshotLine -Label $script:BTHealthLine -Text "Health: Check failed" -Severity "FAIL"
-            }
-
-            # === DEVICES LIST - Two-axis model (Presence | Activity) ===
-            # Presence: Connected | Paired | Remembered | Ghost
-            # Activity: Active | Idle | Inactive
-            #
-            # GOVERNANCE RULE (DO NOT REMOVE):
-            # Bluetooth devices must NEVER be labeled "Paired" unless a live bond exists.
-            # "Remembered" devices (registry-only) must be explicitly distinguished from "Paired".
-            # This prevents the dangerous conflation that misleads technicians.
-            try {
-                if ($script:BTDevicesList) {
-                    $script:BTDevicesList.Items.Clear()
-                    $script:BTDevicesList.Columns.Clear()
-
-                    # Set up columns based on Expert View mode
-                    # Column widths kept compact to leave room for actions panel
-                    if ($script:BTExpertViewEnabled) {
-                        # Expert view: Dense table with full diagnostic data
-                        # Name | Conn | Class | Address | Driver | PM | Drops | COM
-                        [void]$script:BTDevicesList.Columns.Add("Name", 90)
-                        [void]$script:BTDevicesList.Columns.Add("Conn", 40)
-                        [void]$script:BTDevicesList.Columns.Add("Class", 50)
-                        [void]$script:BTDevicesList.Columns.Add("Address", 70)
-                        [void]$script:BTDevicesList.Columns.Add("Driver", 55)
-                        [void]$script:BTDevicesList.Columns.Add("PM", 30)
-                        [void]$script:BTDevicesList.Columns.Add("COM", 30)
-                        $script:BTDevicesList.Font = New-Object System.Drawing.Font("Consolas", 7)
-                    } else {
-                        # Normal view: Clean, focused display
-                        [void]$script:BTDevicesList.Columns.Add("Device", 140)
-                        [void]$script:BTDevicesList.Columns.Add("Status", 80)
-                        [void]$script:BTDevicesList.Columns.Add("Notes", 60)
-                        $script:BTDevicesList.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-                    }
-
-                    # Use WinRT-based enumeration for transport truth
-                    $devices = @()
-                    if (Get-Command Get-WinConfigBluetoothDevicesEnriched -ErrorAction SilentlyContinue) {
-                        $devices = @(& 'Get-WinConfigBluetoothDevicesEnriched')
-                    } elseif (Get-Command Get-WinConfigBluetoothAudioDevices -ErrorAction SilentlyContinue) {
-                        # Fallback to PnP-based enumeration
-                        $devices = @(& 'Get-WinConfigBluetoothAudioDevices')
-                    }
-
-                    # Filter: Default view shows ONLY connected devices (noise reduction)
-                    # Expert View shows all (connected + remembered)
-                    $filtered = @()
-                    $connectedCount = 0
-                    $rememberedCount = 0
-
-                    if ($devices.Count -gt 0) {
-                        $connectedCount = @($devices | Where-Object { $_.IsConnected -eq $true -or $_.Presence -eq "Connected" }).Count
-                        $rememberedCount = @($devices | Where-Object { $_.Presence -eq "Remembered" -or ($_.IsConnected -eq $false -and $_.IsPaired -eq $true) }).Count
-
-                        if ($script:BTExpertViewEnabled) {
-                            $filtered = $devices  # Show all paired devices
-                        } else {
-                            # Default: ONLY connected devices (transport-verified)
-                            $filtered = @($devices | Where-Object { $_.IsConnected -eq $true -or $_.Presence -eq "Connected" })
-                        }
-                    }
-
-                    # For footer messaging
-                    $cachedCount = $rememberedCount
-
-                    if ($filtered.Count -gt 0) {
-                        # Re-enable grid lines when we have visible devices
-                        $script:BTDevicesList.GridLines = $true
-
-                        # Sort by Presence: Connected > Paired > Remembered > Ghost
-                        $sorted = $filtered | Sort-Object {
-                            switch ($_.Presence) {
-                                "Connected"  { 0 }
-                                "Paired"     { 1 }
-                                "Remembered" { 2 }
-                                "Ghost"      { 3 }
-                                default      { 4 }
-                            }
-                        }
-
-                        foreach ($dev in $sorted) {
-                            # Determine visual state from Presence
-                            $isRemembered = $dev.Presence -eq "Remembered"
-                            $isGhost = $dev.Presence -eq "Ghost"
-
-                            # Presence icon prefix for <1s scan (visual hierarchy)
-                            # Uses distinct Unicode characters that render well in Windows Forms
-                            # Connection state for icon
-                            $isConnected = $dev.IsConnected -eq $true -or $dev.Presence -eq "Connected"
-
-                            if ($script:BTExpertViewEnabled) {
-                                # Expert View: Dense diagnostic table
-                                # Name | Conn | Class | Address | Driver | PM | COM
-
-                                $item = New-Object System.Windows.Forms.ListViewItem($dev.Name)
-
-                                # Conn column (Y/N)
-                                $connText = if ($isConnected) { "Y" } else { "N" }
-                                [void]$item.SubItems.Add($connText)
-
-                                # Class column (from ClassOfDevice)
-                                $classText = "-"
-                                if ($dev.ClassOfDevice -and $dev.ClassOfDevice.MajorClass) {
-                                    $classText = $dev.ClassOfDevice.MajorClass -replace "AudioVideo", "AV"
-                                }
-                                [void]$item.SubItems.Add($classText)
-
-                                # Address column (Bluetooth MAC)
-                                $addrText = if ($dev.Address) { $dev.Address } else { "-" }
-                                [void]$item.SubItems.Add($addrText)
-
-                                # Driver column (version)
-                                $drvText = if ($dev.DriverVersion) { $dev.DriverVersion.Split('.')[0..1] -join "." } else { "-" }
-                                [void]$item.SubItems.Add($drvText)
-
-                                # PM column (power management)
-                                $pmText = if ($dev.PowerManagement -eq $true) { "ON" } elseif ($dev.PowerManagement -eq $false) { "off" } else { "-" }
-                                [void]$item.SubItems.Add($pmText)
-
-                                # COM column (ghost COM port count)
-                                $comText = if ($dev.GhostCOMCount -gt 0) { "$($dev.GhostCOMCount)" } else { "-" }
-                                [void]$item.SubItems.Add($comText)
-
-                                # Color coding for Expert View
-                                if (-not $isConnected) {
-                                    $item.ForeColor = [System.Drawing.Color]::FromArgb(150, 150, 150)
-                                }
-                                if ($dev.PowerManagement -eq $true) {
-                                    $item.BackColor = [System.Drawing.Color]::FromArgb(255, 250, 240)  # Warm hint
-                                }
-                            } else {
-                                # Default View: Clean, user-friendly
-                                # Device | Status | Notes
-
-                                # Status prefix icon
-                                $statusIcon = if ($isConnected) { "$([char]0x25B6) " } else { "" }
-                                $displayName = $statusIcon + $dev.Name
-                                if ($dev.Activity -eq "Active") { $displayName += " $([char]0x2605)" }
-
-                                $item = New-Object System.Windows.Forms.ListViewItem($displayName)
-
-                                # Status column
-                                $statusText = if ($isConnected) {
-                                    if ($dev.Activity -eq "Active") { "Active" } else { "Connected" }
-                                } else { "Remembered" }
-                                [void]$item.SubItems.Add($statusText)
-
-                                # Notes column
-                                $notesText = ""
-                                if ($dev.Activity -eq "Active") { $notesText = "Default" }
-                                elseif ($dev.GhostCOMCount -gt 0) { $notesText = "Residue" }
-                                [void]$item.SubItems.Add($notesText)
-
-                                # Dim remembered devices
-                                if (-not $isConnected) {
-                                    $item.ForeColor = [System.Drawing.Color]::FromArgb(150, 150, 150)
-                                }
-                            }
-
-                            # Build contextual tooltip
-                            $tipLines = @()
-                            $tipLines += "Device: $($dev.Name)"
-
-                            # Connection status
-                            if ($isConnected) {
-                                $tipLines += "Status: Connected (live Bluetooth link)"
-                                if ($dev.Activity -eq "Active") {
-                                    $tipLines += "Audio: Routing to this device (default playback)"
-                                } else {
-                                    $tipLines += "Audio: Not routing (connected but idle)"
-                                }
-                            } else {
-                                $tipLines += "Status: Remembered (paired but not present)"
-                            }
-
-                            # Address if available
-                            if ($dev.Address) {
-                                $tipLines += "Address: $($dev.Address)"
-                            }
-
-                            # Expert view extras
-                            if ($script:BTExpertViewEnabled) {
-                                if ($dev.DriverVersion) {
-                                    $tipLines += "Driver: $($dev.DriverVersion)"
-                                }
-                                if ($dev.PowerManagement -eq $true) {
-                                    $tipLines += "PM: Enabled (may cause disconnects)"
-                                }
-                                if ($dev.GhostCOMCount -gt 0) {
-                                    $tipLines += "COM Residue: $($dev.GhostCOMCount) ghost port(s)"
-                                }
-                                if ($dev.InstanceId) {
-                                    $tipLines += "Instance: $($dev.InstanceId)"
-                                }
-                            }
-
-                            $item.ToolTipText = $tipLines -join "`n"
-
-                            # === VISUAL STYLING ===
-                            # Connected: Bold
-                            # Remembered: Gray italic
-                            if ($isConnected) {
-                                $item.Font = New-Object System.Drawing.Font($script:BTDevicesList.Font, [System.Drawing.FontStyle]::Bold)
-                                $item.ForeColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
-                            } else {
-                                $item.Font = New-Object System.Drawing.Font($script:BTDevicesList.Font, [System.Drawing.FontStyle]::Italic)
-                                $item.ForeColor = [System.Drawing.Color]::FromArgb(140, 140, 140)
-                            }
-
-                            # Ghost device highlight (COM residue)
-                            if ($dev.GhostCOMCount -gt 0) {
-                                $item.BackColor = [System.Drawing.Color]::FromArgb(255, 250, 235)
-                            }
-
-                            [void]$script:BTDevicesList.Items.Add($item)
-                        }
-
-                        # Footer hint: when visible devices exist but cached devices are hidden
-                        # (footer is BELOW grid, not inside it - scan efficiency rule)
-                        if ($cachedCount -gt 0 -and -not $script:BTExpertViewEnabled) {
-                            if ($script:BTCachedFooter) {
-                                $script:BTCachedFooter.Text = "$cachedCount remembered device(s) hidden $([char]0x25B8)"
-                                $script:BTCachedFooter.Visible = $true
-                            }
-                        } else {
-                            if ($script:BTCachedFooter) {
-                                $script:BTCachedFooter.Visible = $false
-                            }
-                        }
-                    } else {
-                        # Empty state - no connected devices visible
-                        $script:BTDevicesList.GridLines = $false
-
-                        # Show clean "no devices" message in table
-                        $item = New-Object System.Windows.Forms.ListViewItem("No Bluetooth audio devices connected")
-                        # Add empty subitems for each column
-                        if ($script:BTExpertViewEnabled) {
-                            # Expert: Name | Conn | Class | Address | Driver | PM | COM (7 cols)
-                            for ($i = 1; $i -lt 7; $i++) { [void]$item.SubItems.Add("") }
-                        } else {
-                            # Default: Device | Status | Notes (3 cols)
-                            [void]$item.SubItems.Add("")
-                            [void]$item.SubItems.Add("")
-                        }
-                        $item.ForeColor = [System.Drawing.Color]::FromArgb(140, 140, 140)
-                        $script:BTDevicesList.Items.Add($item)
-
-                        # Show cached count in footer (below grid)
-                        if ($cachedCount -gt 0 -and -not $script:BTExpertViewEnabled) {
-                            if ($script:BTCachedFooter) {
-                                $script:BTCachedFooter.Text = "$cachedCount remembered device(s) hidden $([char]0x25B8)"
-                                $script:BTCachedFooter.Visible = $true
-                            }
-                        } else {
-                            if ($script:BTCachedFooter) {
-                                $script:BTCachedFooter.Visible = $false
-                            }
-                        }
-                    }
-                }
-            } catch {
-                # Show error in list - no instructions
-                if ($script:BTDevicesList) {
-                    $script:BTDevicesList.Items.Clear()
-                    $script:BTDevicesList.GridLines = $false
-                    $item = New-Object System.Windows.Forms.ListViewItem("Device enumeration failed")
-                    [void]$item.SubItems.Add("")
-                    [void]$item.SubItems.Add("")
-                    [void]$item.SubItems.Add("")
-                    if ($script:BTExpertViewEnabled) { [void]$item.SubItems.Add("") }
-                    $item.ForeColor = [System.Drawing.Color]::FromArgb(180, 50, 50)
-                    $script:BTDevicesList.Items.Add($item)
-                }
-            }
-
-            # === BLUETOOTH COM PORTS - State accretion visibility ===
-            # Uses $comPortsData and $ghostCOMCount from early fetch above
-            # Default view: collapsed stub only when residue exists
-            # Expert View: full COM ports list
-            try {
-                if ($script:BTCOMPortsList -and $script:BTCOMPortsPanel) {
-                    $script:BTCOMPortsList.Items.Clear()
-
-                    # Show panel if ghost COM ports exist (the actionable signal)
-                    if ($comPortsData -and -not $comPortsData.Error -and $ghostCOMCount -gt 0) {
-                        $script:BTCOMPortsPanel.Visible = $true
-
-                        # Header with ghost count and severity color
-                        if ($script:BTCOMPortsHeader) {
-                            if ($script:BTExpertViewEnabled) {
-                                # Expert View: full header
-                                $script:BTCOMPortsHeader.Text = "$([char]0x26A0) Ghost BT COM Ports: $ghostCOMCount"
-                            } else {
-                                # Default View: collapsed stub with expand hint
-                                $script:BTCOMPortsHeader.Text = "$([char]0x26A0) COM residue detected ($ghostCOMCount) $([char]0x25B8)"
-                            }
-
-                            if ($ghostCOMCount -ge 8) {
-                                $script:BTCOMPortsHeader.ForeColor = [System.Drawing.Color]::FromArgb(180, 50, 50)
-                            } elseif ($ghostCOMCount -ge 3) {
-                                $script:BTCOMPortsHeader.ForeColor = [System.Drawing.Color]::FromArgb(180, 120, 20)
-                            } else {
-                                $script:BTCOMPortsHeader.ForeColor = [System.Drawing.Color]::FromArgb(140, 110, 20)
-                            }
-                        }
-
-                        # Only show list in Expert View (collapsed stub in default)
-                        if ($script:BTExpertViewEnabled) {
-                            $script:BTCOMPortsList.Visible = $true
-                            $script:BTCOMPortsList.GridLines = $true
-                            $script:BTCOMPortsPanel.Height = 75  # Full height
-
-                            # Show ghost ports
-                            foreach ($port in ($comPortsData.COMPorts | Where-Object { $_.IsGhost })) {
-                                $comText = if ($port.COMPort) { $port.COMPort } else { "?" }
-                                $item = New-Object System.Windows.Forms.ListViewItem($comText)
-
-                                # Device name (truncate if needed)
-                                $devName = if ($port.DeviceName.Length -gt 20) { $port.DeviceName.Substring(0, 17) + "..." } else { $port.DeviceName }
-                                [void]$item.SubItems.Add($devName)
-
-                                # Status
-                                [void]$item.SubItems.Add("Ghost")
-                                $item.ForeColor = [System.Drawing.Color]::FromArgb(140, 110, 20)
-                                $item.BackColor = [System.Drawing.Color]::FromArgb(255, 252, 240)
-
-                                # Notes
-                                [void]$item.SubItems.Add("Orphaned")
-
-                                # Tooltip
-                                $tipLines = @(
-                                    "COM Port: $($port.COMPort)"
-                                    "Device: $($port.FriendlyName)"
-                                    "Status: $($port.Status)"
-                                    ""
-                                    "Ghost device - registered but not present."
-                                    "Use 'Remove Ghost COM' to clean up."
-                                )
-                                $item.ToolTipText = $tipLines -join "`n"
-
-                                [void]$script:BTCOMPortsList.Items.Add($item)
-                            }
-                        } else {
-                            # Default view: collapsed stub only (header visible, list hidden)
-                            $script:BTCOMPortsList.Visible = $false
-                            $script:BTCOMPortsPanel.Height = 22  # Header only
-                        }
-                    } else {
-                        # No ghost COM ports - hide the panel (clean state = no noise)
-                        $script:BTCOMPortsPanel.Visible = $false
-                    }
-                }
-            } catch {
-                # On error, hide the panel
-                if ($script:BTCOMPortsPanel) { $script:BTCOMPortsPanel.Visible = $false }
-            }
-
-            # === DETAILS SECTION - Verbose/noise info for advanced troubleshooting ===
-            try {
-                if ($script:BTDetailsLabel) {
-                    $lines = @()
-
-                    # Services detail (expanded view - Health tile shows summary)
-                    if (Get-Command Get-WinConfigBluetoothServiceStates -ErrorAction SilentlyContinue) {
-                        $services = & 'Get-WinConfigBluetoothServiceStates'
-                        $lines += "=== Services ==="
-                        foreach ($svcName in @("bthserv", "AudioEndpointBuilder", "Audiosrv", "BTAGService")) {
-                            if ($services[$svcName]) {
-                                $svc = $services[$svcName]
-                                $lines += "${svcName}: $($svc.Status) ($($svc.StartType))"
-                            }
-                        }
-                        # BluetoothUserService (per-user, optional)
-                        if ($services["BluetoothUserService"]) {
-                            $bu = $services["BluetoothUserService"]
-                            $lines += "BluetoothUserService: $($bu.Status)"
-                        }
-                    }
-
-                    # Adapter hardware details (noise)
-                    if ($adapter -and $adapter.InstanceId) {
-                        $lines += ""
-                        $lines += "=== Adapter ==="
-                        $lines += "Instance: $($adapter.InstanceId)"
-                        if ($adapter.DriverInfo.Manufacturer) {
-                            $lines += "Manufacturer: $($adapter.DriverInfo.Manufacturer)"
-                        }
-                        if ($adapter.DriverInfo.ProviderName) {
-                            $lines += "Provider: $($adapter.DriverInfo.ProviderName)"
-                        }
-                        if ($adapter.PowerManagementEnabled -ne $null) {
-                            $pmText = if ($adapter.PowerManagementEnabled) { "Enabled (may cause disconnects)" } else { "Disabled" }
-                            $lines += "Power Mgmt: $pmText"
-                        }
-                    }
-
-                    $script:BTDetailsLabel.Text = $lines -join "`n"
-                }
-            } catch { }
-
-            # === TIMELINE - NirSoft-inspired event history ===
-            try {
-                if ($script:BTTimelineList -and $eventHints -and $eventHints.Timeline) {
-                    $script:BTTimelineList.Items.Clear()
-                    $evtCount = $eventHints.Timeline.Count
-
-                    # Update header with badge (count in parentheses when collapsed)
-                    if ($script:BTTimelineHeader) {
-                        $badgeText = if ($evtCount -gt 0) { " ($evtCount)" } else { "" }
-                        # Preserve collapse state arrow by checking current text
-                        $arrow = if ($script:BTTimelineHeader.Text -match "^$([char]0x25B6)") { [char]0x25B6 } else { [char]0x25BC }
-                        $script:BTTimelineHeader.Text = "$arrow Timeline (60m)$badgeText"
-                        # Store title in Tag for toggle handler
-                        $script:BTTimelineHeader.Tag = @{ Title = "Timeline (60m)$badgeText"; Container = $script:BTTimelineHeader.Tag.Container }
-                    }
-
-                    if ($evtCount -gt 0) {
-                        foreach ($evt in $eventHints.Timeline | Select-Object -First 15) {
-                            $timeStr = $evt.Time.ToString("HH:mm")
-                            $item = New-Object System.Windows.Forms.ListViewItem($timeStr)
-
-                            # Color-code by event type
-                            $typeText = $evt.Type
-                            switch -Regex ($evt.Type) {
-                                "Disconnected" {
-                                    $item.ForeColor = [System.Drawing.Color]::FromArgb(180, 50, 50)
-                                }
-                                "Connected" {
-                                    $item.ForeColor = [System.Drawing.Color]::FromArgb(50, 120, 50)
-                                }
-                                "Profile:" {
-                                    $item.ForeColor = [System.Drawing.Color]::FromArgb(180, 120, 20)
-                                }
-                                "Error" {
-                                    $item.ForeColor = [System.Drawing.Color]::FromArgb(180, 50, 50)
-                                }
-                            }
-
-                            [void]$item.SubItems.Add($typeText)
-                            $item.ToolTipText = "$($evt.Time.ToString("HH:mm:ss")) - $($evt.Source)`n$($evt.Summary)"
-                            [void]$script:BTTimelineList.Items.Add($item)
-                        }
-                    } else {
-                        $item = New-Object System.Windows.Forms.ListViewItem("")
-                        [void]$item.SubItems.Add("No events (60m)")
-                        $item.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 120)
-                        [void]$script:BTTimelineList.Items.Add($item)
-                    }
-                }
-            } catch { }
-        }
-
-        # Flag for lazy-loading Bluetooth data
-        $script:BluetoothDashboardLoaded = $false
-
         # === STEP 2: CATEGORY SELECTION (with regression guards) ===
         $script:SelectedCategory = $null
         $script:SelectedCategoryIndex = 0  # For keyboard navigation
@@ -7733,38 +5984,6 @@ No system changes were made.
                 }
             }
 
-            # PERF-001: Deferred Bluetooth dashboard creation and data loading
-            # This is the ONLY place where Bluetooth.psm1 and its UI are touched
-            if ($CategoryName -eq "Bluetooth") {
-                # Step 1: Create the dashboard UI (once)
-                if (-not $script:BluetoothDashboardCreated) {
-                    # Replace placeholder with actual dashboard
-                    $placeholder = $script:CategoryPanels["Bluetooth"]
-                    $parent = $placeholder.Parent
-                    if ($parent) {
-                        $parent.Controls.Remove($placeholder)
-                        $placeholder.Dispose()
-                    }
-                    # Now create the real dashboard (this creates scriptblocks with BT references)
-                    $realDashboard = New-BluetoothDashboard
-                    $realDashboard.Visible = $true
-                    $script:CategoryPanels["Bluetooth"] = $realDashboard
-                    if ($parent) {
-                        $parent.Controls.Add($realDashboard)
-                        $realDashboard.BringToFront()
-                    }
-                    $script:BluetoothDashboardCreated = $true
-                }
-
-                # Step 2: Load data (once)
-                if (-not $script:BluetoothDashboardLoaded) {
-                    if ($script:UpdateBluetoothDashboardFn) {
-                        . $script:UpdateBluetoothDashboardFn
-                        $script:BluetoothDashboardLoaded = $true
-                    }
-                }
-            }
-
             # Step 6: Focus first tool only if requested and no tool is running
             if ($FocusFirstTool) {
                 $hasRunningTool = $false
@@ -7797,19 +6016,9 @@ No system changes were made.
         # === STEP 2: CREATE PANELS ONCE ===
         # Iterate over $script:Categories (single source of truth)
         # Use $script:CategoryTools for tool lists
-        # PERF-001: Bluetooth panel is DEFERRED - creates placeholder, replaced on first select
         foreach ($catName in $script:Categories) {
             # Create tool panel for this category (created once, never recreated)
-            if ($catName -eq "Bluetooth") {
-                # PERF-001: Defer Bluetooth dashboard creation until tab is selected
-                # This prevents scriptblock capture from loading Bluetooth.psm1 at startup
-                $toolPanel = New-Object System.Windows.Forms.Panel
-                $toolPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
-                $toolPanel.Tag = "bluetooth-placeholder"
-                $script:BluetoothDashboardCreated = $false
-            } else {
-                $toolPanel = New-CategoryPanel -Title $catName -Buttons $script:CategoryTools[$catName]
-            }
+            $toolPanel = New-CategoryPanel -Title $catName -Buttons $script:CategoryTools[$catName]
             $toolPanel.Visible = $false
             $script:CategoryPanels[$catName] = $toolPanel
             $detailContainer.Controls.Add($toolPanel)
@@ -8390,6 +6599,16 @@ $form.Add_FormClosing({
                         # Error codes (safe - structured error info)
                         if ($ev.ErrorCode) { $safeEvidence.ErrorCode = $ev.ErrorCode }
                         if ($ev.ErrorPhase) { $safeEvidence.ErrorPhase = $ev.ErrorPhase }
+                        # Bluetooth diagnostics (safe - enum/boolean/count values, no device names or identifiers)
+                        if ($ev.VerdictStatus)                   { $safeEvidence.VerdictStatus     = $ev.VerdictStatus }
+                        if ($ev.VerdictConfidence)               { $safeEvidence.VerdictConfidence = $ev.VerdictConfidence }
+                        if ($null -ne $ev.FindingCount)          { $safeEvidence.FindingCount      = $ev.FindingCount }
+                        if ($ev.FindingIds)                      { $safeEvidence.FindingIds        = @($ev.FindingIds) }
+                        if ($null -ne $ev.AdapterPresent)        { $safeEvidence.AdapterPresent    = $ev.AdapterPresent }
+                        if ($null -ne $ev.ServicesHealthy)       { $safeEvidence.ServicesHealthy   = $ev.ServicesHealthy }
+                        if ($null -ne $ev.DisconnectCount)       { $safeEvidence.DisconnectCount   = $ev.DisconnectCount }
+                        if ($ev.FindingId)                       { $safeEvidence.FindingId         = $ev.FindingId }
+                        if ($ev.AppliesTo)                       { $safeEvidence.AppliesTo         = $ev.AppliesTo }
                     }
                     @{
                         Timestamp = $_.Timestamp.ToString("o")
@@ -8540,15 +6759,11 @@ $form.Add_FormClosing({
 # Prevents regression: deferred modules must NOT be loaded before ShowDialog()
 # HARD ASSERTION: Fails startup if violated - symbol references cause parse-time load
 # ============================================================================
-$deferredModules = @('Bluetooth', 'Network.Diagnostics')
+$deferredModules = @('Network.Diagnostics')
 foreach ($moduleName in $deferredModules) {
     if (Get-Module -Name $moduleName -ErrorAction SilentlyContinue) {
         throw "PERF-001 VIOLATION: $moduleName loaded during startup - symbol reference caused parse-time module load"
     }
-}
-# Also check internal flag (catches cases where module was imported but later unloaded)
-if ($script:BluetoothModuleLoaded) {
-    throw "PERF-001 VIOLATION: Bluetooth module flag set during startup - lazy load failed"
 }
 
 # Set initial tab and focus when form loads

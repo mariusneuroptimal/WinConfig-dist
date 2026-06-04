@@ -65,33 +65,33 @@ function Invoke-ToolActionAsync {
         Required for dry run compliance validation.
 
     .EXAMPLE
-        Invoke-ToolActionAsync -ActionName "Bluetooth Diagnostics" -Category "Bluetooth" `
+        Invoke-ToolActionAsync -ActionName "Machine Info" -Category "System" `
             -ActionButton $btn -StatusLabel $statusLabel -CancelButton $cancelBtn `
             -Work {
-                $diag = Get-WinConfigBluetoothDiagnostics
-                @{ Result = $diag.Verdict.Status; Summary = $diag.Verdict.Summary; Evidence = $diag }
+                $info = Get-WinConfigMachineInfo
+                @{ Result = "PASS"; Summary = "Collected machine info"; Evidence = $info }
             }
 
     .EXAMPLE
         # Dry run example
-        Invoke-ToolActionAsync -ActionName "Restart Bluetooth" -Category "AdminChange" `
-            -ToolId "bluetooth-service-restart" -DryRun `
+        Invoke-ToolActionAsync -ActionName "Restart Audio" -Category "AdminChange" `
+            -ToolId "audio-service-restart" -DryRun `
             -ActionButton $btn -StatusLabel $statusLabel -CancelButton $cancelBtn `
             -Work {
                 param($DryRun)
                 if ($DryRun) {
                     @{
                         Result = "SKIP"
-                        Summary = "[DRY RUN] Would restart Bluetooth Support Service"
+                        Summary = "[DRY RUN] Would restart Windows Audio service"
                         Executed = $false
                         Plan = @{
-                            Steps = @("Stop bthserv service", "Wait for stop", "Start bthserv service")
-                            AffectedResources = @("Service:bthserv")
+                            Steps = @("Stop Audiosrv service", "Wait for stop", "Start Audiosrv service")
+                            AffectedResources = @("Service:Audiosrv")
                         }
                     }
                 } else {
-                    Restart-Service -Name bthserv -Force
-                    @{ Result = "PASS"; Summary = "Bluetooth service restarted"; Executed = $true }
+                    Restart-Service -Name Audiosrv -Force
+                    @{ Result = "PASS"; Summary = "Audio service restarted"; Executed = $true }
                 }
             }
     #>
@@ -204,12 +204,6 @@ function Invoke-ToolActionAsync {
                 $result.Result = "CANCELLED"
                 $result.Summary = "Operation cancelled before start"
                 return $result
-            }
-
-            # Import Bluetooth module if available
-            $btModule = Join-Path $ModulesPath "Bluetooth.psm1"
-            if (Test-Path $btModule) {
-                Import-Module $btModule -Force -ErrorAction SilentlyContinue -Prefix WinConfig
             }
 
             # Import DryRun module if available (for dry run infrastructure)

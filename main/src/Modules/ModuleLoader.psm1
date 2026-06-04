@@ -108,7 +108,7 @@ function Import-OptionalModule {
         }
 
     .EXAMPLE
-        $null = Import-OptionalModule -Path "$PSScriptRoot\Modules\Bluetooth.psm1" -Prefix WinConfig
+        $null = Import-OptionalModule -Path "$PSScriptRoot\Modules\DryRun.psm1" -Prefix WinConfig
     #>
     [CmdletBinding()]
     param(

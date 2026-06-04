@@ -23,8 +23,8 @@
         "NO Shortcuts"
         "Disk"
         "System"
-        "Bluetooth"
         "Audio"
+        "Bluetooth"
         "zAmp"
         "Zengar UI"
     )
@@ -38,19 +38,14 @@
             "Flush DNS Cache"
             "Open Speedtest.net"
         )
-        "Bluetooth" = @(
-            "BT Quick Check"
-            "Check Adapter"
-            "Check Services"
-            "List Paired"
-            "Power Settings"
-            "Restart Bluetooth Service"
-            "Bluetooth Settings"
-        )
         "Audio" = @(
             "Remove Intel SST Audio Driver"
             "Restart Audio Service"
             "Sound Panel"
+            "Run Bluetooth Diagnostics"   # Legacy fallback — primary home is now Bluetooth category
+        )
+        "Bluetooth" = @(
+            "Run Bluetooth Diagnostics"
         )
         "System" = @(
             "Copy System Info"
@@ -115,36 +110,6 @@
             Group = "External"
         }
 
-        # Bluetooth tools
-        "BT Quick Check" = @{
-            Description = "Run all Bluetooth checks"
-            Group = "Preset"
-        }
-        "Check Adapter" = @{
-            Description = "Verify Bluetooth adapter status"
-            Group = "Diagnostics"
-        }
-        "Check Services" = @{
-            Description = "Check Bluetooth service state"
-            Group = "Diagnostics"
-        }
-        "List Paired" = @{
-            Description = "Show paired devices"
-            Group = "Diagnostics"
-        }
-        "Power Settings" = @{
-            Description = "Review power management"
-            Group = "Diagnostics"
-        }
-        "Restart Bluetooth Service" = @{
-            Description = "Restart Bluetooth support service"
-            Group = "Actions"
-        }
-        "Bluetooth Settings" = @{
-            Description = "Open Windows BT settings"
-            Group = "Settings"
-        }
-
         # Audio tools
         "Remove Intel SST Audio Driver" = @{
             Description = "Uninstall problematic SST driver"
@@ -157,6 +122,10 @@
         "Sound Panel" = @{
             Description = "Open sound control panel"
             Group = "Settings"
+        }
+        "Run Bluetooth Diagnostics" = @{
+            Description = "Run Bluetooth probe and record findings"
+            Group = "Diagnostics"
         }
 
         # System tools
@@ -273,9 +242,7 @@
     }
 
     # Presets (tools that trigger multiple operations)
-    Presets = @(
-        "BT Quick Check"
-    )
+    Presets = @()
 
     # Expected tab structure
     Tabs = @(

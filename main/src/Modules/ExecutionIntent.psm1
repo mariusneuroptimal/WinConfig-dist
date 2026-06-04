@@ -93,7 +93,7 @@ function Invoke-WithExecutionIntent {
         Required for nested wrapper calls with a different intent than the outer scope.
     .EXAMPLE
         Invoke-WithExecutionIntent -Intent 'ADMIN_ACTION' {
-            Invoke-BluetoothServiceReset
+            Restart-Service -Name Audiosrv -Force
         }
     #>
     [CmdletBinding()]

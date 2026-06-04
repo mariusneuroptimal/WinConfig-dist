@@ -49,9 +49,8 @@
            Prefix = "WinConfig" }
         @{ Path = "src/Modules/DryRun.psm1"                  # Dry Run infrastructure
            Prefix = "WinConfig" }
-        @{ Path = "src/Modules/Bluetooth.psm1"               # BT audio diagnostics (PERF-001)
-           Prefix = "WinConfig"
-           Deferred = $true }                                 # Lazy-loaded on first Bluetooth tab use
+        @{ Path = "src/Modules/DiagnosticsPackage.psm1" }   # Diagnostic run folder + ZIP packaging
+        @{ Path = "src/Modules/DiagnosticsUpload.psm1" }    # Diagnostic package upload (LocalFolder provider)
     )
 
     # Documentation of invariants (for governance reference)
