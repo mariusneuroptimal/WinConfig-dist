@@ -4018,7 +4018,7 @@ $buttonHandlers = @{
                         -Config $uploadConfig `
                         -Metadata @{ RunId = $btDiagRun.RunId }
                     if ($uploadResult.Status -eq 'Uploaded') {
-                        Write-BtLog "Uploaded ($($uploadResult.Provider)): $($uploadResult.RemotePath)" -Level "SUCCESS"
+                        Write-BtLog "Uploaded ($($uploadResult.Provider)): $($uploadResult.RemotePath)" -Level "OK"
                         $dest = if ($uploadResult.Provider -eq 'R2') { "R2: $($uploadResult.RemotePath)" } else { $uploadResult.RemotePath }
                         $btUploadLabel.Text = "Upload: Completed - $dest"
                     } else {
