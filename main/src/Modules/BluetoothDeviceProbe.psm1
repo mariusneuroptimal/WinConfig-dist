@@ -779,6 +779,51 @@ function Get-ProbeStateGuiLevel {
     }
 }
 
+function Get-ProbeStateUserText {
+    [CmdletBinding()]
+    param(
+        [string]$Kind,
+        [string]$State,
+        [switch]$Short
+    )
+
+    if ($Kind -eq 'device') {
+        return switch ($State) {
+            'Missing'         { if ($Short) { 'Not found' }       else { 'Not found — headset not discovered by Windows yet' } }
+            'PairedCandidate' { if ($Short) { 'Paired' }          else { 'Paired' } }
+            'SeenByPnp'       { if ($Short) { 'Discovered' }      else { 'Discovered — visible but not yet paired' } }
+            'Ambiguous'       { if ($Short) { 'Ambiguous' }       else { 'Ambiguous — multiple matching devices found' } }
+            'Configured'      { if ($Short) { 'Configured' }      else { 'Configured' } }
+            'Unconfigured'    { if ($Short) { 'Not configured' }  else { 'Not configured' } }
+            default           { $State }
+        }
+    }
+    if ($Kind -eq 'comport') {
+        return switch ($State) {
+            'ComPortMissing'      { if ($Short) { 'None' }            else { 'None — appears after successful pairing' } }
+            'ComPortFound'        { if ($Short) { 'Found' }           else { 'Found' } }
+            'ComPortAmbiguous'    { if ($Short) { 'Multiple' }        else { 'Multiple ports matched' } }
+            'ComPortUnconfigured' { if ($Short) { 'N/A' }             else { 'N/A' } }
+            default               { $State -replace 'ComPort','' }
+        }
+    }
+    if ($Kind -eq 'btlink') {
+        return switch ($State) {
+            'Connected'    { 'Connected' }
+            'NotConnected' { 'Disconnected' }
+            'Unknown'      { if ($Short) { 'Unknown' } else { 'Unknown — needs admin rights and device discovery' } }
+            default        { $State }
+        }
+    }
+    if ($Kind -eq 'stream') {
+        if ($State -eq 'Active')           { return 'Active' }
+        if ($State -eq 'Stopped')          { return 'Idle' }
+        if ($State -like 'Stopped*')       { return $State -replace '^Stopped','Stopped' }
+        return $State
+    }
+    return $State
+}
+
 function Get-ProbeStateColor {
     <#
     .SYNOPSIS
@@ -819,5 +864,6 @@ Export-ModuleMember -Function @(
     'Get-DeviceProbeSessionSummary',
     'Invoke-AnomalyDiagnosticSnapshot',
     'Get-ProbeStateGuiLevel',
-    'Get-ProbeStateColor'
+    'Get-ProbeStateColor',
+    'Get-ProbeStateUserText'
 )

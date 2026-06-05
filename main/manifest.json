@@ -1,9 +1,4 @@
 {
-  "branch": "main",
-  "build_id": "27019153882-1",
-  "source_ref": "23450bc080c925f6c12c48b3a8d7e5ffd3f58575",
-  "schema_version": "2.0",
-  "timestamp": "2026-06-05T13:57:13.3259824Z",
   "artifacts": [
     {
       "sha256": "d1278321cdcd5c0759d3dfa773e964cda8d254ccdfd7f08dce12f878d317fff9",
@@ -11,8 +6,8 @@
       "path": "Win11Config.ps1"
     },
     {
-      "sha256": "b4d5201c084bf13c2aba2c7ebf8566914636a65422fadd244a50606a986fec78",
-      "size": 373579,
+      "sha256": "ea8dbecfe8f5bd9d4837aa5ea22deba37194438117a11be96a473d88bd735f21",
+      "size": 375001,
       "path": "src/Win11Config.App.ps1"
     },
     {
@@ -146,10 +141,15 @@
       "path": "src/Modules/TargetDeviceWatch.psm1"
     },
     {
-      "sha256": "df450f5aae7241ea677cd769c30e1bfd193c20b1ba5ad3fcdef58d7efa31187e",
-      "size": 37118,
+      "sha256": "ba6a9197820b4ab1627d16f45e99ec09829f3f63d8d91a6eae0f847a86e0c5eb",
+      "size": 39233,
       "path": "src/Modules/BluetoothDeviceProbe.psm1"
     }
   ],
-  "event": "push"
+  "timestamp": "2026-06-05T14:42:52.8931803Z",
+  "build_id": "27021557072-1",
+  "schema_version": "2.0",
+  "event": "push",
+  "branch": "main",
+  "source_ref": "861084f53d3c63f62584f2496bd806ae692ca866"
 }

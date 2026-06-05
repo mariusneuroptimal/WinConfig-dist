@@ -3960,17 +3960,17 @@ $buttonHandlers = @{
 
             $btStateLabels = @{}
             $stateIndicators = @(
-                @{ Key = 'Device';  X = 8;   Text = 'Device: --' }
-                @{ Key = 'COM';     X = 148; Text = 'COM: --' }
-                @{ Key = 'Link';    X = 288; Text = 'Link: --' }
-                @{ Key = 'Stream';  X = 408; Text = 'Stream: --' }
-                @{ Key = 'App';     X = 528; Text = 'NO.exe: --' }
+                @{ Key = 'Device';  X = 8;   W = 140; Text = 'Device: --' }
+                @{ Key = 'COM';     X = 148; W = 120; Text = 'COM: --' }
+                @{ Key = 'Link';    X = 268; W = 130; Text = 'Radio: --' }
+                @{ Key = 'Stream';  X = 398; W = 120; Text = 'Stream: --' }
+                @{ Key = 'App';     X = 518; W = 120; Text = 'NO.exe: --' }
             )
             foreach ($ind in $stateIndicators) {
                 $lbl = New-Object System.Windows.Forms.Label
                 $lbl.Text = $ind.Text
                 $lbl.AutoSize = $false
-                $lbl.Width = 130
+                $lbl.Width = if ($ind.W) { $ind.W } else { 130 }
                 $lbl.Height = 22
                 $lbl.Location = New-Object System.Drawing.Point($ind.X, 5)
                 $lbl.Font = New-Object System.Drawing.Font("Consolas", 8)
@@ -4157,11 +4157,13 @@ $buttonHandlers = @{
                 # Show status strip and initial state
                 $btStateStrip.Visible = $true
 
-                Write-BtLog "  Device state  : $($btProbeWatch.DeviceState)" -Level (Get-ProbeStateGuiLevel $btProbeWatch.DeviceState)
-                Write-BtLog "  COM port      : $($btProbeWatch.ComPortState)" -Level (Get-ProbeStateGuiLevel $btProbeWatch.ComPortState)
-                Write-BtLog "  BT link (ACL) : $initLink" -Level (Get-ProbeStateGuiLevel $initLink)
-                $streamDetail = if ($initStream.State -eq 'Active' -and $initStream.ActivePort) { " ($($initStream.ActivePort))" } else { '' }
-                Write-BtLog "  EEG streaming : $($initStream.State)$streamDetail" -Level (Get-ProbeStateGuiLevel $initStream.State)
+                Write-BtLog "  Device        : $(Get-ProbeStateUserText -Kind device -State $btProbeWatch.DeviceState)" -Level (Get-ProbeStateGuiLevel $btProbeWatch.DeviceState)
+                Write-BtLog "  COM port      : $(Get-ProbeStateUserText -Kind comport -State $btProbeWatch.ComPortState)" -Level (Get-ProbeStateGuiLevel $btProbeWatch.ComPortState)
+                Write-BtLog "  Radio link    : $(Get-ProbeStateUserText -Kind btlink -State $initLink)" -Level (Get-ProbeStateGuiLevel $initLink)
+                if ($initStream.State -eq 'Active') {
+                    $streamPort = if ($initStream.ActivePort) { " ($($initStream.ActivePort))" } else { '' }
+                    Write-BtLog "  EEG streaming : Active$streamPort" -Level "OK"
+                }
                 $noRunning = Test-ProcessRunningInSnapshot -ProcessNames $initProc -Name $btProbeAppName
                 Write-BtLog "  NO.exe        : $(if ($noRunning) { 'Running' } else { 'Not running' })" -Level $(if ($noRunning) { 'OK' } else { 'DIM' })
                 if ($btProbeSession.AdapterInfo -and $btProbeSession.AdapterInfo.Present) {
@@ -4178,7 +4180,7 @@ $buttonHandlers = @{
                 Write-BtLog "  Start a session and reproduce the Bluetooth issue" -Level "INFO"
                 Write-BtLog "  Click  Stop and Upload  when done (~10 sec to finish)" -Level "INFO"
                 Write-BtLog "" -Level "DIM"
-                Write-BtLog "  Monitoring Bluetooth activity (3s interval) -- state changes will appear here" -Level "DIM"
+                Write-BtLog "  Watching for Bluetooth changes (every 3s) — events appear below as they happen" -Level "DIM"
             } else {
                 Write-BtLog "  Deep device probe not available -- using basic monitoring" -Level "WARN"
                 Write-BtLog "  NeurOptimal can be launched now" -Level "INFO"
@@ -4199,8 +4201,8 @@ $buttonHandlers = @{
 
                 # Update elapsed label with current state summary
                 if ($btDeepProbeAvailable -and $btProbeWatch) {
-                    $devShort = $btProbeWatch.DeviceState -replace 'PairedCandidate','Paired' -replace 'ComPort',''
-                    $streamShort = $btProbeSession.StreamingState
+                    $devShort = Get-ProbeStateUserText -Kind device -State $btProbeWatch.DeviceState -Short
+                    $streamShort = Get-ProbeStateUserText -Kind stream -State $btProbeSession.StreamingState -Short
                     $btElapsedLabel.Text = "Recording  {0:mm\:ss}  |  {1}  |  Stream: {2}" -f $elapsed, $devShort, $streamShort
                 } else {
                     $btElapsedLabel.Text = "Recording  {0:mm\:ss}  -- click Stop and Upload when done" -f $elapsed
@@ -4220,8 +4222,19 @@ $buttonHandlers = @{
 
                         foreach ($evt in $probeEvents) {
                             $ts = $evt.Timestamp.ToString('HH:mm:ss')
-                            $kindTag = $evt.Kind.ToUpper().PadRight(8)
-                            Write-BtLog "  $ts  [$kindTag]  $($evt.State)  --  $($evt.Reason)" -Level $evt.Level
+                            $kindTag = switch ($evt.Kind) {
+                                'device'  { 'DEVICE' }
+                                'comport' { 'COM' }
+                                'STREAM'  { 'STREAM' }
+                                'BTLINK'  { 'RADIO' }
+                                'ANOMALY' { 'ALERT' }
+                                'process' { 'PROCESS' }
+                                default   { $evt.Kind.ToUpper() }
+                            }
+                            $kindTag = $kindTag.PadRight(8)
+                            $evtKind = switch ($evt.Kind) { 'device' { 'device' } 'comport' { 'comport' } 'BTLINK' { 'btlink' } 'STREAM' { 'stream' } default { '' } }
+                            $evtStateText = if ($evtKind) { Get-ProbeStateUserText -Kind $evtKind -State $evt.State -Short } else { $evt.State }
+                            Write-BtLog "  $ts  [$kindTag]  $evtStateText  --  $($evt.Reason)" -Level $evt.Level
                             if ($evt.Annotation) {
                                 $annoLevel = if ($evt.Annotation.StartsWith('[!]')) { 'FAIL' } elseif ($evt.Annotation.StartsWith('[~]')) { 'WARN' } else { 'OK' }
                                 Write-BtLog "             $($evt.Annotation)" -Level $annoLevel
@@ -4229,9 +4242,9 @@ $buttonHandlers = @{
                         }
 
                         # Update status strip
-                        $btStateLabels['Device'].Text = "Device: $($btProbeWatch.DeviceState -replace 'PairedCandidate','Paired')"
+                        $btStateLabels['Device'].Text = "Device: $(Get-ProbeStateUserText -Kind device -State $btProbeWatch.DeviceState -Short)"
                         $btStateLabels['Device'].ForeColor = Get-ProbeStateColor $btProbeWatch.DeviceState
-                        $comText = $btProbeWatch.ComPortState -replace 'ComPort',''
+                        $comText = Get-ProbeStateUserText -Kind comport -State $btProbeWatch.ComPortState -Short
                         if ($btProbeWatch.ComPortState -in @('ComPortFound','ComPortAmbiguous')) {
                             $portNames = @()
                             if ($btProbeWatch.ComPortMatches.Count -gt 0) { $portNames += $btProbeWatch.ComPortMatches | ForEach-Object { $_.PortName } }
@@ -4241,9 +4254,9 @@ $buttonHandlers = @{
                         }
                         $btStateLabels['COM'].Text = "COM: $comText"
                         $btStateLabels['COM'].ForeColor = Get-ProbeStateColor $btProbeWatch.ComPortState
-                        $btStateLabels['Link'].Text = "Link: $($btProbeSession.BtLinkState)"
+                        $btStateLabels['Link'].Text = "Radio: $(Get-ProbeStateUserText -Kind btlink -State $btProbeSession.BtLinkState -Short)"
                         $btStateLabels['Link'].ForeColor = Get-ProbeStateColor $btProbeSession.BtLinkState
-                        $btStateLabels['Stream'].Text = "Stream: $($btProbeSession.StreamingState)"
+                        $btStateLabels['Stream'].Text = "Stream: $(Get-ProbeStateUserText -Kind stream -State $btProbeSession.StreamingState -Short)"
                         $btStateLabels['Stream'].ForeColor = Get-ProbeStateColor $btProbeSession.StreamingState
                         $appState = $btProbeWatch.AppProcessState
                         $btStateLabels['App'].Text = "NO.exe: $(if ($appState -eq 'Running') { 'Running' } else { 'Off' })"
@@ -4293,7 +4306,9 @@ $buttonHandlers = @{
                     if ($btHeartbeatTick -ge 30) {
                         $btHeartbeatTick = 0
                         $elSec = [int]$elapsed.TotalSeconds
-                        Write-BtLog "  ... still watching  [${elSec}s  device=$($btProbeWatch.DeviceState)  COM=$($btProbeWatch.ComPortState)  stream=$($btProbeSession.StreamingState)]" -Level "DIM"
+                        $hbDevice = Get-ProbeStateUserText -Kind device -State $btProbeWatch.DeviceState -Short
+                        $hbStream = Get-ProbeStateUserText -Kind stream -State $btProbeSession.StreamingState -Short
+                        Write-BtLog "  ... watching  [${elSec}s]  Device: $hbDevice  |  Stream: $hbStream" -Level "DIM"
                     }
 
                     $btNextProbeTick = $now.AddSeconds(3)
@@ -4380,8 +4395,8 @@ $buttonHandlers = @{
 
                 Write-BtLog ""
                 Write-BtLog "SESSION SUMMARY" -Level "STEP"
-                Write-BtLog "  Final device state  : $($btWatchReport.DeviceState)" -Level (Get-ProbeStateGuiLevel $btWatchReport.DeviceState)
-                Write-BtLog "  Final COM port state: $($btWatchReport.ComPortState)" -Level (Get-ProbeStateGuiLevel $btWatchReport.ComPortState)
+                Write-BtLog "  Final device state  : $(Get-ProbeStateUserText -Kind device -State $btWatchReport.DeviceState -Short)" -Level (Get-ProbeStateGuiLevel $btWatchReport.DeviceState)
+                Write-BtLog "  Final COM port      : $(Get-ProbeStateUserText -Kind comport -State $btWatchReport.ComPortState -Short)" -Level (Get-ProbeStateGuiLevel $btWatchReport.ComPortState)
                 Write-BtLog "  Total state changes : $($btProbeSummary.ObservationCount)" -Level "INFO"
 
                 if ($btProbeSummary.ReconnectStats) {
