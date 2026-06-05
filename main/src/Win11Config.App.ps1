@@ -3860,7 +3860,7 @@ $buttonHandlers = @{
             # ── Build form ────────────────────────────────────────────────────────
             $btForm = New-Object System.Windows.Forms.Form
             $btForm.Text = "Bluetooth Flight Recorder"
-            $btForm.Size = New-Object System.Drawing.Size(700, 580)
+            $btForm.Size = New-Object System.Drawing.Size(700, 650)
             $btForm.StartPosition = "CenterScreen"
             $btForm.FormBorderStyle = "FixedDialog"
             $btForm.MaximizeBox = $false
@@ -3893,15 +3893,6 @@ $buttonHandlers = @{
             $btUploadLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
             $btStatusPanel.Controls.Add($btUploadLabel)
 
-            $btOpenFolderBtn = New-Object System.Windows.Forms.Button
-            $btOpenFolderBtn.Text = "Open Folder"
-            $btOpenFolderBtn.Size = New-Object System.Drawing.Size(100, 28)
-            $btOpenFolderBtn.Location = New-Object System.Drawing.Point(8, 48)
-            $btOpenFolderBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-            $btOpenFolderBtn.Enabled = $false
-            $btOpenFolderBtn.Add_Click({ if ($btOpenFolderBtn.Tag) { Start-Process explorer.exe $btOpenFolderBtn.Tag } })
-            $btStatusPanel.Controls.Add($btOpenFolderBtn)
-
             # Top instruction banner (add second)
             $btBanner = New-Object System.Windows.Forms.Panel
             $btBanner.Dock = [System.Windows.Forms.DockStyle]::Top
@@ -3917,6 +3908,77 @@ $buttonHandlers = @{
             $btBannerLabel.Padding = New-Object System.Windows.Forms.Padding(12, 0, 0, 0)
             $btBannerLabel.Text = "Step 1 of 3 - Taking Bluetooth baseline snapshot, please wait..."
             $btBanner.Controls.Add($btBannerLabel)
+
+            # Anomaly confirmation bar (initially hidden, shown when anomaly detected)
+            $btAnomalyBar = New-Object System.Windows.Forms.Panel
+            $btAnomalyBar.Dock = [System.Windows.Forms.DockStyle]::Top
+            $btAnomalyBar.Height = 40
+            $btAnomalyBar.BackColor = [System.Drawing.Color]::FromArgb(180, 130, 20)
+            $btAnomalyBar.Visible = $false
+            $btForm.Controls.Add($btAnomalyBar)
+
+            $btAnomalyLabel = New-Object System.Windows.Forms.Label
+            $btAnomalyLabel.Text = "Stream stopped unexpectedly -- was this a manual stop?"
+            $btAnomalyLabel.AutoSize = $false
+            $btAnomalyLabel.Width = 390
+            $btAnomalyLabel.Height = 28
+            $btAnomalyLabel.Location = New-Object System.Drawing.Point(12, 7)
+            $btAnomalyLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+            $btAnomalyLabel.ForeColor = [System.Drawing.Color]::White
+            $btAnomalyBar.Controls.Add($btAnomalyLabel)
+
+            $script:BtAnomaly_Resolved = $false
+            $script:BtAnomaly_IsExpected = $false
+
+            $btAnomalyExpectedBtn = New-Object System.Windows.Forms.Button
+            $btAnomalyExpectedBtn.Text = "Expected"
+            $btAnomalyExpectedBtn.Size = New-Object System.Drawing.Size(90, 26)
+            $btAnomalyExpectedBtn.Location = New-Object System.Drawing.Point(420, 7)
+            $btAnomalyExpectedBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btAnomalyExpectedBtn.BackColor = [System.Drawing.Color]::FromArgb(60, 140, 60)
+            $btAnomalyExpectedBtn.ForeColor = [System.Drawing.Color]::White
+            $btAnomalyExpectedBtn.Add_Click({ $script:BtAnomaly_Resolved = $true; $script:BtAnomaly_IsExpected = $true })
+            $btAnomalyBar.Controls.Add($btAnomalyExpectedBtn)
+
+            $btAnomalyInvestBtn = New-Object System.Windows.Forms.Button
+            $btAnomalyInvestBtn.Text = "Investigate"
+            $btAnomalyInvestBtn.Size = New-Object System.Drawing.Size(90, 26)
+            $btAnomalyInvestBtn.Location = New-Object System.Drawing.Point(520, 7)
+            $btAnomalyInvestBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btAnomalyInvestBtn.BackColor = [System.Drawing.Color]::FromArgb(200, 60, 60)
+            $btAnomalyInvestBtn.ForeColor = [System.Drawing.Color]::White
+            $btAnomalyInvestBtn.Add_Click({ $script:BtAnomaly_Resolved = $true; $script:BtAnomaly_IsExpected = $false })
+            $btAnomalyBar.Controls.Add($btAnomalyInvestBtn)
+
+            # Device status strip (5 compact state indicators)
+            $btStateStrip = New-Object System.Windows.Forms.Panel
+            $btStateStrip.Dock = [System.Windows.Forms.DockStyle]::Top
+            $btStateStrip.Height = 32
+            $btStateStrip.BackColor = [System.Drawing.Color]::FromArgb(25, 25, 30)
+            $btStateStrip.Visible = $false
+            $btForm.Controls.Add($btStateStrip)
+
+            $btStateLabels = @{}
+            $stateIndicators = @(
+                @{ Key = 'Device';  X = 8;   Text = 'Device: --' }
+                @{ Key = 'COM';     X = 148; Text = 'COM: --' }
+                @{ Key = 'Link';    X = 288; Text = 'Link: --' }
+                @{ Key = 'Stream';  X = 408; Text = 'Stream: --' }
+                @{ Key = 'App';     X = 528; Text = 'NO.exe: --' }
+            )
+            foreach ($ind in $stateIndicators) {
+                $lbl = New-Object System.Windows.Forms.Label
+                $lbl.Text = $ind.Text
+                $lbl.AutoSize = $false
+                $lbl.Width = 130
+                $lbl.Height = 22
+                $lbl.Location = New-Object System.Drawing.Point($ind.X, 5)
+                $lbl.Font = New-Object System.Drawing.Font("Consolas", 8)
+                $lbl.ForeColor = [System.Drawing.Color]::FromArgb(180, 180, 180)
+                $lbl.TextAlign = "MiddleLeft"
+                $btStateStrip.Controls.Add($lbl)
+                $btStateLabels[$ind.Key] = $lbl
+            }
 
             # Console output fills remaining space (add last)
             $btOutputBox = New-Object System.Windows.Forms.RichTextBox
@@ -3980,24 +4042,36 @@ $buttonHandlers = @{
                 Write-BtLog "Baseline complete (Bluetooth adapter may be unavailable)" -Level "WARN"
             }
 
-            # ── PHASE 2: Recording — DoEvents loop, Stop button breaks it ─────────
+            # ── PHASE 2: Recording — Deep probe with DoEvents loop ────────────────
             $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(20, 65, 25)
             $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(160, 240, 160)
             $btBannerLabel.Text      = "Step 2 of 3 - Recording.  Launch NeurOptimal, reproduce the issue, then click Stop and Upload."
 
             Write-BtLog ""
             Write-BtLog "Step 2 of 3: Recording in progress" -Level "STEP"
-            Write-BtLog "  - NeurOptimal can be launched now" -Level "INFO"
-            Write-BtLog "  - Start a session and reproduce the Bluetooth issue" -Level "INFO"
-            Write-BtLog "  - Try pairing / unpairing / streaming audio until the problem occurs" -Level "INFO"
-            Write-BtLog "  - Click  Stop and Upload  in the status bar when done (~10 sec to finish)" -Level "INFO"
-            Write-BtLog ""
+
+            # Check if deep probe modules are available
+            $btDeepProbeAvailable = (Get-Command New-TargetDeviceConfiguration -ErrorAction SilentlyContinue) -and
+                                    (Get-Command Initialize-BtWin32Api -ErrorAction SilentlyContinue) -and
+                                    (Get-Command New-DeviceProbeSession -ErrorAction SilentlyContinue)
+
+            # Load probe modules if not already loaded
+            if (-not $btDeepProbeAvailable) {
+                $tdwPath = Join-Path $PSScriptRoot "Modules\TargetDeviceWatch.psm1"
+                $bdpPath = Join-Path $PSScriptRoot "Modules\BluetoothDeviceProbe.psm1"
+                try {
+                    if (Test-Path $tdwPath) { Import-Module $tdwPath -Force -DisableNameChecking -ErrorAction Stop }
+                    if (Test-Path $bdpPath) { Import-Module $bdpPath -Force -DisableNameChecking -ErrorAction Stop }
+                    $btDeepProbeAvailable = (Get-Command New-TargetDeviceConfiguration -ErrorAction SilentlyContinue) -and
+                                            (Get-Command Initialize-BtWin32Api -ErrorAction SilentlyContinue)
+                } catch { }
+            }
 
             $script:BtRec_StopClicked = $false
             $btStopBtn = New-Object System.Windows.Forms.Button
             $btStopBtn.Text = "Stop and Upload"
             $btStopBtn.Size = New-Object System.Drawing.Size(130, 28)
-            $btStopBtn.Location = New-Object System.Drawing.Point(118, 48)
+            $btStopBtn.Location = New-Object System.Drawing.Point(8, 48)
             $btStopBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
             $btStopBtn.BackColor = [System.Drawing.Color]::FromArgb(200, 50, 50)
             $btStopBtn.ForeColor = [System.Drawing.Color]::White
@@ -4005,14 +4079,291 @@ $buttonHandlers = @{
             $btStatusPanel.Controls.Add($btStopBtn)
 
             $btRecordStart = Get-Date
-            while (-not $script:BtRec_StopClicked) {
-                [System.Windows.Forms.Application]::DoEvents()
-                $elapsed = [datetime]::Now - $btRecordStart
-                $btElapsedLabel.Text = "Recording  {0:mm\:ss}  -- click Stop and Upload when done" -f $elapsed
-                Start-Sleep -Milliseconds 500
+            $btPollJob     = $null
+            $btPollSince   = $btRecordStart
+            $btNextPoll    = $btRecordStart.AddSeconds(6)
+            $btSvcStates   = $null
+            $btFirstPoll   = $true
+
+            # Deep probe session state (used across recording + summary)
+            $btProbeSession  = $null
+            $btProbeWatch    = $null
+            $btProbeConfig   = $null
+            $btProbeTargetMac = ''
+            $btProbeAppName  = 'NO'
+
+            if ($btDeepProbeAvailable) {
+                # ── Initialize deep probe ────────────────────────────────────
+                $btWin32Ok = Initialize-BtWin32Api
+                $btProbeSession = New-DeviceProbeSession
+                $btProbeSession.BtWin32Available = $btWin32Ok
+
+                # Auto-detect NeurOptimal device from PnP
+                $btTargetName = 'NeurOptimal Headset'
+                try {
+                    $initPnp = Get-BluetoothPnpSnapshot
+                    $noDevice = $initPnp.Devices | Where-Object { $_.FriendlyName -match 'NeurOptimal' } | Select-Object -First 1
+                    if ($noDevice) {
+                        $btTargetName = $noDevice.FriendlyName
+                        $detectedMac = Get-MacFromPnpInstanceId -InstanceId $noDevice.InstanceId
+                        if ($detectedMac) { $btProbeTargetMac = $detectedMac }
+                        Write-BtLog "  Target detected: $btTargetName  MAC: $(if ($btProbeTargetMac) { $btProbeTargetMac } else { '(name match only)' })" -Level "OK"
+                    } else {
+                        Write-BtLog "  No NeurOptimal device found in PnP -- watching for any changes" -Level "DIM"
+                    }
+                } catch {
+                    $initPnp = [pscustomobject]@{ Devices = @(); Failures = @() }
+                }
+
+                $btProbeConfig = New-TargetDeviceConfiguration -TargetName $btTargetName -TargetMac $btProbeTargetMac -AppProcessName $btProbeAppName
+                $btProbeWatch  = New-TargetWatchState -Configuration $btProbeConfig
+
+                # Initial state snapshot
+                $initCom  = try { Get-BluetoothComPortSnapshot } catch { [pscustomobject]@{ Ports = @() } }
+                $initProc = try { Get-TargetDeviceProcessSnapshot } catch { @() }
+                $null = Update-TargetWatchState -WatchState $btProbeWatch -PnpSnapshot $initPnp -ProcessNames $initProc -ComPortSnapshot $initCom
+
+                # Seed timing
+                $btProbeSession.StateEnteredAt['device']  = Get-Date
+                $btProbeSession.StateEnteredAt['comport'] = Get-Date
+                $btProbeSession.StateEnteredAt['process'] = Get-Date
+
+                # Seed known COM ports
+                if ($btProbeWatch.ComPortState -eq 'ComPortAmbiguous') {
+                    $btProbeSession.LastComPortNames = @($btProbeWatch.AmbiguousComPortMatches | ForEach-Object { $_.PortName } | Where-Object { $_ } | Sort-Object)
+                } elseif ($btProbeWatch.ComPortState -eq 'ComPortFound') {
+                    $btProbeSession.LastComPortNames = @($btProbeWatch.ComPortMatches | ForEach-Object { $_.PortName } | Where-Object { $_ } | Sort-Object)
+                }
+
+                # SPP server channel count
+                $sppPorts = @($initCom.Ports | Where-Object { $_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000' })
+                $btProbeSession.StartupSppChannelCount = $sppPorts.Count
+
+                # Adapter info + power plan (captured once)
+                try { $btProbeSession.AdapterInfo = Get-BluetoothAdapterInfo } catch { }
+                try { $btProbeSession.PowerPlan   = Get-PowerPlanInfo } catch { }
+
+                # BT link initial state
+                $initLink = Get-BtConnectionState -Mac $btProbeTargetMac -BtWin32Available $btWin32Ok
+                $btProbeSession.BtLinkState    = $initLink
+                $btProbeSession.BtLinkEnteredAt = Get-Date
+
+                # Streaming initial state
+                $initStream = Get-StreamingState -WatchState $btProbeWatch
+                $btProbeSession.StreamingState = $initStream.State
+                $btProbeSession.ActiveStreamPort = $initStream.ActivePort
+                if ($initStream.State -eq 'Active') { $btProbeSession.StateEnteredAt['streaming_Active_at'] = Get-Date }
+
+                # Show status strip and initial state
+                $btStateStrip.Visible = $true
+
+                Write-BtLog "  Device state  : $($btProbeWatch.DeviceState)" -Level (Get-ProbeStateGuiLevel $btProbeWatch.DeviceState)
+                Write-BtLog "  COM port      : $($btProbeWatch.ComPortState)" -Level (Get-ProbeStateGuiLevel $btProbeWatch.ComPortState)
+                Write-BtLog "  BT link (ACL) : $initLink" -Level (Get-ProbeStateGuiLevel $initLink)
+                $streamDetail = if ($initStream.State -eq 'Active' -and $initStream.ActivePort) { " ($($initStream.ActivePort))" } else { '' }
+                Write-BtLog "  EEG streaming : $($initStream.State)$streamDetail" -Level (Get-ProbeStateGuiLevel $initStream.State)
+                $noRunning = Test-ProcessRunningInSnapshot -ProcessNames $initProc -Name $btProbeAppName
+                Write-BtLog "  NO.exe        : $(if ($noRunning) { 'Running' } else { 'Not running' })" -Level $(if ($noRunning) { 'OK' } else { 'DIM' })
+                if ($btProbeSession.AdapterInfo -and $btProbeSession.AdapterInfo.Present) {
+                    $driverVer = if ($btProbeSession.AdapterInfo.DriverInfo -and $btProbeSession.AdapterInfo.DriverInfo.Version) { $btProbeSession.AdapterInfo.DriverInfo.Version } else { 'unknown' }
+                    Write-BtLog "  Adapter       : $($btProbeSession.AdapterInfo.FriendlyName)  driver v$driverVer" -Level "DIM"
+                    $pm = $btProbeSession.AdapterInfo.PowerManagementEnabled
+                    if ($pm -eq $true) { Write-BtLog "  USB suspend   : ENABLED (risk factor)" -Level "WARN" }
+                }
+                if ($btProbeSession.PowerPlan -and $btProbeSession.PowerPlan.IsPowerSaver) {
+                    Write-BtLog "  Power plan    : $($btProbeSession.PowerPlan.ActivePlan) -- throttles USB/BT" -Level "WARN"
+                }
+                Write-BtLog "" -Level "DIM"
+                Write-BtLog "  NeurOptimal can be launched now" -Level "INFO"
+                Write-BtLog "  Start a session and reproduce the Bluetooth issue" -Level "INFO"
+                Write-BtLog "  Click  Stop and Upload  when done (~10 sec to finish)" -Level "INFO"
+                Write-BtLog "" -Level "DIM"
+                Write-BtLog "  Monitoring Bluetooth activity (3s interval) -- state changes will appear here" -Level "DIM"
+            } else {
+                Write-BtLog "  Deep device probe not available -- using basic monitoring" -Level "WARN"
+                Write-BtLog "  NeurOptimal can be launched now" -Level "INFO"
+                Write-BtLog "  Start a session and reproduce the Bluetooth issue" -Level "INFO"
+                Write-BtLog "  Click  Stop and Upload  when done (~10 sec to finish)" -Level "INFO"
+                Write-BtLog "" -Level "DIM"
+                Write-BtLog "  Monitoring Bluetooth activity -- connect/disconnect events will appear here" -Level "DIM"
             }
 
+            $btNextProbeTick = $btRecordStart.AddSeconds(3)
+            $btHeartbeatTick = 0
+            $btAnomalyBarTime = $null
+
+            while (-not $script:BtRec_StopClicked) {
+                [System.Windows.Forms.Application]::DoEvents()
+                $now = Get-Date
+                $elapsed = $now - $btRecordStart
+
+                # Update elapsed label with current state summary
+                if ($btDeepProbeAvailable -and $btProbeWatch) {
+                    $devShort = $btProbeWatch.DeviceState -replace 'PairedCandidate','Paired' -replace 'ComPort',''
+                    $streamShort = $btProbeSession.StreamingState
+                    $btElapsedLabel.Text = "Recording  {0:mm\:ss}  |  {1}  |  Stream: {2}" -f $elapsed, $devShort, $streamShort
+                } else {
+                    $btElapsedLabel.Text = "Recording  {0:mm\:ss}  -- click Stop and Upload when done" -f $elapsed
+                }
+
+                # ── Deep probe tick (every 3s, main thread) ──────────────────
+                if ($btDeepProbeAvailable -and $btProbeWatch -and $now -ge $btNextProbeTick) {
+                    try {
+                        $pnpNow  = Get-BluetoothPnpSnapshot
+                        $comNow  = try { Get-BluetoothComPortSnapshot } catch { [pscustomobject]@{ Ports = @() } }
+                        $procNow = try { Get-TargetDeviceProcessSnapshot } catch { @() }
+
+                        $newObs = Update-TargetWatchState -WatchState $btProbeWatch -PnpSnapshot $pnpNow -ProcessNames $procNow -ComPortSnapshot $comNow
+
+                        $probeEvents = Invoke-DeviceProbeTick -Session $btProbeSession -WatchState $btProbeWatch `
+                            -NewObservations $newObs -TargetMac $btProbeTargetMac -AppProcessName $btProbeAppName
+
+                        foreach ($evt in $probeEvents) {
+                            $ts = $evt.Timestamp.ToString('HH:mm:ss')
+                            $kindTag = $evt.Kind.ToUpper().PadRight(8)
+                            Write-BtLog "  $ts  [$kindTag]  $($evt.State)  --  $($evt.Reason)" -Level $evt.Level
+                            if ($evt.Annotation) {
+                                $annoLevel = if ($evt.Annotation.StartsWith('[!]')) { 'FAIL' } elseif ($evt.Annotation.StartsWith('[~]')) { 'WARN' } else { 'OK' }
+                                Write-BtLog "             $($evt.Annotation)" -Level $annoLevel
+                            }
+                        }
+
+                        # Update status strip
+                        $btStateLabels['Device'].Text = "Device: $($btProbeWatch.DeviceState -replace 'PairedCandidate','Paired')"
+                        $btStateLabels['Device'].ForeColor = Get-ProbeStateColor $btProbeWatch.DeviceState
+                        $comText = $btProbeWatch.ComPortState -replace 'ComPort',''
+                        if ($btProbeWatch.ComPortState -in @('ComPortFound','ComPortAmbiguous')) {
+                            $portNames = @()
+                            if ($btProbeWatch.ComPortMatches.Count -gt 0) { $portNames += $btProbeWatch.ComPortMatches | ForEach-Object { $_.PortName } }
+                            if ($btProbeWatch.AmbiguousComPortMatches.Count -gt 0) { $portNames += $btProbeWatch.AmbiguousComPortMatches | ForEach-Object { $_.PortName } }
+                            $portNames = @($portNames | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+                            if ($portNames.Count -gt 0) { $comText = $portNames -join ',' }
+                        }
+                        $btStateLabels['COM'].Text = "COM: $comText"
+                        $btStateLabels['COM'].ForeColor = Get-ProbeStateColor $btProbeWatch.ComPortState
+                        $btStateLabels['Link'].Text = "Link: $($btProbeSession.BtLinkState)"
+                        $btStateLabels['Link'].ForeColor = Get-ProbeStateColor $btProbeSession.BtLinkState
+                        $btStateLabels['Stream'].Text = "Stream: $($btProbeSession.StreamingState)"
+                        $btStateLabels['Stream'].ForeColor = Get-ProbeStateColor $btProbeSession.StreamingState
+                        $appState = $btProbeWatch.AppProcessState
+                        $btStateLabels['App'].Text = "NO.exe: $(if ($appState -eq 'Running') { 'Running' } else { 'Off' })"
+                        $btStateLabels['App'].ForeColor = Get-ProbeStateColor $appState
+                    } catch {
+                        Write-BtLog "  [probe tick error]: $_" -Level "DIM"
+                    }
+
+                    # Anomaly confirmation bar handling
+                    if ($btProbeSession.PendingConfirmation -and -not $btAnomalyBar.Visible) {
+                        $btAnomalyBar.Visible = $true
+                        $btAnomalyBarTime = Get-Date
+                        $script:BtAnomaly_Resolved = $false
+                    }
+                    if ($btAnomalyBar.Visible) {
+                        if ($script:BtAnomaly_Resolved) {
+                            if ($script:BtAnomaly_IsExpected) {
+                                Write-BtLog "  Confirmed: stream stop was expected (user-initiated)" -Level "OK"
+                            } else {
+                                Write-BtLog "  Confirmed: stream stop was unexpected -- capturing diagnostic snapshot..." -Level "WARN"
+                                try {
+                                    $diagSnap = Invoke-AnomalyDiagnosticSnapshot -Context $btProbeSession.PendingConfirmation
+                                    if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
+                                        try { Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name "anomaly-diagnostic.json" -Data $diagSnap } catch { }
+                                    }
+                                    if ($diagSnap.EventLogs -and $diagSnap.EventLogs.Events) {
+                                        Write-BtLog "  Captured $(@($diagSnap.EventLogs.Events).Count) event log entries" -Level "DIM"
+                                    }
+                                    Write-BtLog "  Diagnostic snapshot saved to package" -Level "INFO"
+                                } catch {
+                                    Write-BtLog "  Diagnostic snapshot failed: $_" -Level "WARN"
+                                }
+                            }
+                            $btAnomalyBar.Visible = $false
+                            $btProbeSession.PendingConfirmation = $null
+                            $btAnomalyBarTime = $null
+                        } elseif ($btAnomalyBarTime -and ($now - $btAnomalyBarTime).TotalSeconds -gt 60) {
+                            $btAnomalyBar.Visible = $false
+                            $btProbeSession.PendingConfirmation = $null
+                            $btAnomalyBarTime = $null
+                            Write-BtLog "  (anomaly confirmation timed out -- not confirmed)" -Level "DIM"
+                        }
+                    }
+
+                    # Heartbeat every ~90s
+                    $btHeartbeatTick++
+                    if ($btHeartbeatTick -ge 30) {
+                        $btHeartbeatTick = 0
+                        $elSec = [int]$elapsed.TotalSeconds
+                        Write-BtLog "  ... still watching  [${elSec}s  device=$($btProbeWatch.DeviceState)  COM=$($btProbeWatch.ComPortState)  stream=$($btProbeSession.StreamingState)]" -Level "DIM"
+                    }
+
+                    $btNextProbeTick = $now.AddSeconds(3)
+                }
+
+                # ── Event log poll (background job, every 8s -- unchanged) ───
+                if ($btPollJob -and $btPollJob.State -notin @('Running', 'NotStarted')) {
+                    $pollData = $null
+                    try { $pollData = Receive-Job $btPollJob -ErrorAction SilentlyContinue } catch { }
+                    Remove-Job $btPollJob -Force -ErrorAction SilentlyContinue
+                    $btPollJob = $null
+
+                    if ($pollData) {
+                        if (-not $btSvcStates) {
+                            $btSvcStates = $pollData.Services
+                        } else {
+                            foreach ($k in @($pollData.Services.Keys)) {
+                                $prev = $btSvcStates[$k]; $curr = $pollData.Services[$k]
+                                if ($prev -and $curr -and $prev.Status -ne $curr.Status) {
+                                    $lvl = if ($curr.Running) { 'OK' } else { 'WARN' }
+                                    Write-BtLog "  Service: $($curr.DisplayName)  $($prev.Status) -> $($curr.Status)" -Level $lvl
+                                }
+                            }
+                            $btSvcStates = $pollData.Services
+                        }
+
+                        if (-not $btDeepProbeAvailable) {
+                            $newEvts = @($pollData.Events.Events | Where-Object { $_ -and $_.TimeCreated -gt $btPollSince })
+                            if ($newEvts.Count -gt 0) {
+                                $btPollSince = ($newEvts | Sort-Object TimeCreated | Select-Object -Last 1).TimeCreated
+                                $connEvts  = @($newEvts | Where-Object { $_.StableClass -eq 'Connected' })
+                                $discEvts  = @($newEvts | Where-Object { $_.StableClass -eq 'Disconnected' })
+                                $otherEvts = @($newEvts | Where-Object { $_.StableClass -eq 'Unknown' })
+                                foreach ($ev in $connEvts) {
+                                    Write-BtLog "  $($ev.TimeCreated.ToString('HH:mm:ss'))  Connected  ($($ev.ProviderName))" -Level "OK"
+                                }
+                                foreach ($ev in $discEvts) {
+                                    Write-BtLog "  $($ev.TimeCreated.ToString('HH:mm:ss'))  Disconnected  ($($ev.ProviderName))" -Level "WARN"
+                                }
+                                if ($otherEvts.Count -gt 0) {
+                                    Write-BtLog "  $($otherEvts.Count) Bluetooth event(s) captured" -Level "DIM"
+                                }
+                            } elseif ($btFirstPoll) {
+                                Write-BtLog "  (no Bluetooth activity yet)" -Level "DIM"
+                            }
+                        }
+                        $btFirstPoll = $false
+                    }
+
+                    $btNextPoll = (Get-Date).AddSeconds(8)
+                }
+
+                if (-not $btPollJob -and $now -ge $btNextPoll) {
+                    $pollSince = $btPollSince; $pollMod = $btModPath
+                    $btPollJob = Start-Job -ScriptBlock {
+                        param($mp, $since)
+                        Import-Module $mp -Force -ErrorAction SilentlyContinue
+                        $evts = try { Get-BluetoothRecentEvents -Since $since -MaxEventsPerLog 100 } catch { $null }
+                        $svcs = try { Get-BluetoothServiceStates } catch { @{} }
+                        return @{ Events = $evts; Services = $svcs }
+                    } -ArgumentList $pollMod, $pollSince
+                }
+
+                Start-Sleep -Milliseconds 200
+            }
+
+            if ($btPollJob) { Remove-Job $btPollJob -Force -ErrorAction SilentlyContinue }
+
             $btStopBtn.Enabled = $false
+            $btAnomalyBar.Visible = $false
             $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(60, 40, 10)
             $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 200, 100)
             $btBannerLabel.Text      = "Step 3 of 3 - Taking final snapshot, packaging and uploading..."
@@ -4020,6 +4371,74 @@ $buttonHandlers = @{
 
             Write-BtLog ""
             Write-BtLog "Step 3 of 3: Stopping - taking final snapshot..." -Level "STEP"
+
+            # ── Probe session summary (before final snapshot) ─────────────────────
+            $btProbeSummary = $null
+            if ($btDeepProbeAvailable -and $btProbeSession -and $btProbeWatch) {
+                $btProbeSummary = Get-DeviceProbeSessionSummary -Session $btProbeSession -WatchState $btProbeWatch
+                $btWatchReport  = New-TargetWatchReport -WatchState $btProbeWatch
+
+                Write-BtLog ""
+                Write-BtLog "SESSION SUMMARY" -Level "STEP"
+                Write-BtLog "  Final device state  : $($btWatchReport.DeviceState)" -Level (Get-ProbeStateGuiLevel $btWatchReport.DeviceState)
+                Write-BtLog "  Final COM port state: $($btWatchReport.ComPortState)" -Level (Get-ProbeStateGuiLevel $btWatchReport.ComPortState)
+                Write-BtLog "  Total state changes : $($btProbeSummary.ObservationCount)" -Level "INFO"
+
+                if ($btProbeSummary.ReconnectStats) {
+                    $rs = $btProbeSummary.ReconnectStats
+                    Write-BtLog "  Reconnect times     : min=$($rs.Min)s  avg=$($rs.Avg)s  max=$($rs.Max)s  ($($rs.Count) reconnect(s))" -Level "INFO"
+                }
+
+                if ($btProbeSummary.ComPortHistory.Count -gt 0) {
+                    Write-BtLog "" -Level "DIM"
+                    Write-BtLog "COM PORT HISTORY" -Level "STEP"
+                    foreach ($h in $btProbeSummary.ComPortHistory) {
+                        $portStr = ($h.Ports | Sort-Object) -join ', '
+                        $timeStr = $h.Time.ToString('HH:mm:ss')
+                        if ($h.IsFirst) {
+                            Write-BtLog "  Re-pair $($h.RepairNum.ToString().PadLeft(2))  $timeStr  $portStr  (initial)" -Level "DIM"
+                        } elseif ($h.Changed) {
+                            $parts = @()
+                            if ($h.Removed.Count -gt 0) { $parts += "lost $($h.Removed -join ', ')" }
+                            if ($h.Added.Count -gt 0)   { $parts += "gained $($h.Added -join ', ')" }
+                            Write-BtLog "  Re-pair $($h.RepairNum.ToString().PadLeft(2))  $timeStr  $portStr  [~] $($parts -join ', ')" -Level "WARN"
+                        } else {
+                            Write-BtLog "  Re-pair $($h.RepairNum.ToString().PadLeft(2))  $timeStr  $portStr  [ok] same ports" -Level "DIM"
+                        }
+                    }
+                }
+
+                Write-BtLog "" -Level "DIM"
+                Write-BtLog "FINDINGS" -Level "STEP"
+                foreach ($f in $btProbeSummary.Findings) {
+                    $fLevel = if ($f.StartsWith('[!]')) { 'FAIL' } elseif ($f.StartsWith('[~]')) { 'WARN' } elseif ($f.StartsWith('[ok]')) { 'OK' } else { 'DIM' }
+                    Write-BtLog "  $f" -Level $fLevel
+                }
+
+                $realIssues = @($btWatchReport.Unresolved | Where-Object {
+                    $_ -notmatch 'Ambiguous COM-port matches' -and $_ -notmatch 'Multiple COM-port entries share MAC'
+                })
+                if ($realIssues.Count -gt 0) {
+                    Write-BtLog "" -Level "DIM"
+                    Write-BtLog "UNRESOLVED ISSUES" -Level "FAIL"
+                    foreach ($u in $realIssues) { Write-BtLog "  - $u" -Level "WARN" }
+                } else {
+                    Write-BtLog "" -Level "DIM"
+                    Write-BtLog "  No unresolved issues." -Level "OK"
+                }
+                Write-BtLog "" -Level "DIM"
+
+                # Save probe session artifact
+                if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
+                    try {
+                        Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'probe-session.json' -Data @{
+                            SessionSummary = $btProbeSummary
+                            WatchReport    = $btWatchReport
+                            Observations   = @($btProbeWatch.Observations)
+                        }
+                    } catch { }
+                }
+            }
 
             # ── PHASE 3: Final snapshot, package, upload ──────────────────────────
             $btFinalJob = Start-Job -ScriptBlock {
@@ -4057,17 +4476,54 @@ $buttonHandlers = @{
                 }
             }
 
+            # System identity — computed once for manifest + zip naming
+            $systemModel = try { (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).Model } catch { 'Unknown' }
+            $safeModel   = ($systemModel -replace '[^A-Za-z0-9 -]', '' -replace '\s+', '-').Trim('-')
+            if ($safeModel.Length -gt 20) { $safeModel = $safeModel.Substring(0, 20).TrimEnd('-') }
+            $safeHost    = ($env:COMPUTERNAME -replace '[^A-Za-z0-9]', '').ToUpper()
+            if ($safeHost.Length -gt 12) { $safeHost = $safeHost.Substring(0, 12) }
+
+            # Manifest artifact — machine identity + run summary for triage
+            if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
+                try {
+                    $osCaption = try { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').ProductName } catch { $null }
+                    $manifest = [ordered]@{
+                        RunId                = $btDiagRun.RunId
+                        StartedAtUtc         = $btDiagRun.StartedAtUtc
+                        PackagedAtUtc        = [datetime]::UtcNow.ToString('o')
+                        MachineName          = $env:COMPUTERNAME
+                        UserName             = $env:USERNAME
+                        UserDomain           = $env:USERDOMAIN
+                        SystemModel          = $systemModel
+                        PSVersion            = $PSVersionTable.PSVersion.ToString()
+                        OSCaption            = $osCaption
+                        BaselineVerdict      = if ($baselineResult) { $baselineResult.VerdictStatus } else { $null }
+                        BaselineFindingCount = if ($baselineResult) { $baselineResult.FindingCount  } else { $null }
+                        BaselineStatus       = if ($baselineResult) { $baselineResult.Status        } else { $null }
+                        FinalVerdict         = if ($finalResult)    { $finalResult.VerdictStatus    } else { $null }
+                        FinalFindingCount    = if ($finalResult)    { $finalResult.FindingCount     } else { $null }
+                        FinalStatus          = if ($finalResult)    { $finalResult.Status           } else { $null }
+                        ProbeObservationCount  = if ($btProbeSummary) { $btProbeSummary.ObservationCount } else { $null }
+                        ProbeFindingCount      = if ($btProbeSummary) { $btProbeSummary.Findings.Count   } else { $null }
+                        ProbeReconnectCount    = if ($btProbeSession) { $btProbeSession.ReconnectTimes.Count } else { $null }
+                        ProbeBtLinkFlapCount   = if ($btProbeSession) { $btProbeSession.BtLinkFlapCount } else { $null }
+                    }
+                    Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'manifest.json' -Data $manifest
+                } catch { }
+            }
+
             # Package
-            $btZipPath = $null
+            $btZipPath   = $null
+            $btZipFolder = $safeModel
             if ($btDiagRun -and (Get-Command Compress-WinConfigDiagnosticRun -ErrorAction SilentlyContinue)) {
                 try {
+                    $btZipLabel = "${safeModel}_${safeHost}_$([datetime]::UtcNow.ToString('yyyyMMdd'))"
                     Write-BtLog "Packaging diagnostic artifacts..."
-                    $pkg       = Compress-WinConfigDiagnosticRun -RunFolder $btDiagRun.RunFolder -ExportsRoot $btDiagRun.ExportsRoot
+                    $pkg       = Compress-WinConfigDiagnosticRun -RunFolder $btDiagRun.RunFolder -ExportsRoot $btDiagRun.ExportsRoot -Label $btZipLabel
                     $btZipPath = $pkg.ZipPath
                     $sizeKb    = [Math]::Round($pkg.SizeBytes / 1024, 1)
                     Write-BtLog "Package ready: $btZipPath ($sizeKb KB)"
-                    $btOpenFolderBtn.Tag     = Split-Path $btZipPath -Parent
-                    $btOpenFolderBtn.Enabled = $true
+
                 } catch {
                     Write-BtLog "Packaging failed: $($_.Exception.Message)" -Level "WARN"
                 }
@@ -4080,7 +4536,7 @@ $buttonHandlers = @{
                 $btUploadLabel.Text = "Upload: Sending..."
                 $btForm.Refresh()
                 $runIdForMeta = if ($btDiagRun) { $btDiagRun.RunId } else { "" }
-                $uploadResult = Send-WinConfigDiagnosticPackage -PackagePath $btZipPath -Config $uploadConfig -Metadata @{ RunId = $runIdForMeta }
+                $uploadResult = Send-WinConfigDiagnosticPackage -PackagePath $btZipPath -Config $uploadConfig -Metadata @{ RunId = $runIdForMeta } -FolderPrefix $btZipFolder
                 if ($uploadResult.Status -eq 'Uploaded') {
                     Write-BtLog "Uploaded ($($uploadResult.Provider)): $($uploadResult.RemotePath)" -Level "OK"
                     $dest = if ($uploadResult.Provider -eq 'R2') { "R2: $($uploadResult.RemotePath)" } else { $uploadResult.RemotePath }

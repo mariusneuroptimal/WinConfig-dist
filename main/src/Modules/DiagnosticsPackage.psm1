@@ -82,7 +82,9 @@ function Compress-WinConfigDiagnosticRun {
         [string]$RunFolder,
 
         [Parameter(Mandatory)]
-        [string]$ExportsRoot
+        [string]$ExportsRoot,
+
+        [string]$Label = ''
     )
 
     if (-not (Test-Path $RunFolder)) {
@@ -91,8 +93,9 @@ function Compress-WinConfigDiagnosticRun {
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-    $runId = Split-Path $RunFolder -Leaf
-    $zipPath = Join-Path $ExportsRoot "bt_$runId.zip"
+    $runId   = Split-Path $RunFolder -Leaf
+    $stem    = if ($Label) { "bt_${Label}_${runId}" } else { "bt_$runId" }
+    $zipPath = Join-Path $ExportsRoot "$stem.zip"
 
     if (Test-Path $zipPath) {
         Remove-Item $zipPath -Force

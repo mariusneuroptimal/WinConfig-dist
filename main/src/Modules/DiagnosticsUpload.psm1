@@ -155,7 +155,8 @@ function Send-WinConfigDiagnosticPackage {
     param(
         [Parameter(Mandatory)] [string]$PackagePath,
         [Parameter(Mandatory)] [hashtable]$Config,
-        [hashtable]$Metadata = @{}
+        [hashtable]$Metadata = @{},
+        [string]$FolderPrefix = ''
     )
 
     if (-not (Test-Path $PackagePath)) {
@@ -176,7 +177,7 @@ function Send-WinConfigDiagnosticPackage {
     # --- R2 upload ---
     if ($Config.Provider -eq 'R2' -and $Config.R2) {
         try {
-            $objectKey = $fileName
+            $objectKey = if ($FolderPrefix) { "$FolderPrefix/$fileName" } else { $fileName }
             $ok = Invoke-R2Put `
                 -FilePath    $PackagePath `
                 -AccountId   $Config.R2.AccountId `
