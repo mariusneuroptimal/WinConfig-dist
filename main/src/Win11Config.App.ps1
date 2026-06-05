@@ -4133,6 +4133,9 @@ $buttonHandlers = @{
                     $initPnp = [pscustomobject]@{ Devices = @(); Failures = @() }
                 }
 
+                Write-BtLog "  Gathering system state (adapters, COM ports, power settings)..." -Level "DIM"
+                [System.Windows.Forms.Application]::DoEvents()
+
                 $btProbeConfig = New-TargetDeviceConfiguration -TargetName $btTargetName -TargetMac $btProbeTargetMac -AppProcessName $btProbeAppName
                 $btProbeWatch  = New-TargetWatchState -Configuration $btProbeConfig
 
