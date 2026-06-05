@@ -4180,7 +4180,7 @@ $buttonHandlers = @{
                 Write-BtLog "  Start a session and reproduce the Bluetooth issue" -Level "INFO"
                 Write-BtLog "  Click  Stop and Upload  when done (~10 sec to finish)" -Level "INFO"
                 Write-BtLog "" -Level "DIM"
-                Write-BtLog "  Watching for Bluetooth changes (every 3s) — events appear below as they happen" -Level "DIM"
+                Write-BtLog "  Watching for Bluetooth changes (every 3s) -- events appear below as they happen" -Level "DIM"
             } else {
                 Write-BtLog "  Deep device probe not available -- using basic monitoring" -Level "WARN"
                 Write-BtLog "  NeurOptimal can be launched now" -Level "INFO"
