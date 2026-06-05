@@ -4081,6 +4081,18 @@ $buttonHandlers = @{
             $btStopBtn.Add_Click({ $script:BtRec_StopClicked = $true })
             $btStatusPanel.Controls.Add($btStopBtn)
 
+            $script:BtRec_AbortClicked = $false
+            $btAbortBtn = New-Object System.Windows.Forms.Button
+            $btAbortBtn.Text = "Abort"
+            $btAbortBtn.Size = New-Object System.Drawing.Size(70, 28)
+            $btAbortBtn.Location = New-Object System.Drawing.Point(146, 48)
+            $btAbortBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btAbortBtn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(120, 120, 120)
+            $btAbortBtn.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+            $btAbortBtn.ForeColor = [System.Drawing.Color]::FromArgb(180, 180, 180)
+            $btAbortBtn.Add_Click({ $script:BtRec_AbortClicked = $true; $script:BtRec_StopClicked = $true })
+            $btStatusPanel.Controls.Add($btAbortBtn)
+
             $btRecordStart = Get-Date
             $btPollJob     = $null
             $btPollSince   = $btRecordStart
@@ -4160,27 +4172,37 @@ $buttonHandlers = @{
                 # Show status strip and initial state
                 $btStateStrip.Visible = $true
 
+                Write-BtLog "CURRENT STATE" -Level "STEP"
                 Write-BtLog "  Device        : $(Get-ProbeStateUserText -Kind device -State $btProbeWatch.DeviceState)" -Level (Get-ProbeStateGuiLevel $btProbeWatch.DeviceState)
                 Write-BtLog "  COM port      : $(Get-ProbeStateUserText -Kind comport -State $btProbeWatch.ComPortState)" -Level (Get-ProbeStateGuiLevel $btProbeWatch.ComPortState)
                 Write-BtLog "  Radio link    : $(Get-ProbeStateUserText -Kind btlink -State $initLink)" -Level (Get-ProbeStateGuiLevel $initLink)
                 if ($initStream.State -eq 'Active') {
                     $streamPort = if ($initStream.ActivePort) { " ($($initStream.ActivePort))" } else { '' }
                     Write-BtLog "  EEG streaming : Active$streamPort" -Level "OK"
+                } else {
+                    Write-BtLog "  EEG streaming : $(Get-ProbeStateUserText -Kind stream -State $initStream.State)" -Level "DIM"
                 }
                 $noRunning = Test-ProcessRunningInSnapshot -ProcessNames $initProc -Name $btProbeAppName
                 Write-BtLog "  NO.exe        : $(if ($noRunning) { 'Running' } else { 'Not running' })" -Level $(if ($noRunning) { 'OK' } else { 'DIM' })
                 if ($btProbeSession.AdapterInfo -and $btProbeSession.AdapterInfo.Present) {
                     $driverVer = if ($btProbeSession.AdapterInfo.DriverInfo -and $btProbeSession.AdapterInfo.DriverInfo.Version) { $btProbeSession.AdapterInfo.DriverInfo.Version } else { 'unknown' }
-                    Write-BtLog "  Adapter       : $($btProbeSession.AdapterInfo.FriendlyName)  driver v$driverVer" -Level "DIM"
+                    Write-BtLog "  BT adapter    : $($btProbeSession.AdapterInfo.FriendlyName)  driver v$driverVer" -Level "DIM"
                     $pm = $btProbeSession.AdapterInfo.PowerManagementEnabled
-                    if ($pm -eq $true) { Write-BtLog "  USB suspend   : ENABLED (risk factor)" -Level "WARN" }
+                    if ($pm -eq $true) { Write-BtLog "  USB suspend   : ENABLED (risk factor -- can cause random disconnects)" -Level "WARN" }
                 }
                 if ($btProbeSession.PowerPlan -and $btProbeSession.PowerPlan.IsPowerSaver) {
-                    Write-BtLog "  Power plan    : $($btProbeSession.PowerPlan.ActivePlan) -- throttles USB/BT" -Level "WARN"
+                    Write-BtLog "  Power plan    : $($btProbeSession.PowerPlan.ActivePlan) -- throttles USB/Bluetooth performance" -Level "WARN"
                 }
                 Write-BtLog "" -Level "DIM"
+                Write-BtLog "WHAT THESE MEAN" -Level "DIM"
+                Write-BtLog "  Device     = Is the Bluetooth headset visible to Windows?" -Level "DIM"
+                Write-BtLog "  COM port   = Virtual serial port NeurOptimal uses to receive EEG data" -Level "DIM"
+                Write-BtLog "  Radio link = Active wireless connection between this PC and the headset" -Level "DIM"
+                Write-BtLog "  Stream     = Is EEG data actually flowing right now?" -Level "DIM"
+                Write-BtLog "  NO.exe     = Is the NeurOptimal application running?" -Level "DIM"
+                Write-BtLog "" -Level "DIM"
                 if ($noRunning) {
-                    Write-BtLog "  NeurOptimal is already running -- reproduce the Bluetooth issue" -Level "INFO"
+                    Write-BtLog "  NeurOptimal is already running. Run tests or reproduce the issue you have been seeing." -Level "INFO"
                 } else {
                     Write-BtLog "  Launch NeurOptimal, start a session and reproduce the Bluetooth issue" -Level "INFO"
                 }
@@ -4195,7 +4217,7 @@ $buttonHandlers = @{
                 Write-BtLog "  Only Bluetooth connect/disconnect events will be captured" -Level "DIM"
                 $noRunningBasic = try { !!(Get-Process -Name $btProbeAppName -ErrorAction SilentlyContinue) } catch { $false }
                 if ($noRunningBasic) {
-                    Write-BtLog "  NeurOptimal is already running -- reproduce the Bluetooth issue" -Level "INFO"
+                    Write-BtLog "  NeurOptimal is already running. Run tests or reproduce the issue you have been seeing." -Level "INFO"
                 } else {
                     Write-BtLog "  Launch NeurOptimal, start a session and reproduce the Bluetooth issue" -Level "INFO"
                 }
@@ -4392,7 +4414,20 @@ $buttonHandlers = @{
             if ($btPollJob) { Remove-Job $btPollJob -Force -ErrorAction SilentlyContinue }
 
             $btStopBtn.Enabled = $false
+            $btAbortBtn.Enabled = $false
             $btAnomalyBar.Visible = $false
+
+            if ($script:BtRec_AbortClicked) {
+                Write-BtLog ""
+                Write-BtLog "ABORTED -- recording stopped without uploading." -Level "WARN"
+                $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(60, 50, 10)
+                $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(220, 180, 80)
+                $btBannerLabel.Text      = "Aborted -- no data was uploaded. You may close this window."
+                $btElapsedLabel.Text     = "Aborted."
+                if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
+                return
+            }
+
             $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(60, 40, 10)
             $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 200, 100)
             $btBannerLabel.Text      = "Step 3 of 3 - Taking final snapshot, packaging and uploading..."
