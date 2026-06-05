@@ -304,7 +304,7 @@ function Find-TargetDeviceInPnpSnapshot {
             State      = 'Missing'
             Confidence = 'none'
             Matches    = @()
-            Reason     = 'No Bluetooth devices found by Windows.'
+            Reason     = 'No Bluetooth devices found by Windows (PnP snapshot empty).'
         }
     }
 
@@ -322,7 +322,7 @@ function Find-TargetDeviceInPnpSnapshot {
                 State      = 'Ambiguous'
                 Confidence = 'mac'
                 Matches    = $macMatches
-                Reason     = "Multiple devices found with same Bluetooth address $($Configuration.NormalizedTargetMac)."
+                Reason     = "Multiple devices found with same Bluetooth address $($Configuration.NormalizedTargetMac) (ambiguous PnP MAC match)."
             }
         }
         if ($macMatches.Count -eq 1) {
@@ -331,7 +331,7 @@ function Find-TargetDeviceInPnpSnapshot {
                 State      = $state
                 Confidence = 'mac'
                 Matches    = $macMatches
-                Reason     = "Identified by Bluetooth address $($Configuration.NormalizedTargetMac)."
+                Reason     = "Identified by Bluetooth address $($Configuration.NormalizedTargetMac) (PnP MAC match)."
             }
         }
     }
@@ -349,7 +349,7 @@ function Find-TargetDeviceInPnpSnapshot {
                 State      = 'Ambiguous'
                 Confidence = 'name'
                 Matches    = $nameMatches
-                Reason     = "Multiple devices found with name '$($Configuration.TargetName)'."
+                Reason     = "Multiple devices found with name '$($Configuration.TargetName)' (ambiguous PnP name match)."
             }
         }
         if ($nameMatches.Count -eq 1) {
@@ -367,7 +367,7 @@ function Find-TargetDeviceInPnpSnapshot {
         State      = 'Missing'
         Confidence = 'none'
         Matches    = @()
-        Reason     = 'Windows cannot see the target headset -- is it powered on and in range?'
+        Reason     = 'Windows cannot see the target headset -- is it powered on and in range? (no PnP match).'
     }
 }
 
@@ -434,8 +434,8 @@ function Find-TargetBluetoothComPort {
             Confidence       = 'none'
             Matches          = @()
             AmbiguousMatches = @()
-            Unresolved       = @('No Bluetooth serial ports found -- headset may not be paired yet.')
-            Reason           = 'No Bluetooth serial ports found -- headset may not be paired yet.'
+            Unresolved       = @('No Bluetooth serial ports found -- headset may not be paired yet (BTHENUM empty).')
+            Reason           = 'No Bluetooth serial ports found -- headset may not be paired yet (BTHENUM empty).'
         }
     }
 
@@ -466,8 +466,8 @@ function Find-TargetBluetoothComPort {
                 Confidence       = 'high'
                 Matches          = $hits
                 AmbiguousMatches = $hits
-                Unresolved       = @("Multiple COM ports found for Bluetooth address $($Configuration.NormalizedTargetMac).")
-                Reason           = "Multiple COM ports found for Bluetooth address $($Configuration.NormalizedTargetMac)."
+                Unresolved       = @("Multiple COM ports for Bluetooth address $($Configuration.NormalizedTargetMac) (ambiguous BTHENUM MAC match).")
+                Reason           = "Multiple COM ports for Bluetooth address $($Configuration.NormalizedTargetMac) (ambiguous BTHENUM MAC match)."
             }
         }
         if ($hits.Count -eq 1) {
@@ -479,7 +479,7 @@ function Find-TargetBluetoothComPort {
                 Matches          = $hits
                 AmbiguousMatches = @()
                 Unresolved       = $unresolved
-                Reason           = "COM port identified by Bluetooth address $($Configuration.NormalizedTargetMac) -> $(if ($hits[0].PortName) { $hits[0].PortName } else { '(no PortName)' })."
+                Reason           = "COM port identified by Bluetooth address $($Configuration.NormalizedTargetMac) -> $(if ($hits[0].PortName) { $hits[0].PortName } else { '(no PortName)' }) (BTHENUM MAC match)."
             }
         }
     }
@@ -507,8 +507,8 @@ function Find-TargetBluetoothComPort {
                 Confidence       = 'medium'
                 Matches          = $hits
                 AmbiguousMatches = $hits
-                Unresolved       = @("Multiple COM ports found with name '$($Configuration.TargetName)'.")
-                Reason           = "Multiple COM ports found with name '$($Configuration.TargetName)'."
+                Unresolved       = @("Multiple COM ports found with name '$($Configuration.TargetName)' (ambiguous BTHENUM name match).")
+                Reason           = "Multiple COM ports found with name '$($Configuration.TargetName)' (ambiguous BTHENUM name match)."
             }
         }
         if ($hits.Count -eq 1) {
@@ -520,7 +520,7 @@ function Find-TargetBluetoothComPort {
                 Matches          = $hits
                 AmbiguousMatches = @()
                 Unresolved       = $unresolved
-                Reason           = "COM port identified by name '$($Configuration.TargetName)' -> $(if ($hits[0].PortName) { $hits[0].PortName } else { '(no PortName)' })."
+                Reason           = "COM port identified by name '$($Configuration.TargetName)' -> $(if ($hits[0].PortName) { $hits[0].PortName } else { '(no PortName)' }) (BTHENUM name match)."
             }
         }
     }
@@ -530,8 +530,8 @@ function Find-TargetBluetoothComPort {
         Confidence       = 'none'
         Matches          = @()
         AmbiguousMatches = @()
-        Unresolved       = @('No COM port assigned to the headset -- usually appears after pairing completes.')
-        Reason           = 'No COM port assigned to the headset -- usually appears after pairing completes.'
+        Unresolved       = @('No COM port assigned to the headset -- usually appears after pairing completes (no BTHENUM match).')
+        Reason           = 'No COM port assigned to the headset -- usually appears after pairing completes (no BTHENUM match).'
     }
 }
 
