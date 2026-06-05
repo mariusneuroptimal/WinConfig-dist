@@ -1,7 +1,7 @@
 # BluetoothDeviceProbe.psm1 - Deep device probe engine for the Flight Recorder GUI
 #
 # Extracted from Probe-NeurOptimalDevice.ps1 (winconfig-bluetooth). Provides:
-#   - Win32 BluetoothGetDeviceInfo P/Invoke for ACL radio link state
+#   - Win32 BluetoothGetDeviceInfo P/Invoke for Bluetooth radio link state
 #   - COM port in-use detection (EEG streaming detection)
 #   - Pattern recognition engine ([ok]/[~]/[!] classification)
 #   - Session state management (COM port history, reconnect times, link flaps)
@@ -84,7 +84,7 @@ function Get-BtConnectionState {
     <#
     .SYNOPSIS
         Returns 'Connected', 'NotConnected', or 'Unknown' for the target device's
-        active ACL radio link -- the same flag Windows Bluetooth settings displays.
+        Bluetooth radio link -- the same flag Windows Bluetooth settings displays.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -213,14 +213,14 @@ function Get-PatternAnnotation {
                     $missingAt = $Session.StateEnteredAt['device_Missing_at']
                     if ($missingAt) {
                         $outSec = [int]($Now - $missingAt).TotalSeconds
-                        if ($outSec -lt 5)   { return "[ok] Back in ${outSec}s -- PnP blip only" }
+                        if ($outSec -lt 5)   { return "[ok] Back in ${outSec}s -- brief glitch only" }
                         if ($outSec -lt 90)  { return "[ok] Back after ${outSec}s -- normal pairing/reconnect cycle" }
                         if ($outSec -lt 300) { return "[~] Back after ${outSec}s -- slow reconnect, worth monitoring" }
                         return "[!] Back after ${outSec}s -- extended outage, investigate"
                     }
                 }
                 'SeenByPnp' {
-                    return "[~] Device seen in PnP but not yet paired/connected"
+                    return "[~] Windows sees the device but it is not paired or connected yet"
                 }
             }
         }
@@ -448,19 +448,19 @@ function Invoke-DeviceProbeTick {
             $anno = $null
             $level = 'OK'
             if ($WatchState.DeviceState -ne 'PairedCandidate') {
-                $anno = "[~] Link connected but device PnP state is '$($WatchState.DeviceState)'"
+                $anno = "[~] Radio link connected but device state is '$(Get-ProbeStateUserText -Kind device -State $WatchState.DeviceState -Short)'"
                 $level = 'WARN'
             }
-            $events += @{ Kind = 'BTLINK'; State = 'Connected'; Reason = "ACL radio link established$fromStr"; Annotation = $anno; Level = $level; Timestamp = $now }
+            $events += @{ Kind = 'BTLINK'; State = 'Connected'; Reason = "Bluetooth radio link established$fromStr"; Annotation = $anno; Level = $level; Timestamp = $now }
         } elseif ($newBtLink -eq 'NotConnected') {
             $fromStr = if ($prevBtLink -eq 'Connected') { " after ${linkElapsed}s connected" } else { '' }
             if ($Session.StreamingState -eq 'Active') {
-                $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "ACL link dropped during active EEG stream$fromStr"; Annotation = "[!] Radio link lost while streaming -- this is the mid-session disconnect event"; Level = 'FAIL'; Timestamp = $now }
+                $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "Radio link dropped during active EEG stream$fromStr"; Annotation = "[!] Radio link lost while streaming -- this is the mid-session disconnect event"; Level = 'FAIL'; Timestamp = $now }
             } elseif ($WatchState.DeviceState -eq 'PairedCandidate') {
-                $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "ACL link dropped, device still in PnP$fromStr"; Annotation = "[~] Device paired but radio link down"; Level = 'WARN'; Timestamp = $now }
+                $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "Radio link dropped, device still paired$fromStr"; Annotation = "[~] Device paired but radio link down"; Level = 'WARN'; Timestamp = $now }
                 $Session.BtLinkFlapCount++
             } else {
-                $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "ACL link down$fromStr"; Annotation = $null; Level = 'DIM'; Timestamp = $now }
+                $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "Radio link down$fromStr"; Annotation = $null; Level = 'DIM'; Timestamp = $now }
             }
         }
     }
@@ -604,11 +604,11 @@ function Get-DeviceProbeSessionSummary {
     # BT link stability
     if ($Session.BtWin32Available) {
         if ($Session.BtLinkFlapCount -ge 3) {
-            [void]$findings.Add("[!] BT link instability: $($Session.BtLinkFlapCount) link drop(s) detected while device stayed in PnP")
+            [void]$findings.Add("[!] Radio link instability: $($Session.BtLinkFlapCount) link drop(s) detected while device stayed paired")
         } elseif ($Session.BtLinkFlapCount -gt 0) {
             [void]$findings.Add("[~] BT link flap: $($Session.BtLinkFlapCount) link drop(s) while device stayed paired")
         } else {
-            [void]$findings.Add("[ok] BT link stable throughout session (no ACL drops observed)")
+            [void]$findings.Add("[ok] BT radio link stable throughout session (no drops observed)")
         }
         [void]$findings.Add("[info] Final BT link state: $($Session.BtLinkState)")
     } else {

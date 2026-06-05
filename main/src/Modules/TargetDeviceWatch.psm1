@@ -304,7 +304,7 @@ function Find-TargetDeviceInPnpSnapshot {
             State      = 'Missing'
             Confidence = 'none'
             Matches    = @()
-            Reason     = 'PnP snapshot contained no devices.'
+            Reason     = 'No Bluetooth devices found by Windows.'
         }
     }
 
@@ -322,7 +322,7 @@ function Find-TargetDeviceInPnpSnapshot {
                 State      = 'Ambiguous'
                 Confidence = 'mac'
                 Matches    = $macMatches
-                Reason     = "Multiple PnP entries share MAC $($Configuration.NormalizedTargetMac)."
+                Reason     = "Multiple devices found with same Bluetooth address $($Configuration.NormalizedTargetMac)."
             }
         }
         if ($macMatches.Count -eq 1) {
@@ -331,7 +331,7 @@ function Find-TargetDeviceInPnpSnapshot {
                 State      = $state
                 Confidence = 'mac'
                 Matches    = $macMatches
-                Reason     = "Matched by MAC $($Configuration.NormalizedTargetMac)."
+                Reason     = "Identified by Bluetooth address $($Configuration.NormalizedTargetMac)."
             }
         }
     }
@@ -349,7 +349,7 @@ function Find-TargetDeviceInPnpSnapshot {
                 State      = 'Ambiguous'
                 Confidence = 'name'
                 Matches    = $nameMatches
-                Reason     = "Multiple PnP entries share name '$($Configuration.TargetName)'."
+                Reason     = "Multiple devices found with name '$($Configuration.TargetName)'."
             }
         }
         if ($nameMatches.Count -eq 1) {
@@ -367,7 +367,7 @@ function Find-TargetDeviceInPnpSnapshot {
         State      = 'Missing'
         Confidence = 'none'
         Matches    = @()
-        Reason     = 'No PnP entry matched the configured target.'
+        Reason     = 'Windows cannot see the target headset -- is it powered on and in range?'
     }
 }
 
@@ -434,8 +434,8 @@ function Find-TargetBluetoothComPort {
             Confidence       = 'none'
             Matches          = @()
             AmbiguousMatches = @()
-            Unresolved       = @('COM-port snapshot contained no Bluetooth-serial entries.')
-            Reason           = 'COM-port snapshot contained no Bluetooth-serial entries.'
+            Unresolved       = @('No Bluetooth serial ports found -- headset may not be paired yet.')
+            Reason           = 'No Bluetooth serial ports found -- headset may not be paired yet.'
         }
     }
 
@@ -466,20 +466,20 @@ function Find-TargetBluetoothComPort {
                 Confidence       = 'high'
                 Matches          = $hits
                 AmbiguousMatches = $hits
-                Unresolved       = @("Multiple COM-port entries share MAC $($Configuration.NormalizedTargetMac).")
-                Reason           = "Multiple COM-port entries share MAC $($Configuration.NormalizedTargetMac)."
+                Unresolved       = @("Multiple COM ports found for Bluetooth address $($Configuration.NormalizedTargetMac).")
+                Reason           = "Multiple COM ports found for Bluetooth address $($Configuration.NormalizedTargetMac)."
             }
         }
         if ($hits.Count -eq 1) {
             $unresolved = @()
-            if (-not $hits[0].PortName) { $unresolved += "Matched COM-port entry has no PortName (InstanceId=$($hits[0].InstanceId))." }
+            if (-not $hits[0].PortName) { $unresolved += "COM port entry found but no port number assigned (InstanceId=$($hits[0].InstanceId))." }
             return @{
                 MatchState       = 'Found'
                 Confidence       = 'high'
                 Matches          = $hits
                 AmbiguousMatches = @()
                 Unresolved       = $unresolved
-                Reason           = "Matched COM-port by MAC $($Configuration.NormalizedTargetMac) -> $(if ($hits[0].PortName) { $hits[0].PortName } else { '(no PortName)' })."
+                Reason           = "COM port identified by Bluetooth address $($Configuration.NormalizedTargetMac) -> $(if ($hits[0].PortName) { $hits[0].PortName } else { '(no PortName)' })."
             }
         }
     }
@@ -507,20 +507,20 @@ function Find-TargetBluetoothComPort {
                 Confidence       = 'medium'
                 Matches          = $hits
                 AmbiguousMatches = $hits
-                Unresolved       = @("Multiple COM-port entries share name '$($Configuration.TargetName)'.")
-                Reason           = "Multiple COM-port entries share name '$($Configuration.TargetName)'."
+                Unresolved       = @("Multiple COM ports found with name '$($Configuration.TargetName)'.")
+                Reason           = "Multiple COM ports found with name '$($Configuration.TargetName)'."
             }
         }
         if ($hits.Count -eq 1) {
             $unresolved = @()
-            if (-not $hits[0].PortName) { $unresolved += "Matched COM-port entry has no PortName (InstanceId=$($hits[0].InstanceId))." }
+            if (-not $hits[0].PortName) { $unresolved += "COM port entry found but no port number assigned (InstanceId=$($hits[0].InstanceId))." }
             return @{
                 MatchState       = 'Found'
                 Confidence       = 'medium'
                 Matches          = $hits
                 AmbiguousMatches = @()
                 Unresolved       = $unresolved
-                Reason           = "Matched COM-port by name '$($Configuration.TargetName)' -> $(if ($hits[0].PortName) { $hits[0].PortName } else { '(no PortName)' })."
+                Reason           = "COM port identified by name '$($Configuration.TargetName)' -> $(if ($hits[0].PortName) { $hits[0].PortName } else { '(no PortName)' })."
             }
         }
     }
@@ -530,8 +530,8 @@ function Find-TargetBluetoothComPort {
         Confidence       = 'none'
         Matches          = @()
         AmbiguousMatches = @()
-        Unresolved       = @('No COM-port entry matched the configured target.')
-        Reason           = 'No COM-port entry matched the configured target.'
+        Unresolved       = @('No COM port assigned to the headset -- usually appears after pairing completes.')
+        Reason           = 'No COM port assigned to the headset -- usually appears after pairing completes.'
     }
 }
 

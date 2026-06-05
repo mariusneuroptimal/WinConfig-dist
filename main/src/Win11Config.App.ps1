@@ -3860,10 +3860,11 @@ $buttonHandlers = @{
             # ── Build form ────────────────────────────────────────────────────────
             $btForm = New-Object System.Windows.Forms.Form
             $btForm.Text = "Bluetooth Flight Recorder"
-            $btForm.Size = New-Object System.Drawing.Size(700, 650)
+            $btForm.Size = New-Object System.Drawing.Size(780, 700)
+            $btForm.MinimumSize = New-Object System.Drawing.Size(600, 450)
             $btForm.StartPosition = "CenterScreen"
-            $btForm.FormBorderStyle = "FixedDialog"
-            $btForm.MaximizeBox = $false
+            $btForm.FormBorderStyle = "Sizable"
+            $btForm.MaximizeBox = $true
 
             # Bottom status bar (add first — docking is processed in reverse add order)
             $btStatusPanel = New-Object System.Windows.Forms.Panel
@@ -3876,9 +3877,10 @@ $buttonHandlers = @{
             $btElapsedLabel = New-Object System.Windows.Forms.Label
             $btElapsedLabel.Text = "Initializing..."
             $btElapsedLabel.AutoSize = $false
-            $btElapsedLabel.Width = 500
             $btElapsedLabel.Height = 18
             $btElapsedLabel.Location = New-Object System.Drawing.Point(8, 6)
+            $btElapsedLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+            $btElapsedLabel.Width = $btStatusPanel.ClientSize.Width - 16
             $btElapsedLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
             $btElapsedLabel.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
             $btStatusPanel.Controls.Add($btElapsedLabel)
@@ -3886,9 +3888,10 @@ $buttonHandlers = @{
             $btUploadLabel = New-Object System.Windows.Forms.Label
             $btUploadLabel.Text = "Upload: -"
             $btUploadLabel.AutoSize = $false
-            $btUploadLabel.Width = 660
             $btUploadLabel.Height = 18
             $btUploadLabel.Location = New-Object System.Drawing.Point(8, 28)
+            $btUploadLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+            $btUploadLabel.Width = $btStatusPanel.ClientSize.Width - 16
             $btUploadLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
             $btUploadLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
             $btStatusPanel.Controls.Add($btUploadLabel)
