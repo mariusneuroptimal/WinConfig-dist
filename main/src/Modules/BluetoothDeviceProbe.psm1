@@ -593,7 +593,7 @@ function Get-DeviceProbeSessionSummary {
     # COM port exhaustion
     if ($allPortNums -and $allPortNums.Count -gt 0) {
         $slotsUsed = ($allPortNums | Select-Object -Unique | Measure-Object).Count
-        $maxPort   = [math]::Max([int[]]$allPortNums)
+        $maxPort   = ($allPortNums | Measure-Object -Maximum).Maximum
         if ($maxPort -ge 10) {
             [void]$findings.Add("[!] COM port exhaustion: reached COM$maxPort this session ($slotsUsed slots consumed)")
         } elseif ($slotsUsed -gt 4) {
