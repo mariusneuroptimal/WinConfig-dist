@@ -170,6 +170,36 @@
             Description    = "Runs Bluetooth probe and records findings via analytics callback"
         }
         @{
+            Id             = "bt-reset-com-ports"
+            Name           = "Reset COM Port Numbers"
+            Category       = "Bluetooth"
+            ToolCategory   = "Bluetooth"
+            MutatesSystem  = $true
+            SupportsDryRun = $true   # REQUIRED: Modifies COM Name Arbiter registry
+            Description    = "Clears COM Name Arbiter bitmap so next Bluetooth pairing gets low COM port numbers"
+            RequiresAdmin  = $true
+        }
+        @{
+            Id             = "bt-clean-ports"
+            Name           = "Clean Bluetooth Ports"
+            Category       = "Bluetooth"
+            ToolCategory   = "Bluetooth"
+            MutatesSystem  = $true
+            SupportsDryRun = $true   # REQUIRED: Removes PnP devices + modifies registry
+            Description    = "Removes ghost BTHENUM port entries and resets COM Name Arbiter"
+            RequiresAdmin  = $true
+        }
+        @{
+            Id             = "bt-stack-reset"
+            Name           = "Full Bluetooth Stack Reset"
+            Category       = "Bluetooth"
+            ToolCategory   = "Bluetooth"
+            MutatesSystem  = $true
+            SupportsDryRun = $true   # REQUIRED: Wipes BTHPORT pairing database
+            Description    = "Wipes BTHPORT pairing database and COM state -- all devices must re-pair after reboot"
+            RequiresAdmin  = $true
+        }
+        @{
             Id             = "audio-diagnostics"
             Name           = "Audio Diagnostics"
             Category       = "Audio"

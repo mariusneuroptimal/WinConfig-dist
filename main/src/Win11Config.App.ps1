@@ -4584,6 +4584,204 @@ $buttonHandlers = @{
             if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
         }
 
+        # =========================================================================
+        # BLUETOOTH RESET TOOLS (Mutating - Dry Run supported)
+        # =========================================================================
+        "Reset COM Port Numbers" = {
+            $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            if (-not $isAdmin) {
+                [System.Windows.Forms.MessageBox]::Show("Reset COM Port Numbers requires Administrator privileges.`n`nPlease restart WinConfig as Administrator.", "Elevation Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                return
+            }
+
+            $arbiterPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\COM Name Arbiter'
+            $regExportPath = 'HKLM\SYSTEM\CurrentControlSet\Control\COM Name Arbiter'
+
+            $comDb = $null
+            try { $comDb = (Get-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop).ComDB } catch {}
+
+            if (-not $comDb) {
+                [System.Windows.Forms.MessageBox]::Show("COM Name Arbiter ComDB is already clean -- no action needed.", "No Action Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+                return
+            }
+
+            $backupDir = Join-Path $env:TEMP "WinConfig-BT-Backups"
+            if (-not (Test-Path $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
+            $backupPath = Join-Path $backupDir "ComArbiter-$(Get-Date -Format 'yyyyMMdd-HHmmss').reg"
+
+            try {
+                & reg export $regExportPath $backupPath /y 2>&1 | Out-Null
+                Remove-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop
+
+                if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                    Register-WinConfigSessionAction -Action "BT COM Port Reset" -Detail "ComDB cleared, backup at $backupPath" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "PASS" -Tier 2 -Summary "COM arbiter reset"
+                }
+                if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
+                [System.Windows.Forms.MessageBox]::Show("COM Name Arbiter has been reset.`n`nNext Bluetooth pairing will use low COM port numbers (COM3, COM4).`n`nBackup saved to:`n$backupPath", "Success", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+            } catch {
+                if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                    Register-WinConfigSessionAction -Action "BT COM Port Reset" -Detail "Reset failed: $($_.Exception.Message)" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "FAIL" -Tier 3 -Summary "COM arbiter reset failed"
+                }
+                [System.Windows.Forms.MessageBox]::Show("COM port reset failed: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            }
+        }
+
+        "Clean Bluetooth Ports" = {
+            $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            if (-not $isAdmin) {
+                [System.Windows.Forms.MessageBox]::Show("Clean Bluetooth Ports requires Administrator privileges.`n`nPlease restart WinConfig as Administrator.", "Elevation Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                return
+            }
+
+            $ghostPorts = @()
+            try {
+                $allBtPorts = Get-PnpDevice -Class Ports -ErrorAction Stop |
+                    Where-Object { $_.InstanceId -match 'BTHENUM' }
+                $ghostPorts = @($allBtPorts | Where-Object {
+                    $_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000'
+                })
+            } catch {
+                [System.Windows.Forms.MessageBox]::Show("Failed to enumerate Bluetooth ports: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                return
+            }
+
+            $arbiterPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\COM Name Arbiter'
+            $regExportPath = 'HKLM\SYSTEM\CurrentControlSet\Control\COM Name Arbiter'
+            $hasComDb = $false
+            try { $hasComDb = $null -ne (Get-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop).ComDB } catch {}
+
+            if ($ghostPorts.Count -eq 0 -and -not $hasComDb) {
+                [System.Windows.Forms.MessageBox]::Show("No ghost Bluetooth ports or COM allocations found -- no action needed.", "No Action Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+                return
+            }
+
+            $confirm = [System.Windows.Forms.MessageBox]::Show(
+                "This will remove $($ghostPorts.Count) ghost Bluetooth port(s) and reset COM port assignments.`n`nDevices may need to be re-paired after this operation.`n`nContinue?",
+                "Confirm Bluetooth Port Cleanup",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+            $backupDir = Join-Path $env:TEMP "WinConfig-BT-Backups"
+            if (-not (Test-Path $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
+            $backupPath = Join-Path $backupDir "ComArbiter-$(Get-Date -Format 'yyyyMMdd-HHmmss').reg"
+
+            try {
+                & reg export $regExportPath $backupPath /y 2>&1 | Out-Null
+
+                $removed = 0
+                $failed = 0
+                foreach ($ghost in $ghostPorts) {
+                    $result = & pnputil /remove-device $ghost.InstanceId 2>&1
+                    if ($LASTEXITCODE -eq 0) { $removed++ } else { $failed++ }
+                }
+
+                if ($hasComDb) {
+                    Remove-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop
+                }
+
+                $summary = "$removed ghost port(s) removed"
+                if ($failed -gt 0) { $summary += ", $failed failed" }
+                if ($hasComDb) { $summary += ", COM arbiter reset" }
+
+                if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                    Register-WinConfigSessionAction -Action "BT Port Cleanup" -Detail "$summary; backup at $backupPath" -Category "AdminChange" -ToolCategory "Bluetooth" -Result $(if ($failed -gt 0) { "WARN" } else { "PASS" }) -Tier 2 -Summary $summary
+                }
+                if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
+                [System.Windows.Forms.MessageBox]::Show("Bluetooth port cleanup complete.`n`n$summary`n`nBackup saved to:`n$backupPath", "Success", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+            } catch {
+                if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                    Register-WinConfigSessionAction -Action "BT Port Cleanup" -Detail "Cleanup failed: $($_.Exception.Message)" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "FAIL" -Tier 3 -Summary "Bluetooth port cleanup failed"
+                }
+                [System.Windows.Forms.MessageBox]::Show("Bluetooth port cleanup failed: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            }
+        }
+
+        "Full Bluetooth Stack Reset" = {
+            $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            if (-not $isAdmin) {
+                [System.Windows.Forms.MessageBox]::Show("Full Bluetooth Stack Reset requires Administrator privileges.`n`nPlease restart WinConfig as Administrator.", "Elevation Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                return
+            }
+
+            $confirm = [System.Windows.Forms.MessageBox]::Show(
+                "WARNING: This will wipe ALL Bluetooth pairing data.`n`n" +
+                "- All paired Bluetooth devices will be removed`n" +
+                "- All local Bluetooth services will be cleared`n" +
+                "- Ghost port entries will be removed`n" +
+                "- COM port assignments will be reset`n`n" +
+                "A system REBOOT is required after this operation.`n" +
+                "ALL Bluetooth devices will need to be re-paired.`n`n" +
+                "Continue?",
+                "Confirm Full Bluetooth Stack Reset",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+            $devicesPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices'
+            $localSvcPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\LocalServices'
+            $arbiterPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\COM Name Arbiter'
+
+            $backupDir = Join-Path $env:TEMP "WinConfig-BT-Backups"
+            if (-not (Test-Path $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
+            $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+
+            try {
+                & reg export 'HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters' (Join-Path $backupDir "BTHPORT-$timestamp.reg") /y 2>&1 | Out-Null
+                & reg export 'HKLM\SYSTEM\CurrentControlSet\Control\COM Name Arbiter' (Join-Path $backupDir "ComArbiter-$timestamp.reg") /y 2>&1 | Out-Null
+
+                $devicesRemoved = 0
+                $servicesRemoved = 0
+                $ghostsRemoved = 0
+
+                if (Test-Path $devicesPath) {
+                    $devSubkeys = Get-ChildItem $devicesPath -ErrorAction SilentlyContinue
+                    foreach ($dev in $devSubkeys) {
+                        Remove-Item $dev.PSPath -Recurse -Force -ErrorAction Stop
+                        $devicesRemoved++
+                    }
+                }
+
+                if (Test-Path $localSvcPath) {
+                    $svcSubkeys = Get-ChildItem $localSvcPath -ErrorAction SilentlyContinue
+                    foreach ($svc in $svcSubkeys) {
+                        Remove-Item $svc.PSPath -Recurse -Force -ErrorAction Stop
+                        $servicesRemoved++
+                    }
+                }
+
+                try {
+                    $ghostPorts = @(Get-PnpDevice -Class Ports -ErrorAction Stop |
+                        Where-Object { $_.InstanceId -match 'BTHENUM' -and $_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000' })
+                    foreach ($ghost in $ghostPorts) {
+                        & pnputil /remove-device $ghost.InstanceId 2>&1 | Out-Null
+                        if ($LASTEXITCODE -eq 0) { $ghostsRemoved++ }
+                    }
+                } catch {}
+
+                try { Remove-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop } catch {}
+
+                $summary = "$devicesRemoved paired device(s), $servicesRemoved service(s), $ghostsRemoved ghost port(s) removed, COM arbiter reset"
+                if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                    Register-WinConfigSessionAction -Action "BT Stack Reset" -Detail "$summary; backups at $backupDir" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "PASS" -Tier 4 -Summary "Full BT stack reset"
+                }
+                if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Bluetooth stack reset complete.`n`n$summary`n`nBackups saved to:`n$backupDir`n`nPlease REBOOT your computer now to complete the reset.",
+                    "Reboot Required",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning
+                )
+            } catch {
+                if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                    Register-WinConfigSessionAction -Action "BT Stack Reset" -Detail "Reset failed: $($_.Exception.Message)" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "FAIL" -Tier 4 -Summary "BT stack reset failed"
+                }
+                [System.Windows.Forms.MessageBox]::Show("Bluetooth stack reset failed: $($_.Exception.Message)`n`nPartial changes may have been made. Backups are at:`n$backupDir", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            }
+        }
+
 "Delete old backups" = {
     # Confirm the cleanup process
     $confirmation = [System.Windows.Forms.MessageBox]::Show(
@@ -5893,6 +6091,314 @@ foreach ($tabPage in $tabControl.TabPages) {
                             }
                         }
                 }
+
+                "bt-reset-com-ports" = {
+                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+                    if (-not $isAdmin) {
+                        return New-DryRunPlan `
+                            -ToolId "bt-reset-com-ports" `
+                            -ToolName "Reset COM Port Numbers" `
+                            -Steps @("PLAN FAILED: Cannot proceed") `
+                            -AffectedResources @("Unknown - planning aborted") `
+                            -RequiresAdmin $true `
+                            -Reversible $true `
+                            -EstimatedImpact "Unknown" `
+                            -Preconditions @("Admin: FAILED") `
+                            -Evidence @{
+                                PlanFailed    = $true
+                                FailureReason = "Administrator privileges are required to read and modify the COM Name Arbiter registry."
+                                Preconditions = @{ IsAdmin = $false }
+                                Findings      = @{}
+                            }
+                    }
+
+                    $arbiterPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\COM Name Arbiter'
+                    $allocatedPorts = @()
+                    $comDbSize = 0
+                    try {
+                        $comDb = (Get-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop).ComDB
+                        if ($comDb) {
+                            $comDbSize = $comDb.Length
+                            for ($i = 0; $i -lt ($comDb.Length * 8); $i++) {
+                                $byteIndex = [Math]::Floor($i / 8)
+                                $bitIndex = $i % 8
+                                if ($comDb[$byteIndex] -band (1 -shl $bitIndex)) {
+                                    $allocatedPorts += "COM$($i + 1)"
+                                }
+                            }
+                        }
+                    } catch {
+                        # ComDB not present -- already clean
+                    }
+
+                    if ($allocatedPorts.Count -eq 0) {
+                        return New-DryRunPlan `
+                            -ToolId "bt-reset-com-ports" `
+                            -ToolName "Reset COM Port Numbers" `
+                            -Steps @("No action required -- COM Name Arbiter is already clean") `
+                            -AffectedResources @("COM Name Arbiter (0 ports allocated)") `
+                            -RequiresAdmin $true `
+                            -Reversible $true `
+                            -EstimatedImpact "None" `
+                            -Preconditions @("Admin: $isAdmin") `
+                            -Evidence @{
+                                Preconditions = @{ IsAdmin = $isAdmin }
+                                Findings      = @{ AllocatedPorts = @(); PortCount = 0; ComDbSize = $comDbSize }
+                            }
+                    }
+
+                    $actions = @(
+                        (New-DryRunStep -Verb WOULD_CREATE -Target "registry backup" -Detail "COM Name Arbiter .reg export").Summary,
+                        (New-DryRunStep -Verb WOULD_DELETE -Target "COM Name Arbiter ComDB value" -Detail "$($allocatedPorts.Count) port slots ($($allocatedPorts -join ', '))").Summary
+                    )
+
+                    New-DryRunPlan `
+                        -ToolId "bt-reset-com-ports" `
+                        -ToolName "Reset COM Port Numbers" `
+                        -Steps $actions `
+                        -AffectedResources @("HKLM:\...\COM Name Arbiter\ComDB") `
+                        -RequiresAdmin $true `
+                        -Reversible $true `
+                        -EstimatedImpact $(if ($allocatedPorts.Count -gt 10) { "Medium" } else { "Low" }) `
+                        -Preconditions @("Admin: $isAdmin") `
+                        -Evidence @{
+                            Preconditions = @{ IsAdmin = $isAdmin }
+                            Findings      = @{
+                                AllocatedPorts = $allocatedPorts
+                                PortCount      = $allocatedPorts.Count
+                                ComDbSize      = $comDbSize
+                            }
+                        }
+                }
+
+                "bt-clean-ports" = {
+                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+                    if (-not $isAdmin) {
+                        return New-DryRunPlan `
+                            -ToolId "bt-clean-ports" `
+                            -ToolName "Clean Bluetooth Ports" `
+                            -Steps @("PLAN FAILED: Cannot proceed") `
+                            -AffectedResources @("Unknown - planning aborted") `
+                            -RequiresAdmin $true `
+                            -Reversible $false `
+                            -EstimatedImpact "Unknown" `
+                            -Preconditions @("Admin: FAILED") `
+                            -Evidence @{
+                                PlanFailed    = $true
+                                FailureReason = "Administrator privileges are required to enumerate PnP devices and modify the COM Name Arbiter."
+                                Preconditions = @{ IsAdmin = $false }
+                                Findings      = @{}
+                            }
+                    }
+
+                    $ghostPorts = @()
+                    try {
+                        $allBtPorts = Get-PnpDevice -Class Ports -ErrorAction Stop |
+                            Where-Object { $_.InstanceId -match 'BTHENUM' }
+                        $ghostPorts = @($allBtPorts | Where-Object {
+                            $_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000'
+                        })
+                    } catch {
+                        # Get-PnpDevice may fail on older systems
+                    }
+
+                    $arbiterPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\COM Name Arbiter'
+                    $allocatedPorts = @()
+                    try {
+                        $comDb = (Get-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop).ComDB
+                        if ($comDb) {
+                            for ($i = 0; $i -lt ($comDb.Length * 8); $i++) {
+                                $byteIndex = [Math]::Floor($i / 8)
+                                $bitIndex = $i % 8
+                                if ($comDb[$byteIndex] -band (1 -shl $bitIndex)) {
+                                    $allocatedPorts += "COM$($i + 1)"
+                                }
+                            }
+                        }
+                    } catch {}
+
+                    if ($ghostPorts.Count -eq 0 -and $allocatedPorts.Count -eq 0) {
+                        return New-DryRunPlan `
+                            -ToolId "bt-clean-ports" `
+                            -ToolName "Clean Bluetooth Ports" `
+                            -Steps @("No action required -- no ghost ports or COM allocations found") `
+                            -AffectedResources @("BTHENUM (0 ghosts)", "COM Name Arbiter (0 ports)") `
+                            -RequiresAdmin $true `
+                            -Reversible $false `
+                            -EstimatedImpact "None" `
+                            -Preconditions @("Admin: $isAdmin") `
+                            -Evidence @{
+                                Preconditions = @{ IsAdmin = $isAdmin }
+                                Findings      = @{ GhostPorts = @(); AllocatedPorts = @() }
+                            }
+                    }
+
+                    $actions = @()
+                    $affected = @()
+                    $actions += (New-DryRunStep -Verb WOULD_CREATE -Target "registry backup" -Detail "COM Name Arbiter .reg export").Summary
+                    foreach ($ghost in $ghostPorts) {
+                        $actions += (New-DryRunStep -Verb WOULD_DELETE -Target "ghost PnP device" -Detail "$($ghost.InstanceId)").Summary
+                        $affected += $ghost.InstanceId
+                    }
+                    if ($allocatedPorts.Count -gt 0) {
+                        $actions += (New-DryRunStep -Verb WOULD_DELETE -Target "COM Name Arbiter ComDB value" -Detail "$($allocatedPorts.Count) port slots").Summary
+                        $affected += "HKLM:\...\COM Name Arbiter\ComDB"
+                    }
+
+                    $ghostInfo = @()
+                    foreach ($g in $ghostPorts) {
+                        $ghostInfo += @{ InstanceId = $g.InstanceId; Status = "$($g.Status)"; FriendlyName = $g.FriendlyName }
+                    }
+
+                    New-DryRunPlan `
+                        -ToolId "bt-clean-ports" `
+                        -ToolName "Clean Bluetooth Ports" `
+                        -Steps $actions `
+                        -AffectedResources $affected `
+                        -RequiresAdmin $true `
+                        -Reversible $false `
+                        -EstimatedImpact $(if ($ghostPorts.Count -gt 5) { "Medium" } else { "Low" }) `
+                        -Preconditions @("Admin: $isAdmin") `
+                        -Evidence @{
+                            Preconditions = @{ IsAdmin = $isAdmin }
+                            Findings      = @{
+                                GhostPorts     = $ghostInfo
+                                GhostCount     = $ghostPorts.Count
+                                AllocatedPorts = $allocatedPorts
+                                PortCount      = $allocatedPorts.Count
+                            }
+                        }
+                }
+
+                "bt-stack-reset" = {
+                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+                    if (-not $isAdmin) {
+                        return New-DryRunPlan `
+                            -ToolId "bt-stack-reset" `
+                            -ToolName "Full Bluetooth Stack Reset" `
+                            -Steps @("PLAN FAILED: Cannot proceed") `
+                            -AffectedResources @("Unknown - planning aborted") `
+                            -RequiresAdmin $true `
+                            -Reversible $false `
+                            -EstimatedImpact "Unknown" `
+                            -Preconditions @("Admin: FAILED") `
+                            -Evidence @{
+                                PlanFailed    = $true
+                                FailureReason = "Administrator privileges are required to access BTHPORT registry and remove PnP devices."
+                                Preconditions = @{ IsAdmin = $false }
+                                Findings      = @{}
+                            }
+                    }
+
+                    $devicesPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices'
+                    $localSvcPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\LocalServices'
+
+                    $pairedDevices = @()
+                    if (Test-Path $devicesPath) {
+                        $devSubkeys = Get-ChildItem $devicesPath -ErrorAction SilentlyContinue
+                        foreach ($dev in $devSubkeys) {
+                            $props = Get-ItemProperty $dev.PSPath -ErrorAction SilentlyContinue
+                            $devName = '(unknown)'
+                            if ($props.PSObject.Properties.Name -contains 'Name') {
+                                try { $devName = [System.Text.Encoding]::UTF8.GetString($props.Name).TrimEnd("`0") } catch {}
+                            }
+                            $pairedDevices += @{ MAC = $dev.PSChildName; Name = $devName }
+                        }
+                    }
+
+                    $localServices = @()
+                    if (Test-Path $localSvcPath) {
+                        $svcSubkeys = Get-ChildItem $localSvcPath -ErrorAction SilentlyContinue
+                        foreach ($svc in $svcSubkeys) {
+                            $localServices += $svc.PSChildName
+                        }
+                    }
+
+                    $ghostPorts = @()
+                    try {
+                        $allBtPorts = Get-PnpDevice -Class Ports -ErrorAction Stop |
+                            Where-Object { $_.InstanceId -match 'BTHENUM' }
+                        $ghostPorts = @($allBtPorts | Where-Object {
+                            $_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000'
+                        })
+                    } catch {}
+
+                    $allocatedPorts = @()
+                    try {
+                        $comDb = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\COM Name Arbiter' -Name 'ComDB' -ErrorAction Stop).ComDB
+                        if ($comDb) {
+                            for ($i = 0; $i -lt ($comDb.Length * 8); $i++) {
+                                $byteIndex = [Math]::Floor($i / 8)
+                                $bitIndex = $i % 8
+                                if ($comDb[$byteIndex] -band (1 -shl $bitIndex)) {
+                                    $allocatedPorts += "COM$($i + 1)"
+                                }
+                            }
+                        }
+                    } catch {}
+
+                    $actions = @()
+                    $affected = @()
+
+                    $actions += (New-DryRunStep -Verb WOULD_CREATE -Target "registry backup" -Detail "BTHPORT + COM Name Arbiter .reg exports").Summary
+
+                    foreach ($dev in $pairedDevices) {
+                        $actions += (New-DryRunStep -Verb WOULD_DELETE -Target "paired device: $($dev.Name)" -Detail "MAC $($dev.MAC)").Summary
+                        $affected += "BTHPORT\Devices\$($dev.MAC)"
+                    }
+
+                    foreach ($svc in $localServices) {
+                        $actions += (New-DryRunStep -Verb WOULD_DELETE -Target "local BT service: $svc").Summary
+                        $affected += "BTHPORT\LocalServices\$svc"
+                    }
+
+                    foreach ($ghost in $ghostPorts) {
+                        $actions += (New-DryRunStep -Verb WOULD_DELETE -Target "ghost PnP device" -Detail "$($ghost.InstanceId)").Summary
+                        $affected += $ghost.InstanceId
+                    }
+
+                    if ($allocatedPorts.Count -gt 0) {
+                        $actions += (New-DryRunStep -Verb WOULD_DELETE -Target "COM Name Arbiter ComDB value" -Detail "$($allocatedPorts.Count) port slots").Summary
+                        $affected += "HKLM:\...\COM Name Arbiter\ComDB"
+                    }
+
+                    $actions += (New-DryRunStep -Verb WOULD_EXEC -Target "reboot prompt" -Detail "system restart required to complete stack reset").Summary
+
+                    if ($actions.Count -le 1) {
+                        $actions = @("No Bluetooth state found -- stack may already be clean")
+                    }
+
+                    $ghostInfo = @()
+                    foreach ($g in $ghostPorts) {
+                        $ghostInfo += @{ InstanceId = $g.InstanceId; Status = "$($g.Status)" }
+                    }
+
+                    New-DryRunPlan `
+                        -ToolId "bt-stack-reset" `
+                        -ToolName "Full Bluetooth Stack Reset" `
+                        -Steps $actions `
+                        -AffectedResources $affected `
+                        -RequiresAdmin $true `
+                        -Reversible $false `
+                        -EstimatedImpact "High" `
+                        -Preconditions @("Admin: $isAdmin") `
+                        -Evidence @{
+                            Preconditions = @{ IsAdmin = $isAdmin }
+                            Findings      = @{
+                                PairedDevices  = $pairedDevices
+                                DeviceCount    = $pairedDevices.Count
+                                LocalServices  = $localServices
+                                ServiceCount   = $localServices.Count
+                                GhostPorts     = $ghostInfo
+                                GhostCount     = $ghostPorts.Count
+                                AllocatedPorts = $allocatedPorts
+                                PortCount      = $allocatedPorts.Count
+                            }
+                        }
+                }
             }
 
             # Check if we have a plan generator for this tool
@@ -6109,6 +6615,27 @@ No system changes were made.
                 SupportsDryRun = $false
                 MutatesSystem = $false
             }
+            "Reset COM Port Numbers" = @{
+                Description = "Clear COM Name Arbiter bitmap"
+                Group = "Actions"
+                ToolId = "bt-reset-com-ports"
+                SupportsDryRun = $true
+                MutatesSystem = $true
+            }
+            "Clean Bluetooth Ports" = @{
+                Description = "Remove ghost BTHENUM entries + reset COM arbiter"
+                Group = "Actions"
+                ToolId = "bt-clean-ports"
+                SupportsDryRun = $true
+                MutatesSystem = $true
+            }
+            "Full Bluetooth Stack Reset" = @{
+                Description = "Wipe all BT pairing data -- requires reboot"
+                Group = "Actions"
+                ToolId = "bt-stack-reset"
+                SupportsDryRun = $true
+                MutatesSystem = $true
+            }
             # Maintenance tools
             "DISM Restore Health"      = @{ Description = "Repair Windows component store"; Group = "Repair" }
             "/sfc scannow"             = @{ Description = "Scan and repair system files"; Group = "Repair" }
@@ -6158,7 +6685,7 @@ No system changes were made.
         $script:CategoryTools = [ordered]@{
             "Network"      = @("Run Network Test", "Domain, IP && Ports Test", "Network Reset", "Flush DNS Cache", "Open Speedtest.net")
             "Audio"        = @("Remove Intel SST Audio Driver", "Restart Audio Service", "Sound Panel", "Run Bluetooth Diagnostics")
-            "Bluetooth"    = @("Run Bluetooth Diagnostics")
+            "Bluetooth"    = @("Run Bluetooth Diagnostics", "Reset COM Port Numbers", "Clean Bluetooth Ports", "Full Bluetooth Stack Reset")
             "System"       = @("Copy System Info", "Copy Device Name", "Copy Serial Number", "Device Manager", "Task Manager", "Control Panel")
             "zAmp"         = @("Uninstall zAmp Drivers")
             "Zengar UI"    = @("Apply Win 11 Start Menu", "Apply branding colors", "Pin Taskbar Icons", "Apply Win Update Icon")
