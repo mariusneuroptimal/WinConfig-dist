@@ -49,6 +49,7 @@
             "Reset COM Port Numbers"
             "Clean Bluetooth Ports"
             "Full Bluetooth Stack Reset"
+            "Disable USB Suspend"
         )
         "System" = @(
             "Copy System Info"
@@ -140,6 +141,10 @@
         }
         "Full Bluetooth Stack Reset" = @{
             Description = "Wipe all BT pairing data -- requires reboot"
+            Group = "Actions"
+        }
+        "Disable USB Suspend" = @{
+            Description = "Disable USB selective suspend on BT adapter"
             Group = "Actions"
         }
 

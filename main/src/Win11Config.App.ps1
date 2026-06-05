@@ -4191,7 +4191,11 @@ $buttonHandlers = @{
                     $driverVer = if ($btProbeSession.AdapterInfo.DriverInfo -and $btProbeSession.AdapterInfo.DriverInfo.Version) { $btProbeSession.AdapterInfo.DriverInfo.Version } else { 'unknown' }
                     Write-BtLog "  BT adapter    : $($btProbeSession.AdapterInfo.FriendlyName)  driver v$driverVer" -Level "DIM"
                     $pm = $btProbeSession.AdapterInfo.PowerManagementEnabled
-                    if ($pm -eq $true) { Write-BtLog "  USB suspend   : ENABLED (risk factor -- can cause random disconnects)" -Level "WARN" }
+                    if ($pm -eq $true) {
+                        Write-BtLog "  USB suspend   : ENABLED (risk factor -- can cause random disconnects)" -Level "WARN"
+                        Write-BtLog "                  To disable: Device Manager > Bluetooth adapter > Properties > Power Management" -Level "WARN"
+                        Write-BtLog "                  Uncheck 'Allow the computer to turn off this device to save power'" -Level "WARN"
+                    }
                 }
                 if ($btProbeSession.PowerPlan -and $btProbeSession.PowerPlan.IsPowerSaver) {
                     Write-BtLog "  Power plan    : $($btProbeSession.PowerPlan.ActivePlan) -- throttles USB/Bluetooth performance" -Level "WARN"
@@ -4203,6 +4207,7 @@ $buttonHandlers = @{
                 Write-BtLog "  Radio link = Active wireless connection between this PC and the headset" -Level "DIM"
                 Write-BtLog "  Stream     = Is EEG data actually flowing right now?" -Level "DIM"
                 Write-BtLog "  NO.exe     = Is the NeurOptimal application running?" -Level "DIM"
+                Write-BtLog "  USB suspend= Power-saving feature that can shut down the Bluetooth radio mid-session" -Level "DIM"
                 Write-BtLog "" -Level "DIM"
                 if ($noRunning) {
                     Write-BtLog "  NeurOptimal is already running. Run tests or reproduce the issue you have been seeing." -Level "INFO"
@@ -4817,6 +4822,63 @@ $buttonHandlers = @{
                     Register-WinConfigSessionAction -Action "BT Stack Reset" -Detail "Reset failed: $($_.Exception.Message)" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "FAIL" -Tier 4 -Summary "BT stack reset failed"
                 }
                 [System.Windows.Forms.MessageBox]::Show("Bluetooth stack reset failed: $($_.Exception.Message)`n`nPartial changes may have been made. Backups are at:`n$backupDir", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            }
+        }
+
+        "Disable USB Suspend" = {
+            $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            if (-not $isAdmin) {
+                [System.Windows.Forms.MessageBox]::Show("Disable USB Suspend requires Administrator privileges.`n`nPlease restart WinConfig as Administrator.", "Elevation Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                return
+            }
+
+            try {
+                $btAdapter = Get-PnpDevice -Class Bluetooth -ErrorAction Stop |
+                    Where-Object { $_.FriendlyName -notmatch 'Enumerator' -and $_.Status -eq 'OK' } |
+                    Select-Object -First 1
+
+                if (-not $btAdapter) {
+                    [System.Windows.Forms.MessageBox]::Show("No active Bluetooth adapter found.", "Not Found", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+                    return
+                }
+
+                $instanceIdPrefix = $btAdapter.InstanceId
+                $powerSettings = Get-CimInstance -Namespace root\WMI -ClassName MSPower_DeviceEnable -ErrorAction Stop |
+                    Where-Object { $_.InstanceName -like "$instanceIdPrefix*" } |
+                    Select-Object -First 1
+
+                if (-not $powerSettings) {
+                    [System.Windows.Forms.MessageBox]::Show("Cannot read power management settings for '$($btAdapter.FriendlyName)'.`n`nThe adapter may not support USB selective suspend control.", "Not Available", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+                    return
+                }
+
+                if ($powerSettings.Enable -eq $false) {
+                    [System.Windows.Forms.MessageBox]::Show("USB selective suspend is already disabled on '$($btAdapter.FriendlyName)'.`n`nNo changes needed.", "Already Disabled", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+                    return
+                }
+
+                $powerSettings | Set-CimInstance -Property @{ Enable = $false } -ErrorAction Stop
+
+                $verify = Get-CimInstance -Namespace root\WMI -ClassName MSPower_DeviceEnable -ErrorAction SilentlyContinue |
+                    Where-Object { $_.InstanceName -like "$instanceIdPrefix*" } |
+                    Select-Object -First 1
+
+                $success = ($verify -and $verify.Enable -eq $false)
+
+                if ($success) {
+                    if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                        Register-WinConfigSessionAction -Action "Disable USB Suspend" -Detail "Disabled USB selective suspend on '$($btAdapter.FriendlyName)'" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "PASS" -Tier 3 -Summary "USB suspend disabled"
+                    }
+                    if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
+                    [System.Windows.Forms.MessageBox]::Show("USB selective suspend disabled on '$($btAdapter.FriendlyName)'.`n`nThis prevents Windows from powering down the Bluetooth radio to save energy, which can cause random disconnects.", "Success", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+                } else {
+                    [System.Windows.Forms.MessageBox]::Show("Setting was written but verification failed.`n`nTry disabling manually: Device Manager > $($btAdapter.FriendlyName) > Properties > Power Management", "Verification Failed", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                }
+            } catch {
+                if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                    Register-WinConfigSessionAction -Action "Disable USB Suspend" -Detail "Failed: $($_.Exception.Message)" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "FAIL" -Tier 3 -Summary "USB suspend disable failed"
+                }
+                [System.Windows.Forms.MessageBox]::Show("Failed to disable USB selective suspend: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
             }
         }
 
@@ -6437,6 +6499,90 @@ foreach ($tabPage in $tabControl.TabPages) {
                             }
                         }
                 }
+
+                "bt-disable-usb-suspend" = {
+                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+                    if (-not $isAdmin) {
+                        return New-DryRunPlan `
+                            -ToolId "bt-disable-usb-suspend" `
+                            -ToolName "Disable USB Suspend" `
+                            -Steps @("PLAN FAILED: Cannot proceed") `
+                            -AffectedResources @("Unknown - planning aborted") `
+                            -RequiresAdmin $true `
+                            -Reversible $true `
+                            -EstimatedImpact "Unknown" `
+                            -Preconditions @("Admin: FAILED") `
+                            -Evidence @{
+                                PlanFailed    = $true
+                                FailureReason = "Administrator privileges are required to modify WMI power management settings."
+                                Preconditions = @{ IsAdmin = $false }
+                                Findings      = @{}
+                            }
+                    }
+
+                    $btAdapter = $null
+                    try {
+                        $btAdapter = Get-PnpDevice -Class Bluetooth -ErrorAction Stop |
+                            Where-Object { $_.FriendlyName -notmatch 'Enumerator' -and $_.Status -eq 'OK' } |
+                            Select-Object -First 1
+                    } catch {}
+
+                    if (-not $btAdapter) {
+                        return New-DryRunPlan `
+                            -ToolId "bt-disable-usb-suspend" `
+                            -ToolName "Disable USB Suspend" `
+                            -Steps @("No active Bluetooth adapter found -- nothing to change") `
+                            -AffectedResources @() `
+                            -RequiresAdmin $true `
+                            -Reversible $true `
+                            -EstimatedImpact "None" `
+                            -Preconditions @("Admin: $isAdmin", "BT Adapter: NOT FOUND") `
+                            -Evidence @{
+                                Preconditions = @{ IsAdmin = $isAdmin; AdapterFound = $false }
+                                Findings      = @{}
+                            }
+                    }
+
+                    $currentState = $null
+                    try {
+                        $instanceIdPrefix = $btAdapter.InstanceId
+                        $powerSettings = Get-CimInstance -Namespace root\WMI -ClassName MSPower_DeviceEnable -ErrorAction Stop |
+                            Where-Object { $_.InstanceName -like "$instanceIdPrefix*" } |
+                            Select-Object -First 1
+                        if ($powerSettings) { $currentState = $powerSettings.Enable }
+                    } catch {}
+
+                    $actions = @()
+                    $affected = @()
+
+                    if ($currentState -eq $true) {
+                        $actions += (New-DryRunStep -Verb WOULD_DISABLE -Target "USB selective suspend" -Detail "on '$($btAdapter.FriendlyName)' (WMI MSPower_DeviceEnable)").Summary
+                        $affected += "WMI MSPower_DeviceEnable for $($btAdapter.InstanceId)"
+                    } elseif ($currentState -eq $false) {
+                        $actions = @("USB selective suspend is already DISABLED -- no change needed")
+                    } else {
+                        $actions = @("Cannot read power management state for '$($btAdapter.FriendlyName)' -- WMI query returned no result")
+                    }
+
+                    New-DryRunPlan `
+                        -ToolId "bt-disable-usb-suspend" `
+                        -ToolName "Disable USB Suspend" `
+                        -Steps $actions `
+                        -AffectedResources $affected `
+                        -RequiresAdmin $true `
+                        -Reversible $true `
+                        -EstimatedImpact "Low" `
+                        -Preconditions @("Admin: $isAdmin", "BT Adapter: $($btAdapter.FriendlyName)") `
+                        -Evidence @{
+                            Preconditions = @{ IsAdmin = $isAdmin; AdapterFound = $true }
+                            Findings      = @{
+                                AdapterName    = $btAdapter.FriendlyName
+                                AdapterInstanceId = $btAdapter.InstanceId
+                                CurrentSuspendEnabled = $currentState
+                            }
+                        }
+                }
             }
 
             # Check if we have a plan generator for this tool
@@ -6674,6 +6820,13 @@ No system changes were made.
                 SupportsDryRun = $true
                 MutatesSystem = $true
             }
+            "Disable USB Suspend" = @{
+                Description = "Disable USB selective suspend on BT adapter"
+                Group = "Actions"
+                ToolId = "bt-disable-usb-suspend"
+                SupportsDryRun = $true
+                MutatesSystem = $true
+            }
             # Maintenance tools
             "DISM Restore Health"      = @{ Description = "Repair Windows component store"; Group = "Repair" }
             "/sfc scannow"             = @{ Description = "Scan and repair system files"; Group = "Repair" }
@@ -6723,7 +6876,7 @@ No system changes were made.
         $script:CategoryTools = [ordered]@{
             "Network"      = @("Run Network Test", "Domain, IP && Ports Test", "Network Reset", "Flush DNS Cache", "Open Speedtest.net")
             "Audio"        = @("Remove Intel SST Audio Driver", "Restart Audio Service", "Sound Panel", "Run Bluetooth Diagnostics")
-            "Bluetooth"    = @("Run Bluetooth Diagnostics", "Reset COM Port Numbers", "Clean Bluetooth Ports", "Full Bluetooth Stack Reset")
+            "Bluetooth"    = @("Run Bluetooth Diagnostics", "Reset COM Port Numbers", "Clean Bluetooth Ports", "Full Bluetooth Stack Reset", "Disable USB Suspend")
             "System"       = @("Copy System Info", "Copy Device Name", "Copy Serial Number", "Device Manager", "Task Manager", "Control Panel")
             "zAmp"         = @("Uninstall zAmp Drivers")
             "Zengar UI"    = @("Apply Win 11 Start Menu", "Apply branding colors", "Pin Taskbar Icons", "Apply Win Update Icon")

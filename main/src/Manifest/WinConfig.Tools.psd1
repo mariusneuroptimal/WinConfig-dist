@@ -200,6 +200,16 @@
             RequiresAdmin  = $true
         }
         @{
+            Id             = "bt-disable-usb-suspend"
+            Name           = "Disable USB Suspend"
+            Category       = "Bluetooth"
+            ToolCategory   = "Bluetooth"
+            MutatesSystem  = $true
+            SupportsDryRun = $true   # REQUIRED: Modifies WMI power management setting
+            Description    = "Disables USB selective suspend on the Bluetooth adapter to prevent random disconnects"
+            RequiresAdmin  = $true
+        }
+        @{
             Id             = "audio-diagnostics"
             Name           = "Audio Diagnostics"
             Category       = "Audio"
