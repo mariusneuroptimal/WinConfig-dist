@@ -787,40 +787,47 @@ function Get-ProbeStateUserText {
         [switch]$Short
     )
 
-    if ($Kind -eq 'device') {
-        return switch ($State) {
-            'Missing'         { if ($Short) { 'Not found' }       else { 'Not found -- headset not discovered by Windows yet' } }
-            'PairedCandidate' { if ($Short) { 'Paired' }          else { 'Paired' } }
-            'SeenByPnp'       { if ($Short) { 'Discovered' }      else { 'Discovered -- visible but not yet paired' } }
-            'Ambiguous'       { if ($Short) { 'Ambiguous' }       else { 'Ambiguous -- multiple matching devices found' } }
-            'Configured'      { if ($Short) { 'Configured' }      else { 'Configured' } }
-            'Unconfigured'    { if ($Short) { 'Not configured' }  else { 'Not configured' } }
-            default           { $State }
-        }
+    $shortText = @{
+        'device.Missing'              = 'Not found'
+        'device.PairedCandidate'      = 'Paired'
+        'device.SeenByPnp'            = 'Discovered'
+        'device.Ambiguous'            = 'Ambiguous'
+        'device.Configured'           = 'Configured'
+        'device.Unconfigured'         = 'Not configured'
+        'comport.ComPortMissing'      = 'None'
+        'comport.ComPortFound'        = 'Found'
+        'comport.ComPortAmbiguous'    = 'Multiple'
+        'comport.ComPortUnconfigured' = 'N/A'
+        'btlink.Connected'            = 'Connected'
+        'btlink.NotConnected'         = 'Disconnected'
+        'btlink.Unknown'              = 'Unknown'
+        'stream.Active'               = 'Active'
+        'stream.Stopped'              = 'Idle'
     }
-    if ($Kind -eq 'comport') {
-        return switch ($State) {
-            'ComPortMissing'      { if ($Short) { 'None' }            else { 'None -- appears after successful pairing' } }
-            'ComPortFound'        { if ($Short) { 'Found' }           else { 'Found' } }
-            'ComPortAmbiguous'    { if ($Short) { 'Multiple' }        else { 'Multiple ports matched' } }
-            'ComPortUnconfigured' { if ($Short) { 'N/A' }             else { 'N/A' } }
-            default               { $State -replace 'ComPort','' }
-        }
+    $longText = @{
+        'device.Missing'              = 'Not found -- headset not discovered by Windows yet'
+        'device.PairedCandidate'      = 'Paired'
+        'device.SeenByPnp'            = 'Discovered -- visible but not yet paired'
+        'device.Ambiguous'            = 'Ambiguous -- multiple matching devices found'
+        'device.Configured'           = 'Configured'
+        'device.Unconfigured'         = 'Not configured'
+        'comport.ComPortMissing'      = 'None -- appears after successful pairing'
+        'comport.ComPortFound'        = 'Found'
+        'comport.ComPortAmbiguous'    = 'Multiple ports matched'
+        'comport.ComPortUnconfigured' = 'N/A'
+        'btlink.Connected'            = 'Connected'
+        'btlink.NotConnected'         = 'Disconnected'
+        'btlink.Unknown'              = 'Unknown -- needs admin rights and device discovery'
+        'stream.Active'               = 'Active'
+        'stream.Stopped'              = 'Idle'
     }
-    if ($Kind -eq 'btlink') {
-        return switch ($State) {
-            'Connected'    { 'Connected' }
-            'NotConnected' { 'Disconnected' }
-            'Unknown'      { if ($Short) { 'Unknown' } else { 'Unknown -- needs admin rights and device discovery' } }
-            default        { $State }
-        }
-    }
-    if ($Kind -eq 'stream') {
-        if ($State -eq 'Active')           { return 'Active' }
-        if ($State -eq 'Stopped')          { return 'Idle' }
-        if ($State -like 'Stopped*')       { return $State -replace '^Stopped','Stopped' }
-        return $State
-    }
+
+    $key = "$Kind.$State"
+    $table = if ($Short) { $shortText } else { $longText }
+    if ($table.ContainsKey($key)) { return $table[$key] }
+
+    if ($Kind -eq 'stream' -and $State -like 'Stopped*') { return $State }
+    if ($Kind -eq 'comport') { return $State -replace 'ComPort','' }
     return $State
 }
 
