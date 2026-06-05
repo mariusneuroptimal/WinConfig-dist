@@ -4056,6 +4056,7 @@ $buttonHandlers = @{
                                     (Get-Command New-DeviceProbeSession -ErrorAction SilentlyContinue)
 
             # Load probe modules if not already loaded
+            $btProbeLoadError = $null
             if (-not $btDeepProbeAvailable) {
                 $tdwPath = Join-Path $PSScriptRoot "Modules\TargetDeviceWatch.psm1"
                 $bdpPath = Join-Path $PSScriptRoot "Modules\BluetoothDeviceProbe.psm1"
@@ -4064,7 +4065,9 @@ $buttonHandlers = @{
                     if (Test-Path $bdpPath) { Import-Module $bdpPath -Force -DisableNameChecking -ErrorAction Stop }
                     $btDeepProbeAvailable = (Get-Command New-TargetDeviceConfiguration -ErrorAction SilentlyContinue) -and
                                             (Get-Command Initialize-BtWin32Api -ErrorAction SilentlyContinue)
-                } catch { }
+                } catch {
+                    $btProbeLoadError = $_.Exception.Message
+                }
             }
 
             $script:BtRec_StopClicked = $false
@@ -4185,7 +4188,11 @@ $buttonHandlers = @{
                 Write-BtLog "" -Level "DIM"
                 Write-BtLog "  Watching for Bluetooth changes (every 3s) -- events appear below as they happen" -Level "DIM"
             } else {
-                Write-BtLog "  Deep device probe not available -- using basic monitoring" -Level "WARN"
+                Write-BtLog "  Limited monitoring mode -- device tracking not available" -Level "WARN"
+                if ($btProbeLoadError) {
+                    Write-BtLog "  Reason: $btProbeLoadError" -Level "DIM"
+                }
+                Write-BtLog "  Only Bluetooth connect/disconnect events will be captured" -Level "DIM"
                 $noRunningBasic = try { !!(Get-Process -Name $btProbeAppName -ErrorAction SilentlyContinue) } catch { $false }
                 if ($noRunningBasic) {
                     Write-BtLog "  NeurOptimal is already running -- reproduce the Bluetooth issue" -Level "INFO"
