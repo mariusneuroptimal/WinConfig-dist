@@ -46,6 +46,9 @@
         )
         "Bluetooth" = @(
             "Run Bluetooth Diagnostics"
+            "Reset COM Port Numbers"
+            "Clean Bluetooth Ports"
+            "Full Bluetooth Stack Reset"
         )
         "System" = @(
             "Copy System Info"
@@ -126,6 +129,18 @@
         "Run Bluetooth Diagnostics" = @{
             Description = "Run Bluetooth probe and record findings"
             Group = "Diagnostics"
+        }
+        "Reset COM Port Numbers" = @{
+            Description = "Clear COM Name Arbiter bitmap"
+            Group = "Actions"
+        }
+        "Clean Bluetooth Ports" = @{
+            Description = "Remove ghost BTHENUM entries + reset COM arbiter"
+            Group = "Actions"
+        }
+        "Full Bluetooth Stack Reset" = @{
+            Description = "Wipe all BT pairing data -- requires reboot"
+            Group = "Actions"
         }
 
         # System tools
