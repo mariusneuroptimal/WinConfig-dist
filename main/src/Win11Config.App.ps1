@@ -4176,15 +4176,22 @@ $buttonHandlers = @{
                     Write-BtLog "  Power plan    : $($btProbeSession.PowerPlan.ActivePlan) -- throttles USB/BT" -Level "WARN"
                 }
                 Write-BtLog "" -Level "DIM"
-                Write-BtLog "  NeurOptimal can be launched now" -Level "INFO"
-                Write-BtLog "  Start a session and reproduce the Bluetooth issue" -Level "INFO"
+                if ($noRunning) {
+                    Write-BtLog "  NeurOptimal is already running -- reproduce the Bluetooth issue" -Level "INFO"
+                } else {
+                    Write-BtLog "  Launch NeurOptimal, start a session and reproduce the Bluetooth issue" -Level "INFO"
+                }
                 Write-BtLog "  Click  Stop and Upload  when done (~10 sec to finish)" -Level "INFO"
                 Write-BtLog "" -Level "DIM"
                 Write-BtLog "  Watching for Bluetooth changes (every 3s) -- events appear below as they happen" -Level "DIM"
             } else {
                 Write-BtLog "  Deep device probe not available -- using basic monitoring" -Level "WARN"
-                Write-BtLog "  NeurOptimal can be launched now" -Level "INFO"
-                Write-BtLog "  Start a session and reproduce the Bluetooth issue" -Level "INFO"
+                $noRunningBasic = try { !!(Get-Process -Name $btProbeAppName -ErrorAction SilentlyContinue) } catch { $false }
+                if ($noRunningBasic) {
+                    Write-BtLog "  NeurOptimal is already running -- reproduce the Bluetooth issue" -Level "INFO"
+                } else {
+                    Write-BtLog "  Launch NeurOptimal, start a session and reproduce the Bluetooth issue" -Level "INFO"
+                }
                 Write-BtLog "  Click  Stop and Upload  when done (~10 sec to finish)" -Level "INFO"
                 Write-BtLog "" -Level "DIM"
                 Write-BtLog "  Monitoring Bluetooth activity -- connect/disconnect events will appear here" -Level "DIM"
