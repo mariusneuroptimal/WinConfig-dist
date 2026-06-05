@@ -3860,11 +3860,17 @@ $buttonHandlers = @{
             # ── Build form ────────────────────────────────────────────────────────
             $btForm = New-Object System.Windows.Forms.Form
             $btForm.Text = "Bluetooth Flight Recorder"
-            $btForm.Size = New-Object System.Drawing.Size(780, 700)
-            $btForm.MinimumSize = New-Object System.Drawing.Size(600, 450)
             $btForm.StartPosition = "CenterScreen"
             $btForm.FormBorderStyle = "Sizable"
             $btForm.MaximizeBox = $true
+
+            # Size to fit the screen — remote desktop and small displays may have
+            # less usable area than expected, so cap to 90% of the working area.
+            $btScreen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+            $btFormW = [Math]::Min(780, [int]($btScreen.Width * 0.9))
+            $btFormH = [Math]::Min(700, [int]($btScreen.Height * 0.9))
+            $btForm.Size = New-Object System.Drawing.Size($btFormW, $btFormH)
+            $btForm.MinimumSize = New-Object System.Drawing.Size(500, 400)
 
             # Bottom status bar (add first — docking is processed in reverse add order)
             $btStatusPanel = New-Object System.Windows.Forms.Panel
@@ -3923,9 +3929,10 @@ $buttonHandlers = @{
             $btAnomalyLabel = New-Object System.Windows.Forms.Label
             $btAnomalyLabel.Text = "Stream stopped unexpectedly -- was this a manual stop?"
             $btAnomalyLabel.AutoSize = $false
-            $btAnomalyLabel.Width = 390
             $btAnomalyLabel.Height = 28
             $btAnomalyLabel.Location = New-Object System.Drawing.Point(12, 7)
+            $btAnomalyLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+            $btAnomalyLabel.Width = $btAnomalyBar.ClientSize.Width - 210
             $btAnomalyLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
             $btAnomalyLabel.ForeColor = [System.Drawing.Color]::White
             $btAnomalyBar.Controls.Add($btAnomalyLabel)
@@ -3936,7 +3943,8 @@ $buttonHandlers = @{
             $btAnomalyExpectedBtn = New-Object System.Windows.Forms.Button
             $btAnomalyExpectedBtn.Text = "Expected"
             $btAnomalyExpectedBtn.Size = New-Object System.Drawing.Size(90, 26)
-            $btAnomalyExpectedBtn.Location = New-Object System.Drawing.Point(420, 7)
+            $btAnomalyExpectedBtn.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+            $btAnomalyExpectedBtn.Location = New-Object System.Drawing.Point(($btAnomalyBar.ClientSize.Width - 190), 7)
             $btAnomalyExpectedBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
             $btAnomalyExpectedBtn.BackColor = [System.Drawing.Color]::FromArgb(60, 140, 60)
             $btAnomalyExpectedBtn.ForeColor = [System.Drawing.Color]::White
@@ -3946,36 +3954,38 @@ $buttonHandlers = @{
             $btAnomalyInvestBtn = New-Object System.Windows.Forms.Button
             $btAnomalyInvestBtn.Text = "Investigate"
             $btAnomalyInvestBtn.Size = New-Object System.Drawing.Size(90, 26)
-            $btAnomalyInvestBtn.Location = New-Object System.Drawing.Point(520, 7)
+            $btAnomalyInvestBtn.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+            $btAnomalyInvestBtn.Location = New-Object System.Drawing.Point(($btAnomalyBar.ClientSize.Width - 95), 7)
             $btAnomalyInvestBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
             $btAnomalyInvestBtn.BackColor = [System.Drawing.Color]::FromArgb(200, 60, 60)
             $btAnomalyInvestBtn.ForeColor = [System.Drawing.Color]::White
             $btAnomalyInvestBtn.Add_Click({ $script:BtAnomaly_Resolved = $true; $script:BtAnomaly_IsExpected = $false })
             $btAnomalyBar.Controls.Add($btAnomalyInvestBtn)
 
-            # Device status strip (5 compact state indicators)
-            $btStateStrip = New-Object System.Windows.Forms.Panel
+            # Device status strip (5 compact state indicators, flow layout)
+            $btStateStrip = New-Object System.Windows.Forms.FlowLayoutPanel
             $btStateStrip.Dock = [System.Windows.Forms.DockStyle]::Top
             $btStateStrip.Height = 32
             $btStateStrip.BackColor = [System.Drawing.Color]::FromArgb(25, 25, 30)
             $btStateStrip.Visible = $false
+            $btStateStrip.WrapContents = $false
+            $btStateStrip.Padding = New-Object System.Windows.Forms.Padding(4, 0, 0, 0)
             $btForm.Controls.Add($btStateStrip)
 
             $btStateLabels = @{}
             $stateIndicators = @(
-                @{ Key = 'Device';  X = 8;   W = 140; Text = 'Device: --' }
-                @{ Key = 'COM';     X = 148; W = 120; Text = 'COM: --' }
-                @{ Key = 'Link';    X = 268; W = 130; Text = 'Radio: --' }
-                @{ Key = 'Stream';  X = 398; W = 120; Text = 'Stream: --' }
-                @{ Key = 'App';     X = 518; W = 120; Text = 'NO.exe: --' }
+                @{ Key = 'Device';  Text = 'Device: --' }
+                @{ Key = 'COM';     Text = 'COM: --' }
+                @{ Key = 'Link';    Text = 'Radio: --' }
+                @{ Key = 'Stream';  Text = 'Stream: --' }
+                @{ Key = 'App';     Text = 'NO.exe: --' }
             )
             foreach ($ind in $stateIndicators) {
                 $lbl = New-Object System.Windows.Forms.Label
                 $lbl.Text = $ind.Text
-                $lbl.AutoSize = $false
-                $lbl.Width = if ($ind.W) { $ind.W } else { 130 }
+                $lbl.AutoSize = $true
                 $lbl.Height = 22
-                $lbl.Location = New-Object System.Drawing.Point($ind.X, 5)
+                $lbl.Margin = New-Object System.Windows.Forms.Padding(4, 5, 8, 0)
                 $lbl.Font = New-Object System.Drawing.Font("Consolas", 8)
                 $lbl.ForeColor = [System.Drawing.Color]::FromArgb(180, 180, 180)
                 $lbl.TextAlign = "MiddleLeft"
@@ -4048,7 +4058,7 @@ $buttonHandlers = @{
             # ── PHASE 2: Recording — Deep probe with DoEvents loop ────────────────
             $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(20, 65, 25)
             $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(160, 240, 160)
-            $btBannerLabel.Text      = "Step 2 of 3 - Recording.  Launch NeurOptimal, reproduce the issue, then click Stop and Upload."
+            $btBannerLabel.Text      = "Step 2 of 3 - Recording. Reproduce the issue, then click Stop and Upload."
 
             Write-BtLog ""
             Write-BtLog "Step 2 of 3: Recording in progress" -Level "STEP"
