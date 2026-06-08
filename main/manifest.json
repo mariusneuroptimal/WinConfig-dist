@@ -1,7 +1,6 @@
 {
-  "schema_version": "2.0",
   "event": "push",
-  "branch": "main",
+  "timestamp": "2026-06-08T13:26:54.1871705Z",
   "artifacts": [
     {
       "size": 2001,
@@ -149,7 +148,8 @@
       "path": "src/Modules/BluetoothDeviceProbe.psm1"
     }
   ],
-  "build_id": "27140473726-1",
-  "timestamp": "2026-06-08T13:20:21.6128061Z",
-  "source_ref": "2ad0bdc9b349922e10b693fb7f98a5a3f0503eed"
+  "source_ref": "00d61054392c6b53ca2cc0af586ddf4e85270c64",
+  "branch": "main",
+  "build_id": "27140860070-1",
+  "schema_version": "2.0"
 }
