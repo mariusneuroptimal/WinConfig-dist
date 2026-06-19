@@ -7052,20 +7052,22 @@ No system changes were made.
                             $innerHandler = $buttonHandlers[$btnText]
                             $btn.Add_Click({
                                 param($sender, $e)
-                                # Inline the intent elevation so Resolve-DryRunIntent is called
-                                # in THIS closure's scope (not a nested scriptblock), avoiding
-                                # the module-scope lookup failure that Invoke-WithExecutionIntent
-                                # + GetNewClosure() causes for cross-module functions.
+                                # DryRun.psm1 is loaded at startup with -Prefix WinConfig, so
+                                # the live-execution functions are Resolve-WinConfigDryRunIntent,
+                                # New-WinConfigExecutionContext, Assert-WinConfigMutationGuarded.
+                                # The unprefixed aliases only exist if the Dry Run button was
+                                # clicked first (it re-imports without prefix). Use prefixed names
+                                # to guarantee resolution in any session state.
                                 $prevIntent = Get-ExecutionIntent
                                 try {
                                     Set-ExecutionIntent -Intent ADMIN_ACTION
-                                    $resolution = Resolve-DryRunIntent
-                                    $ctx = New-ExecutionContext `
+                                    $resolution = Resolve-WinConfigDryRunIntent
+                                    $ctx = New-WinConfigExecutionContext `
                                         -ToolId $gateToolId `
                                         -IsDryRun $resolution.IsDryRun `
                                         -DryRunSource $resolution.Source
                                     try {
-                                        Assert-MutationGuarded -ToolId $gateToolId -ToolName $gateToolName -ExecutionContext $ctx
+                                        Assert-WinConfigMutationGuarded -ToolId $gateToolId -ToolName $gateToolName -ExecutionContext $ctx
                                     } catch {
                                         [System.Windows.Forms.MessageBox]::Show(
                                             $_.Exception.Message,
