@@ -7052,10 +7052,13 @@ No system changes were made.
                             $innerHandler = $buttonHandlers[$btnText]
                             $btn.Add_Click({
                                 param($sender, $e)
-                                # Elevate intent to ADMIN_ACTION so Resolve-DryRunIntent
-                                # returns live-execution rather than the DIAGNOSTIC default.
-                                Invoke-WithExecutionIntent -Intent ADMIN_ACTION -Script ({
-                                    # Create execution context via guarded entrypoint
+                                # Inline the intent elevation so Resolve-DryRunIntent is called
+                                # in THIS closure's scope (not a nested scriptblock), avoiding
+                                # the module-scope lookup failure that Invoke-WithExecutionIntent
+                                # + GetNewClosure() causes for cross-module functions.
+                                $prevIntent = Get-ExecutionIntent
+                                try {
+                                    Set-ExecutionIntent -Intent ADMIN_ACTION
                                     $resolution = Resolve-DryRunIntent
                                     $ctx = New-ExecutionContext `
                                         -ToolId $gateToolId `
@@ -7072,8 +7075,19 @@ No system changes were made.
                                         )
                                         return
                                     }
+                                    if ($ctx.IsDryRun) {
+                                        [System.Windows.Forms.MessageBox]::Show(
+                                            "MODE: DRY RUN (Source: $($ctx.DryRunSource))`n`nLive execution blocked in dry-run mode.`nUse the Dry Run button to preview this tool's plan.",
+                                            "Live Execution Blocked - $gateToolName",
+                                            [System.Windows.Forms.MessageBoxButtons]::OK,
+                                            [System.Windows.Forms.MessageBoxIcon]::Information
+                                        )
+                                        return
+                                    }
                                     & $innerHandler
-                                }.GetNewClosure())
+                                } finally {
+                                    Set-ExecutionIntent -Intent $prevIntent
+                                }
                             }.GetNewClosure())
                         } else {
                             # Non-mutating tools: wire directly
