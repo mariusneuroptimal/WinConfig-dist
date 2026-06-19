@@ -7054,7 +7054,7 @@ No system changes were made.
                                 param($sender, $e)
                                 # Elevate intent to ADMIN_ACTION so Resolve-DryRunIntent
                                 # returns live-execution rather than the DIAGNOSTIC default.
-                                Invoke-WithExecutionIntent -Intent ADMIN_ACTION -Script {
+                                Invoke-WithExecutionIntent -Intent ADMIN_ACTION -Script ({
                                     # Create execution context via guarded entrypoint
                                     $resolution = Resolve-DryRunIntent
                                     $ctx = New-ExecutionContext `
@@ -7073,7 +7073,7 @@ No system changes were made.
                                         return
                                     }
                                     & $innerHandler
-                                }
+                                }.GetNewClosure())
                             }.GetNewClosure())
                         } else {
                             # Non-mutating tools: wire directly
