@@ -7050,24 +7050,24 @@ No system changes were made.
                             $gateToolId = $toolDefForGate.ToolId
                             $gateToolName = $btnText
                             $innerHandler = $buttonHandlers[$btnText]
+                            # Capture path before closure — $PSScriptRoot may not resolve inside WinForms event
+                            $gateDryRunPath = Join-Path $PSScriptRoot "Modules\DryRun.psm1"
                             $btn.Add_Click({
                                 param($sender, $e)
-                                # DryRun.psm1 is loaded at startup with -Prefix WinConfig, so
-                                # the live-execution functions are Resolve-WinConfigDryRunIntent,
-                                # New-WinConfigExecutionContext, Assert-WinConfigMutationGuarded.
-                                # The unprefixed aliases only exist if the Dry Run button was
-                                # clicked first (it re-imports without prefix). Use prefixed names
-                                # to guarantee resolution in any session state.
+                                # DryRun.psm1 may have been force-reimported without prefix by the Dry Run
+                                # button handler, invalidating the startup WinConfig-prefixed names. Load
+                                # it inline (no prefix) to guarantee function availability on every click.
+                                if (Test-Path $gateDryRunPath) { Import-Module $gateDryRunPath -Force -Global }
                                 $prevIntent = Get-ExecutionIntent
                                 try {
                                     Set-ExecutionIntent -Intent ADMIN_ACTION
-                                    $resolution = Resolve-WinConfigDryRunIntent
-                                    $ctx = New-WinConfigExecutionContext `
+                                    $resolution = Resolve-DryRunIntent
+                                    $ctx = New-ExecutionContext `
                                         -ToolId $gateToolId `
                                         -IsDryRun $resolution.IsDryRun `
                                         -DryRunSource $resolution.Source
                                     try {
-                                        Assert-WinConfigMutationGuarded -ToolId $gateToolId -ToolName $gateToolName -ExecutionContext $ctx
+                                        Assert-MutationGuarded -ToolId $gateToolId -ToolName $gateToolName -ExecutionContext $ctx
                                     } catch {
                                         [System.Windows.Forms.MessageBox]::Show(
                                             $_.Exception.Message,
