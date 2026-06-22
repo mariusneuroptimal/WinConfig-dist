@@ -4856,35 +4856,27 @@ $buttonHandlers = @{
                     return
                 }
 
-                $instanceIdPrefix = $btAdapter.InstanceId
-                $powerSettings = Get-CimInstance -Namespace root\WMI -ClassName MSPower_DeviceEnable -ErrorAction Stop |
-                    Where-Object { $_.InstanceName -like "$instanceIdPrefix*" } |
-                    Select-Object -First 1
+                $regPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($btAdapter.InstanceId)\Device Parameters"
+                $pmProp = Get-ItemProperty -Path $regPath -Name 'EnhancedPowerManagementEnabled' -ErrorAction SilentlyContinue
+                $currentPmState = if ($null -ne $pmProp -and $null -ne $pmProp.EnhancedPowerManagementEnabled) { $pmProp.EnhancedPowerManagementEnabled } else { 1 }
 
-                if (-not $powerSettings) {
-                    [System.Windows.Forms.MessageBox]::Show("Cannot read power management settings for '$($btAdapter.FriendlyName)'.`n`nThe adapter may not support USB selective suspend control.", "Not Available", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+                if ($currentPmState -eq 0) {
+                    [System.Windows.Forms.MessageBox]::Show("Power management is already disabled on '$($btAdapter.FriendlyName)'.`n`nNo changes needed.", "Already Disabled", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
                     return
                 }
 
-                if ($powerSettings.Enable -eq $false) {
-                    [System.Windows.Forms.MessageBox]::Show("USB selective suspend is already disabled on '$($btAdapter.FriendlyName)'.`n`nNo changes needed.", "Already Disabled", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-                    return
-                }
+                if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+                Set-ItemProperty -Path $regPath -Name 'EnhancedPowerManagementEnabled' -Value 0 -Type DWord -ErrorAction Stop
 
-                $powerSettings | Set-CimInstance -Property @{ Enable = $false } -ErrorAction Stop
-
-                $verify = Get-CimInstance -Namespace root\WMI -ClassName MSPower_DeviceEnable -ErrorAction SilentlyContinue |
-                    Where-Object { $_.InstanceName -like "$instanceIdPrefix*" } |
-                    Select-Object -First 1
-
-                $success = ($verify -and $verify.Enable -eq $false)
+                $verify = Get-ItemProperty -Path $regPath -Name 'EnhancedPowerManagementEnabled' -ErrorAction SilentlyContinue
+                $success = ($null -ne $verify -and $verify.EnhancedPowerManagementEnabled -eq 0)
 
                 if ($success) {
                     if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                        Register-WinConfigSessionAction -Action "Disable USB Suspend" -Detail "Disabled USB selective suspend on '$($btAdapter.FriendlyName)'" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "PASS" -Tier 3 -Summary "USB suspend disabled"
+                        Register-WinConfigSessionAction -Action "Disable USB Suspend" -Detail "Disabled power management on '$($btAdapter.FriendlyName)' via EnhancedPowerManagementEnabled" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "PASS" -Tier 3 -Summary "USB suspend disabled"
                     }
                     if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
-                    [System.Windows.Forms.MessageBox]::Show("USB selective suspend disabled on '$($btAdapter.FriendlyName)'.`n`nThis prevents Windows from powering down the Bluetooth radio to save energy, which can cause random disconnects.", "Success", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+                    [System.Windows.Forms.MessageBox]::Show("Power management disabled on '$($btAdapter.FriendlyName)'.`n`nWindows will no longer turn off the Bluetooth radio to save energy.`n`nA reboot or device re-enumeration may be required for the change to take effect.", "Success", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
                 } else {
                     [System.Windows.Forms.MessageBox]::Show("Setting was written but verification failed.`n`nTry disabling manually: Device Manager > $($btAdapter.FriendlyName) > Properties > Power Management", "Verification Failed", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
                 }
@@ -6547,7 +6539,7 @@ foreach ($tabPage in $tabControl.TabPages) {
                             -ToolId "bt-disable-usb-suspend" `
                             -ToolName "Disable USB Suspend" `
                             -Steps @("No active Bluetooth adapter found -- nothing to change") `
-                            -AffectedResources @() `
+                            -AffectedResources @("Bluetooth adapter (not found)") `
                             -RequiresAdmin $true `
                             -Reversible $true `
                             -EstimatedImpact "None" `
@@ -6558,30 +6550,24 @@ foreach ($tabPage in $tabControl.TabPages) {
                             }
                     }
 
-                    $currentState = $null
-                    try {
-                        $instanceIdPrefix = $btAdapter.InstanceId
-                        $powerSettings = Get-CimInstance -Namespace root\WMI -ClassName MSPower_DeviceEnable -ErrorAction Stop |
-                            Where-Object { $_.InstanceName -like "$instanceIdPrefix*" } |
-                            Select-Object -First 1
-                        if ($powerSettings) { $currentState = $powerSettings.Enable }
-                    } catch {}
+                    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($btAdapter.InstanceId)\Device Parameters"
+                    $pmProp = Get-ItemProperty -Path $regPath -Name 'EnhancedPowerManagementEnabled' -ErrorAction SilentlyContinue
+                    $currentPmState = if ($null -ne $pmProp -and $null -ne $pmProp.EnhancedPowerManagementEnabled) { $pmProp.EnhancedPowerManagementEnabled } else { 1 }
+
+                    $regResource = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($btAdapter.InstanceId)\Device Parameters\EnhancedPowerManagementEnabled"
 
                     $actions = @()
                     $affected = @()
 
-                    if ($currentState -eq $true) {
-                        $actions += (New-DryRunStep -Verb WOULD_DISABLE -Target "USB selective suspend" -Detail "on '$($btAdapter.FriendlyName)' (WMI MSPower_DeviceEnable)").Summary
-                        $affected += "WMI MSPower_DeviceEnable for $($btAdapter.InstanceId)"
-                    } elseif ($currentState -eq $false) {
-                        $actions = @("USB selective suspend is already DISABLED -- no change needed")
-                        $affected = @("WMI MSPower_DeviceEnable for $($btAdapter.InstanceId) (no change -- already disabled)")
+                    if ($currentPmState -ne 0) {
+                        $actions += (New-DryRunStep -Verb WOULD_SET -Target "EnhancedPowerManagementEnabled" -Detail "0 (disable power management for '$($btAdapter.FriendlyName)')").Summary
+                        $affected += $regResource
                     } else {
-                        $actions = @("Cannot read power management state for '$($btAdapter.FriendlyName)' -- WMI query returned no result")
-                        $affected = @("WMI MSPower_DeviceEnable for $($btAdapter.InstanceId) (state unknown)")
+                        $actions = @("Power management is already DISABLED on '$($btAdapter.FriendlyName)' -- no change needed")
+                        $affected = @("$regResource (no change -- already 0)")
                     }
 
-                    $impact = if ($currentState -eq $true) { "Low" } else { "None" }
+                    $impact = if ($currentPmState -ne 0) { "Low" } else { "None" }
                     New-DryRunPlan `
                         -ToolId "bt-disable-usb-suspend" `
                         -ToolName "Disable USB Suspend" `
@@ -6594,9 +6580,10 @@ foreach ($tabPage in $tabControl.TabPages) {
                         -Evidence @{
                             Preconditions = @{ IsAdmin = $isAdmin; AdapterFound = $true }
                             Findings      = @{
-                                AdapterName    = $btAdapter.FriendlyName
-                                AdapterInstanceId = $btAdapter.InstanceId
-                                CurrentSuspendEnabled = $currentState
+                                AdapterName              = $btAdapter.FriendlyName
+                                AdapterInstanceId        = $btAdapter.InstanceId
+                                CurrentPmState           = $currentPmState
+                                RegistryPath             = $regPath
                             }
                         }
                 }
