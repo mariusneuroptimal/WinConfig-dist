@@ -6575,10 +6575,13 @@ foreach ($tabPage in $tabControl.TabPages) {
                         $affected += "WMI MSPower_DeviceEnable for $($btAdapter.InstanceId)"
                     } elseif ($currentState -eq $false) {
                         $actions = @("USB selective suspend is already DISABLED -- no change needed")
+                        $affected = @("WMI MSPower_DeviceEnable for $($btAdapter.InstanceId) (no change -- already disabled)")
                     } else {
                         $actions = @("Cannot read power management state for '$($btAdapter.FriendlyName)' -- WMI query returned no result")
+                        $affected = @("WMI MSPower_DeviceEnable for $($btAdapter.InstanceId) (state unknown)")
                     }
 
+                    $impact = if ($currentState -eq $true) { "Low" } else { "None" }
                     New-DryRunPlan `
                         -ToolId "bt-disable-usb-suspend" `
                         -ToolName "Disable USB Suspend" `
@@ -6586,7 +6589,7 @@ foreach ($tabPage in $tabControl.TabPages) {
                         -AffectedResources $affected `
                         -RequiresAdmin $true `
                         -Reversible $true `
-                        -EstimatedImpact "Low" `
+                        -EstimatedImpact $impact `
                         -Preconditions @("Admin: $isAdmin", "BT Adapter: $($btAdapter.FriendlyName)") `
                         -Evidence @{
                             Preconditions = @{ IsAdmin = $isAdmin; AdapterFound = $true }
