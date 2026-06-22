@@ -4692,8 +4692,8 @@ $buttonHandlers = @{
 
             $ghostPorts = @()
             try {
-                $allBtPorts = Get-PnpDevice -Class Ports -ErrorAction Stop |
-                    Where-Object { $_.InstanceId -match 'BTHENUM' }
+                $allBtPorts = @(Get-PnpDevice -Class Ports -ErrorAction SilentlyContinue |
+                    Where-Object { $_.InstanceId -match 'BTHENUM' })
                 $ghostPorts = @($allBtPorts | Where-Object {
                     $_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000'
                 })
