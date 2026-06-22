@@ -4848,7 +4848,7 @@ $buttonHandlers = @{
 
             try {
                 $btAdapter = Get-PnpDevice -Class Bluetooth -ErrorAction Stop |
-                    Where-Object { $_.FriendlyName -notmatch 'Enumerator' -and $_.Status -eq 'OK' } |
+                    Where-Object { $_.FriendlyName -notmatch 'Enumerator|RFCOMM|Protocol|TDI' -and $_.Status -eq 'OK' } |
                     Select-Object -First 1
 
                 if (-not $btAdapter) {
@@ -6538,7 +6538,7 @@ foreach ($tabPage in $tabControl.TabPages) {
                     $btAdapter = $null
                     try {
                         $btAdapter = Get-PnpDevice -Class Bluetooth -ErrorAction Stop |
-                            Where-Object { $_.FriendlyName -notmatch 'Enumerator' -and $_.Status -eq 'OK' } |
+                            Where-Object { $_.FriendlyName -notmatch 'Enumerator|RFCOMM|Protocol|TDI' -and $_.Status -eq 'OK' } |
                             Select-Object -First 1
                     } catch {}
 
