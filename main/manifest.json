@@ -1,6 +1,6 @@
 {
-  "build_id": "27976149802-1",
-  "timestamp": "2026-06-22T18:49:38.7299340Z",
+  "schema_version": "2.0",
+  "source_ref": "3b5f3ebfb86353297ebda02b184923ccd6cc77d0",
   "artifacts": [
     {
       "size": 2001,
@@ -8,9 +8,9 @@
       "sha256": "d1278321cdcd5c0759d3dfa773e964cda8d254ccdfd7f08dce12f878d317fff9"
     },
     {
-      "size": 421759,
+      "size": 421112,
       "path": "src/Win11Config.App.ps1",
-      "sha256": "6f117f9e17b9190f6635287e7b8e097cd0037c778178154a32120a9b8079a299"
+      "sha256": "34e0137d843e3db84b7315ff865ab757846522f1eb3c355fb21f467a1d1d2e29"
     },
     {
       "size": 330,
@@ -148,8 +148,8 @@
       "sha256": "d7237c073fe174827030c768a36cb40925c8344c1bf311dee158036c3ba20921"
     }
   ],
-  "schema_version": "2.0",
+  "event": "push",
+  "timestamp": "2026-06-22T20:35:39.2856242Z",
   "branch": "main",
-  "source_ref": "89c715fc826cbdd72ba5840ddd87d1db1d4b3cb4",
-  "event": "push"
+  "build_id": "27982221991-1"
 }
