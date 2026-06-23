@@ -2243,9 +2243,20 @@ function Get-BluetoothFindings {
         }
     }
 
-    # Return max 3 findings, prioritized by severity
+    # Return max 3 findings, prioritized by severity (FAIL before WARN before INFO).
+    # Findings carry a `Result` field (not `Severity`); the prior code indexed by the
+    # non-existent `$_.Severity`, so the key was always $null. A hashtable null-index
+    # throws "Index operation failed; the array index evaluated to null", which under the
+    # app's $ErrorActionPreference='Stop' aborted the whole diagnostics run — but only when
+    # $findings was non-empty (Sort-Object evaluates the key per item). That is exactly why
+    # the baseline pass (READY, 0 findings) succeeded while the final pass (post-session
+    # churn -> findings) crashed. Index by [string]$_.Result + ContainsKey so the key is
+    # never $null and an unexpected Result can never throw.
     $severityOrder = @{ "FAIL" = 0; "WARN" = 1; "INFO" = 2 }
-    return $findings | Sort-Object { $severityOrder[$_.Severity] } | Select-Object -First 3
+    return $findings | Sort-Object {
+        $key = [string]$_.Result
+        if ($severityOrder.ContainsKey($key)) { $severityOrder[$key] } else { 99 }
+    } | Select-Object -First 3
 }
 
 function Invoke-BluetoothProbe {
