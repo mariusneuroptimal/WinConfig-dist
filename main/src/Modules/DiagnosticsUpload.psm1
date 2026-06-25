@@ -107,7 +107,7 @@ function Get-WinConfigDiagnosticsUploadConfig {
     .SYNOPSIS
         Returns the active upload configuration, loaded from the bundled config file.
     .OUTPUTS
-        Hashtable: Provider, R2 (sub-hashtable), FallbackPath, Enabled
+        Hashtable: Provider, R2 (sub-hashtable), DestinationPath, Enabled
     #>
     [CmdletBinding()]
     param()
@@ -129,17 +129,22 @@ function Get-WinConfigDiagnosticsUploadConfig {
         } catch { }
     }
 
-    $fallbackPath = if ($env:WINCONFIG_DIAGNOSTICS_DEST) {
-        $env:WINCONFIG_DIAGNOSTICS_DEST
+    $destOverride = $env:WINCONFIG_DIAGNOSTICS_DEST
+    $destPath = if ($destOverride) {
+        $destOverride
     } else {
         Join-Path $env:USERPROFILE 'Documents\WinConfigDiagnostics'
     }
 
+    # Uploads are enabled only when a real destination exists: either R2 credentials
+    # were injected at publish time, or an explicit local destination was set via
+    # WINCONFIG_DIAGNOSTICS_DEST. In plain source (placeholder creds, no override)
+    # uploads are disabled, so dev/test runs do not silently write to Documents.
     return @{
-        Enabled      = $true
-        Provider     = if ($r2Config) { 'R2' } else { 'LocalFolder' }
-        R2           = $r2Config
-        FallbackPath = $fallbackPath
+        Enabled         = ([bool]$r2Config) -or ([bool]$destOverride)
+        Provider        = if ($r2Config) { 'R2' } else { 'LocalFolder' }
+        R2              = $r2Config
+        DestinationPath = $destPath
     }
 }
 
@@ -149,7 +154,11 @@ function Send-WinConfigDiagnosticPackage {
         Sends a diagnostic package to R2, falling back to a local folder on failure.
     .OUTPUTS
         PSCustomObject: Status, Provider, Destination, RemotePath, UploadedAtUtc, Sha256, Error
-        Status values: Uploaded | Failed
+        Status values:
+          Uploaded  - reached its intended destination (R2 cloud, or an intended LocalFolder)
+          LocalOnly - R2 upload FAILED; package saved on this PC only (operator must retry/send)
+          Skipped   - uploads disabled (no destination configured)
+          Failed    - could not be saved anywhere; the package did not survive
     #>
     [CmdletBinding()]
     param(
@@ -158,6 +167,18 @@ function Send-WinConfigDiagnosticPackage {
         [hashtable]$Metadata = @{},
         [string]$FolderPrefix = ''
     )
+
+    if (-not $Config.Enabled) {
+        return [PSCustomObject]@{
+            Status        = 'Skipped'
+            Provider      = $Config.Provider
+            Destination   = ''
+            RemotePath    = $null
+            UploadedAtUtc = $null
+            Sha256        = $null
+            Error         = $null
+        }
+    }
 
     if (-not (Test-Path $PackagePath)) {
         return [PSCustomObject]@{
@@ -174,49 +195,70 @@ function Send-WinConfigDiagnosticPackage {
     $sha256 = (Get-FileHash $PackagePath -Algorithm SHA256).Hash
     $fileName = Split-Path $PackagePath -Leaf
 
-    # --- R2 upload ---
+    # --- R2 upload (retried before giving up) ---
+    $r2Error = $null
     if ($Config.Provider -eq 'R2' -and $Config.R2) {
-        try {
-            $objectKey = if ($FolderPrefix) { "$FolderPrefix/$fileName" } else { $fileName }
-            $ok = Invoke-R2Put `
-                -FilePath    $PackagePath `
-                -AccountId   $Config.R2.AccountId `
-                -BucketName  $Config.R2.BucketName `
-                -ObjectKey   $objectKey `
-                -AccessKeyId $Config.R2.AccessKeyId `
-                -SecretKey   $Config.R2.SecretKey
+        $objectKey   = if ($FolderPrefix) { "$FolderPrefix/$fileName" } else { $fileName }
+        $maxAttempts = 3
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            try {
+                $ok = Invoke-R2Put `
+                    -FilePath    $PackagePath `
+                    -AccountId   $Config.R2.AccountId `
+                    -BucketName  $Config.R2.BucketName `
+                    -ObjectKey   $objectKey `
+                    -AccessKeyId $Config.R2.AccessKeyId `
+                    -SecretKey   $Config.R2.SecretKey
 
-            if ($ok) {
-                return [PSCustomObject]@{
-                    Status        = 'Uploaded'
-                    Provider      = 'R2'
-                    Destination   = "r2://$($Config.R2.BucketName)"
-                    RemotePath    = "$($Config.R2.BucketName)/$objectKey"
-                    UploadedAtUtc = [datetime]::UtcNow.ToString('o')
-                    Sha256        = $sha256
-                    Error         = $null
+                if ($ok) {
+                    return [PSCustomObject]@{
+                        Status        = 'Uploaded'
+                        Provider      = 'R2'
+                        Destination   = "r2://$($Config.R2.BucketName)"
+                        RemotePath    = "$($Config.R2.BucketName)/$objectKey"
+                        UploadedAtUtc = [datetime]::UtcNow.ToString('o')
+                        Sha256        = $sha256
+                        Error         = $null
+                    }
                 }
+                $r2Error = "R2 returned a non-success HTTP status"
+            } catch {
+                $r2Error = $_.Exception.Message
             }
-        } catch {
-            # Fall through to local-folder fallback below
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds (1000 * $attempt) }
         }
+        # All R2 attempts failed — fall through to the local safety net below.
     }
 
-    # --- LocalFolder fallback ---
+    # --- Local save ---
+    # For an intended LocalFolder provider, this IS the destination -> Status=Uploaded.
+    # For an R2 provider whose upload failed, this is only a SAFETY NET: the data did NOT
+    # reach the cloud, so report LocalOnly so the operator knows to retry / send it manually.
     try {
-        $destDir = $Config.FallbackPath
+        $destDir = $Config.DestinationPath
         if (-not (Test-Path $destDir)) {
             New-Item -ItemType Directory -Path $destDir -Force | Out-Null
         }
-        $remotePath = Join-Path $destDir $fileName
-        Copy-Item $PackagePath $remotePath -Force
+        $localPath = Join-Path $destDir $fileName
+        Copy-Item $PackagePath $localPath -Force
 
-        $provider = if ($Config.Provider -eq 'R2') { 'LocalFolder(R2Fallback)' } else { 'LocalFolder' }
+        if ($Config.Provider -eq 'R2') {
+            return [PSCustomObject]@{
+                Status        = 'LocalOnly'
+                Provider      = 'LocalFolder(R2Fallback)'
+                Destination   = $destDir
+                RemotePath    = $localPath
+                UploadedAtUtc = [datetime]::UtcNow.ToString('o')
+                Sha256        = $sha256
+                Error         = if ($r2Error) { "Cloud upload failed: $r2Error" } else { 'Cloud upload failed' }
+            }
+        }
+
         return [PSCustomObject]@{
             Status        = 'Uploaded'
-            Provider      = $provider
+            Provider      = 'LocalFolder'
             Destination   = $destDir
-            RemotePath    = $remotePath
+            RemotePath    = $localPath
             UploadedAtUtc = [datetime]::UtcNow.ToString('o')
             Sha256        = $sha256
             Error         = $null
@@ -225,7 +267,7 @@ function Send-WinConfigDiagnosticPackage {
         return [PSCustomObject]@{
             Status        = 'Failed'
             Provider      = $Config.Provider
-            Destination   = $Config.FallbackPath
+            Destination   = $Config.DestinationPath
             RemotePath    = $null
             UploadedAtUtc = $null
             Sha256        = $null

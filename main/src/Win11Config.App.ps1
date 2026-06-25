@@ -3902,6 +3902,35 @@ $buttonHandlers = @{
             $btUploadLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
             $btStatusPanel.Controls.Add($btUploadLabel)
 
+            # Shows where the package was saved on this PC (filled in when kept locally,
+            # e.g. when the cloud upload fails). Lets the operator find and send the file.
+            $btLocalPathLabel = New-Object System.Windows.Forms.Label
+            $btLocalPathLabel.Text = ""
+            $btLocalPathLabel.AutoSize = $false
+            $btLocalPathLabel.Height = 18
+            $btLocalPathLabel.Location = New-Object System.Drawing.Point(8, 48)
+            $btLocalPathLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+            $btLocalPathLabel.Width = $btStatusPanel.ClientSize.Width - 16 - 120
+            $btLocalPathLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+            $btLocalPathLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
+            $btStatusPanel.Controls.Add($btLocalPathLabel)
+
+            # "Open Folder" — appears after packaging so the operator can grab the ZIP,
+            # which matters most when the cloud upload fails and the file is saved locally.
+            $btOpenFolderBtn = New-Object System.Windows.Forms.Button
+            $btOpenFolderBtn.Text = "Open Folder"
+            $btOpenFolderBtn.Size = New-Object System.Drawing.Size(110, 26)
+            $btOpenFolderBtn.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+            $btOpenFolderBtn.Location = New-Object System.Drawing.Point(($btStatusPanel.ClientSize.Width - 118), 48)
+            $btOpenFolderBtn.Visible = $false
+            $btOpenFolderBtn.Add_Click({
+                $folder = $this.Tag
+                if ($folder -and (Test-Path $folder)) {
+                    Start-Process explorer.exe -ArgumentList "`"$folder`""
+                }
+            })
+            $btStatusPanel.Controls.Add($btOpenFolderBtn)
+
             # Top instruction banner (add second)
             $btBanner = New-Object System.Windows.Forms.Panel
             $btBanner.Dock = [System.Windows.Forms.DockStyle]::Top
@@ -4455,6 +4484,10 @@ $buttonHandlers = @{
             $btBannerLabel.Text      = "Step 3 of 3 - Taking final snapshot, packaging and uploading..."
             $btElapsedLabel.Text     = "Packaging..."
 
+            # Recording is over — free the bottom row for the saved-file path + Open Folder.
+            $btStopBtn.Visible  = $false
+            $btAbortBtn.Visible = $false
+
             Write-BtLog ""
             Write-BtLog "Step 3 of 3: Stopping - taking final snapshot..." -Level "STEP"
 
@@ -4560,6 +4593,10 @@ $buttonHandlers = @{
                 if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
                     try { Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name "final.json" -Data $finalResult } catch { }
                 }
+            } else {
+                # No final result means the final diagnostics pass crashed or timed out.
+                # Don't swallow it — the package will still be saved with what we captured.
+                Write-BtLog "Final check did not finish (it stopped early or timed out). Your results will still be saved with the data collected so far." -Level "WARN"
             }
 
             # System identity — computed once for manifest + zip naming
@@ -4610,33 +4647,103 @@ $buttonHandlers = @{
                     $sizeKb    = [Math]::Round($pkg.SizeBytes / 1024, 1)
                     Write-BtLog "Package ready: $btZipPath ($sizeKb KB)"
 
+                    # Let the operator open the folder holding the package.
+                    $btOpenFolderBtn.Tag     = Split-Path $btZipPath -Parent
+                    $btOpenFolderBtn.Visible = $true
                 } catch {
                     Write-BtLog "Packaging failed: $($_.Exception.Message)" -Level "WARN"
                 }
             }
 
-            # Upload
-            if ($btZipPath -and (Get-Command Get-WinConfigDiagnosticsUploadConfig -ErrorAction SilentlyContinue)) {
+            # Upload — the banner at the end reflects the ACTUAL outcome, in plain language.
+            # Default to a FAILURE state; only a genuine success/handled path upgrades it,
+            # so a packaging failure can never fall through to a false "all good" banner.
+            $btOutcomeLevel = 'fail'
+            $btOutcomeMsg   = "Results were captured, but the package could not be created on this PC. Please run the diagnostics again."
+
+            if (-not $btZipPath) {
+                # Packaging failed or was unavailable — there is nothing to send.
+                Write-BtLog "Could not create the diagnostic package - there is nothing to send." -Level "FAIL"
+                $btUploadLabel.Text = "FAILED - package not created"
+            }
+            elseif (Get-Command Get-WinConfigDiagnosticsUploadConfig -ErrorAction SilentlyContinue) {
                 $uploadConfig = Get-WinConfigDiagnosticsUploadConfig
-                Write-BtLog "Uploading to $($uploadConfig.Provider)..."
+                Write-BtLog "Sending results to support..."
                 $btUploadLabel.Text = "Upload: Sending..."
                 $btForm.Refresh()
                 $runIdForMeta = if ($btDiagRun) { $btDiagRun.RunId } else { "" }
                 $uploadResult = Send-WinConfigDiagnosticPackage -PackagePath $btZipPath -Config $uploadConfig -Metadata @{ RunId = $runIdForMeta } -FolderPrefix $btZipFolder
-                if ($uploadResult.Status -eq 'Uploaded') {
-                    Write-BtLog "Uploaded ($($uploadResult.Provider)): $($uploadResult.RemotePath)" -Level "OK"
-                    $dest = if ($uploadResult.Provider -eq 'R2') { "R2: $($uploadResult.RemotePath)" } else { $uploadResult.RemotePath }
-                    $btUploadLabel.Text = "Upload: Completed - $dest"
-                } else {
-                    Write-BtLog "Upload failed: $($uploadResult.Error)" -Level "WARN"
-                    $btUploadLabel.Text = "Upload: Failed - $($uploadResult.Error)"
+
+                switch ($uploadResult.Status) {
+                    'Uploaded' {
+                        if ($uploadResult.Provider -eq 'R2') {
+                            Write-BtLog "Sent to support successfully." -Level "OK"
+                            $btUploadLabel.Text = "Upload: Sent to support OK"
+                            $btOutcomeLevel = 'success'
+                            $btOutcomeMsg   = "Done - your Bluetooth results were captured and sent to support. You can close this window."
+                        } else {
+                            Write-BtLog "Saved on this PC: $($uploadResult.RemotePath)" -Level "OK"
+                            $btUploadLabel.Text    = "Saved on this PC"
+                            $btLocalPathLabel.Text = "File: $($uploadResult.RemotePath)"
+                            $btOutcomeLevel = 'success'
+                            $btOutcomeMsg   = "Done - your Bluetooth results were saved on this PC. You can close this window."
+                        }
+                    }
+                    'LocalOnly' {
+                        # Cloud upload failed; the file is on this PC only. Make this loud and clear.
+                        $localFolder = Split-Path $uploadResult.RemotePath -Parent
+                        $btOpenFolderBtn.Tag     = $localFolder
+                        $btOpenFolderBtn.Visible = $true
+                        $btLocalPathLabel.Text   = "File on this PC: $($uploadResult.RemotePath)"
+                        Write-BtLog "Could NOT send the results to support (no connection or upload error)." -Level "WARN"
+                        Write-BtLog "The file was saved on this PC instead: $($uploadResult.RemotePath)" -Level "WARN"
+                        Write-BtLog "Please click 'Open Folder' and send that file to support, or run the diagnostics again later." -Level "WARN"
+                        $btUploadLabel.Text = "NOT sent - saved on this PC only (click 'Open Folder')"
+                        $btOutcomeLevel = 'warn'
+                        $btOutcomeMsg   = "Results captured OK, but they could NOT be sent to support. The file is saved on this PC - click 'Open Folder' and send it to support."
+                    }
+                    'Skipped' {
+                        # Uploads disabled — the packaged file is on this PC; point the operator at it.
+                        $btLocalPathLabel.Text = "File on this PC: $btZipPath"
+                        Write-BtLog "Sending is turned off on this PC - the file was kept on this PC: $btZipPath" -Level "WARN"
+                        $btUploadLabel.Text = "Sending disabled - kept on this PC (click 'Open Folder')"
+                        $btOutcomeLevel = 'warn'
+                        $btOutcomeMsg   = "Results captured OK. Sending is turned off on this PC, so the file was kept here - click 'Open Folder' to find it."
+                    }
+                    default {
+                        # Failed - the package did not survive anywhere.
+                        Write-BtLog "Could not save the results: $($uploadResult.Error)" -Level "FAIL"
+                        $btUploadLabel.Text = "FAILED - $($uploadResult.Error)"
+                        $btOutcomeLevel = 'fail'
+                        $btOutcomeMsg   = "Something went wrong saving the results: $($uploadResult.Error). Please run the diagnostics again."
+                    }
                 }
             }
+            else {
+                # Packaged, but the upload component isn't loaded — the ZIP is on disk only.
+                Write-BtLog "Results packaged but the upload component is unavailable - the file is on this PC: $btZipPath" -Level "WARN"
+                $btUploadLabel.Text    = "Saved on this PC - not sent (click 'Open Folder')"
+                $btLocalPathLabel.Text = "File: $btZipPath"
+                $btOutcomeLevel = 'warn'
+                $btOutcomeMsg   = "Results captured and saved on this PC, but they could not be sent automatically. Click 'Open Folder' and send the file to support."
+            }
 
-            $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(20, 65, 25)
-            $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(160, 240, 160)
-            $btBannerLabel.Text      = "Done - diagnostic package uploaded. You may close this window."
-            $btElapsedLabel.Text     = "Complete."
+            switch ($btOutcomeLevel) {
+                'warn' {
+                    $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(70, 55, 10)
+                    $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(250, 225, 150)
+                }
+                'fail' {
+                    $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(70, 20, 20)
+                    $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(250, 170, 170)
+                }
+                default {
+                    $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(20, 65, 25)
+                    $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(160, 240, 160)
+                }
+            }
+            $btBannerLabel.Text  = $btOutcomeMsg
+            $btElapsedLabel.Text = "Complete."
 
             if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
         }
@@ -4662,16 +4769,29 @@ $buttonHandlers = @{
                 return
             }
 
-            $backupDir = Join-Path $env:TEMP "WinConfig-BT-Backups"
+            $backupDir = Join-Path $env:ProgramData "WinConfig\BT-Backups"
             if (-not (Test-Path $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
             $backupPath = Join-Path $backupDir "ComArbiter-$(Get-Date -Format 'yyyyMMdd-HHmmss').reg"
 
             try {
+                # SAFETY: verify the backup actually wrote BEFORE deleting anything.
                 & reg export $regExportPath $backupPath /y 2>&1 | Out-Null
+                $bk = Get-Item $backupPath -ErrorAction SilentlyContinue
+                if ($LASTEXITCODE -ne 0 -or -not $bk -or $bk.Length -le 0) {
+                    throw "Backup failed (reg export did not produce a non-empty $backupPath) - aborting before any change was made."
+                }
+
                 Remove-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop
 
+                # VERIFY: re-read to confirm the change actually took effect.
+                $comDbAfter = $null
+                try { $comDbAfter = (Get-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop).ComDB } catch {}
+                if ($comDbAfter) {
+                    throw "ComDB is still present after the reset - the change did not take effect."
+                }
+
                 if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                    Register-WinConfigSessionAction -Action "BT COM Port Reset" -Detail "ComDB cleared, backup at $backupPath" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "PASS" -Tier 2 -Summary "COM arbiter reset"
+                    Register-WinConfigSessionAction -Action "BT COM Port Reset" -Detail "ComDB cleared and verified absent; backup at $backupPath" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "PASS" -Tier 2 -Summary "COM arbiter reset"
                 }
                 if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
                 [System.Windows.Forms.MessageBox]::Show("COM Name Arbiter has been reset.`n`nNext Bluetooth pairing will use low COM port numbers (COM3, COM4).`n`nBackup saved to:`n$backupPath", "Success", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -4694,8 +4814,10 @@ $buttonHandlers = @{
             try {
                 $allBtPorts = @(Get-PnpDevice -Class Ports -ErrorAction SilentlyContinue |
                     Where-Object { $_.InstanceId -match 'BTHENUM' })
+                # A ghost is either the all-zero LOCALMFG local-service registration, OR any
+                # BTHENUM port whose device is no longer present (stale, safe to remove).
                 $ghostPorts = @($allBtPorts | Where-Object {
-                    $_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000'
+                    ($_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000') -or ($_.Present -eq $false)
                 })
             } catch {
                 [System.Windows.Forms.MessageBox]::Show("Failed to enumerate Bluetooth ports: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
@@ -4720,12 +4842,17 @@ $buttonHandlers = @{
             )
             if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
-            $backupDir = Join-Path $env:TEMP "WinConfig-BT-Backups"
+            $backupDir = Join-Path $env:ProgramData "WinConfig\BT-Backups"
             if (-not (Test-Path $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
             $backupPath = Join-Path $backupDir "ComArbiter-$(Get-Date -Format 'yyyyMMdd-HHmmss').reg"
 
             try {
+                # SAFETY: verify the COM-arbiter backup wrote BEFORE removing anything.
                 & reg export $regExportPath $backupPath /y 2>&1 | Out-Null
+                $bk = Get-Item $backupPath -ErrorAction SilentlyContinue
+                if ($LASTEXITCODE -ne 0 -or -not $bk -or $bk.Length -le 0) {
+                    throw "Backup failed (reg export did not produce a non-empty $backupPath) - aborting before any change was made."
+                }
 
                 $removed = 0
                 $failed = 0
@@ -4738,12 +4865,30 @@ $buttonHandlers = @{
                     Remove-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop
                 }
 
+                # VERIFY: re-read state to confirm the cleanup actually took effect.
+                $verifyNotes = @()
+                if ($hasComDb) {
+                    $comDbAfter = $null
+                    try { $comDbAfter = (Get-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop).ComDB } catch {}
+                    if ($comDbAfter) { $verifyNotes += "ComDB still present" }
+                }
+                $ghostsAfter = @()
+                try {
+                    $ghostsAfter = @(Get-PnpDevice -Class Ports -ErrorAction SilentlyContinue |
+                        Where-Object { $_.InstanceId -match 'BTHENUM' -and (
+                            ($_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000') -or ($_.Present -eq $false)
+                        ) })
+                } catch {}
+                if ($ghostsAfter.Count -gt 0) { $verifyNotes += "$($ghostsAfter.Count) ghost port(s) still present (a reboot may be required)" }
+
                 $summary = "$removed ghost port(s) removed"
                 if ($failed -gt 0) { $summary += ", $failed failed" }
                 if ($hasComDb) { $summary += ", COM arbiter reset" }
+                if ($verifyNotes.Count -gt 0) { $summary += " -- NOT fully verified: " + ($verifyNotes -join '; ') }
 
+                $cleanResult = if ($failed -gt 0 -or $verifyNotes.Count -gt 0) { "WARN" } else { "PASS" }
                 if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                    Register-WinConfigSessionAction -Action "BT Port Cleanup" -Detail "$summary; backup at $backupPath" -Category "AdminChange" -ToolCategory "Bluetooth" -Result $(if ($failed -gt 0) { "WARN" } else { "PASS" }) -Tier 2 -Summary $summary
+                    Register-WinConfigSessionAction -Action "BT Port Cleanup" -Detail "$summary; backup at $backupPath" -Category "AdminChange" -ToolCategory "Bluetooth" -Result $cleanResult -Tier 2 -Summary $summary
                 }
                 if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
                 [System.Windows.Forms.MessageBox]::Show("Bluetooth port cleanup complete.`n`n$summary`n`nBackup saved to:`n$backupPath", "Success", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -4781,17 +4926,29 @@ $buttonHandlers = @{
             $localSvcPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\LocalServices'
             $arbiterPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\COM Name Arbiter'
 
-            $backupDir = Join-Path $env:TEMP "WinConfig-BT-Backups"
+            $backupDir = Join-Path $env:ProgramData "WinConfig\BT-Backups"
             if (-not (Test-Path $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
             $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
             try {
-                & reg export 'HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters' (Join-Path $backupDir "BTHPORT-$timestamp.reg") /y 2>&1 | Out-Null
-                & reg export 'HKLM\SYSTEM\CurrentControlSet\Control\COM Name Arbiter' (Join-Path $backupDir "ComArbiter-$timestamp.reg") /y 2>&1 | Out-Null
+                # SAFETY: this is a Tier-4 wipe of ALL pairing data. Verify BOTH backups
+                # actually wrote before deleting anything; abort if either failed.
+                $bthportBackup = Join-Path $backupDir "BTHPORT-$timestamp.reg"
+                $arbiterBackup = Join-Path $backupDir "ComArbiter-$timestamp.reg"
+                & reg export 'HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters' $bthportBackup /y 2>&1 | Out-Null
+                $bthItem = Get-Item $bthportBackup -ErrorAction SilentlyContinue
+                $bthOk = ($LASTEXITCODE -eq 0 -and $bthItem -and $bthItem.Length -gt 0)
+                & reg export 'HKLM\SYSTEM\CurrentControlSet\Control\COM Name Arbiter' $arbiterBackup /y 2>&1 | Out-Null
+                $arbItem = Get-Item $arbiterBackup -ErrorAction SilentlyContinue
+                $arbOk = ($LASTEXITCODE -eq 0 -and $arbItem -and $arbItem.Length -gt 0)
+                if (-not $bthOk -or -not $arbOk) {
+                    throw "Backup verification failed (BTHPORT ok=$bthOk, ComArbiter ok=$arbOk) - aborting the stack reset BEFORE deleting anything, so no pairing data is lost."
+                }
 
                 $devicesRemoved = 0
                 $servicesRemoved = 0
                 $ghostsRemoved = 0
+                $stackNotes = @()
 
                 if (Test-Path $devicesPath) {
                     $devSubkeys = Get-ChildItem $devicesPath -ErrorAction SilentlyContinue
@@ -4809,24 +4966,42 @@ $buttonHandlers = @{
                     }
                 }
 
+                # Ghost-port and ComDB removal: capture errors rather than swallowing them,
+                # so a silent no-op can't be reported as a clean reset.
                 try {
                     $ghostPorts = @(Get-PnpDevice -Class Ports -ErrorAction Stop |
-                        Where-Object { $_.InstanceId -match 'BTHENUM' -and $_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000' })
+                        Where-Object { $_.InstanceId -match 'BTHENUM' -and (
+                            ($_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000') -or ($_.Present -eq $false)
+                        ) })
                     foreach ($ghost in $ghostPorts) {
                         & pnputil /remove-device $ghost.InstanceId 2>&1 | Out-Null
-                        if ($LASTEXITCODE -eq 0) { $ghostsRemoved++ }
+                        if ($LASTEXITCODE -eq 0) { $ghostsRemoved++ } else { $stackNotes += "ghost removal returned exit $LASTEXITCODE" }
                     }
-                } catch {}
+                } catch { $stackNotes += "ghost enumeration/removal error: $($_.Exception.Message)" }
 
-                try { Remove-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop } catch {}
+                try { Remove-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop } catch { $stackNotes += "ComDB clear error: $($_.Exception.Message)" }
+
+                # VERIFY: confirm the pairing database and COM arbiter are actually empty.
+                $devLeft = if (Test-Path $devicesPath) { @(Get-ChildItem $devicesPath -ErrorAction SilentlyContinue).Count } else { 0 }
+                $svcLeft = if (Test-Path $localSvcPath) { @(Get-ChildItem $localSvcPath -ErrorAction SilentlyContinue).Count } else { 0 }
+                $comDbAfter = $null
+                try { $comDbAfter = (Get-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop).ComDB } catch {}
+                if ($devLeft -gt 0)  { $stackNotes += "$devLeft device key(s) still present" }
+                if ($svcLeft -gt 0)  { $stackNotes += "$svcLeft local-service key(s) still present" }
+                if ($comDbAfter)     { $stackNotes += "ComDB still present" }
 
                 $summary = "$devicesRemoved paired device(s), $servicesRemoved service(s), $ghostsRemoved ghost port(s) removed, COM arbiter reset"
+                if ($stackNotes.Count -gt 0) { $summary += " -- WARNINGS: " + ($stackNotes -join '; ') }
+
+                # The reset isn't complete until the user reboots, so this is recorded as
+                # WARN ("reboot required"), never a plain PASS that reads as "already fixed".
+                $detail = "$summary; REBOOT REQUIRED to finish; backups at $backupDir"
                 if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                    Register-WinConfigSessionAction -Action "BT Stack Reset" -Detail "$summary; backups at $backupDir" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "PASS" -Tier 4 -Summary "Full BT stack reset"
+                    Register-WinConfigSessionAction -Action "BT Stack Reset" -Detail $detail -Category "AdminChange" -ToolCategory "Bluetooth" -Result "WARN" -Tier 4 -Summary "BT stack reset - REBOOT REQUIRED"
                 }
                 if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
                 [System.Windows.Forms.MessageBox]::Show(
-                    "Bluetooth stack reset complete.`n`n$summary`n`nBackups saved to:`n$backupDir`n`nPlease REBOOT your computer now to complete the reset.",
+                    "Bluetooth stack reset applied.`n`n$summary`n`nBackups saved to:`n$backupDir`n`nThe reset is NOT finished until you REBOOT. Please reboot your computer now.",
                     "Reboot Required",
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -4850,38 +5025,82 @@ $buttonHandlers = @{
                 $usbSubGuid  = '2a737441-1930-4402-8d77-b2bebba308a3'
                 $usbSuspGuid = '48e6b7a6-50f5-4782-a5d4-53bb8f07e226'
 
-                $pcfgOut = powercfg /query SCHEME_CURRENT $usbSubGuid $usbSuspGuid
-                $acVal = 1; $dcVal = 1
-                foreach ($line in $pcfgOut) {
-                    if ($line -match 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)') { $acVal = [Convert]::ToInt32($Matches[1], 16) }
-                    if ($line -match 'Current DC Power Setting Index:\s*0x([0-9a-fA-F]+)')  { $dcVal = [Convert]::ToInt32($Matches[1], 16) }
+                # ── Layer A: global power-plan USB selective suspend, ALL schemes ──
+                # (Was SCHEME_CURRENT only, so switching power plans re-enabled it.)
+                $schemeGuids = @()
+                try {
+                    foreach ($l in (powercfg /list)) {
+                        if ($l -match 'Power Scheme GUID:\s*([0-9a-fA-F-]{36})') { $schemeGuids += $Matches[1] }
+                    }
+                } catch {}
+                if ($schemeGuids.Count -eq 0) { $schemeGuids = @('SCHEME_CURRENT') }
+                # Set AND verify EACH scheme — an unverified write to a non-active scheme
+                # must not let the tool over-claim that all plans are disabled.
+                $schemesVerified = 0
+                $schemeNotes = @()
+                foreach ($g in $schemeGuids) {
+                    powercfg /setacvalueindex $g $usbSubGuid $usbSuspGuid 0 2>&1 | Out-Null
+                    powercfg /setdcvalueindex $g $usbSubGuid $usbSuspGuid 0 2>&1 | Out-Null
+                    $sac = -1; $sdc = -1
+                    foreach ($line in (powercfg /query $g $usbSubGuid $usbSuspGuid)) {
+                        if ($line -match 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)') { $sac = [Convert]::ToInt32($Matches[1], 16) }
+                        if ($line -match 'Current DC Power Setting Index:\s*0x([0-9a-fA-F]+)')  { $sdc = [Convert]::ToInt32($Matches[1], 16) }
+                    }
+                    if ($sac -eq 0 -and $sdc -eq 0) { $schemesVerified++ } else { $schemeNotes += "scheme $g not disabled (AC=$sac DC=$sdc)" }
                 }
+                powercfg /setactive SCHEME_CURRENT 2>&1 | Out-Null
+                $globalOk = ($schemeGuids.Count -gt 0 -and $schemesVerified -eq $schemeGuids.Count)
 
-                if ($acVal -eq 0 -and $dcVal -eq 0) {
-                    [System.Windows.Forms.MessageBox]::Show("USB selective suspend is already disabled in the active power plan.`n`nNo changes needed.", "Already Disabled", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-                    return
-                }
+                # ── Layer B: per-device "Allow the computer to turn off this device" ──
+                # This per-device flag (not the power plan) is what the probe flags and what
+                # actually stops the adapter suspending. It cannot be set or verified reliably
+                # in code (the WMI approach never worked across the field adapters), so open the
+                # adapter's Properties window and walk the operator through the one manual step.
+                $adapterOpened = 0
+                $adapterNotes  = @()
+                $btRadios      = @()
+                try {
+                    # Prefer the physical USB radio (it carries the Power Management tab).
+                    $btRadios = @(Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Present -and $_.InstanceId -like 'USB\*' })
+                    if ($btRadios.Count -eq 0) {
+                        $btRadios = @(Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | Where-Object { $_.Present })
+                    }
+                    foreach ($radio in $btRadios) {
+                        try {
+                            # Opens the same Properties dialog as Device Manager for this device.
+                            # (There is no supported way to pre-select the Power Management tab.)
+                            $rdArgs = "devmgr.dll,DeviceProperties_RunDLL /MachineName `"`" /DeviceID `"$($radio.InstanceId)`""
+                            Start-Process -FilePath 'rundll32.exe' -ArgumentList $rdArgs -ErrorAction Stop
+                            $adapterOpened++
+                        } catch { $adapterNotes += "could not open properties for '$($radio.FriendlyName)': $($_.Exception.Message)" }
+                    }
+                } catch { $adapterNotes += "adapter enumeration failed: $($_.Exception.Message)" }
 
-                powercfg /setacvalueindex SCHEME_CURRENT $usbSubGuid $usbSuspGuid 0
-                powercfg /setdcvalueindex SCHEME_CURRENT $usbSubGuid $usbSuspGuid 0
-                powercfg /setactive SCHEME_CURRENT
+                $detail = "Global USB selective suspend disabled and verified on $schemesVerified/$($schemeGuids.Count) power scheme(s); per-device step is MANUAL (opened $adapterOpened adapter properties window(s))"
+                if ($schemeNotes.Count -gt 0)  { $detail += "; " + ($schemeNotes -join '; ') }
+                if ($adapterNotes.Count -gt 0) { $detail += "; " + ($adapterNotes -join '; ') }
 
-                $pcfgVerify = powercfg /query SCHEME_CURRENT $usbSubGuid $usbSuspGuid
-                $acNew = -1; $dcNew = -1
-                foreach ($line in $pcfgVerify) {
-                    if ($line -match 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)') { $acNew = [Convert]::ToInt32($Matches[1], 16) }
-                    if ($line -match 'Current DC Power Setting Index:\s*0x([0-9a-fA-F]+)')  { $dcNew = [Convert]::ToInt32($Matches[1], 16) }
-                }
-                $success = ($acNew -eq 0 -and $dcNew -eq 0)
+                $manualSteps = "In the Bluetooth adapter Properties window:`n  1. Click the 'Power Management' tab.`n  2. Uncheck 'Allow the computer to turn off this device to save power'.`n  3. Click OK."
 
-                if ($success) {
+                if (-not $globalOk) {
                     if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-                        Register-WinConfigSessionAction -Action "Disable USB Suspend" -Detail "USB selective suspend disabled via powercfg (AC=0, DC=0)" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "PASS" -Tier 3 -Summary "USB selective suspend disabled"
+                        Register-WinConfigSessionAction -Action "Disable USB Suspend" -Detail "powercfg verification failed ($schemesVerified/$($schemeGuids.Count) schemes confirmed); $detail" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "FAIL" -Tier 3 -Summary "USB suspend disable not verified"
+                    }
+                    [System.Windows.Forms.MessageBox]::Show("powercfg commands ran but verification failed ($schemesVerified of $($schemeGuids.Count) power plan(s) confirmed).`n`nTry manually: Power Options > Change plan settings > Change advanced power settings > USB settings > USB selective suspend setting.", "Verification Failed", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                } else {
+                    # Global layer verified; the per-device flag is a manual operator step -> WARN, never PASS.
+                    if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                        Register-WinConfigSessionAction -Action "Disable USB Suspend" -Detail $detail -Category "AdminChange" -ToolCategory "Bluetooth" -Result "WARN" -Tier 3 -Summary "USB plan suspend disabled; per-device is a manual step"
                     }
                     if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
-                    [System.Windows.Forms.MessageBox]::Show("USB selective suspend has been disabled in the active power plan.`n`nThis takes effect immediately and persists across reboots.", "Success", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-                } else {
-                    [System.Windows.Forms.MessageBox]::Show("powercfg commands ran but verification failed (AC=$acNew, DC=$dcNew).`n`nTry manually: Power Options > Change plan settings > Change advanced power settings > USB settings > USB selective suspend setting.", "Verification Failed", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                    if ($adapterOpened -gt 0) {
+                        [System.Windows.Forms.MessageBox]::Show("USB selective suspend was disabled on all $($schemeGuids.Count) power plan(s).`n`nOne manual step is needed to finish. The Bluetooth adapter Properties window has been opened for you.`n`n$manualSteps`n`nThen re-run 'Run Bluetooth Diagnostics' to confirm USB suspend no longer shows as ENABLED.", "Almost Done - One Manual Step", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+                    } elseif ($btRadios.Count -eq 0) {
+                        [System.Windows.Forms.MessageBox]::Show("USB selective suspend was disabled on all $($schemeGuids.Count) power plan(s).`n`nNo Bluetooth adapter was detected, so its Properties window could not be opened. If an adapter is present, set it via Device Manager > Bluetooth > [adapter] > Properties > Power Management.", "Plan Setting Disabled", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                    } else {
+                        [System.Windows.Forms.MessageBox]::Show("USB selective suspend was disabled on all $($schemeGuids.Count) power plan(s), but the adapter Properties window could not be opened automatically.`n`nOpen it via Device Manager > Bluetooth > [adapter] > Properties, then:`n$manualSteps", "Almost Done - One Manual Step", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                    }
                 }
             } catch {
                 if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
