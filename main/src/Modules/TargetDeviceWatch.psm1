@@ -257,6 +257,37 @@ function New-TargetDeviceConfiguration {
 # CORRELATION
 # =============================================================================
 
+function Test-DeviceNameMatch {
+    <#
+    .SYNOPSIS
+        Returns $true when a configured target name corresponds to an enumerated
+        device name, tolerating the serial/unit suffix Windows appends.
+    .DESCRIPTION
+        A paired Bluetooth device frequently enumerates under a name that is the
+        base product name plus a unit suffix, e.g. a headset configured as
+        "NeurOptimal Headset" appears in PnP as "NeurOptimal Headset - 000019".
+        Exact-equality matching misses that device forever, so we also accept a
+        token-boundary prefix relationship in either direction. Both arguments
+        must already be normalized (see ConvertTo-NormalizedDeviceName).
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Target,
+        [AllowNull()][AllowEmptyString()][string]$Candidate
+    )
+
+    if ([string]::IsNullOrEmpty($Target) -or [string]::IsNullOrEmpty($Candidate)) { return $false }
+    if ($Candidate -eq $Target) { return $true }
+
+    # Accept only at a separator boundary so "headset" cannot match "headsets".
+    foreach ($sep in @(' ', '-')) {
+        if ($Candidate.StartsWith($Target + $sep, [System.StringComparison]::Ordinal)) { return $true }
+        if ($Target.StartsWith($Candidate + $sep, [System.StringComparison]::Ordinal)) { return $true }
+    }
+    return $false
+}
+
 function Find-TargetDeviceInPnpSnapshot {
     <#
     .SYNOPSIS
@@ -342,7 +373,7 @@ function Find-TargetDeviceInPnpSnapshot {
         $nameMatches = @()
         foreach ($d in $devices) {
             $n = ConvertTo-NormalizedDeviceName -Name $d.FriendlyName
-            if ($n -and ($n -eq $target)) { $nameMatches += $d }
+            if (Test-DeviceNameMatch -Target $target -Candidate $n) { $nameMatches += $d }
         }
         if ($nameMatches.Count -gt 1) {
             return @{
@@ -1023,6 +1054,7 @@ Export-ModuleMember -Function @(
     'ConvertTo-NormalizedDeviceName',
     'Get-MacFromPnpInstanceId',
     'Test-IsBluetoothPnpInstanceId',
+    'Test-DeviceNameMatch',
     'New-TargetDeviceConfiguration',
     'Find-TargetDeviceInPnpSnapshot',
     'Find-TargetBluetoothComPort',

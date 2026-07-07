@@ -577,17 +577,21 @@ function Get-DeviceProbeSessionSummary {
         if ($_ -match 'COM(\d+)') { [int]$Matches[1] }
     } | Where-Object { $_ })
 
-    # COM port reassignment
-    if ($Session.ComPortHistory.Count -gt 1) {
-        $changedCount = @($Session.ComPortHistory | Where-Object { $_.Changed -and -not $_.IsFirst }).Count
-        $totalRepairs = $Session.ComPortHistory.Count - 1
-        if ($changedCount -eq $totalRepairs) {
-            [void]$findings.Add("[!] COM port reassignment: occurred on EVERY re-pair ($changedCount/$totalRepairs) -- NO.exe cache invalidated each time")
-        } elseif ($changedCount -gt 0) {
-            [void]$findings.Add("[~] COM port reassignment: occurred on $changedCount of $totalRepairs re-pairs")
-        } else {
-            [void]$findings.Add("[ok] COM port numbers stable across all $totalRepairs re-pairs")
-        }
+    # COM port reassignment across reconnects.
+    # Base this on the actual device re-pair count (ReconnectTimes), NOT on the
+    # ComPortHistory row count. A single re-pair produces SEVERAL COM-history
+    # rows -- the headset exposes two SPP channels that re-register on separate
+    # ticks -- so the old `changedCount / (rowCount - 1)` math produced nonsense
+    # like "2 of 1 re-pairs", and the `rowCount -gt 1` gate silently dropped the
+    # single-row case (a real reassignment on one reconnect went unreported).
+    $comChangeRows = @($Session.ComPortHistory | Where-Object { $_.Changed -and -not $_.IsFirst })
+    if ($comChangeRows.Count -gt 0) {
+        # Any reassignment invalidates NO.exe's cached port, so it's always [!].
+        $repairCount = @($Session.ReconnectTimes).Count
+        $reconLabel  = if ($repairCount -le 1) { '1 reconnect' } else { "$repairCount reconnects" }
+        [void]$findings.Add("[!] COM port reassignment: the headset's serial port changed $($comChangeRows.Count) time(s) across $reconLabel -- NO.exe's cached port is invalidated, so it must re-enumerate the COM port on every connect")
+    } elseif ($Session.ReconnectTimes.Count -gt 0) {
+        [void]$findings.Add("[ok] COM port numbers stayed stable across $($Session.ReconnectTimes.Count) reconnect(s)")
     }
 
     # COM port exhaustion

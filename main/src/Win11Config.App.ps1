@@ -3863,6 +3863,12 @@ $buttonHandlers = @{
             $btForm.StartPosition = "CenterScreen"
             $btForm.FormBorderStyle = "Sizable"
             $btForm.MaximizeBox = $true
+            # Mirror the main form's DPI mode for consistency. NOTE: WinForms
+            # auto-scaling does not reliably fire for a code-built form (the layout
+            # stays at its birth-DPI), so the actual fix for buttons clipping on
+            # scaled displays is the AutoSize bottom action bar below -- the panel
+            # and buttons grow with the font/DPI instead of relying on auto-scale.
+            $btForm.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
 
             # Size to fit the screen — remote desktop and small displays may have
             # less usable area than expected, so cap to 90% of the working area.
@@ -3872,32 +3878,33 @@ $buttonHandlers = @{
             $btForm.Size = New-Object System.Drawing.Size($btFormW, $btFormH)
             $btForm.MinimumSize = New-Object System.Drawing.Size(500, 400)
 
-            # Bottom status bar (add first — docking is processed in reverse add order)
-            $btStatusPanel = New-Object System.Windows.Forms.Panel
+            # Bottom status bar (add first — docking is processed in reverse add order).
+            # AutoSize + TopDown flow: the panel reserves exactly the height its content
+            # needs, so on scaled/high-DPI displays the labels and action buttons grow
+            # with the font instead of overflowing a fixed-height panel and clipping the
+            # Stop/Upload and Abort buttons. Do NOT set a fixed Height here.
+            $btStatusPanel = New-Object System.Windows.Forms.FlowLayoutPanel
             $btStatusPanel.Dock = [System.Windows.Forms.DockStyle]::Bottom
-            $btStatusPanel.Height = 80
+            $btStatusPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $btStatusPanel.WrapContents = $false
+            $btStatusPanel.AutoSize = $true
+            $btStatusPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
             $btStatusPanel.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
-            $btStatusPanel.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 6)
+            $btStatusPanel.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 8)
             $btForm.Controls.Add($btStatusPanel)
 
             $btElapsedLabel = New-Object System.Windows.Forms.Label
             $btElapsedLabel.Text = "Initializing..."
-            $btElapsedLabel.AutoSize = $false
-            $btElapsedLabel.Height = 18
-            $btElapsedLabel.Location = New-Object System.Drawing.Point(8, 6)
-            $btElapsedLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
-            $btElapsedLabel.Width = $btStatusPanel.ClientSize.Width - 16
+            $btElapsedLabel.AutoSize = $true
+            $btElapsedLabel.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 1)
             $btElapsedLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
             $btElapsedLabel.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
             $btStatusPanel.Controls.Add($btElapsedLabel)
 
             $btUploadLabel = New-Object System.Windows.Forms.Label
             $btUploadLabel.Text = "Upload: -"
-            $btUploadLabel.AutoSize = $false
-            $btUploadLabel.Height = 18
-            $btUploadLabel.Location = New-Object System.Drawing.Point(8, 28)
-            $btUploadLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
-            $btUploadLabel.Width = $btStatusPanel.ClientSize.Width - 16
+            $btUploadLabel.AutoSize = $true
+            $btUploadLabel.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 1)
             $btUploadLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
             $btUploadLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
             $btStatusPanel.Controls.Add($btUploadLabel)
@@ -3906,22 +3913,31 @@ $buttonHandlers = @{
             # e.g. when the cloud upload fails). Lets the operator find and send the file.
             $btLocalPathLabel = New-Object System.Windows.Forms.Label
             $btLocalPathLabel.Text = ""
-            $btLocalPathLabel.AutoSize = $false
-            $btLocalPathLabel.Height = 18
-            $btLocalPathLabel.Location = New-Object System.Drawing.Point(8, 48)
-            $btLocalPathLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
-            $btLocalPathLabel.Width = $btStatusPanel.ClientSize.Width - 16 - 120
+            $btLocalPathLabel.AutoSize = $true
+            $btLocalPathLabel.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 2)
             $btLocalPathLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
             $btLocalPathLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
             $btStatusPanel.Controls.Add($btLocalPathLabel)
+
+            # Action-button row (left-to-right flow of AutoSize buttons). Stop/Abort are
+            # added here at recording start; Open Folder appears after packaging. AutoSize
+            # buttons never clip their text, and hidden buttons take no space in the flow.
+            $btButtonRow = New-Object System.Windows.Forms.FlowLayoutPanel
+            $btButtonRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+            $btButtonRow.WrapContents = $false
+            $btButtonRow.AutoSize = $true
+            $btButtonRow.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btButtonRow.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 0)
+            $btStatusPanel.Controls.Add($btButtonRow)
 
             # "Open Folder" — appears after packaging so the operator can grab the ZIP,
             # which matters most when the cloud upload fails and the file is saved locally.
             $btOpenFolderBtn = New-Object System.Windows.Forms.Button
             $btOpenFolderBtn.Text = "Open Folder"
-            $btOpenFolderBtn.Size = New-Object System.Drawing.Size(110, 26)
-            $btOpenFolderBtn.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
-            $btOpenFolderBtn.Location = New-Object System.Drawing.Point(($btStatusPanel.ClientSize.Width - 118), 48)
+            $btOpenFolderBtn.AutoSize = $true
+            $btOpenFolderBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btOpenFolderBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
+            $btOpenFolderBtn.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
             $btOpenFolderBtn.Visible = $false
             $btOpenFolderBtn.Add_Click({
                 $folder = $this.Tag
@@ -3929,7 +3945,7 @@ $buttonHandlers = @{
                     Start-Process explorer.exe -ArgumentList "`"$folder`""
                 }
             })
-            $btStatusPanel.Controls.Add($btOpenFolderBtn)
+            $btButtonRow.Controls.Add($btOpenFolderBtn)
 
             # Top instruction banner (add second)
             $btBanner = New-Object System.Windows.Forms.Panel
@@ -4112,28 +4128,37 @@ $buttonHandlers = @{
                 }
             }
 
+            # AutoSize buttons in the bottom action row (see $btButtonRow above) so
+            # their text is never clipped on scaled displays. Inserted before the
+            # Open Folder button so they read left-to-right: Stop, Abort.
             $script:BtRec_StopClicked = $false
             $btStopBtn = New-Object System.Windows.Forms.Button
             $btStopBtn.Text = "Stop and Upload"
-            $btStopBtn.Size = New-Object System.Drawing.Size(130, 28)
-            $btStopBtn.Location = New-Object System.Drawing.Point(8, 48)
+            $btStopBtn.AutoSize = $true
+            $btStopBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btStopBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
+            $btStopBtn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
             $btStopBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
             $btStopBtn.BackColor = [System.Drawing.Color]::FromArgb(200, 50, 50)
             $btStopBtn.ForeColor = [System.Drawing.Color]::White
             $btStopBtn.Add_Click({ $script:BtRec_StopClicked = $true })
-            $btStatusPanel.Controls.Add($btStopBtn)
+            $btButtonRow.Controls.Add($btStopBtn)
+            $btButtonRow.Controls.SetChildIndex($btStopBtn, 0)
 
             $script:BtRec_AbortClicked = $false
             $btAbortBtn = New-Object System.Windows.Forms.Button
             $btAbortBtn.Text = "Abort"
-            $btAbortBtn.Size = New-Object System.Drawing.Size(70, 28)
-            $btAbortBtn.Location = New-Object System.Drawing.Point(146, 48)
+            $btAbortBtn.AutoSize = $true
+            $btAbortBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btAbortBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
+            $btAbortBtn.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
             $btAbortBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
             $btAbortBtn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(120, 120, 120)
             $btAbortBtn.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
             $btAbortBtn.ForeColor = [System.Drawing.Color]::FromArgb(180, 180, 180)
             $btAbortBtn.Add_Click({ $script:BtRec_AbortClicked = $true; $script:BtRec_StopClicked = $true })
-            $btStatusPanel.Controls.Add($btAbortBtn)
+            $btButtonRow.Controls.Add($btAbortBtn)
+            $btButtonRow.Controls.SetChildIndex($btAbortBtn, 1)
 
             $btRecordStart = Get-Date
             $btPollJob     = $null
@@ -4301,6 +4326,28 @@ $buttonHandlers = @{
                         $pnpNow  = Get-BluetoothPnpSnapshot
                         $comNow  = try { Get-BluetoothComPortSnapshot } catch { [pscustomobject]@{ Ports = @() } }
                         $procNow = try { Get-TargetDeviceProcessSnapshot } catch { @() }
+
+                        # ── Self-heal target acquisition ─────────────────────
+                        # If we never locked onto the headset's MAC (operator
+                        # started the recorder before Windows finished bringing
+                        # the paired device up, so the seed detect fell back to
+                        # the base name with no MAC), keep re-detecting. Without
+                        # the MAC the COM ports -- whose friendly name is the
+                        # generic "Standard Serial over Bluetooth link" -- can't
+                        # be tied to this headset, so it would read COM: none
+                        # for the whole session even after it reconnects.
+                        if (-not $btProbeTargetMac -and $pnpNow -and $pnpNow.Devices) {
+                            $lateDev = $pnpNow.Devices | Where-Object { $_.FriendlyName -match 'NeurOptimal' } | Select-Object -First 1
+                            if ($lateDev) {
+                                $lateMac = Get-MacFromPnpInstanceId -InstanceId $lateDev.InstanceId
+                                $btProbeConfig = New-TargetDeviceConfiguration -TargetName $lateDev.FriendlyName -TargetMac $lateMac -AppProcessName $btProbeAppName
+                                $btProbeWatch.Configuration = $btProbeConfig
+                                if ($lateMac) {
+                                    $btProbeTargetMac = $lateMac
+                                    Write-BtLog "  Target acquired: $($lateDev.FriendlyName)  MAC: $lateMac" -Level "OK"
+                                }
+                            }
+                        }
 
                         $newObs = Update-TargetWatchState -WatchState $btProbeWatch -PnpSnapshot $pnpNow -ProcessNames $procNow -ComPortSnapshot $comNow
 
