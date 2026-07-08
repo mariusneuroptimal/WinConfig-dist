@@ -339,6 +339,7 @@ function New-DeviceProbeSession {
         BtLinkState              = 'Unknown'
         BtLinkEnteredAt          = $null
         BtLinkFlapCount          = 0
+        BtLinkEverConnected      = $false
         StreamingState           = 'Stopped'
         ActiveStreamPort         = $null
         StreamPeakCpuS           = 0.0
@@ -437,6 +438,7 @@ function Invoke-DeviceProbeTick {
 
     # ── BT link monitoring ───────────────────────────────────────────────
     $newBtLink = Get-BtConnectionState -Mac $TargetMac -BtWin32Available $Session.BtWin32Available
+    if ($newBtLink -eq 'Connected') { $Session.BtLinkEverConnected = $true }
     if ($newBtLink -ne 'Unknown' -and $newBtLink -ne $Session.BtLinkState) {
         $prevBtLink = $Session.BtLinkState
         $Session.BtLinkState = $newBtLink
@@ -605,12 +607,21 @@ function Get-DeviceProbeSessionSummary {
         }
     }
 
-    # BT link stability
+    # BT link stability. "No drops" only means "stable" if the link actually
+    # came up at some point -- a radio that never connected has nothing to drop,
+    # so claiming [ok] stable would mislead the operator (field bug 2026-07-08:
+    # session showed Radio: Disconnected end-to-end yet reported [ok] stable).
     if ($Session.BtWin32Available) {
         if ($Session.BtLinkFlapCount -ge 3) {
             [void]$findings.Add("[!] Radio link instability: $($Session.BtLinkFlapCount) link drop(s) detected while device stayed paired")
         } elseif ($Session.BtLinkFlapCount -gt 0) {
             [void]$findings.Add("[~] BT link flap: $($Session.BtLinkFlapCount) link drop(s) while device stayed paired")
+        } elseif (-not $Session.BtLinkEverConnected) {
+            if ($Session.BtLinkState -eq 'Unknown') {
+                [void]$findings.Add("[info] BT radio link state could not be read this session (no readings -- likely no MAC available)")
+            } else {
+                [void]$findings.Add("[~] BT radio link never connected during this session (radio stayed disconnected) -- link stability could not be assessed")
+            }
         } else {
             [void]$findings.Add("[ok] BT radio link stable throughout session (no drops observed)")
         }
@@ -672,6 +683,7 @@ function Get-DeviceProbeSessionSummary {
         ComPortHistory  = @($Session.ComPortHistory)
         ReconnectStats  = $reconnectStats
         BtLinkFlapCount = $Session.BtLinkFlapCount
+        BtLinkEverConnected = $Session.BtLinkEverConnected
         ObservationCount = $WatchState.Observations.Count
     }
 }
