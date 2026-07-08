@@ -3850,6 +3850,29 @@ $buttonHandlers = @{
                 return
             }
 
+            # One recorder at a time. The recording loop pumps DoEvents, which keeps
+            # the whole main window clickable -- without this guard a second click on
+            # this button would nest a second recording loop over the same shared
+            # script-scoped state ($script:BtRec_StopClicked etc.).
+            if ($script:BtRecordingActive) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "A Bluetooth Flight Recorder session is already running.`n`nUse the existing recorder window - click 'Stop and Upload' (or Abort) there before starting a new recording.",
+                    "Recording Already Running",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Information
+                ) | Out-Null
+                return
+            }
+            # While this flag is set, the mutating-tool click gate blocks
+            # 'bt-stack-reset' (pairing wipe + reboot would destroy the recording
+            # before upload) and records every other repair tool the operator runs
+            # into $script:BtRecOperatorActions so the session log + ZIP can
+            # attribute the resulting Bluetooth changes to the operator instead of
+            # counting them as spontaneous field evidence.
+            $script:BtRecordingActive    = $true
+            $script:BtRecOperatorActions = [System.Collections.ArrayList]::new()
+            try {
+
             # Resolve path string for Start-Job (loaded module not accessible across runspace boundary)
             $btModPath = $env:WINCONFIG_BT_MODULE_PATH
             if (-not $btModPath) { $btModPath = Join-Path $PSScriptRoot "Modules\BluetoothProbe.psm1" }
@@ -4283,6 +4306,8 @@ $buttonHandlers = @{
                     Write-BtLog "  Launch NeurOptimal, start a session and reproduce the Bluetooth issue" -Level "INFO"
                 }
                 Write-BtLog "  Click  Stop and Upload  when done (~10 sec to finish)" -Level "INFO"
+                Write-BtLog "  You can run the Bluetooth repair tools from the main window while recording" -Level "DIM"
+                Write-BtLog "  (except Full Bluetooth Stack Reset) -- they will be marked in this log" -Level "DIM"
                 Write-BtLog "" -Level "DIM"
                 Write-BtLog "  Watching for Bluetooth changes (every 3s) -- events appear below as they happen" -Level "DIM"
             } else {
@@ -4305,11 +4330,23 @@ $buttonHandlers = @{
             $btNextProbeTick = $btRecordStart.AddSeconds(3)
             $btHeartbeatTick = 0
             $btAnomalyBarTime = $null
+            $btOpActionsLogged = 0
 
             while (-not $script:BtRec_StopClicked) {
                 [System.Windows.Forms.Application]::DoEvents()
                 $now = Get-Date
                 $elapsed = $now - $btRecordStart
+
+                # Repair tools clicked in the main window execute nested inside the
+                # DoEvents call above; when the loop resumes, surface them here so
+                # the recording attributes the resulting Bluetooth changes to the
+                # operator instead of presenting them as spontaneous events.
+                while ($btOpActionsLogged -lt $script:BtRecOperatorActions.Count) {
+                    $opa = $script:BtRecOperatorActions[$btOpActionsLogged]
+                    $btOpActionsLogged++
+                    $opaDur = if ($opa.CompletedAt) { " (took $([int]($opa.CompletedAt - $opa.StartedAt).TotalSeconds)s)" } else { '' }
+                    Write-BtLog "[~] Operator ran '$($opa.Tool)'$opaDur -- Bluetooth changes right after this are likely caused by it, not by NeurOptimal" -Level "WARN"
+                }
 
                 # Update elapsed label with current state summary
                 if ($btDeepProbeAvailable -and $btProbeWatch) {
@@ -4544,6 +4581,15 @@ $buttonHandlers = @{
                 $btProbeSummary = Get-DeviceProbeSessionSummary -Session $btProbeSession -WatchState $btProbeWatch
                 $btWatchReport  = New-TargetWatchReport -WatchState $btProbeWatch
 
+                # Attribution caveat: repair tools run mid-recording change the very
+                # state the probe observes (COM ports, BTHENUM entries), so flag it
+                # for triage -- readers must not count those changes as field
+                # evidence of spontaneous/NO.exe-driven behavior.
+                if ($script:BtRecOperatorActions.Count -gt 0) {
+                    $opaTools = @($script:BtRecOperatorActions | ForEach-Object { "'$($_.Tool)'" }) -join ', '
+                    $btProbeSummary.Findings = @($btProbeSummary.Findings) + "[info] Operator ran $($script:BtRecOperatorActions.Count) repair action(s) during this recording ($opaTools) -- some changes above may be operator-induced, not spontaneous"
+                }
+
                 Write-BtLog ""
                 Write-BtLog "SESSION SUMMARY" -Level "STEP"
                 Write-BtLog "  Final device state  : $(Get-ProbeStateUserText -Kind device -State $btWatchReport.DeviceState -Short)" -Level (Get-ProbeStateGuiLevel $btWatchReport.DeviceState)
@@ -4598,9 +4644,15 @@ $buttonHandlers = @{
                 if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
                     try {
                         Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'probe-session.json' -Data @{
-                            SessionSummary = $btProbeSummary
-                            WatchReport    = $btWatchReport
-                            Observations   = @($btProbeWatch.Observations)
+                            SessionSummary  = $btProbeSummary
+                            WatchReport     = $btWatchReport
+                            Observations    = @($btProbeWatch.Observations)
+                            OperatorActions = @($script:BtRecOperatorActions | ForEach-Object { @{
+                                Tool        = $_.Tool
+                                ToolId      = $_.ToolId
+                                StartedAt   = $_.StartedAt.ToString('o')
+                                CompletedAt = if ($_.CompletedAt) { $_.CompletedAt.ToString('o') } else { $null }
+                            } })
                         }
                     } catch { }
                 }
@@ -4793,6 +4845,13 @@ $buttonHandlers = @{
             $btElapsedLabel.Text = "Complete."
 
             if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
+
+            } finally {
+                # Always release the recorder lock -- every exit path (Stop, Abort,
+                # early returns, exceptions) must re-enable 'Run Bluetooth
+                # Diagnostics' and stop routing repair-tool clicks to this session.
+                $script:BtRecordingActive = $false
+            }
         }
 
         # =========================================================================
@@ -7154,6 +7213,13 @@ No system changes were made.
         # REGRESSION GUARD: This hashtable persists - never cleared on category switch
         if (-not $script:ToolButtonRegistry) { $script:ToolButtonRegistry = @{} }
 
+        # Flight Recorder coordination: BtRecordingActive is set for the duration of
+        # a Bluetooth Flight Recorder session; the mutating-tool click gate consults
+        # it to block bt-stack-reset and to record other repair tools the operator
+        # runs mid-recording into BtRecOperatorActions (attribution in the evidence).
+        $script:BtRecordingActive    = $false
+        $script:BtRecOperatorActions = [System.Collections.ArrayList]::new()
+
         # Store category panels for selection switching (created once, never recreated)
         $script:CategoryPanels = @{}
         $script:CategoryListButtons = @{}
@@ -7306,6 +7372,7 @@ No system changes were made.
                                 # button handler, invalidating the startup WinConfig-prefixed names. Load
                                 # it inline (no prefix) to guarantee function availability on every click.
                                 if (Test-Path $gateDryRunPath) { Import-Module $gateDryRunPath -Force -Global }
+                                $recOpAction = $null
                                 $prevIntent = Get-ExecutionIntent
                                 try {
                                     Set-ExecutionIntent -Intent ADMIN_ACTION
@@ -7334,8 +7401,29 @@ No system changes were made.
                                         )
                                         return
                                     }
+                                    # === FLIGHT RECORDER COORDINATION ===
+                                    # While a Bluetooth recording is running, mutating tools are
+                                    # allowed but recorded as operator actions so the captured
+                                    # evidence attributes the changes correctly. The one exception
+                                    # is the full stack reset: it wipes pairing data and requires
+                                    # a reboot, which would destroy the recording before upload.
+                                    if ($script:BtRecordingActive) {
+                                        if ($gateToolId -eq 'bt-stack-reset') {
+                                            [System.Windows.Forms.MessageBox]::Show(
+                                                "A Bluetooth recording is in progress.`n`nThe Full Bluetooth Stack Reset removes all pairing data and needs a reboot, which would destroy the recording before it is sent to support.`n`nClick 'Stop and Upload' in the Flight Recorder window first, then run the stack reset.",
+                                                "Finish the Recording First",
+                                                [System.Windows.Forms.MessageBoxButtons]::OK,
+                                                [System.Windows.Forms.MessageBoxIcon]::Warning
+                                            )
+                                            return
+                                        }
+                                        if (-not $script:BtRecOperatorActions) { $script:BtRecOperatorActions = [System.Collections.ArrayList]::new() }
+                                        $recOpAction = @{ Tool = $gateToolName; ToolId = $gateToolId; StartedAt = Get-Date; CompletedAt = $null }
+                                        [void]$script:BtRecOperatorActions.Add($recOpAction)
+                                    }
                                     & $innerHandler
                                 } finally {
+                                    if ($recOpAction) { $recOpAction.CompletedAt = Get-Date }
                                     Set-ExecutionIntent -Intent $prevIntent
                                 }
                             }.GetNewClosure())
