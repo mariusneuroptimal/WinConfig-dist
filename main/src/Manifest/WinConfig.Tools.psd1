@@ -156,6 +156,16 @@
             Description    = "Canonical Zengar driver removal"
             RequiresAdmin  = $true
         }
+        @{
+            Id             = "zamp-driver-trust-repair"
+            Name           = "Repair zAmp Driver Trust"
+            Category       = "zAmp"
+            ToolCategory   = "Audio"
+            MutatesSystem  = $true
+            SupportsDryRun = $true   # REQUIRED: Imports certificates + installs driver packages
+            Description    = "Fix zAmp driver install failure 0x800B010A: trust cert chain + reinstall drivers"
+            RequiresAdmin  = $true
+        }
 
         # =========================================================================
         # AUDIO TOOLS

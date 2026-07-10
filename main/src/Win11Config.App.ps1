@@ -1260,6 +1260,138 @@ function Invoke-InstrumentedAction {
     return $output
 }
 
+# =============================================================================
+# ZAMP TRUST-REPAIR DIAGNOSTIC REPORT (ZAMP-TRUST-REPAIR-001 §6)
+# =============================================================================
+# One builder feeds both operator and analytics channels. Defined at script
+# scope as scriptblocks so BOTH the dry-run PLAN generator (invoked across the
+# DryRun module boundary) and the EXECUTE button handler resolve the same code.
+# The builder is pure (no side effects); delivery to clipboard/file happens only
+# on the EXECUTE path, so PLAN stays read-only per TOOL_AUTHORING_PROTOCOL.
+$script:BuildZampRepairReport = {
+    param([hashtable]$Ctx)
+
+    # Cap an array and append an explicit truncation marker (never truncate silently).
+    function _capArray { param($Items, [int]$Max, [string]$Noun)
+        $a = @($Items)
+        if ($a.Count -le $Max) { return $a }
+        return @($a[0..($Max - 1)]) + @("...truncated ($($a.Count - $Max) more $Noun)")
+    }
+
+    $now = Get-Date
+    $osBuild = $null
+    try {
+        $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+        if ($cv.CurrentBuildNumber) { $osBuild = "$($cv.CurrentBuildNumber).$([int]$cv.UBR)" }
+    } catch { }
+    if (-not $osBuild) { $osBuild = [System.Environment]::OSVersion.Version.ToString() }
+
+    # pnputil entries carry both decimal and hex exit codes (KI-001 triage need).
+    $pnputil = @()
+    foreach ($p in @($Ctx.Pnputil)) {
+        if (-not $p) { continue }
+        $exitVal = [int]$p.exit
+        $pnputil += [ordered]@{
+            inf        = $p.inf
+            exit       = $exitVal
+            exitHex    = ('0x{0:X8}' -f $exitVal)
+            outputTail = @(_capArray $p.outputTail 15 "lines")
+        }
+    }
+
+    $report = [ordered]@{
+        report        = "ZAMP-REPAIR"
+        v             = 1
+        ts            = $now.ToString("yyyy-MM-ddTHH:mm:sszzz")
+        computer      = $env:COMPUTERNAME
+        osBuild       = $osBuild
+        toolId        = "zamp-driver-trust-repair"
+        mode          = $Ctx.Mode
+        elevated      = [bool]$Ctx.Elevated
+        outcome       = $Ctx.Outcome
+        preconditions = [ordered]@{
+            admin            = [bool]$Ctx.Admin
+            loaderDirPresent = [bool]$Ctx.LoaderDirPresent
+        }
+        findings      = [ordered]@{
+            deviceBefore           = @(_capArray $Ctx.DeviceBefore 8 "instances")
+            catalogSignatures      = $Ctx.CatalogSignatures
+            embeddedCerts          = @($Ctx.EmbeddedCerts)
+            chainBuildsBefore      = [bool]$Ctx.ChainBuildsBefore
+            chainStatus            = @($Ctx.ChainStatus)
+            leafInTrustedPublisher = [bool]$Ctx.LeafInTrustedPublisher
+            rootE46InRoot          = [bool]$Ctx.RootE46InRoot
+            staged                 = $Ctx.Staged
+            bundledRoot            = $Ctx.BundledRoot
+        }
+        actions       = [ordered]@{
+            certsAdded       = @($Ctx.CertsAdded)
+            chainBuildsAfter = $Ctx.ChainBuildsAfter
+        }
+        pnputil        = $pnputil
+        setupapiTail   = @(if ($Ctx.SetupapiTail) { _capArray $Ctx.SetupapiTail 40 "lines" } else { @() })
+        deviceAfter    = @(_capArray $Ctx.DeviceAfter 8 "instances")
+        rebootRequired = [bool]$Ctx.RebootRequired
+        operatorAction = $(if ($Ctx.OperatorAction) { $Ctx.OperatorAction } else { "none" })
+        errors         = @($Ctx.Errors)
+    }
+    return [PSCustomObject]$report
+}
+
+# Wrap a report object in the fixed BEGIN/END markers around its JSON form.
+$script:ConvertZampReportToBlock = {
+    param($Report)
+    $json = $Report | ConvertTo-Json -Depth 12
+    return "----- BEGIN ZAMP-REPAIR REPORT v1 -----`r`n$json`r`n----- END ZAMP-REPAIR REPORT -----"
+}
+
+# Persist the report JSON to ProgramData (fallback: user temp). Returns path or $null.
+$script:SaveZampRepairReportFile = {
+    param([string]$Json, [string]$Stamp)
+    $name = "zamp-repair-report-$Stamp.json"
+    $targets = @(
+        (Join-Path (Join-Path $env:ProgramData "Zengar\WinConfig") $name),
+        (Join-Path $env:TEMP $name)
+    )
+    foreach ($target in $targets) {
+        try {
+            $dir = Split-Path $target -Parent
+            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            [System.IO.File]::WriteAllText($target, $Json)
+            return $target
+        } catch { }
+    }
+    return $null
+}
+
+# Filtered tail of setupapi.dev.log for lines written after $Since (best-effort
+# section-start scoping), matching sig:/VID_1167/zamp. Captured only on pnputil
+# failure — the artifact that revealed the Authenticode-fallback mechanism.
+$script:GetZampSetupapiTail = {
+    param([datetime]$Since, [int]$Max = 40)
+    $log = Join-Path $env:SystemRoot "INF\setupapi.dev.log"
+    if (-not (Test-Path $log)) { return @("setupapi.dev.log not found") }
+    try {
+        $lines = @(Get-Content -LiteralPath $log -Tail 4000 -ErrorAction Stop)
+    } catch {
+        return @("setupapi.dev.log unreadable: $($_.Exception.Message)")
+    }
+    $startIdx = 0
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match 'Section start\s+(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})') {
+            $t = [datetime]::MinValue
+            if ([datetime]::TryParseExact($Matches[1], 'yyyy/MM/dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$t)) {
+                if ($t -ge $Since) { $startIdx = $i; break }
+            }
+        }
+    }
+    $scoped = @($lines[$startIdx..($lines.Count - 1)])
+    $filtered = @($scoped | Where-Object { $_ -match '(?i)sig:|VID_1167|zamp' })
+    if ($filtered.Count -eq 0) { return @("(no matching setupapi lines after run start)") }
+    if ($filtered.Count -le $Max) { return $filtered }
+    return @($filtered[0..($Max - 1)]) + @("...truncated ($($filtered.Count - $Max) more lines)")
+}
+
 # Button event handlers
 # PERF-001: Use Get-WinConfigMachineInfo for cached CIM queries (no repeated WMI calls)
 $buttonHandlers = @{
@@ -5643,6 +5775,358 @@ $buttonHandlers = @{
 
     $outputForm.ShowDialog() | Out-Null
 }
+
+# ===== ZAMP DRIVER TRUST REPAIR (ZAMP-TRUST-REPAIR-001) =====
+# Fix 0x800B010A CERT_E_CHAINING driver-install failure: import the Sectigo ->
+# Zengar catalog trust chain, re-stage both zAmp packages, verify device state.
+# Every run terminates by emitting exactly one §6 diagnostic report (output
+# pane + clipboard + ProgramData file), including aborts and precondition fails.
+"Repair zAmp Driver Trust" = {
+    if (-not (Assert-AuditTrailHealthyForMutation)) { return }
+
+    # --- Constants (ZAMP-TRUST-REPAIR-001 §8) ---
+    $ZampLoaderDriverDir  = 'C:\zengar\zAmpLoader\driver'
+    $ZampBootloaderInf    = 'zAmpBootloader_WinUSB.inf'   # PID_1104
+    $ZampRuntimeInf       = 'zAmpVISA_W8x64.inf'          # PID_1124
+    $ZampCatalogForChain  = 'zAmpBootloader_WinUSB.cat'
+    $ZengarLeafThumbprint = 'E2DF802CEF9C3C3EE6DCF4842812DB03E0E5C00F'
+    $SectigoE46Thumbprint = 'BBEF5C4C11489770F586FB307D143291307F119A'
+    $SectigoE46FileSha256 = '8F6371D8CC5AA7CA149667A98B5496398951E4319F7AFBCC6A660D673E438D0B'
+    $ZampVidMatch         = '*VID_1167*'
+    $PnputilSuccessCodes  = @(0, 3010)
+
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+
+    $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isElevated) {
+        # No output pane yet; still emit the report (clipboard + file) before returning.
+        $report = & $script:BuildZampRepairReport @{
+            Mode = "Execute"; Outcome = "PLAN_FAILED_NOT_ADMIN"; Elevated = $false
+            Admin = $false; LoaderDirPresent = $false
+            Errors = @(@{ step = "Preconditions"; message = "Administrator privileges are required to import certificates and install drivers."; hresult = "" })
+        }
+        $json = $report | ConvertTo-Json -Depth 12
+        $block = & $script:ConvertZampReportToBlock $report
+        $clipOk = $false
+        try { Set-Clipboard -Value $block -ErrorAction Stop; $clipOk = $true } catch { }
+        $reportFile = & $script:SaveZampRepairReportFile $json $stamp
+        $extra = if ($clipOk) { "`n`nA diagnostic report was copied to your clipboard" + $(if ($reportFile) { " and saved to:`n$reportFile" } else { "." }) } else { "" }
+        [System.Windows.Forms.MessageBox]::Show(
+            "This operation requires Administrator privileges.`n`nPlease restart the Support Tool as Administrator.$extra",
+            "Elevation Required",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+        if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+            Register-WinConfigSessionAction -Action "zAmp Trust Repair" -Detail "Elevation required" -Category "AdminChange" -Result "FAIL" -Tier 2 -Summary "PLAN_FAILED_NOT_ADMIN" -Evidence @{ Report = $report; ReportFile = $reportFile }
+        }
+        if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
+        return
+    }
+
+    $outputForm = New-Object System.Windows.Forms.Form
+    $outputForm.Text = "zAmp Driver Trust Repair"
+    $outputForm.Size = New-Object System.Drawing.Size(920, 720)
+    $outputForm.StartPosition = "CenterScreen"
+    $outputForm.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+
+    $outputTextBox = New-Object System.Windows.Forms.RichTextBox
+    Initialize-GuiDiagnosticBox -Box $outputTextBox
+    $outputTextBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $outputForm.Controls.Add($outputTextBox)
+
+    $runStart = Get-Date
+
+    # Report accumulator — every §6 field. Pessimistic default outcome so an
+    # unexpected crash still reports a failure, never a false pass.
+    $ctx = @{
+        Mode = "Execute"; Outcome = "EXEC_FAILED_UNEXPECTED"; Elevated = $true
+        Admin = $true; LoaderDirPresent = $false
+        DeviceBefore = @(); CatalogSignatures = @{}; EmbeddedCerts = @()
+        ChainBuildsBefore = $false; ChainStatus = @(); LeafInTrustedPublisher = $false
+        RootE46InRoot = $false; Staged = @{ bootloader = $false; visa = $false }
+        BundledRoot = "not-checked"; CertsAdded = @(); ChainBuildsAfter = $null
+        Pnputil = @(); SetupapiTail = @(); DeviceAfter = @()
+        RebootRequired = $false; OperatorAction = $null; Errors = @()
+    }
+
+    function Write-LedgerLog {
+        param([string]$Message, [string]$Level = "INFO")
+        $ts = Get-Date -Format "HH:mm:ss"
+        $outputTextBox.AppendText("[$ts] [$Level] $Message`r`n")
+        $outputTextBox.SelectionStart = $outputTextBox.TextLength
+        $outputTextBox.ScrollToCaret()
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    function Add-CtxError {
+        param([string]$Step, [string]$Message, $Hresult = "")
+        $hr = if ($Hresult -is [int]) { ('0x{0:X8}' -f $Hresult) } else { "$Hresult" }
+        $ctx.Errors += @{ step = $Step; message = $Message; hresult = $hr }
+    }
+
+    function Import-ZampCert {
+        param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert, [string]$StoreName)
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($StoreName, [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine)
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        try {
+            $found = $store.Certificates.Find([System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint, $Cert.Thumbprint, $false)
+            if ($found.Count -gt 0) { return "present" }
+            $store.Add($Cert)
+            return "added"
+        } finally { $store.Close() }
+    }
+
+    $outputForm.Add_Shown({
+        Write-LedgerLog "=== zAmp Driver Trust Repair ===" "INFO"
+        Write-LedgerLog "OS: $([System.Environment]::OSVersion.VersionString)" "INFO"
+        Write-LedgerLog "Elevated: $isElevated" "INFO"
+        Write-LedgerLog ""
+
+        try {
+            # ---- Precondition: loader package present ----
+            $catPath = Join-Path $ZampLoaderDriverDir $ZampCatalogForChain
+            $bootInf = Join-Path $ZampLoaderDriverDir $ZampBootloaderInf
+            $runInf  = Join-Path $ZampLoaderDriverDir $ZampRuntimeInf
+            $ctx.LoaderDirPresent = (Test-Path $catPath) -and (Test-Path $bootInf) -and (Test-Path $runInf)
+            if (-not $ctx.LoaderDirPresent) {
+                Write-LedgerLog "zAmp loader package not found at $ZampLoaderDriverDir." "ERROR"
+                Write-LedgerLog "NO 3.5.0.32+ update has not been applied on this system." "ERROR"
+                $ctx.Outcome = "PLAN_FAILED_NO_LOADER"
+                Add-CtxError -Step "Preconditions" -Message "zAmp loader package not found at $ZampLoaderDriverDir"
+                return
+            }
+
+            # ---- Discovery (before state) ----
+            Write-LedgerLog "--- DISCOVERY ---" "INFO"
+            $devsBefore = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like $ZampVidMatch })
+            $ctx.DeviceBefore = @($devsBefore | ForEach-Object { @{ id = $_.InstanceId; status = "$($_.Status)"; problem = "$($_.Problem)" } })
+            Write-LedgerLog "VID_1167 devices present: $($devsBefore.Count)" "INFO"
+
+            $catSigs = [ordered]@{}
+            $catSigs["bootloader"] = $(try { "$((Get-AuthenticodeSignature -FilePath $catPath -ErrorAction Stop).Status)" } catch { "Error" })
+            $visaCat = Join-Path $ZampLoaderDriverDir 'zAmpVISA_W8x64.cat'
+            $catSigs["visa"] = $(if (Test-Path $visaCat) { try { "$((Get-AuthenticodeSignature -FilePath $visaCat -ErrorAction Stop).Status)" } catch { "Error" } } else { "Missing" })
+            $ctx.CatalogSignatures = $catSigs
+
+            # embedded certs (pure parse, no trust needed)
+            $embedded = @()
+            $leafCert = $null
+            $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
+            $cms.Decode([System.IO.File]::ReadAllBytes($catPath))
+            foreach ($c in $cms.Certificates) {
+                $role = if ($c.Subject -eq $c.Issuer) { "Root" } elseif ($c.Subject -like "*Zengar*") { "Leaf" } else { "Intermediate" }
+                $embedded += [PSCustomObject]@{ Cert = $c; role = $role; subject = $c.Subject; thumb = $c.Thumbprint }
+                if ($c.Thumbprint -eq $ZengarLeafThumbprint) { $leafCert = $c }
+            }
+            if (-not $leafCert -and $cms.SignerInfos.Count -gt 0) { $leafCert = $cms.SignerInfos[0].Certificate }
+            $ctx.EmbeddedCerts = @($embedded | ForEach-Object { @{ role = $_.role; subject = $_.subject; thumb = $_.thumb } })
+            Write-LedgerLog "Catalog embeds $($embedded.Count) certificate(s)." "INFO"
+
+            $chainBefore = $false
+            if ($leafCert) {
+                $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+                $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+                $chainBefore = $chain.Build($leafCert)
+                $ctx.ChainStatus = @($chain.ChainStatus | ForEach-Object { "$($_.Status)" })
+            }
+            $ctx.ChainBuildsBefore = $chainBefore
+
+            $ctx.LeafInTrustedPublisher = [bool](Get-ChildItem "Cert:\LocalMachine\TrustedPublisher" -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $ZengarLeafThumbprint })
+            $ctx.RootE46InRoot = [bool](Get-ChildItem "Cert:\LocalMachine\Root" -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $SectigoE46Thumbprint })
+
+            $enum = & pnputil /enum-drivers 2>&1 | Out-String
+            $bootStaged = [bool]($enum -match 'zampbootloader_winusb\.inf')
+            $runStaged  = [bool]($enum -match 'zampvisa_w8x64\.inf')
+            $ctx.Staged = @{ bootloader = $bootStaged; visa = $runStaged }
+
+            $embeddedRootPresent = @($embedded | Where-Object { $_.role -eq "Root" }).Count -gt 0
+            $e46Path = $null
+            foreach ($cand in @((Join-Path $PSScriptRoot "..\assets\E46.cer"), (Join-Path $PSScriptRoot "assets\E46.cer"), (Join-Path (Split-Path $PSScriptRoot -Parent) "assets\E46.cer"))) {
+                if (Test-Path $cand) { $e46Path = $cand; break }
+            }
+            $bundledRootValid = $false
+            if (-not $e46Path) {
+                $ctx.BundledRoot = "missing"
+            } else {
+                $h = $null
+                try { $h = (Get-FileHash -Path $e46Path -Algorithm SHA256).Hash } catch { }
+                if ($h -eq $SectigoE46FileSha256) { $bundledRootValid = $true; $ctx.BundledRoot = "valid" } else { $ctx.BundledRoot = "hash-mismatch" }
+            }
+            if ($embeddedRootPresent) { $ctx.BundledRoot = "embedded" }
+
+            # ---- Healthy no-op ----
+            if ($bootStaged -and $runStaged -and $chainBefore) {
+                Write-LedgerLog "zAmp driver trust is healthy - no action required." "INFO"
+                $ctx.Outcome = "HEALTHY_NOOP"
+                $ctx.ChainBuildsAfter = $true
+                return
+            }
+
+            # ---- Unrepairable: chain cannot be completed from any source ----
+            $rootObtainable = $chainBefore -or $embeddedRootPresent -or $ctx.RootE46InRoot -or $bundledRootValid
+            if (-not $rootObtainable) {
+                Write-LedgerLog "Certificate chain cannot be completed from available sources." "ERROR"
+                Write-LedgerLog "Obtain E46.cer per SUPPORT-BULLETIN-KI-001 and place it in the WinConfig assets folder." "ERROR"
+                $ctx.Outcome = "PLAN_FAILED_UNREPAIRABLE_CHAIN"
+                Add-CtxError -Step "ChainSourceCheck" -Message "No embedded root, Sectigo E46 not in Root store, and no valid bundled E46.cer ($($ctx.BundledRoot))."
+                return
+            }
+
+            # ---- Step 1: import certificates (idempotent; records reversibility) ----
+            Write-LedgerLog "--- TRUST CHAIN IMPORT ---" "INFO"
+            foreach ($e in $embedded) {
+                $stores = switch ($e.role) {
+                    "Root"         { @("Root") }
+                    "Intermediate" { @("CA") }
+                    "Leaf"         { @("TrustedPublisher", "CA") }
+                    default        { @() }
+                }
+                foreach ($sn in $stores) {
+                    $o = Import-ZampCert -Cert $e.Cert -StoreName $sn
+                    if ($o -eq "added") {
+                        $ctx.CertsAdded += @{ store = $sn; thumb = $e.thumb }
+                        Write-LedgerLog "  Imported [$($e.role)] -> LocalMachine\$sn" "INFO"
+                    } else {
+                        Write-LedgerLog "  Present [$($e.role)] in LocalMachine\$sn - skipped" "INFO"
+                    }
+                }
+            }
+            if (-not $embeddedRootPresent -and -not $ctx.RootE46InRoot) {
+                if ($bundledRootValid) {
+                    $rootCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($e46Path)
+                    $o = Import-ZampCert -Cert $rootCert -StoreName "Root"
+                    if ($o -eq "added") {
+                        $ctx.CertsAdded += @{ store = "Root"; thumb = $rootCert.Thumbprint }
+                        Write-LedgerLog "  Imported bundled Sectigo Root E46 -> LocalMachine\Root (SHA-256 verified)" "INFO"
+                    }
+                } else {
+                    Write-LedgerLog "Bundled E46.cer $($ctx.BundledRoot) - not imported (Root store integrity preserved)." "WARN"
+                }
+            }
+
+            # ---- Step 2: re-verify chain BEFORE pnputil ----
+            Write-LedgerLog "--- CHAIN VERIFICATION ---" "INFO"
+            $chainAfter = $false
+            if ($leafCert) {
+                $chain2 = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+                $chain2.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+                $chainAfter = $chain2.Build($leafCert)
+                $ctx.ChainStatus = @($chain2.ChainStatus | ForEach-Object { "$($_.Status)" })
+            }
+            $ctx.ChainBuildsAfter = $chainAfter
+            if (-not $chainAfter) {
+                Write-LedgerLog "Chain still does not build after import - ABORTING before pnputil." "ERROR"
+                Write-LedgerLog "Running pnputil now would fail with the same 0x800B010A." "ERROR"
+                $ctx.Outcome = "EXEC_FAILED_CHAIN_AFTER_IMPORT"
+                Add-CtxError -Step "ChainVerify" -Message "X509Chain.Build() returned false after import" -Hresult "0x800B010A"
+                return
+            }
+            Write-LedgerLog "Certificate chain builds successfully." "INFO"
+
+            # ---- Steps 3-4: stage driver packages ----
+            Write-LedgerLog "--- DRIVER PACKAGE STAGING ---" "INFO"
+            $installTargets = @(
+                @{ Inf = $bootInf; Name = $ZampBootloaderInf; Staged = $bootStaged; FailOutcome = "EXEC_FAILED_PNPUTIL_BOOTLOADER"; Step = "PnputilBootloader" },
+                @{ Inf = $runInf;  Name = $ZampRuntimeInf;    Staged = $runStaged;  FailOutcome = "EXEC_FAILED_PNPUTIL_RUNTIME";    Step = "PnputilRuntime" }
+            )
+            $installFailed = $false
+            foreach ($t in $installTargets) {
+                if ($t.Staged) { Write-LedgerLog "$($t.Name) already staged - skipping." "INFO"; continue }
+                Write-LedgerLog "Installing $($t.Name)..." "INFO"
+                $out = & pnputil /add-driver $t.Inf /install 2>&1 | Out-String
+                $exit = $LASTEXITCODE
+                $ok = $PnputilSuccessCodes -contains $exit
+                $tail = @($out -split "`r?`n" | Where-Object { $_.Trim() })
+                $ctx.Pnputil += @{ inf = $t.Name; exit = $exit; outputTail = $tail }
+                if ($exit -eq 3010) { $ctx.RebootRequired = $true }
+                $hex = ('0x{0:X8}' -f $exit)
+                if ($ok) {
+                    Write-LedgerLog "  $($t.Name): exit $exit ($hex) - success" "INFO"
+                } else {
+                    Write-LedgerLog "  $($t.Name): exit $exit ($hex) - FAILED" "ERROR"
+                    $ctx.Outcome = $t.FailOutcome
+                    Add-CtxError -Step $t.Step -Message "pnputil /add-driver /install failed" -Hresult $exit
+                    $ctx.SetupapiTail = & $script:GetZampSetupapiTail $runStart 40
+                    $installFailed = $true
+                    break
+                }
+            }
+            if ($installFailed) { return }
+
+            # ---- Step 5: device verification (staged => success even if unplugged) ----
+            Write-LedgerLog "--- DEVICE VERIFICATION ---" "INFO"
+            $deviceReady = $false
+            $devs = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like $ZampVidMatch })
+            if ($devs.Count -eq 0) {
+                $ctx.OperatorAction = "Plug in (or unplug/replug) the zAmp, wait ~1 minute, then verify PID_1124 appears in Device Manager."
+                Write-LedgerLog "No VID_1167 device enumerated. $($ctx.OperatorAction)" "INFO"
+            } elseif ($devs | Where-Object { $_.InstanceId -like "*PID_1124*" -and $_.Status -eq "OK" }) {
+                $deviceReady = $true
+                Write-LedgerLog "Runtime device PID_1124 present and OK - zAmp ready." "INFO"
+            } elseif ($devs | Where-Object { $_.InstanceId -like "*PID_1104*" -and $_.Status -eq "OK" }) {
+                Write-LedgerLog "Bootloader PID_1104 present - waiting up to 90s for renumeration to PID_1124..." "INFO"
+                $limit = (Get-Date).AddSeconds(90)
+                while ((Get-Date) -lt $limit) {
+                    Start-Sleep -Milliseconds 2000
+                    [System.Windows.Forms.Application]::DoEvents()
+                    if (Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like "*PID_1124*" -and $_.Status -eq "OK" }) { $deviceReady = $true; break }
+                }
+                if ($deviceReady) {
+                    Write-LedgerLog "Renumerated to PID_1124 - zAmp ready." "INFO"
+                } else {
+                    $ctx.OperatorAction = "Unplug and replug the zAmp, wait ~1 minute, then verify PID_1124 in Device Manager."
+                    Write-LedgerLog "Did not renumerate within 90s. $($ctx.OperatorAction)" "WARN"
+                }
+            } else {
+                $ctx.OperatorAction = "Unplug and replug the zAmp, wait ~1 minute, then verify PID_1124 in Device Manager."
+                Write-LedgerLog "VID_1167 present but not OK. $($ctx.OperatorAction)" "WARN"
+            }
+            $devsAfter = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like $ZampVidMatch })
+            $ctx.DeviceAfter = @($devsAfter | ForEach-Object { @{ id = $_.InstanceId; status = "$($_.Status)"; problem = "$($_.Problem)" } })
+
+            $ctx.Outcome = if ($deviceReady) { "REPAIRED_VERIFIED" } else { "REPAIRED_AWAITING_REPLUG" }
+        } catch {
+            Write-LedgerLog "UNEXPECTED ERROR: $($_.Exception.Message)" "ERROR"
+            $ctx.Outcome = "EXEC_FAILED_UNEXPECTED"
+            Add-CtxError -Step "Unexpected" -Message $_.Exception.Message -Hresult $_.Exception.HResult
+        } finally {
+            # ===== ALWAYS emit exactly one §6 diagnostic report =====
+            $report = & $script:BuildZampRepairReport $ctx
+            $json = $report | ConvertTo-Json -Depth 12
+            $block = & $script:ConvertZampReportToBlock $report
+
+            Write-LedgerLog "" "INFO"
+            Write-LedgerLog "Outcome: $($ctx.Outcome)" "INFO"
+            if ($ctx.RebootRequired) { Write-LedgerLog "REBOOT REQUIRED to finish driver install (pnputil returned 3010)." "WARN" }
+
+            $clipOk = $false
+            try { Set-Clipboard -Value $block -ErrorAction Stop; $clipOk = $true } catch { }
+            $reportFile = & $script:SaveZampRepairReportFile $json $stamp
+
+            $outputTextBox.AppendText("`r`n$block`r`n`r`n")
+            if ($clipOk) { Write-LedgerLog "Report copied to clipboard - paste it into the support ticket." "INFO" }
+            else { Write-LedgerLog "Clipboard copy failed - use the saved report file below." "WARN" }
+            if ($reportFile) { Write-LedgerLog "Report saved: $reportFile" "INFO" }
+            $outputTextBox.SelectionStart = $outputTextBox.TextLength
+            $outputTextBox.ScrollToCaret()
+
+            $result = if ($ctx.Outcome -like "REPAIRED_*" -or $ctx.Outcome -eq "HEALTHY_NOOP") { "PASS" } else { "FAIL" }
+            if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                Register-WinConfigSessionAction -Action "zAmp Trust Repair" `
+                    -Detail "Cert chain import + driver re-stage (0x800B010A remediation)" `
+                    -Category "AdminChange" `
+                    -Result $result `
+                    -Tier $(if ($result -eq "PASS") { 0 } else { 2 }) `
+                    -Summary $ctx.Outcome `
+                    -Evidence @{ Report = $report; ReportFile = $reportFile }
+            }
+            if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
+        }
+    })
+
+    $outputForm.ShowDialog() | Out-Null
+}
 }
 
 # FINAL: 2-tab structure (Tools → Details)
@@ -5964,6 +6448,219 @@ foreach ($tabPage in $tabControl.TabPages) {
                                 DriverCount = $driversFound.Count
                             }
                         }
+                }
+
+                "zamp-driver-trust-repair" = {
+                    # === PLAN PHASE: Pure, read-only system inspection (ZAMP-TRUST-REPAIR-001 §4) ===
+                    # Queries real state; never throws. A §6 diagnostic report is attached to
+                    # Evidence.Report (the analytics channel). Operator-facing clipboard/file
+                    # delivery happens on EXECUTE only, so PLAN stays side-effect-free.
+
+                    $ZampLoaderDriverDir  = 'C:\zengar\zAmpLoader\driver'
+                    $ZampBootloaderInf    = 'zAmpBootloader_WinUSB.inf'
+                    $ZampRuntimeInf       = 'zAmpVISA_W8x64.inf'
+                    $ZampCatalogForChain  = 'zAmpBootloader_WinUSB.cat'
+                    $ZengarLeafThumbprint = 'E2DF802CEF9C3C3EE6DCF4842812DB03E0E5C00F'
+                    $SectigoE46Thumbprint = 'BBEF5C4C11489770F586FB307D143291307F119A'
+                    $SectigoE46FileSha256 = '8F6371D8CC5AA7CA149667A98B5496398951E4319F7AFBCC6A660D673E438D0B'
+                    $ZampVidMatch         = '*VID_1167*'
+
+                    # --- P1: Admin ---
+                    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+                    if (-not $isAdmin) {
+                        $rep = & $script:BuildZampRepairReport @{
+                            Mode = "Plan"; Outcome = "PLAN_FAILED_NOT_ADMIN"; Elevated = $false
+                            Admin = $false; LoaderDirPresent = $false
+                            Errors = @(@{ step = "Preconditions"; message = "Administrator privileges are required to import certificates and install drivers."; hresult = "" })
+                        }
+                        return New-DryRunPlan `
+                            -ToolId "zamp-driver-trust-repair" -ToolName "Repair zAmp Driver Trust" `
+                            -Steps @("PLAN FAILED: Cannot proceed") -AffectedResources @("Unknown - planning aborted") `
+                            -RequiresAdmin $true -Reversible $true -EstimatedImpact "Unknown" `
+                            -Preconditions @("Admin: FAILED") `
+                            -Evidence @{
+                                PlanFailed = $true
+                                FailureReason = "Administrator privileges are required to import certificates and install drivers."
+                                Preconditions = @{ IsAdmin = $false }
+                                Report = $rep
+                            }
+                    }
+
+                    # --- P2: loader package present ---
+                    $catPath = Join-Path $ZampLoaderDriverDir $ZampCatalogForChain
+                    $bootInf = Join-Path $ZampLoaderDriverDir $ZampBootloaderInf
+                    $runInf  = Join-Path $ZampLoaderDriverDir $ZampRuntimeInf
+                    $pkgPresent = (Test-Path $catPath) -and (Test-Path $bootInf) -and (Test-Path $runInf)
+                    if (-not $pkgPresent) {
+                        $rep = & $script:BuildZampRepairReport @{
+                            Mode = "Plan"; Outcome = "PLAN_FAILED_NO_LOADER"; Elevated = $true
+                            Admin = $true; LoaderDirPresent = $false
+                            Errors = @(@{ step = "Preconditions"; message = "zAmp loader package not found at $ZampLoaderDriverDir"; hresult = "" })
+                        }
+                        return New-DryRunPlan `
+                            -ToolId "zamp-driver-trust-repair" -ToolName "Repair zAmp Driver Trust" `
+                            -Steps @("PLAN FAILED: Cannot proceed") -AffectedResources @("Unknown - planning aborted") `
+                            -RequiresAdmin $true -Reversible $true -EstimatedImpact "Unknown" `
+                            -Preconditions @("Admin: $isAdmin", "LoaderPackage: MISSING") `
+                            -Evidence @{
+                                PlanFailed = $true
+                                FailureReason = "zAmp loader package not found at C:\zengar\zAmpLoader\driver - NO 3.5.0.32+ update has not been applied on this system."
+                                Preconditions = @{ IsAdmin = $isAdmin; LoaderPackagePresent = $false }
+                                Report = $rep
+                            }
+                    }
+
+                    # --- Read-only discovery ---
+                    $deviceState = @()
+                    try {
+                        foreach ($d in @(Get-PnpDevice -ErrorAction Stop | Where-Object { $_.InstanceId -like $ZampVidMatch })) {
+                            $deviceState += @{ id = $d.InstanceId; status = "$($d.Status)"; problem = "$($d.Problem)" }
+                        }
+                    } catch { }
+
+                    $catSigs = [ordered]@{}
+                    $catSigs["bootloader"] = $(try { "$((Get-AuthenticodeSignature -FilePath $catPath -ErrorAction Stop).Status)" } catch { "Error" })
+                    $visaCat = Join-Path $ZampLoaderDriverDir 'zAmpVISA_W8x64.cat'
+                    $catSigs["visa"] = $(if (Test-Path $visaCat) { try { "$((Get-AuthenticodeSignature -FilePath $visaCat -ErrorAction Stop).Status)" } catch { "Error" } } else { "Missing" })
+
+                    $embedded = @()
+                    $leafCert = $null
+                    try {
+                        $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
+                        $cms.Decode([System.IO.File]::ReadAllBytes($catPath))
+                        foreach ($c in $cms.Certificates) {
+                            $role = if ($c.Subject -eq $c.Issuer) { "Root" } elseif ($c.Subject -like "*Zengar*") { "Leaf" } else { "Intermediate" }
+                            $embedded += @{ role = $role; subject = $c.Subject; thumb = $c.Thumbprint }
+                            if ($c.Thumbprint -eq $ZengarLeafThumbprint) { $leafCert = $c }
+                        }
+                        if (-not $leafCert -and $cms.SignerInfos.Count -gt 0) { $leafCert = $cms.SignerInfos[0].Certificate }
+                    } catch { }
+
+                    $chainBuilds = $false
+                    $chainStatus = @()
+                    if ($leafCert) {
+                        try {
+                            $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+                            $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+                            $chainBuilds = $chain.Build($leafCert)
+                            $chainStatus = @($chain.ChainStatus | ForEach-Object { "$($_.Status)" })
+                        } catch { }
+                    }
+
+                    $leafInTP = [bool](Get-ChildItem "Cert:\LocalMachine\TrustedPublisher" -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $ZengarLeafThumbprint })
+                    $rootInStore = [bool](Get-ChildItem "Cert:\LocalMachine\Root" -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $SectigoE46Thumbprint })
+
+                    $bootStaged = $false; $runStaged = $false
+                    try {
+                        $enum = & pnputil /enum-drivers 2>&1 | Out-String
+                        $bootStaged = [bool]($enum -match 'zampbootloader_winusb\.inf')
+                        $runStaged  = [bool]($enum -match 'zampvisa_w8x64\.inf')
+                    } catch { }
+
+                    $embeddedRootPresent = @($embedded | Where-Object { $_.role -eq "Root" }).Count -gt 0
+                    $bundledRootValid = $false
+                    $bundledRootState = "missing"
+                    $e46Path = $null
+                    foreach ($cand in @((Join-Path $PSScriptRoot "..\assets\E46.cer"), (Join-Path $PSScriptRoot "assets\E46.cer"), (Join-Path (Split-Path $PSScriptRoot -Parent) "assets\E46.cer"))) {
+                        if (Test-Path $cand) { $e46Path = $cand; break }
+                    }
+                    if ($e46Path) {
+                        $h = $null
+                        try { $h = (Get-FileHash -Path $e46Path -Algorithm SHA256).Hash } catch { }
+                        if ($h -eq $SectigoE46FileSha256) { $bundledRootValid = $true; $bundledRootState = "valid" } else { $bundledRootState = "hash-mismatch" }
+                    }
+                    if ($embeddedRootPresent) { $bundledRootState = "embedded" }
+
+                    $baseCtx = @{
+                        Mode = "Plan"; Elevated = $true; Admin = $true; LoaderDirPresent = $true
+                        DeviceBefore = $deviceState; CatalogSignatures = $catSigs; EmbeddedCerts = $embedded
+                        ChainBuildsBefore = $chainBuilds; ChainStatus = $chainStatus
+                        LeafInTrustedPublisher = $leafInTP; RootE46InRoot = $rootInStore
+                        Staged = @{ bootloader = $bootStaged; visa = $runStaged }; BundledRoot = $bundledRootState
+                        CertsAdded = @(); ChainBuildsAfter = $null; Pnputil = @(); SetupapiTail = @()
+                        DeviceAfter = @(); RebootRequired = $false; OperatorAction = $null; Errors = @()
+                    }
+
+                    $findings = @{
+                        DeviceState = $(if ($deviceState.Count -gt 0) { $deviceState } else { "none-enumerated" })
+                        CatalogSignatureValid = $catSigs; EmbeddedCerts = $embedded; ChainBuilds = $chainBuilds
+                        ChainStatus = $chainStatus; LeafInTrustedPublisher = $leafInTP; RootE46InStore = $rootInStore
+                        PackagesStaged = @{ Bootloader = $bootStaged; Runtime = $runStaged }
+                        BundledRootAvailable = $bundledRootValid; BundledRoot = $bundledRootState
+                    }
+
+                    # --- Healthy no-op ---
+                    if ($bootStaged -and $runStaged -and $chainBuilds) {
+                        $rep = & $script:BuildZampRepairReport ($baseCtx + @{ Outcome = "HEALTHY_NOOP"; ChainBuildsAfter = $true })
+                        return New-DryRunPlan `
+                            -ToolId "zamp-driver-trust-repair" -ToolName "Repair zAmp Driver Trust" `
+                            -Steps @("zAmp driver trust is healthy - no action required") -AffectedResources @("None") `
+                            -RequiresAdmin $true -Reversible $true -EstimatedImpact "None" `
+                            -Preconditions @("Admin: $isAdmin", "LoaderPackage: $pkgPresent", "ChainBuilds: $chainBuilds") `
+                            -Evidence @{ Preconditions = @{ IsAdmin = $isAdmin; LoaderPackagePresent = $pkgPresent }; Findings = $findings; Healthy = $true; Report = $rep }
+                    }
+
+                    # --- Unrepairable: no source can complete the chain ---
+                    $rootObtainable = $chainBuilds -or $embeddedRootPresent -or $rootInStore -or $bundledRootValid
+                    if (-not $rootObtainable) {
+                        $rep = & $script:BuildZampRepairReport ($baseCtx + @{ Outcome = "PLAN_FAILED_UNREPAIRABLE_CHAIN"; Errors = @(@{ step = "ChainSourceCheck"; message = "No embedded root, Sectigo E46 not in Root store, no valid bundled E46.cer ($bundledRootState)."; hresult = "" }) })
+                        return New-DryRunPlan `
+                            -ToolId "zamp-driver-trust-repair" -ToolName "Repair zAmp Driver Trust" `
+                            -Steps @("PLAN FAILED: Cannot proceed") -AffectedResources @("Unknown - planning aborted") `
+                            -RequiresAdmin $true -Reversible $true -EstimatedImpact "Unknown" `
+                            -Preconditions @("Admin: $isAdmin", "LoaderPackage: $pkgPresent", "ChainBuilds: false") `
+                            -Evidence @{
+                                PlanFailed = $true
+                                FailureReason = "Certificate chain cannot be completed from available sources. Obtain E46.cer per SUPPORT-BULLETIN-KI-001 and place it in the WinConfig assets folder."
+                                Preconditions = @{ IsAdmin = $isAdmin; LoaderPackagePresent = $pkgPresent }
+                                Findings = $findings; Report = $rep
+                            }
+                    }
+
+                    # --- Repair plan: emit WOULD_* only for what is missing ---
+                    $steps = @()
+                    $resources = @()
+                    $storeThumbs = @{}
+                    foreach ($sn in @("Root", "CA", "TrustedPublisher")) {
+                        $set = @{}
+                        try { Get-ChildItem "Cert:\LocalMachine\$sn" -ErrorAction Stop | ForEach-Object { $set[$_.Thumbprint] = $true } } catch { }
+                        $storeThumbs[$sn] = $set
+                    }
+                    foreach ($e in $embedded) {
+                        $targets = switch ($e.role) {
+                            "Root"         { @("Root") }
+                            "Intermediate" { @("CA") }
+                            "Leaf"         { @("TrustedPublisher", "CA") }
+                            default        { @() }
+                        }
+                        foreach ($sn in $targets) {
+                            if (-not $storeThumbs[$sn][$e.thumb]) {
+                                $steps += (New-DryRunStep -Verb WOULD_CREATE -Target "certificate: $($e.subject) -> LocalMachine\$sn").Summary
+                                $resources += "CertStore:LocalMachine\${sn}:$($e.thumb)"
+                            }
+                        }
+                    }
+                    if (-not $embeddedRootPresent -and -not $rootInStore -and $bundledRootValid) {
+                        $steps += (New-DryRunStep -Verb WOULD_CREATE -Target "certificate: Sectigo Root E46 (bundled) -> LocalMachine\Root").Summary
+                        $resources += "CertStore:LocalMachine\Root:$SectigoE46Thumbprint"
+                    }
+                    if (-not $bootStaged) {
+                        $steps += (New-DryRunStep -Verb WOULD_EXEC -Target "pnputil /add-driver $ZampBootloaderInf /install").Summary
+                        $resources += "DriverStore:zampbootloader_winusb.inf"
+                    }
+                    if (-not $runStaged) {
+                        $steps += (New-DryRunStep -Verb WOULD_EXEC -Target "pnputil /add-driver $ZampRuntimeInf /install").Summary
+                        $resources += "DriverStore:zampvisa_w8x64.inf"
+                    }
+                    $steps += (New-DryRunStep -Verb WOULD_EXEC -Target "device state verification (VID_1167)").Summary
+
+                    $rep = & $script:BuildZampRepairReport ($baseCtx + @{ Outcome = "PLAN_REPAIR_AVAILABLE" })
+                    New-DryRunPlan `
+                        -ToolId "zamp-driver-trust-repair" -ToolName "Repair zAmp Driver Trust" `
+                        -Steps $steps -AffectedResources $(if ($resources.Count -gt 0) { $resources } else { @("None") }) `
+                        -RequiresAdmin $true -Reversible $true -EstimatedImpact "Medium" `
+                        -Preconditions @("Admin: $isAdmin", "LoaderPackage: $pkgPresent", "ChainBuilds: $chainBuilds") `
+                        -Evidence @{ Preconditions = @{ IsAdmin = $isAdmin; LoaderPackagePresent = $pkgPresent }; Findings = $findings; Report = $rep }
                 }
 
                 # =========================================================================
@@ -7176,6 +7873,13 @@ No system changes were made.
                 SupportsDryRun = $true
                 MutatesSystem = $true
             }
+            "Repair zAmp Driver Trust" = @{
+                Description = "Fix driver install failure 0x800B010A (cert chain + reinstall)"
+                Group = "Actions"
+                ToolId = "zamp-driver-trust-repair"
+                SupportsDryRun = $true
+                MutatesSystem = $true
+            }
             # Zengar UI tools
             "Apply Win 11 Start Menu"  = @{ Description = "Apply custom Start Menu layout"; Group = "UI" }
             "Apply branding colors"    = @{ Description = "Apply Zengar brand colors"; Group = "UI" }
@@ -7199,7 +7903,7 @@ No system changes were made.
             "Audio"        = @("Remove Intel SST Audio Driver", "Restart Audio Service", "Sound Panel", "Run Bluetooth Diagnostics")
             "Bluetooth"    = @("Run Bluetooth Diagnostics", "Reset COM Port Numbers", "Clean Bluetooth Ports", "Full Bluetooth Stack Reset", "Disable USB Suspend")
             "System"       = @("Copy System Info", "Copy Device Name", "Copy Serial Number", "Device Manager", "Task Manager", "Control Panel")
-            "zAmp"         = @("Uninstall zAmp Drivers")
+            "zAmp"         = @("Uninstall zAmp Drivers", "Repair zAmp Driver Trust")
             "Zengar UI"    = @("Apply Win 11 Start Menu", "Apply branding colors", "Pin Taskbar Icons", "Apply Win Update Icon")
             "Updates"      = @("MS Store Updates", "Update Surface Drivers", "Microsoft Update Catalog", "Windows Insider")
             "Disk"         = @("DISM Restore Health", "/sfc scannow", "Defrag && Optimize", "Delete old backups", "Disk Cleanup", "Empty Recycle Bin")
