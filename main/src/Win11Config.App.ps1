@@ -18,6 +18,9 @@ if ($script:IsUIDebug) {
 # Load Windows Forms early (needed for MessageBox in error handling)
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+# System.Security is NOT loaded by default in PowerShell 5.1 — required for
+# SignedCms catalog parsing (zamp-driver-trust-repair plan + execute phases).
+Add-Type -AssemblyName System.Security
 
 # === STA ENFORCEMENT (Phase 4 requirement) ===
 # WinForms requires STA apartment state for proper async behavior
@@ -6525,6 +6528,7 @@ foreach ($tabPage in $tabControl.TabPages) {
 
                     $embedded = @()
                     $leafCert = $null
+                    $catalogParseError = $null
                     try {
                         $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
                         $cms.Decode([System.IO.File]::ReadAllBytes($catPath))
@@ -6534,7 +6538,7 @@ foreach ($tabPage in $tabControl.TabPages) {
                             if ($c.Thumbprint -eq $ZengarLeafThumbprint) { $leafCert = $c }
                         }
                         if (-not $leafCert -and $cms.SignerInfos.Count -gt 0) { $leafCert = $cms.SignerInfos[0].Certificate }
-                    } catch { }
+                    } catch { $catalogParseError = $_.Exception.Message }
 
                     $chainBuilds = $false
                     $chainStatus = @()
@@ -6578,7 +6582,8 @@ foreach ($tabPage in $tabControl.TabPages) {
                         LeafInTrustedPublisher = $leafInTP; RootE46InRoot = $rootInStore
                         Staged = @{ bootloader = $bootStaged; visa = $runStaged }; BundledRoot = $bundledRootState
                         CertsAdded = @(); ChainBuildsAfter = $null; Pnputil = @(); SetupapiTail = @()
-                        DeviceAfter = @(); RebootRequired = $false; OperatorAction = $null; Errors = @()
+                        DeviceAfter = @(); RebootRequired = $false; OperatorAction = $null
+                        Errors = $(if ($catalogParseError) { @(@{ step = "CatalogParse"; message = $catalogParseError; hresult = "" }) } else { @() })
                     }
 
                     $findings = @{
@@ -6587,6 +6592,7 @@ foreach ($tabPage in $tabControl.TabPages) {
                         ChainStatus = $chainStatus; LeafInTrustedPublisher = $leafInTP; RootE46InStore = $rootInStore
                         PackagesStaged = @{ Bootloader = $bootStaged; Runtime = $runStaged }
                         BundledRootAvailable = $bundledRootValid; BundledRoot = $bundledRootState
+                        CatalogParseError = $catalogParseError
                     }
 
                     # --- Healthy no-op ---
