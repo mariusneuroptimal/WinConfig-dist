@@ -6597,7 +6597,12 @@ foreach ($tabPage in $tabControl.TabPages) {
 
                     # --- Healthy no-op ---
                     if ($bootStaged -and $runStaged -and $chainBuilds) {
-                        $rep = & $script:BuildZampRepairReport ($baseCtx + @{ Outcome = "HEALTHY_NOOP"; ChainBuildsAfter = $true })
+                        # Hashtable + throws on duplicate keys, so overwrite via Clone (baseCtx
+                        # already carries ChainBuildsAfter/Errors defaults).
+                        $repCtx = $baseCtx.Clone()
+                        $repCtx.Outcome = "HEALTHY_NOOP"
+                        $repCtx.ChainBuildsAfter = $true
+                        $rep = & $script:BuildZampRepairReport $repCtx
                         return New-DryRunPlan `
                             -ToolId "zamp-driver-trust-repair" -ToolName "Repair zAmp Driver Trust" `
                             -Steps @("zAmp driver trust is healthy - no action required") -AffectedResources @("None") `
@@ -6609,7 +6614,10 @@ foreach ($tabPage in $tabControl.TabPages) {
                     # --- Unrepairable: no source can complete the chain ---
                     $rootObtainable = $chainBuilds -or $embeddedRootPresent -or $rootInStore -or $bundledRootValid
                     if (-not $rootObtainable) {
-                        $rep = & $script:BuildZampRepairReport ($baseCtx + @{ Outcome = "PLAN_FAILED_UNREPAIRABLE_CHAIN"; Errors = @(@{ step = "ChainSourceCheck"; message = "No embedded root, Sectigo E46 not in Root store, no valid bundled E46.cer ($bundledRootState)."; hresult = "" }) })
+                        $repCtx = $baseCtx.Clone()
+                        $repCtx.Outcome = "PLAN_FAILED_UNREPAIRABLE_CHAIN"
+                        $repCtx.Errors = @($repCtx.Errors) + @(@{ step = "ChainSourceCheck"; message = "No embedded root, Sectigo E46 not in Root store, no valid bundled E46.cer ($bundledRootState)."; hresult = "" })
+                        $rep = & $script:BuildZampRepairReport $repCtx
                         return New-DryRunPlan `
                             -ToolId "zamp-driver-trust-repair" -ToolName "Repair zAmp Driver Trust" `
                             -Steps @("PLAN FAILED: Cannot proceed") -AffectedResources @("Unknown - planning aborted") `
@@ -6660,7 +6668,9 @@ foreach ($tabPage in $tabControl.TabPages) {
                     }
                     $steps += (New-DryRunStep -Verb WOULD_EXEC -Target "device state verification (VID_1167)").Summary
 
-                    $rep = & $script:BuildZampRepairReport ($baseCtx + @{ Outcome = "PLAN_REPAIR_AVAILABLE" })
+                    $repCtx = $baseCtx.Clone()
+                    $repCtx.Outcome = "PLAN_REPAIR_AVAILABLE"
+                    $rep = & $script:BuildZampRepairReport $repCtx
                     New-DryRunPlan `
                         -ToolId "zamp-driver-trust-repair" -ToolName "Repair zAmp Driver Trust" `
                         -Steps $steps -AffectedResources $(if ($resources.Count -gt 0) { $resources } else { @("None") }) `
