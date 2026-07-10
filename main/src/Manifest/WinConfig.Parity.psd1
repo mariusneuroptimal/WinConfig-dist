@@ -61,6 +61,7 @@
         )
         "zAmp" = @(
             "Uninstall zAmp Drivers"
+            "Repair zAmp Driver Trust"
         )
         "Zengar UI" = @(
             "Apply Win 11 Start Menu"
@@ -177,6 +178,10 @@
         # zAmp tools
         "Uninstall zAmp Drivers" = @{
             Description = "Canonical Zengar driver removal"
+            Group = "Actions"
+        }
+        "Repair zAmp Driver Trust" = @{
+            Description = "Fix driver install failure 0x800B010A (cert chain + reinstall)"
             Group = "Actions"
         }
 

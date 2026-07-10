@@ -1,8 +1,4 @@
 {
-  "event": "push",
-  "schema_version": "2.0",
-  "build_id": "29121076462-1",
-  "branch": "main",
   "artifacts": [
     {
       "size": 2001,
@@ -30,9 +26,9 @@
       "sha256": "5c007c4dd687a03bf90e4fa6278e6d8d51cf68dd177a751b9fba3410b58d654f"
     },
     {
-      "size": 7955,
+      "size": 8165,
       "path": "src/Manifest/WinConfig.Parity.psd1",
-      "sha256": "7560f455a70891f977a452e934a15ded4ad69f1d1725edcf652146f073624026"
+      "sha256": "2702ed1d605de0347ec9c53f314ab5ea2bdc393a9dae9ff3837fa16621d69985"
     },
     {
       "size": 272,
@@ -150,6 +146,10 @@
       "sha256": "3e0757eb5c4f19957e4e6685e903b8ad08af388cf8967d0e9ae16ae52c0d0067"
     }
   ],
-  "timestamp": "2026-07-10T20:21:02.1899664Z",
-  "source_ref": "f5fe4019e06a9ef3b5cf1952b614cc7783e488ee"
+  "schema_version": "2.0",
+  "build_id": "29121610222-1",
+  "source_ref": "c0cc45a9be559c5af12a33ea930fa43e709c115e",
+  "timestamp": "2026-07-10T20:30:41.6192184Z",
+  "branch": "main",
+  "event": "push"
 }
