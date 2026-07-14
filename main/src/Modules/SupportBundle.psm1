@@ -433,7 +433,10 @@ function Get-WinConfigSupportCollectors {
             Script = {
                 param($Context)
                 $xmlPath = Join-Path $Context.ZengarRoot 'components.xml'
-                if (-not (Test-Path $xmlPath)) { throw "components.xml not found at $xmlPath" }
+                if (-not (Test-Path $xmlPath)) {
+                    # Absence is a fact, not a failure (field lesson: partial installs exist)
+                    return @{ Facts = @{ present = $false; path = $xmlPath } }
+                }
                 [xml]$xml = Get-Content -LiteralPath $xmlPath -Raw
                 $packages = @()
                 foreach ($pkg in $xml.SelectNodes('//Package')) {
@@ -524,8 +527,11 @@ function Get-WinConfigSupportCollectors {
             Script = {
                 param($Context)
                 $xmlPath = Join-Path $Context.ZengarRoot 'network.xml'
-                if (-not (Test-Path $xmlPath)) { throw "network.xml not found" }
-                $facts = @{}
+                if (-not (Test-Path $xmlPath)) {
+                    # Absence is a fact, not a failure (confirmed on a media-only install)
+                    return @{ Facts = @{ present = $false; path = $xmlPath } }
+                }
+                $facts = @{ present = $true }
                 try {
                     [xml]$xml = Get-Content -LiteralPath $xmlPath -Raw
                     $proxy = $xml.SelectSingleNode('//ProxyType')
@@ -707,7 +713,10 @@ function Get-WinConfigSupportCollectors {
             Script = {
                 param($Context)
                 $logPath = Join-Path $env:SystemRoot 'INF\setupapi.dev.log'
-                if (-not (Test-Path $logPath)) { throw "setupapi.dev.log not found" }
+                if (-not (Test-Path $logPath)) {
+                    # Absence is a fact, not a failure
+                    return @{ Facts = @{ present = $false; path = $logPath } }
+                }
                 $size = (Get-Item -LiteralPath $logPath).Length
                 @{
                     Facts = @{ sizeBytes = $size; tailCap = $Context.Caps.SetupApiTailLines }
@@ -908,9 +917,13 @@ function Get-WinConfigSupportCollectors {
                 # OWN authenticated repo URL. MUST NOT authenticate — 401 proves
                 # reachability without putting credentials in flight (§6).
                 $url = $Context.Repository.RepositoryUrl
-                if (-not $url) { throw "No repository URL parsed from maintenancetool.ini (parseStatus=$($Context.Repository.ParseStatus))" }
+                if (-not $url) {
+                    # No URL to probe is itself the finding (e.g. maintenancetool.ini
+                    # absent on partial installs) — record why, don't fail
+                    return @{ Facts = @{ repoUrlParsed = $false; parseStatus = "$($Context.Repository.ParseStatus)" } }
+                }
                 $uri = [Uri]$url
-                $facts = @{ url = $url; host = $uri.Host }
+                $facts = @{ repoUrlParsed = $true; url = $url; host = $uri.Host }
                 try {
                     $addrs = [System.Net.Dns]::GetHostAddresses($uri.Host)
                     $facts.dns = @{ resolved = $true; addresses = @($addrs | ForEach-Object { "$_" }) }
@@ -1336,6 +1349,15 @@ function Invoke-WinConfigSupportCollection {
 
     $zengarBlock = @{ present = $zengarPresent }
     if ($zengarPresent) {
+        # Install-completeness fact (field lesson: media-only/partial installs exist,
+        # and missing core files are a classic corrupt-install signature). Stating
+        # WHICH expected files are absent is a fact; the engineer-side triage tooling
+        # turns a non-empty list into the incomplete-install flag.
+        $zengarBlock.coreFilesMissing = @(
+            foreach ($core in @('NO.exe', 'components.xml', 'maintenancetool.ini', 'network.xml')) {
+                if (-not (Test-Path (Join-Path $ZengarRoot $core))) { $core }
+            }
+        )
         $zengarBlock.productVersionIni = $repoInfo.ProductVersion
         try {
             $noExe = Join-Path $ZengarRoot 'NO.exe'

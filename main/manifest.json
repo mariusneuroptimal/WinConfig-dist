@@ -1,9 +1,4 @@
 {
-  "source_ref": "c51ba9c057e19ffbe40a02096882d50e83387ded",
-  "schema_version": "2.0",
-  "branch": "main",
-  "timestamp": "2026-07-14T17:46:29.9176210Z",
-  "build_id": "29355138189-1",
   "artifacts": [
     {
       "size": 2001,
@@ -136,8 +131,8 @@
       "path": "src/Modules/DiagnosticsUpload.psm1"
     },
     {
-      "size": 75121,
-      "sha256": "5ab38951e5340a388b4770d2b9265df4b5ad0649611905d0d049cca347330a37",
+      "size": 76336,
+      "sha256": "ef65b2dd2f0b2439eebe3d63ff3bef57575f6ff77fcf63350748358865eb0966",
       "path": "src/Modules/SupportBundle.psm1"
     },
     {
@@ -156,5 +151,10 @@
       "path": "src/Modules/BluetoothDeviceProbe.psm1"
     }
   ],
-  "event": "push"
+  "build_id": "29361358359-1",
+  "event": "push",
+  "branch": "main",
+  "timestamp": "2026-07-14T19:19:23.9610653Z",
+  "schema_version": "2.0",
+  "source_ref": "488bbbca65fd0544099407012d2fc62648874025"
 }
