@@ -266,6 +266,19 @@
         }
 
         # =========================================================================
+        # SUPPORT TOOLS
+        # =========================================================================
+        @{
+            Id             = "support-bundle-collect"
+            Name           = "Collect Support Bundle"
+            Category       = "Support"
+            ToolCategory   = "Diagnostics"
+            MutatesSystem  = $false
+            SupportsDryRun = $false  # Read-only collector (blessed opt-out, DryRunContract.Tests.ps1)
+            Description    = "Collect a full diagnostic bundle for engineering escalation"
+        }
+
+        # =========================================================================
         # CONFIGURATION TOOLS
         # =========================================================================
         @{

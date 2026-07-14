@@ -48,6 +48,10 @@ function Add-WinConfigDiagnosticArtifact {
     <#
     .SYNOPSIS
         Writes a JSON artifact to the run folder.
+    .PARAMETER Depth
+        ConvertTo-Json depth. Defaults to 5 (the original behaviour). Callers
+        with nested collector output MUST pass a higher depth explicitly —
+        ConvertTo-Json silently flattens anything below its depth limit.
     #>
     [CmdletBinding()]
     param(
@@ -58,7 +62,9 @@ function Add-WinConfigDiagnosticArtifact {
         [string]$Name,
 
         [Parameter(Mandatory)]
-        $Data
+        $Data,
+
+        [int]$Depth = 5
     )
 
     if (-not (Test-Path $RunFolder)) {
@@ -66,7 +72,52 @@ function Add-WinConfigDiagnosticArtifact {
     }
 
     $filePath = Join-Path $RunFolder $Name
-    $Data | ConvertTo-Json -Depth 5 | Out-File -FilePath $filePath -Encoding UTF8 -Force
+    $Data | ConvertTo-Json -Depth $Depth | Out-File -FilePath $filePath -Encoding UTF8 -Force
+}
+
+function Add-WinConfigDiagnosticFile {
+    <#
+    .SYNOPSIS
+        Copies a raw file into the run folder (Add-WinConfigDiagnosticArtifact
+        only writes JSON; some bundles must carry files verbatim).
+    .DESCRIPTION
+        Enforces the clinical-data deny-list at the shared-module level as
+        defence in depth: no diagnostic bundle, present or future, may package
+        anything under C:\zengar\sessions or C:\zengar\BLT_data.
+    .OUTPUTS
+        The destination path of the copied file.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RunFolder,
+
+        [Parameter(Mandatory)]
+        [string]$SourcePath,
+
+        # Leaf name for the copy; defaults to the source file name.
+        [string]$TargetName = ''
+    )
+
+    # Deny-list first: a denied path is refused as denied whether or not it exists
+    $full = [System.IO.Path]::GetFullPath($SourcePath)
+    foreach ($denied in @('C:\zengar\sessions', 'C:\zengar\BLT_data')) {
+        if ($full.TrimEnd('\') -eq $denied -or $full -like "$denied\*") {
+            throw "Denied: '$SourcePath' is under the clinical-data deny-list ($denied)"
+        }
+    }
+
+    if (-not (Test-Path $RunFolder)) {
+        throw "Run folder not found: $RunFolder"
+    }
+    if (-not (Test-Path -LiteralPath $SourcePath)) {
+        throw "Source file not found: $SourcePath"
+    }
+
+    $leaf = if ($TargetName) { Split-Path $TargetName -Leaf } else { Split-Path $SourcePath -Leaf }
+    $destination = Join-Path $RunFolder $leaf
+    Copy-Item -LiteralPath $SourcePath -Destination $destination -Force
+    return $destination
 }
 
 function Compress-WinConfigDiagnosticRun {
@@ -84,7 +135,11 @@ function Compress-WinConfigDiagnosticRun {
         [Parameter(Mandatory)]
         [string]$ExportsRoot,
 
-        [string]$Label = ''
+        [string]$Label = '',
+
+        # Filename prefix. Defaults to 'bt' so every existing Bluetooth call
+        # site produces byte-identical names. The support bundle passes 'support'.
+        [string]$Prefix = 'bt'
     )
 
     if (-not (Test-Path $RunFolder)) {
@@ -94,7 +149,7 @@ function Compress-WinConfigDiagnosticRun {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
 
     $runId   = Split-Path $RunFolder -Leaf
-    $stem    = if ($Label) { "bt_${Label}_${runId}" } else { "bt_$runId" }
+    $stem    = if ($Label) { "${Prefix}_${Label}_${runId}" } else { "${Prefix}_$runId" }
     $zipPath = Join-Path $ExportsRoot "$stem.zip"
 
     if (Test-Path $zipPath) {
@@ -112,5 +167,6 @@ function Compress-WinConfigDiagnosticRun {
 Export-ModuleMember -Function @(
     'New-WinConfigDiagnosticRun'
     'Add-WinConfigDiagnosticArtifact'
+    'Add-WinConfigDiagnosticFile'
     'Compress-WinConfigDiagnosticRun'
 )

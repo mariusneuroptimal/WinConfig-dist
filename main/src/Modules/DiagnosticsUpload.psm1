@@ -106,11 +106,19 @@ function Get-WinConfigDiagnosticsUploadConfig {
     <#
     .SYNOPSIS
         Returns the active upload configuration, loaded from the bundled config file.
+    .PARAMETER Channel
+        Which credential block to use. 'Default' (the existing R2 block —
+        Bluetooth diagnostics, bucket winconfig-diagnostics) or 'Support'
+        (the SupportR2 block — support bundles, bucket winconfig-support).
+        Omitting the parameter is byte-for-byte the pre-Channel behaviour.
     .OUTPUTS
-        Hashtable: Provider, R2 (sub-hashtable), DestinationPath, Enabled
+        Hashtable: Provider, R2 (sub-hashtable), DestinationPath, Enabled, Channel
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [ValidateSet('Default', 'Support')]
+        [string]$Channel = 'Default'
+    )
 
     # Locate bundled config (staged next to Modules/ at src/Config/)
     $configPath = Join-Path $PSScriptRoot '..\Config\WinConfig.DiagnosticsConfig.psd1'
@@ -119,7 +127,7 @@ function Get-WinConfigDiagnosticsUploadConfig {
     if (Test-Path $configPath) {
         try {
             $raw = Import-PowerShellDataFile $configPath -ErrorAction Stop
-            $r2  = $raw.R2
+            $r2  = if ($Channel -eq 'Support') { $raw.SupportR2 } else { $raw.R2 }
             if ($r2 -and
                 $r2.AccountId   -and $r2.AccountId   -ne 'PLACEHOLDER' -and
                 $r2.AccessKeyId -and $r2.AccessKeyId -ne 'PLACEHOLDER' -and
@@ -145,6 +153,7 @@ function Get-WinConfigDiagnosticsUploadConfig {
         Provider        = if ($r2Config) { 'R2' } else { 'LocalFolder' }
         R2              = $r2Config
         DestinationPath = $destPath
+        Channel         = $Channel
     }
 }
 

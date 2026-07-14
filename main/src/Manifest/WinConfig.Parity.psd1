@@ -27,6 +27,7 @@
         "Bluetooth"
         "zAmp"
         "Zengar UI"
+        "Support"
     )
 
     # Tools per category (SSOT)
@@ -88,6 +89,9 @@
             "%localappdata%"
             "C:\zengar"
             "Documents\ScreenConnect"
+        )
+        "Support" = @(
+            "Collect Support Bundle"
         )
     }
 
@@ -245,6 +249,12 @@
         "Empty Recycle Bin" = @{
             Description = "Clear recycle bin contents"
             Group = "Cleanup"
+        }
+
+        # Support tools
+        "Collect Support Bundle" = @{
+            Description = "Collect a full diagnostic bundle for engineering escalation (read-only)"
+            Group = "Diagnostics"
         }
 
         # NO Shortcuts tools

@@ -1421,6 +1421,227 @@ $buttonHandlers = @{
         [System.Windows.Forms.Clipboard]::SetText($machineInfo.FormattedVersion)
         [System.Windows.Forms.MessageBox]::Show("Windows version copied to clipboard: $($machineInfo.FormattedVersion)", "Windows Version", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     }
+    "Collect Support Bundle" = {
+        # SUPPORT-PROBE-001: read-only escalation collector. All collection logic
+        # lives in SupportBundle.psm1; this handler owns only UI + upload wiring.
+        if (-not (Get-Command Initialize-WinConfigGuiDiagnosticBox -ErrorAction SilentlyContinue)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Collect Support Bundle cannot start: Console module failed to load.",
+                "Module Load Error",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+            return
+        }
+        if ($script:SupportBundleActive) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "A support bundle collection is already running.",
+                "Collection In Progress",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            ) | Out-Null
+            return
+        }
+
+        # Locate bundle module: bundled copy (mirrors the Bluetooth probe pattern)
+        if (-not (Get-Command New-WinConfigSupportBundle -ErrorAction SilentlyContinue)) {
+            $sbModulePath = Join-Path $PSScriptRoot "Modules\SupportBundle.psm1"
+            if (Test-Path $sbModulePath) {
+                try {
+                    Import-Module $sbModulePath -Force -Global -ErrorAction Stop
+                } catch {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "Failed to load support bundle module:`n$($_.Exception.Message)",
+                        "Module Load Error",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Error
+                    ) | Out-Null
+                    return
+                }
+            }
+        }
+        if (-not (Get-Command New-WinConfigSupportBundle -ErrorAction SilentlyContinue)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Support bundle module not found. This is unexpected for a bootstrap install - please re-run the bootstrap command to repair.",
+                "Module Not Available",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return
+        }
+
+        # --- Case ID prompt: pre-filled, never blocking (§12.5) ---
+        $caseForm = New-Object System.Windows.Forms.Form
+        $caseForm.Text = "Collect Support Bundle"
+        $caseForm.StartPosition = "CenterScreen"
+        $caseForm.FormBorderStyle = "FixedDialog"
+        $caseForm.MaximizeBox = $false
+        $caseForm.MinimizeBox = $false
+        $caseForm.ClientSize = New-Object System.Drawing.Size(420, 130)
+
+        $caseLabel = New-Object System.Windows.Forms.Label
+        $caseLabel.Text = "Case / ticket number (pre-filled value works fine):"
+        $caseLabel.Location = New-Object System.Drawing.Point(12, 12)
+        $caseLabel.AutoSize = $true
+        $caseForm.Controls.Add($caseLabel)
+
+        # Value input field (not diagnostic output) — $txtValue naming per the
+        # console-wrapper contract exemption for value fields
+        $txtValueCaseId = New-Object System.Windows.Forms.TextBox
+        $txtValueCaseId.Location = New-Object System.Drawing.Point(12, 38)
+        $txtValueCaseId.Width = 396
+        $txtValueCaseId.Text = "$($env:COMPUTERNAME)-$([datetime]::Now.ToString('yyyyMMdd'))"
+        $caseForm.Controls.Add($txtValueCaseId)
+
+        $caseOk = New-Object System.Windows.Forms.Button
+        $caseOk.Text = "Start Collection"
+        $caseOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $caseOk.Location = New-Object System.Drawing.Point(200, 84)
+        $caseOk.Size = New-Object System.Drawing.Size(120, 30)
+        $caseForm.Controls.Add($caseOk)
+        $caseForm.AcceptButton = $caseOk
+
+        $caseCancel = New-Object System.Windows.Forms.Button
+        $caseCancel.Text = "Cancel"
+        $caseCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $caseCancel.Location = New-Object System.Drawing.Point(328, 84)
+        $caseCancel.Size = New-Object System.Drawing.Size(80, 30)
+        $caseForm.Controls.Add($caseCancel)
+        $caseForm.CancelButton = $caseCancel
+
+        if ($caseForm.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+            $caseForm.Dispose()
+            return
+        }
+        $sbCaseId = $txtValueCaseId.Text
+        $caseForm.Dispose()
+
+        $script:SupportBundleActive = $true
+        try {
+            # --- Progress window ---
+            $sbForm = New-Object System.Windows.Forms.Form
+            $sbForm.Text = "Collect Support Bundle"
+            $sbForm.StartPosition = "CenterScreen"
+            $sbForm.Size = New-Object System.Drawing.Size(560, 440)
+            $sbForm.MinimumSize = New-Object System.Drawing.Size(460, 320)
+            $sbForm.ControlBox = $false   # no closing mid-collection; Close enables at the end
+
+            $sbStatusLabel = New-Object System.Windows.Forms.Label
+            $sbStatusLabel.Dock = [System.Windows.Forms.DockStyle]::Top
+            $sbStatusLabel.Height = 28
+            $sbStatusLabel.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 0)
+            $sbStatusLabel.Text = "Starting collection..."
+
+            $sbLog = New-Object System.Windows.Forms.RichTextBox
+            $sbLog.Dock = [System.Windows.Forms.DockStyle]::Fill
+            Initialize-WinConfigGuiDiagnosticBox -Box $sbLog
+
+            $sbButtonRow = New-Object System.Windows.Forms.FlowLayoutPanel
+            $sbButtonRow.Dock = [System.Windows.Forms.DockStyle]::Bottom
+            $sbButtonRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+            $sbButtonRow.AutoSize = $true
+            $sbButtonRow.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $sbButtonRow.Padding = New-Object System.Windows.Forms.Padding(8)
+
+            $sbCloseBtn = New-Object System.Windows.Forms.Button
+            $sbCloseBtn.Text = "Close"
+            $sbCloseBtn.AutoSize = $true
+            $sbCloseBtn.Enabled = $false
+            $sbCloseBtn.Add_Click({ $this.FindForm().Close() })
+            $sbButtonRow.Controls.Add($sbCloseBtn)
+
+            $sbOpenFolderBtn = New-Object System.Windows.Forms.Button
+            $sbOpenFolderBtn.Text = "Open Folder"
+            $sbOpenFolderBtn.AutoSize = $true
+            $sbOpenFolderBtn.Visible = $false
+            $sbOpenFolderBtn.Add_Click({
+                $folder = $this.Tag
+                if ($folder -and (Test-Path $folder)) { Start-Process explorer.exe -ArgumentList "`"$folder`"" }
+            })
+            $sbButtonRow.Controls.Add($sbOpenFolderBtn)
+
+            $sbForm.Controls.Add($sbLog)
+            $sbForm.Controls.Add($sbStatusLabel)
+            $sbForm.Controls.Add($sbButtonRow)
+            $sbForm.Show()
+            [System.Windows.Forms.Application]::DoEvents()
+
+            $sbProgress = {
+                param($CollectorId, $Status, $Index, $Total)
+                if ($Status -eq 'Running') {
+                    $sbStatusLabel.Text = "Collecting $CollectorId ($Index of $Total)..."
+                } else {
+                    $sbLevel = switch ($Status) {
+                        'Ok'      { 'OK' }
+                        'Skipped' { 'DIM' }
+                        'Timeout' { 'WARN' }
+                        default   { 'FAIL' }
+                    }
+                    Write-WinConfigGuiDiagnostic -Level $sbLevel -Message "$CollectorId ($Status)" -Box $sbLog
+                }
+                [System.Windows.Forms.Application]::DoEvents()
+            }.GetNewClosure()
+
+            $sbBundle = New-WinConfigSupportBundle -CaseId $sbCaseId -ProgressCallback $sbProgress
+
+            # --- Upload (Support channel — bucket winconfig-support, never the BT bucket) ---
+            $sbUpload = $null
+            if ($sbBundle.ZipPath -and (Get-Command Get-WinConfigDiagnosticsUploadConfig -ErrorAction SilentlyContinue)) {
+                $sbStatusLabel.Text = "Uploading bundle..."
+                [System.Windows.Forms.Application]::DoEvents()
+                $sbConfig = Get-WinConfigDiagnosticsUploadConfig -Channel Support
+                $sbUpload = Send-WinConfigDiagnosticPackage `
+                    -PackagePath $sbBundle.ZipPath `
+                    -Config $sbConfig `
+                    -Metadata @{ RunId = $sbBundle.RunId; CaseId = $sbBundle.CaseId } `
+                    -FolderPrefix $sbBundle.CaseId
+            }
+
+            # --- Honest outcome banner: LocalOnly/Skipped must NOT read as success ---
+            $sbSummary = if ($sbBundle.Counts) {
+                "Collectors: $($sbBundle.Counts.ok) ok, $($sbBundle.Counts.skipped) skipped, $($sbBundle.Counts.error) error, $($sbBundle.Counts.timeout) timeout."
+            } else { "Collection did not produce a manifest." }
+            Write-WinConfigGuiDiagnostic -Level STEP -Message $sbSummary -Box $sbLog
+
+            if (-not $sbBundle.ZipPath) {
+                $sbStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 50, 50)
+                $sbStatusLabel.Text = "FAILED: no bundle was produced. $($sbBundle.Error)"
+            } elseif ($sbUpload -and $sbUpload.Status -eq 'Uploaded') {
+                $sbStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(40, 120, 40)
+                $sbStatusLabel.Text = "Bundle uploaded to support. Case ID: $($sbBundle.CaseId)"
+                Write-WinConfigGuiDiagnostic -Level OK -Message "Uploaded to $($sbUpload.Destination) as $($sbUpload.RemotePath)" -Box $sbLog
+            } elseif ($sbUpload -and $sbUpload.Status -eq 'LocalOnly') {
+                $sbStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 120, 20)
+                $sbStatusLabel.Text = "Upload FAILED - bundle is on this PC only. Send it manually."
+                Write-WinConfigGuiDiagnostic -Level FAIL -Message "Cloud upload failed: $($sbUpload.Error)" -Box $sbLog
+                Write-WinConfigGuiDiagnostic -Level ACTION -Message "Saved to: $($sbUpload.RemotePath) - send this file to support manually." -Box $sbLog
+                $sbOpenFolderBtn.Tag = $sbUpload.Destination
+                $sbOpenFolderBtn.Visible = $true
+            } else {
+                # Skipped (no upload configured in this build) or upload module missing.
+                # The ZIP lives in the ephemeral session folder and is DELETED when
+                # WinConfig closes - the operator must copy it out first.
+                $sbStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 120, 20)
+                $sbStatusLabel.Text = "Bundle NOT uploaded (uploads not configured). Copy it out before closing WinConfig."
+                Write-WinConfigGuiDiagnostic -Level WARN -Message "Bundle saved to: $($sbBundle.ZipPath)" -Box $sbLog
+                Write-WinConfigGuiDiagnostic -Level ACTION -Message "This folder is deleted when WinConfig closes - copy the file out first." -Box $sbLog
+                $sbOpenFolderBtn.Tag = (Split-Path $sbBundle.ZipPath -Parent)
+                $sbOpenFolderBtn.Visible = $true
+            }
+
+            if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+                $sbLedgerSummary = "$sbSummary Upload: $(if ($sbUpload) { $sbUpload.Status } else { 'NotAttempted' })"
+                Write-WinConfigSessionOperation -Category "Support" -OperationType "Diagnostics" `
+                    -Name "Collect Support Bundle" -Source "Button:CollectSupportBundle" -MutatesSystem $false `
+                    -Result "Success" -Summary $sbLedgerSummary
+            }
+
+            $sbForm.ControlBox = $true
+            $sbCloseBtn.Enabled = $true
+        } finally {
+            $script:SupportBundleActive = $false
+        }
+    }
     "%programdata%" = { Start-Process "explorer.exe" "$env:ProgramData" }
     "%localappdata%" = { Start-Process "explorer.exe" "$env:LocalAppData" }
     "Documents\ScreenConnect" = { 
@@ -6216,7 +6437,8 @@ foreach ($tabPage in $tabControl.TabPages) {
             "Audio",
             "Bluetooth",
             "zAmp",
-            "Zengar UI"
+            "Zengar UI",
+            "Support"
         )
 
         # === DRY RUN INFRASTRUCTURE ===
@@ -7906,6 +8128,14 @@ No system changes were made.
             "Update Surface Drivers"   = @{ Description = "Update Surface firmware"; Group = "Updates" }
             "Microsoft Update Catalog" = @{ Description = "Open MS Update Catalog"; Group = "Updates" }
             "Windows Insider"          = @{ Description = "Open Windows Insider settings"; Group = "Updates" }
+            # Support tools
+            "Collect Support Bundle" = @{
+                Description = "Collect a full diagnostic bundle for engineering escalation (read-only)"
+                Group = "Diagnostics"
+                ToolId = "support-bundle-collect"
+                SupportsDryRun = $false
+                MutatesSystem = $false
+            }
             # NO Shortcuts tools
             "%programdata%"            = @{ Description = "Open ProgramData folder"; Group = "Shortcuts" }
             "%localappdata%"           = @{ Description = "Open LocalAppData folder"; Group = "Shortcuts" }
@@ -7924,6 +8154,7 @@ No system changes were made.
             "Updates"      = @("MS Store Updates", "Update Surface Drivers", "Microsoft Update Catalog", "Windows Insider")
             "Disk"         = @("DISM Restore Health", "/sfc scannow", "Defrag && Optimize", "Delete old backups", "Disk Cleanup", "Empty Recycle Bin")
             "NO Shortcuts" = @("%programdata%", "%localappdata%", "C:\zengar", "Documents\ScreenConnect")
+            "Support"      = @("Collect Support Bundle")
         }
 
         # Phase 7.2: Store category badge references for pattern-aware surfacing
