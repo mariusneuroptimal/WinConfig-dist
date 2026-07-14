@@ -2,8 +2,8 @@
     R2 = @{
         AccountId   = 'f1a5f21df12cd7ca88df390a2b106037'
         BucketName  = 'winconfig-diagnostics'
-        AccessKeyId = 'db231a4f74e45d75cdef316ff8c446db'
-        SecretKey   = '4fc55b62ab0df666d18c4261d34d6ef0d809beda51e61aed6b07cabad38933f5'
+        AccessKeyId = '﻿af1d08d91725868edd0ade07baf012ee'
+        SecretKey   = '﻿025fc534b2ece73b7a893556951bd081a58e22f6e5d124f1a2eac404efd8b303'
     }
     SupportR2 = @{
         AccountId   = 'f1a5f21df12cd7ca88df390a2b106037'
