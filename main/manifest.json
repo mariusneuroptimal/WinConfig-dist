@@ -1,8 +1,9 @@
 {
-  "event": "push",
+  "source_ref": "c51ba9c057e19ffbe40a02096882d50e83387ded",
   "schema_version": "2.0",
   "branch": "main",
-  "source_ref": "0dc5c560609e2530344de50d1ca8e20266d8035d",
+  "timestamp": "2026-07-14T17:46:29.9176210Z",
+  "build_id": "29355138189-1",
   "artifacts": [
     {
       "size": 2001,
@@ -10,8 +11,8 @@
       "path": "Win11Config.ps1"
     },
     {
-      "size": 504436,
-      "sha256": "88738363858c147d5465bddfd9640c4147ef07895c244b704f49c5c174bb98eb",
+      "size": 506980,
+      "sha256": "70eba8ee8a262f4e05c8936b381aaf03d6b701625cccd3c3b800efac60c9ccfa",
       "path": "src/Win11Config.App.ps1"
     },
     {
@@ -100,8 +101,8 @@
       "path": "src/Logging/Logger.psm1"
     },
     {
-      "size": 60753,
-      "sha256": "d656e2cd85b5f340fc4606e9d2628c0a0ae3151266a9085e52126929ca687ad4",
+      "size": 60785,
+      "sha256": "1592b508c7a3437001dc5ea99b3b1b451eee40a3b815a684e4c7f76f43a3b054",
       "path": "src/Modules/SessionOperationLedger.psm1"
     },
     {
@@ -135,8 +136,8 @@
       "path": "src/Modules/DiagnosticsUpload.psm1"
     },
     {
-      "size": 74868,
-      "sha256": "3a219e05b2b1f4a788c38db027e279eadf3e6e0f57e7d3f3b4776f5db813d9fa",
+      "size": 75121,
+      "sha256": "5ab38951e5340a388b4770d2b9265df4b5ad0649611905d0d049cca347330a37",
       "path": "src/Modules/SupportBundle.psm1"
     },
     {
@@ -155,6 +156,5 @@
       "path": "src/Modules/BluetoothDeviceProbe.psm1"
     }
   ],
-  "build_id": "29353580287-1",
-  "timestamp": "2026-07-14T17:24:07.1132758Z"
+  "event": "push"
 }

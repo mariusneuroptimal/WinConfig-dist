@@ -488,11 +488,15 @@ function Get-WinConfigSupportCollectors {
             Script = {
                 param($Context)
                 $logPath = Join-Path $Context.ZengarRoot 'InstallationLog.txt'
-                if (-not (Test-Path $logPath)) { throw "InstallationLog.txt not found" }
+                if (-not (Test-Path $logPath)) {
+                    # Absence is itself a fact worth shipping (some installs never write
+                    # this log) — a healthy box must not score a collector Error for it
+                    return @{ Facts = @{ present = $false; path = $logPath } }
+                }
                 $lineCount = 0
                 try { $lineCount = @(Get-Content -LiteralPath $logPath).Count } catch { }
                 @{
-                    Facts = @{ totalLines = $lineCount; tailCap = $Context.Caps.InstallLogTailLines }
+                    Facts = @{ present = $true; totalLines = $lineCount; tailCap = $Context.Caps.InstallLogTailLines }
                     Files = @(@{ SourcePath = $logPath; TargetName = 'InstallationLog.txt'; TailLines = $Context.Caps.InstallLogTailLines })
                 }
             }

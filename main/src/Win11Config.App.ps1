@@ -1195,7 +1195,7 @@ function Invoke-InstrumentedAction {
         [string]$Source,
 
         [Parameter(Mandatory = $true)]
-        [ValidateSet("Network", "System", "Audio", "Bluetooth", "Maintenance", "Other")]
+        [ValidateSet("Network", "System", "Audio", "Bluetooth", "Maintenance", "Support", "Other")]
         [string]$Category,
 
         [Parameter(Mandatory = $true)]
@@ -1471,42 +1471,68 @@ $buttonHandlers = @{
         }
 
         # --- Case ID prompt: pre-filled, never blocking (§12.5) ---
+        # Pre-fill must identify the machine to support staff: BIOS serial is the
+        # identifier Zengar can map to a customer; DESKTOP-xxxx names alone are not.
+        $sbBiosSerial = ''
+        try { $sbBiosSerial = [string](Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SerialNumber } catch { $sbBiosSerial = '' }
+        if ($sbBiosSerial -match 'To be filled|System Serial|Default string|^Unknown$|^None$|^\s*$') { $sbBiosSerial = '' }
+        $sbCasePrefill = (@($env:COMPUTERNAME, $sbBiosSerial, [datetime]::Now.ToString('yyyyMMdd')) | Where-Object { $_ }) -join '-'
+
+        # AutoSize flow layout throughout — fixed pixel positions clip on
+        # DPI-scaled displays (AutoScaleMode is a no-op for code-built forms)
         $caseForm = New-Object System.Windows.Forms.Form
         $caseForm.Text = "Collect Support Bundle"
         $caseForm.StartPosition = "CenterScreen"
         $caseForm.FormBorderStyle = "FixedDialog"
         $caseForm.MaximizeBox = $false
         $caseForm.MinimizeBox = $false
-        $caseForm.ClientSize = New-Object System.Drawing.Size(420, 130)
+        $caseForm.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+        $caseForm.AutoSize = $true
+        $caseForm.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+
+        $casePanel = New-Object System.Windows.Forms.FlowLayoutPanel
+        $casePanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+        $casePanel.WrapContents = $false
+        $casePanel.AutoSize = $true
+        $casePanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+        $casePanel.Padding = New-Object System.Windows.Forms.Padding(12)
+        $caseForm.Controls.Add($casePanel)
 
         $caseLabel = New-Object System.Windows.Forms.Label
         $caseLabel.Text = "Case / ticket number (pre-filled value works fine):"
-        $caseLabel.Location = New-Object System.Drawing.Point(12, 12)
         $caseLabel.AutoSize = $true
-        $caseForm.Controls.Add($caseLabel)
+        $caseLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
+        $casePanel.Controls.Add($caseLabel)
 
         # Value input field (not diagnostic output) — $txtValue naming per the
         # console-wrapper contract exemption for value fields
         $txtValueCaseId = New-Object System.Windows.Forms.TextBox
-        $txtValueCaseId.Location = New-Object System.Drawing.Point(12, 38)
-        $txtValueCaseId.Width = 396
-        $txtValueCaseId.Text = "$($env:COMPUTERNAME)-$([datetime]::Now.ToString('yyyyMMdd'))"
-        $caseForm.Controls.Add($txtValueCaseId)
+        $txtValueCaseId.Width = 440
+        $txtValueCaseId.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 12)
+        $txtValueCaseId.Text = $sbCasePrefill
+        $casePanel.Controls.Add($txtValueCaseId)
+
+        $caseButtonRow = New-Object System.Windows.Forms.FlowLayoutPanel
+        $caseButtonRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+        $caseButtonRow.AutoSize = $true
+        $caseButtonRow.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+        $caseButtonRow.Margin = New-Object System.Windows.Forms.Padding(0)
+        $casePanel.Controls.Add($caseButtonRow)
 
         $caseOk = New-Object System.Windows.Forms.Button
         $caseOk.Text = "Start Collection"
         $caseOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
-        $caseOk.Location = New-Object System.Drawing.Point(200, 84)
-        $caseOk.Size = New-Object System.Drawing.Size(120, 30)
-        $caseForm.Controls.Add($caseOk)
+        $caseOk.AutoSize = $true
+        $caseOk.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
+        $caseButtonRow.Controls.Add($caseOk)
         $caseForm.AcceptButton = $caseOk
 
         $caseCancel = New-Object System.Windows.Forms.Button
         $caseCancel.Text = "Cancel"
         $caseCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-        $caseCancel.Location = New-Object System.Drawing.Point(328, 84)
-        $caseCancel.Size = New-Object System.Drawing.Size(80, 30)
-        $caseForm.Controls.Add($caseCancel)
+        $caseCancel.AutoSize = $true
+        $caseCancel.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
+        $caseButtonRow.Controls.Add($caseCancel)
         $caseForm.CancelButton = $caseCancel
 
         if ($caseForm.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
@@ -1522,19 +1548,21 @@ $buttonHandlers = @{
             $sbForm = New-Object System.Windows.Forms.Form
             $sbForm.Text = "Collect Support Bundle"
             $sbForm.StartPosition = "CenterScreen"
-            $sbForm.Size = New-Object System.Drawing.Size(560, 440)
-            $sbForm.MinimumSize = New-Object System.Drawing.Size(460, 320)
+            $sbForm.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+            $sbForm.Size = New-Object System.Drawing.Size(720, 540)
+            $sbForm.MinimumSize = New-Object System.Drawing.Size(560, 400)
             $sbForm.ControlBox = $false   # no closing mid-collection; Close enables at the end
 
             $sbStatusLabel = New-Object System.Windows.Forms.Label
             $sbStatusLabel.Dock = [System.Windows.Forms.DockStyle]::Top
-            $sbStatusLabel.Height = 28
+            $sbStatusLabel.Height = 34
             $sbStatusLabel.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 0)
             $sbStatusLabel.Text = "Starting collection..."
 
             $sbLog = New-Object System.Windows.Forms.RichTextBox
             $sbLog.Dock = [System.Windows.Forms.DockStyle]::Fill
             Initialize-WinConfigGuiDiagnosticBox -Box $sbLog
+            $sbLog.Font = New-Object System.Drawing.Font('Consolas', 10)
 
             $sbButtonRow = New-Object System.Windows.Forms.FlowLayoutPanel
             $sbButtonRow.Dock = [System.Windows.Forms.DockStyle]::Bottom
@@ -1546,6 +1574,7 @@ $buttonHandlers = @{
             $sbCloseBtn = New-Object System.Windows.Forms.Button
             $sbCloseBtn.Text = "Close"
             $sbCloseBtn.AutoSize = $true
+            $sbCloseBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
             $sbCloseBtn.Enabled = $false
             $sbCloseBtn.Add_Click({ $this.FindForm().Close() })
             $sbButtonRow.Controls.Add($sbCloseBtn)
@@ -1553,6 +1582,7 @@ $buttonHandlers = @{
             $sbOpenFolderBtn = New-Object System.Windows.Forms.Button
             $sbOpenFolderBtn.Text = "Open Folder"
             $sbOpenFolderBtn.AutoSize = $true
+            $sbOpenFolderBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
             $sbOpenFolderBtn.Visible = $false
             $sbOpenFolderBtn.Add_Click({
                 $folder = $this.Tag
@@ -1631,15 +1661,23 @@ $buttonHandlers = @{
 
             if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
                 $sbLedgerSummary = "$sbSummary Upload: $(if ($sbUpload) { $sbUpload.Status } else { 'NotAttempted' })"
-                Write-WinConfigSessionOperation -Category "Support" -OperationType "Diagnostics" `
-                    -Name "Collect Support Bundle" -Source "Button:CollectSupportBundle" -MutatesSystem $false `
-                    -Result "Success" -Summary $sbLedgerSummary
+                try {
+                    Write-WinConfigSessionOperation -Category "Support" -OperationType "Test" `
+                        -Name "Collect Support Bundle" -Source "Button:CollectSupportBundle" -MutatesSystem $false `
+                        -Result "Success" -Summary $sbLedgerSummary
+                } catch {
+                    # Bookkeeping must never take down a completed collection — the
+                    # bundle has already shipped by this point. Surface, don't throw.
+                    Write-WinConfigGuiDiagnostic -Level WARN -Message "Session ledger write failed: $($_.Exception.Message)" -Box $sbLog
+                }
             }
-
-            $sbForm.ControlBox = $true
-            $sbCloseBtn.Enabled = $true
         } finally {
             $script:SupportBundleActive = $false
+            # Whatever happened above, never leave the window wedged with Close disabled
+            if ($sbForm -and -not $sbForm.IsDisposed) {
+                $sbForm.ControlBox = $true
+                $sbCloseBtn.Enabled = $true
+            }
         }
     }
     "%programdata%" = { Start-Process "explorer.exe" "$env:ProgramData" }

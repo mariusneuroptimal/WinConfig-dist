@@ -538,7 +538,7 @@ function Write-SessionOperation {
         Appends to in-memory ledger and persists to operations.json.
         THROWS on failure - if recording fails, the operation must not execute.
     .PARAMETER Category
-        Network | System | Audio | Bluetooth | Maintenance | Other
+        Network | System | Audio | Bluetooth | Maintenance | Support | Other
     .PARAMETER OperationType
         Test | Action | ExternalTool | UI
     .PARAMETER Name
@@ -565,7 +565,7 @@ function Write-SessionOperation {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet("Network", "System", "Audio", "Bluetooth", "Maintenance", "Other")]
+        [ValidateSet("Network", "System", "Audio", "Bluetooth", "Maintenance", "Support", "Other")]
         [string]$Category,
 
         [Parameter(Mandatory = $true)]
@@ -667,7 +667,7 @@ function Start-SessionOperation {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet("Network", "System", "Audio", "Bluetooth", "Maintenance", "Other")]
+        [ValidateSet("Network", "System", "Audio", "Bluetooth", "Maintenance", "Support", "Other")]
         [string]$Category,
 
         [Parameter(Mandatory = $true)]
