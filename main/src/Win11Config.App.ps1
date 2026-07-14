@@ -1471,12 +1471,16 @@ $buttonHandlers = @{
         }
 
         # --- Case ID prompt: pre-filled, never blocking (§12.5) ---
-        # Pre-fill must identify the machine to support staff: BIOS serial is the
-        # identifier Zengar can map to a customer; DESKTOP-xxxx names alone are not.
-        $sbBiosSerial = ''
-        try { $sbBiosSerial = [string](Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SerialNumber } catch { $sbBiosSerial = '' }
-        if ($sbBiosSerial -match 'To be filled|System Serial|Default string|^Unknown$|^None$|^\s*$') { $sbBiosSerial = '' }
-        $sbCasePrefill = (@($env:COMPUTERNAME, $sbBiosSerial, [datetime]::Now.ToString('yyyyMMdd')) | Where-Object { $_ }) -join '-'
+        # Pre-fill must identify the machine to support staff with zero typing:
+        # hostname + model + BIOS serial + date (Get-WinConfigSupportCaseIdPrefill).
+        # A stale module copy without the function degrades to hostname-date.
+        $sbCasePrefill = ''
+        if (Get-Command Get-WinConfigSupportCaseIdPrefill -ErrorAction SilentlyContinue) {
+            try { $sbCasePrefill = Get-WinConfigSupportCaseIdPrefill } catch { $sbCasePrefill = '' }
+        }
+        if (-not $sbCasePrefill) {
+            $sbCasePrefill = "$($env:COMPUTERNAME)-$([datetime]::Now.ToString('yyyyMMdd'))"
+        }
 
         # AutoSize flow layout throughout — fixed pixel positions clip on
         # DPI-scaled displays (AutoScaleMode is a no-op for code-built forms)

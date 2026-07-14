@@ -89,6 +89,51 @@ function ConvertTo-WinConfigSupportCaseId {
     return $clean
 }
 
+function Get-WinConfigSupportCaseIdPrefill {
+    <#
+    .SYNOPSIS
+        Machine-identifying case ID prefill: <hostname>-<model>-<biosSerial>-<yyyyMMdd>.
+    .DESCRIPTION
+        Zero-typing escalation: the tech should only have to click Start
+        Collection. Model + BIOS serial let support staff map the bundle to a
+        customer system without a follow-up question (a DESKTOP-xxxx hostname
+        alone cannot). OEM placeholder values ("To be filled by O.E.M.",
+        "System Product Name", ...) are dropped rather than shipped. Segments
+        are capped so the trailing date always survives the sanitizer's 64-char
+        cap: hostname(<=15) + model(<=16) + serial(<=20) + date(8) + dashes = 62.
+    .OUTPUTS
+        Sanitized case ID string (via ConvertTo-WinConfigSupportCaseId).
+    #>
+    [CmdletBinding()]
+    param(
+        # Test injection points — production callers pass nothing
+        [AllowEmptyString()][string]$Model,
+        [AllowEmptyString()][string]$BiosSerial,
+        [string]$Stamp
+    )
+
+    if (-not $PSBoundParameters.ContainsKey('Model')) {
+        try { $Model = [string](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).Model } catch { $Model = '' }
+    }
+    if (-not $PSBoundParameters.ContainsKey('BiosSerial')) {
+        try { $BiosSerial = [string](Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SerialNumber } catch { $BiosSerial = '' }
+    }
+    if (-not $Stamp) { $Stamp = [datetime]::Now.ToString('yyyyMMdd') }
+
+    # OEM placeholder junk — worse than absent
+    $junk = 'To be filled|System Product|System Serial|Default string|O\.E\.M\.|^Unknown$|^None$|^INVALID$|^\s*$'
+    if ($Model -match $junk)      { $Model = '' }
+    if ($BiosSerial -match $junk) { $BiosSerial = '' }
+
+    $Model = $Model -replace '[^A-Za-z0-9]', ''            # "Surface Pro 6" -> SurfacePro6
+    if ($Model.Length -gt 16) { $Model = $Model.Substring(0, 16) }
+    $BiosSerial = $BiosSerial -replace '[^A-Za-z0-9-]', ''
+    if ($BiosSerial.Length -gt 20) { $BiosSerial = $BiosSerial.Substring(0, 20) }
+
+    $raw = (@($env:COMPUTERNAME, $Model, $BiosSerial, $Stamp) | Where-Object { $_ }) -join '-'
+    return ConvertTo-WinConfigSupportCaseId -CaseId $raw
+}
+
 # =============================================================================
 # DENY-LIST (§6) — central path filter; a carelessly-added collector cannot
 # reach clinical data because every file copy funnels through here
@@ -1497,6 +1542,7 @@ function New-WinConfigSupportBundle {
 
 Export-ModuleMember -Function @(
     'ConvertTo-WinConfigSupportCaseId'
+    'Get-WinConfigSupportCaseIdPrefill'
     'Test-WinConfigSupportPathAllowed'
     'Add-WinConfigSupportBundleFile'
     'Get-WinConfigSupportRepositoryInfo'
