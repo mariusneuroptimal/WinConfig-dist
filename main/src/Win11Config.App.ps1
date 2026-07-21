@@ -4600,6 +4600,7 @@ $buttonHandlers = @{
                 $btWin32Ok = Initialize-BtWin32Api
                 $btProbeSession = New-DeviceProbeSession
                 $btProbeSession.BtWin32Available = $btWin32Ok
+                $btProbeSession.NoExeVersion = try { Get-NoExeVersion } catch { $null }
 
                 # Auto-detect NeurOptimal device from PnP
                 $btTargetName = 'NeurOptimal Headset'
@@ -4675,6 +4676,13 @@ $buttonHandlers = @{
                 }
                 $noRunning = Test-ProcessRunningInSnapshot -ProcessNames $initProc -Name $btProbeAppName
                 Write-BtLog "  NO.exe        : $(if ($noRunning) { 'Running' } else { 'Not running' })" -Level $(if ($noRunning) { 'OK' } else { 'DIM' })
+                if ($btProbeSession.NoExeVersion) {
+                    if (Test-NoUsesMacResolve -Version $btProbeSession.NoExeVersion) {
+                        Write-BtLog "  NO.exe version: $($btProbeSession.NoExeVersion) -- resolves COM port from MAC each connect (port-number changes are benign)" -Level "DIM"
+                    } else {
+                        Write-BtLog "  NO.exe version: $($btProbeSession.NoExeVersion) -- caches COM port (a port-number change can break reconnect)" -Level "DIM"
+                    }
+                }
                 if ($btProbeSession.AdapterInfo -and $btProbeSession.AdapterInfo.Present) {
                     $driverVer = if ($btProbeSession.AdapterInfo.DriverInfo -and $btProbeSession.AdapterInfo.DriverInfo.Version) { $btProbeSession.AdapterInfo.DriverInfo.Version } else { 'unknown' }
                     Write-BtLog "  BT adapter    : $($btProbeSession.AdapterInfo.FriendlyName)  driver v$driverVer" -Level "DIM"

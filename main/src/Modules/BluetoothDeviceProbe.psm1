@@ -20,6 +20,77 @@ $ErrorActionPreference = 'Stop'
 
 $script:BtWin32Available = $false
 
+# NO.exe >= this version resolves the Arc COM port from its Bluetooth MAC on every
+# connect (the 4.0 "Device Panel" overhaul that removed cached-port usage), so a
+# COM-port reassignment across reconnects no longer breaks a connection. Older
+# builds cache the port and fail when it changes. Single source of truth for the
+# gate -- adjust here if the exact first build is pinned down (4.0.0.5 is the
+# earliest confirmed to carry the change; 4.0.0.0 is the conservative boundary).
+$script:NoMacResolveMinVersion = [version]'4.0.0.0'
+
+# =============================================================================
+# NO.EXE VERSION GATE
+# =============================================================================
+
+function Get-NoExeVersion {
+    <#
+    .SYNOPSIS
+        Reads the NeurOptimal (NO.exe) product version as a [version], or $null if
+        it can't be determined. Prefers the running process's on-disk image, then
+        an explicit path, then the canonical install location.
+    .DESCRIPTION
+        The version gates Test-NoUsesMacResolve: NO.exe >= 4.0 re-resolves each
+        Arc's COM port from its MAC on every connect, so a port-number change is
+        benign on those builds but breaks older cached-port builds.
+    #>
+    [CmdletBinding()]
+    [OutputType([version])]
+    param([string]$ExePath)
+
+    $candidates = @()
+    if ($ExePath) { $candidates += $ExePath }
+    # The exact image that's actually running is the most authoritative source.
+    try {
+        $proc = Get-Process -Name 'NO' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($proc) {
+            $running = try { $proc.MainModule.FileName } catch { $null }
+            if ($running) { $candidates += $running }
+        }
+    } catch { }
+    $candidates += 'C:\zengar\NO.exe'
+
+    foreach ($c in ($candidates | Where-Object { $_ } | Select-Object -Unique)) {
+        try {
+            if (-not (Test-Path -LiteralPath $c)) { continue }
+            $vi  = (Get-Item -LiteralPath $c).VersionInfo
+            $raw = if ($vi.ProductVersion) { $vi.ProductVersion } else { $vi.FileVersion }
+            if (-not $raw) { continue }
+            # Version strings can carry a suffix ("4.0.0.5 (internal)") -- take the
+            # leading dotted-numeric (major.minor required so [version] never throws).
+            $m = [regex]::Match([string]$raw, '\d+\.\d+(\.\d+){0,2}')
+            if ($m.Success) { return [version]$m.Value }
+        } catch { continue }
+    }
+    return $null
+}
+
+function Test-NoUsesMacResolve {
+    <#
+    .SYNOPSIS
+        $true if the given NO.exe version resolves COM ports from the device MAC on
+        every connect (>= $script:NoMacResolveMinVersion), making a COM-port
+        reassignment benign. A $null/unknown version returns $false: the field fleet
+        is pre-overhaul, so we keep the strong cached-port warning unless we can
+        prove the box runs a fixed build.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([version]$Version)
+
+    if (-not $Version) { return $false }
+    return ($Version -ge $script:NoMacResolveMinVersion)
+}
+
 # =============================================================================
 # WIN32 BLUETOOTH API
 # =============================================================================
@@ -244,7 +315,11 @@ function Get-PatternAnnotation {
                             $changeNote = "port numbers changed after re-pair"
                             if ($removed) { $changeNote += ": lost $($removed -join ', ')" }
                             if ($added)   { $changeNote += ", gained $($added -join ', ')" }
-                            $annotation = "[~] $changeNote -- if NO.exe has a hardcoded port it may fail to connect ($portList now)"
+                            if (Test-NoUsesMacResolve -Version $Session.NoExeVersion) {
+                                $annotation = "[ok] $changeNote -- NO.exe $($Session.NoExeVersion) re-resolves the port from the device MAC, so this is harmless ($portList now)"
+                            } else {
+                                $annotation = "[~] $changeNote -- if NO.exe has a hardcoded port it may fail to connect ($portList now)"
+                            }
                         }
                     }
                     $Session.LastComPortNames = $currentPorts
@@ -262,7 +337,11 @@ function Get-PatternAnnotation {
                             $changeNote = "port number changed after re-pair"
                             if ($removed) { $changeNote += ": lost $($removed -join ', ')" }
                             if ($added)   { $changeNote += ", gained $($added -join ', ')" }
-                            $annotation = "[~] $changeNote -- if NO.exe has a hardcoded port it may fail ($portList now)"
+                            if (Test-NoUsesMacResolve -Version $Session.NoExeVersion) {
+                                $annotation = "[ok] $changeNote -- NO.exe $($Session.NoExeVersion) re-resolves the port from the device MAC, so this is harmless ($portList now)"
+                            } else {
+                                $annotation = "[~] $changeNote -- if NO.exe has a hardcoded port it may fail ($portList now)"
+                            }
                         }
                     }
                     $Session.LastComPortNames = $currentPorts
@@ -299,9 +378,16 @@ function Get-EstimatedScanCycles {
     <#
     .SYNOPSIS
         Estimates how many NO.exe scan cycles were needed to discover the device.
+    .DESCRIPTION
+        Defaults model NO.exe >= 4.0's Device Panel discovery cadence: start 1s,
+        +1s per cycle, cap 3s (the 4.0 overhaul cut this from the old "start ~10s,
+        +3s, cap 10s"). Pass OrigTime/Increment/MaxTime to model a pre-4.0 build.
+        NOTE: currently unused -- the live slow-discovery signal is the >=90s
+        reconnect-gap threshold in Get-DeviceProbeSessionSummary, which measures
+        Windows re-pair wall-time and is independent of NO.exe's scan cadence.
     #>
     [CmdletBinding()]
-    param([int]$GapSeconds, [int]$OrigTime = 3, [int]$Increment = 1, [int]$MaxTime = 10)
+    param([int]$GapSeconds, [int]$OrigTime = 1, [int]$Increment = 1, [int]$MaxTime = 3)
 
     $scanTime    = $OrigTime
     $totalScan   = 0
@@ -344,8 +430,11 @@ function New-DeviceProbeSession {
         ActiveStreamPort         = $null
         StreamPeakCpuS           = 0.0
         StreamPeakWorkingSetMB   = 0
+        AppNotRespondingTicks    = 0
+        AppHangReported          = $false
         StartupSppChannelCount   = 0
         BtWin32Available         = $false
+        NoExeVersion             = $null
         AdapterInfo              = $null
         PowerPlan                = $null
         PendingConfirmation      = $null
@@ -476,6 +565,34 @@ function Invoke-DeviceProbeTick {
                 $wsMB = [math]::Round($noProc.WorkingSet64 / 1MB, 0)
                 if ($cpuS -gt $Session.StreamPeakCpuS)        { $Session.StreamPeakCpuS = $cpuS }
                 if ($wsMB -gt $Session.StreamPeakWorkingSetMB) { $Session.StreamPeakWorkingSetMB = $wsMB }
+
+                # Sync-VISA hang detection. NO.exe >= 4.0 does synchronous serial
+                # (VISA) read/write, so a stalled Arc blocks the UI thread and the
+                # main window stops pumping messages -> Responding = false. We only
+                # look while streaming (COM held open), and stop after the first
+                # report so a genuinely hung window's ~5s SendMessageTimeout cost is
+                # paid at most a few times, not every tick. A healthy window answers
+                # instantly, so healthy sessions pay nothing.
+                if (-not $Session.AppHangReported) {
+                    $responding = try { $noProc.Responding } catch { $true }
+                    if (-not $responding) {
+                        $Session.AppNotRespondingTicks++
+                        # Ticks are ~3s apart; require 3 consecutive (~9s) so a brief
+                        # stall doesn't read as a hang.
+                        if ($Session.AppNotRespondingTicks -ge 3) {
+                            $Session.AppHangReported = $true
+                            $hangSec = $Session.AppNotRespondingTicks * 3
+                            $hangAnno = if (Test-NoUsesMacResolve -Version $Session.NoExeVersion) {
+                                "[!] NO.exe UI frozen mid-stream -- on 4.0+ the serial (VISA) read/write is synchronous, so a stalled Arc blocks the UI thread"
+                            } else {
+                                "[!] NO.exe UI frozen mid-stream -- app not responding while the COM port is held open"
+                            }
+                            $events += @{ Kind = 'ANOMALY'; State = 'AppNotResponding'; Reason = "NO.exe stopped responding for ~${hangSec}s while EEG streaming"; Annotation = $hangAnno; Level = 'FAIL'; Timestamp = $now }
+                        }
+                    } else {
+                        $Session.AppNotRespondingTicks = 0
+                    }
+                }
             }
         } catch { }
     }
@@ -588,22 +705,57 @@ function Get-DeviceProbeSessionSummary {
     # single-row case (a real reassignment on one reconnect went unreported).
     $comChangeRows = @($Session.ComPortHistory | Where-Object { $_.Changed -and -not $_.IsFirst })
     if ($comChangeRows.Count -gt 0) {
-        # Any reassignment invalidates NO.exe's cached port, so it's always [!].
-        $repairCount = @($Session.ReconnectTimes).Count
-        $reconLabel  = if ($repairCount -le 1) { '1 reconnect' } else { "$repairCount reconnects" }
-        [void]$findings.Add("[!] COM port reassignment: the headset's serial port changed $($comChangeRows.Count) time(s) across $reconLabel -- NO.exe's cached port is invalidated, so it must re-enumerate the COM port on every connect")
+        $repairCount  = @($Session.ReconnectTimes).Count
+        $reconLabel   = if ($repairCount -le 1) { '1 reconnect' } else { "$repairCount reconnects" }
+        $changedTimes = $comChangeRows.Count
+        if (Test-NoUsesMacResolve -Version $Session.NoExeVersion) {
+            # NO.exe >= 4.0 re-resolves the COM port from the device MAC on every
+            # connect, so a changed port number invalidates nothing. Keep the
+            # "COM port reassignment" phrase but under [ok]; the dashboard's problem
+            # signal keys on the [!] prefix (dashboard/scripts/lib/bt-zip.js), so a
+            # benign observation no longer inflates the rollup.
+            [void]$findings.Add("[ok] COM port reassignment: the headset's serial port changed $changedTimes time(s) across $reconLabel -- benign on NO.exe $($Session.NoExeVersion), which resolves the COM port from the device MAC on every connect (no cached port to invalidate)")
+        } else {
+            # Pre-4.0 (or unknown) NO.exe caches the port, so any reassignment
+            # invalidates it -- always [!].
+            [void]$findings.Add("[!] COM port reassignment: the headset's serial port changed $changedTimes time(s) across $reconLabel -- NO.exe's cached port is invalidated, so it must re-enumerate the COM port on every connect")
+        }
     } elseif ($Session.ReconnectTimes.Count -gt 0) {
         [void]$findings.Add("[ok] COM port numbers stayed stable across $($Session.ReconnectTimes.Count) reconnect(s)")
     }
 
-    # COM port exhaustion
+    # COM port exhaustion / stale-slot accumulation. High COM numbers mean stale
+    # (hidden) COM ports are holding the low slots -- the "abnormally increased COM
+    # port numbers" the NO dev saw under intensive testing. NO.exe >= 4.0 ships a
+    # first-party cleanup tool for exactly this (NO Device Manager > Configuration,
+    # needs the UAC prompt); older builds have no such button.
     if ($allPortNums -and $allPortNums.Count -gt 0) {
         $slotsUsed = ($allPortNums | Select-Object -Unique | Measure-Object).Count
         $maxPort   = ($allPortNums | Measure-Object -Maximum).Maximum
+        $exhaustionHit = $false
         if ($maxPort -ge 10) {
             [void]$findings.Add("[!] COM port exhaustion: reached COM$maxPort this session ($slotsUsed slots consumed)")
+            $exhaustionHit = $true
         } elseif ($slotsUsed -gt 4) {
             [void]$findings.Add("[~] COM port churn: $slotsUsed unique slots consumed this session")
+            $exhaustionHit = $true
+        }
+        if ($exhaustionHit) {
+            if (Test-NoUsesMacResolve -Version $Session.NoExeVersion) {
+                [void]$findings.Add("[info] Remediation: NO Device Manager > Configuration has a built-in Bluetooth cleanup tool that removes stale COM ports (accept the UAC prompt when it runs)")
+            } else {
+                [void]$findings.Add("[info] Remediation: clear stale COM ports (Device Manager > View > Show hidden devices, remove greyed-out COM ports) -- or update NO.exe to 4.0+, which adds a built-in cleanup tool")
+            }
+        }
+    }
+
+    # NO.exe UI hang during streaming (sync-VISA stall). Flagged live in
+    # Invoke-DeviceProbeTick; surface it in the summary too.
+    if ($Session.AppHangReported) {
+        if (Test-NoUsesMacResolve -Version $Session.NoExeVersion) {
+            [void]$findings.Add("[!] NO.exe UI hang during streaming: the app stopped responding while the COM port was held open -- likely a synchronous serial (VISA) read/write stall on NO.exe $($Session.NoExeVersion)")
+        } else {
+            [void]$findings.Add("[!] NO.exe UI hang during streaming: the app stopped responding while the COM port was held open")
         }
     }
 
@@ -877,6 +1029,8 @@ function Get-ProbeStateColor {
 
 Export-ModuleMember -Function @(
     'Initialize-BtWin32Api',
+    'Get-NoExeVersion',
+    'Test-NoUsesMacResolve',
     'Get-BtConnectionState',
     'Test-ComPortInUse',
     'Get-StreamingState',
