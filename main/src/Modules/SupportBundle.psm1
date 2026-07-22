@@ -32,6 +32,27 @@ $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
 $script:ZengarDenyList    = @('sessions', 'BLT_data')        # HARD deny — §6 (clinical data)
+
+# FI-001: components stage into C:\ProgramData\<AnyName>\ and the uninstaller does
+# not clean them. Folder names are NOT uniformly '*_Installer' (observed in the
+# field: 'NO WebView2 Runtime', 'NeurOptimal', 'RepoTool', 'NODatabaseBackup') —
+# the only reliable marker is an installerResources\com.zengar.* child.
+$script:StagingRootDefault     = $(if ($env:ProgramData) { $env:ProgramData } else { 'C:\ProgramData' })
+$script:StagingComponentPrefix = 'com.zengar.'
+
+# FI-008: NO.exe hosts its visualizer in a WebView2 loaded from a FIXED-VERSION
+# runtime staged under ProgramData — NOT the machine-wide Evergreen runtime.
+# Evergreen msedgewebview2 processes exist on every Win11 box (SearchHost, Teams,
+# Outlook, Copilot) and are pure noise; only this tree matters to NO.exe.
+# If these binaries are gone the visualizer pane renders blank while the rest of
+# the app works perfectly — and components.xml still reports the component
+# installed, so nothing else in the bundle contradicts it.
+$script:WebView2RuntimeDirName = 'NO WebView2 Runtime'
+$script:WebView2KeyBinaries    = @(
+    'libs\x64\WebView2Loader.dll',                          # loaded by NO.exe itself
+    'runtime\x64\EBWebView\x64\EmbeddedBrowserWebView.dll',  # loaded by NO.exe itself
+    'runtime\x64\msedgewebview2.exe'                         # the browser process
+)
 $script:ZampLoaderRelDir  = 'zAmpLoader\driver'
 $script:ZengarLeafThumb   = 'E2DF802CEF9C3C3EE6DCF4842812DB03E0E5C00F'
 $script:SectigoE46Thumb   = 'BBEF5C4C11489770F586FB307D143291307F119A'
@@ -49,6 +70,8 @@ $script:InstallLogTailLines  = 2000
 $script:SetupApiTailLines    = 3000
 $script:EventSliceMax        = 250
 $script:TreeListingMaxItems  = 5000
+$script:StagingMaxDirs       = 200
+$script:WebView2MaxSiblings  = 20
 $script:DefaultCollectorTimeoutSeconds = 45
 
 # Repo URL is parsed at runtime from maintenancetool.ini DefaultRepositories.
@@ -626,6 +649,145 @@ function Get-WinConfigSupportCollectors {
                 }
                 $facts = @{ entryCount = $entries.Count; entries = @($entries) }
                 if ($truncated -gt 0) { $facts.truncationMarker = "...truncated ($truncated more entries)" }
+                @{ Facts = $facts }
+            }
+        }
+        @{
+            # RequiresZengar = $false ON PURPOSE — this collector breaks the Ring-1
+            # pattern deliberately (FI-005). Installer rollback wipes C:\zengar, so
+            # during the exact failure this exists to diagnose there is often no
+            # install left at all. Gating on Zengar would blind it precisely when it
+            # matters: all three bundles of the 2026-07-22 escalation were collected
+            # with C:\zengar empty or absent while the real evidence sat here.
+            Id = 'ZEN-STAGING-001'; Ring = 1; RequiresAdmin = $false; RequiresZengar = $false
+            Script = {
+                param($Context)
+                # FI-001: uninstall does not remove C:\ProgramData\<Component>\ staging
+                # trees. On reinstall QtIFW renames each pre-existing file aside before
+                # overwriting; the rename is denied, the write is then denied, and
+                # extraction aborts with an opaque E_FAIL -- component by component,
+                # with no path or reason shown to the tech.
+                #
+                # FACTS ONLY (§3.4): staleness and ACL shape are reported, never judged.
+                # Listing only -- names, sizes, mtimes, ACL metadata; never contents.
+                $root = $Context.StagingRoot
+                $prefix = $Context.StagingPrefix
+                $facts = @{ stagingRoot = $root; rootPresent = (Test-Path -LiteralPath $root) }
+                if (-not $facts.rootPresent) { return @{ Facts = $facts } }
+
+                $entries = [System.Collections.ArrayList]::new()
+                $truncated = 0
+                # Cap comes from $Context.Caps, NOT $script: — module scope is not
+                # available inside a collector scriptblock, and `$n -ge $null` is TRUE
+                # in PowerShell, which silently truncates every entry.
+                $max = $Context.Caps.StagingMaxDirs
+                foreach ($dir in (Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue)) {
+                    $irPath = Join-Path $dir.FullName 'installerResources'
+                    if (-not (Test-Path -LiteralPath $irPath)) { continue }
+                    $components = @(Get-ChildItem -LiteralPath $irPath -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -like "$prefix*" })
+                    # No com.zengar.* child => not ours (e.g. BeyondTrust_Installer, which
+                    # is the remote-access path into the box and must never be touched).
+                    if ($components.Count -eq 0) { continue }
+                    if ($entries.Count -ge $max) { $truncated++; continue }
+
+                    $entry = @{
+                        name         = $dir.Name
+                        path         = $dir.FullName
+                        mtime        = $dir.LastWriteTime.ToString('o')
+                        componentIds = @($components | ForEach-Object { $_.Name })
+                    }
+                    # Newest per-component manifest .txt dates the last time this component
+                    # actually completed an install here -- the sharpest staleness signal.
+                    $manifests = @(Get-ChildItem -LiteralPath $irPath -File -Recurse -ErrorAction SilentlyContinue)
+                    if ($manifests.Count -gt 0) {
+                        $entry.manifestNewestMtime = ($manifests | Sort-Object LastWriteTime -Descending |
+                            Select-Object -First 1).LastWriteTime.ToString('o')
+                    }
+                    $children = @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue)
+                    $entry.childCount = $children.Count
+                    $entry.readOnlyChildCount = @($children | Where-Object {
+                        $_.Attributes -band [System.IO.FileAttributes]::ReadOnly }).Count
+                    try {
+                        $acl = Get-Acl -LiteralPath $dir.FullName -ErrorAction Stop
+                        $entry.owner        = "$($acl.Owner)"
+                        # Inheritance blocked on a ProgramData child is abnormal and is the
+                        # shape most likely to deny the installer's rename-aside.
+                        $entry.aclProtected = [bool]$acl.AreAccessRulesProtected
+                        $entry.aclDenyCount = @($acl.Access | Where-Object {
+                            "$($_.AccessControlType)" -eq 'Deny' }).Count
+                    } catch {
+                        $entry.aclError = $_.Exception.Message
+                    }
+                    [void]$entries.Add($entry)
+                }
+                $facts.entries    = @($entries)
+                $facts.entryCount = $entries.Count
+                if ($truncated -gt 0) { $facts.truncationMarker = "...truncated ($truncated more staging dirs)" }
+                @{ Facts = $facts }
+            }
+        }
+        @{
+            # RequiresZengar = $false for the same reason as ZEN-STAGING-001 (FI-005):
+            # this evidence lives outside C:\zengar, which is exactly what installer
+            # rollback wipes. Gating on Zengar would blind it when it matters most.
+            Id = 'ZEN-WEBVIEW2-001'; Ring = 1; RequiresAdmin = $false; RequiresZengar = $false
+            Script = {
+                param($Context)
+                # FI-008: the fixed-version WebView2 runtime NO.exe actually loads.
+                # Known-good shape, measured on MMEVOLD_06 (healthy NO 4.0.0.5):
+                #   339 files / ~998.7 MB; msedgewebview2.exe 122.0.2365.92
+                # Observed failure: the directory PRESENT but holding 0 files, after the
+                # FI-001 staging sweep renamed the real tree to '<name>.bak'. NO.exe then
+                # silently gets no WebView2 and the visualizer pane paints blank.
+                #
+                # FACTS ONLY (§3.4): counts, sizes, versions and sibling names. No verdict
+                # about whether the runtime "should" be there. Metadata only, never contents.
+                $root = Join-Path $Context.StagingRoot $Context.WebView2DirName
+                $facts = @{ runtimeRoot = $root; present = [bool](Test-Path -LiteralPath $root) }
+
+                if ($facts.present) {
+                    $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)
+                    $facts.fileCount  = $files.Count
+                    $facts.totalBytes = [int64](($files | Measure-Object -Property Length -Sum).Sum)
+                    # The three binaries whose absence is the actual failure. Reported
+                    # individually so triage says WHICH one is gone, not just "incomplete".
+                    $facts.binaries = @($Context.WebView2Binaries | ForEach-Object {
+                        $rel  = $_
+                        $full = Join-Path $root $rel
+                        $b    = @{ rel = $rel; present = [bool](Test-Path -LiteralPath $full) }
+                        if ($b.present) {
+                            $item = Get-Item -LiteralPath $full -ErrorAction SilentlyContinue
+                            if ($item) {
+                                $b.size    = $item.Length
+                                $b.version = "$($item.VersionInfo.ProductVersion)"
+                            }
+                        }
+                        $b
+                    })
+                }
+
+                # Sibling '<name>.bak' / '.bak.bak' / '.empty' trees. When the live tree is
+                # broken, a sibling holding a full copy turns remediation from a reinstall
+                # into a rename — so it is worth knowing before anyone re-downloads 1 GB.
+                # Cap from $Context.Caps, NOT $script: — module scope is invisible inside a
+                # collector scriptblock, and `$n -ge $null` is TRUE in PowerShell.
+                $max = $Context.Caps.WebView2MaxSiblings
+                $siblings = [System.Collections.ArrayList]::new()
+                $truncated = 0
+                if (Test-Path -LiteralPath $Context.StagingRoot) {
+                    foreach ($dir in (Get-ChildItem -LiteralPath $Context.StagingRoot -Directory -Force -ErrorAction SilentlyContinue |
+                                      Where-Object { $_.Name -like "$($Context.WebView2DirName).*" })) {
+                        if ($siblings.Count -ge $max) { $truncated++; continue }
+                        [void]$siblings.Add(@{
+                            name      = $dir.Name
+                            mtime     = $dir.LastWriteTime.ToString('o')
+                            fileCount = @(Get-ChildItem -LiteralPath $dir.FullName -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+                        })
+                    }
+                }
+                $facts.siblings = @($siblings)
+                if ($truncated -gt 0) { $facts.truncationMarker = "...truncated ($truncated more sibling dirs)" }
                 @{ Facts = $facts }
             }
         }
@@ -1252,6 +1414,10 @@ function Invoke-WinConfigSupportCollection {
 
     $context = @{
         ZengarRoot       = $ZengarRoot
+        StagingRoot      = $StagingRoot
+        StagingPrefix    = $script:StagingComponentPrefix
+        WebView2DirName  = $script:WebView2RuntimeDirName
+        WebView2Binaries = $script:WebView2KeyBinaries
         ZampLoaderDir    = Join-Path $ZengarRoot $script:ZampLoaderRelDir
         DenyListAbsolute = @($script:ZengarDenyList | ForEach-Object { [System.IO.Path]::GetFullPath((Join-Path $ZengarRoot $_)) })
         Elevated         = $elevated
@@ -1268,6 +1434,8 @@ function Invoke-WinConfigSupportCollection {
             SetupApiTailLines   = $script:SetupApiTailLines
             EventSliceMax       = $script:EventSliceMax
             TreeListingMaxItems = $script:TreeListingMaxItems
+            StagingMaxDirs      = $script:StagingMaxDirs
+            WebView2MaxSiblings = $script:WebView2MaxSiblings
         }
     }
 
@@ -1486,6 +1654,7 @@ function New-WinConfigSupportBundle {
         [string]$CaseId = '',
         [object[]]$Collectors = $null,
         [string]$ZengarRoot = $script:ZengarRootDefault,
+        [string]$StagingRoot = $script:StagingRootDefault,
         [nullable[bool]]$ElevatedOverride = $null,
         [scriptblock]$ProgressCallback = $null
     )
