@@ -27,7 +27,13 @@ Set-StrictMode -Off
 # =============================================================================
 # CONSTANTS (SUPPORT-PROBE-001 §11) — single block; do not scatter endpoints
 # =============================================================================
-$script:SupportBundleProbeVersion = '1.0.0'
+# Bump on ANY collector-semantics change (new/removed collector, changed facts
+# shape, new transform) — the analyzer reads this to know which collector
+# behavior produced a bundle's facts. Pinned by a test in SupportBundle.Tests.ps1.
+# 1.1.0 (2026-07-23): RedactInstallationLog transform (FI-007), maintenancetool
+#   facts in ZEN-VERSION-001, WIN-VISA-001 + WIN-ODBC-001 collectors,
+#   zengar.repositoryChannels manifest fact.
+$script:SupportBundleProbeVersion = '1.1.0'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -64,6 +70,20 @@ $script:SupportDomains    = @('zengar.com', 'neuroptimal.com', 'noreleases.neuro
 $script:BltLicensingHost  = 'blt-server.neuroptimal.com'
 $script:BltLicensingPorts = @(7000, 7001, 7002)   # CRITICAL for licensing
 $script:TrustFetchHosts   = @('ctldl.windowsupdate.com', 'crt.sectigo.com')  # KI-001
+
+# FI-004 (2026-07-22): NO 4.x drives the zAmp through WinUSB + NI-VISA, and
+# ZEN-ZAMP-001 inspects zAmpLoader\driver — a directory that does not exist on
+# a healthy 4.x box. These are the load-bearing VISA DLLs NO.exe loads from
+# System32; their presence/versions are the 4.x amp-stack facts.
+$script:VisaSystemDlls = @('nivisa64.dll', 'NiViSv64.dll', 'visa64.dll', 'visaUtilities.dll', 'visaConfMgr.dll')
+
+# MsiInstaller 1918 field lesson: ODBC "driver could not be loaded" events were
+# falsely escalated; the documented triage move is checking the CURRENT ODBC
+# registration, both registry views. HKLM ODBCINST.INI is world-readable.
+$script:OdbcInstRegPaths = @(
+    @{ view = '64-bit'; path = 'HKLM:\SOFTWARE\ODBC\ODBCINST.INI' }
+    @{ view = '32-bit'; path = 'HKLM:\SOFTWARE\WOW6432Node\ODBC\ODBCINST.INI' }
+)
 
 # Caps (size target for the whole bundle: < 10 MB — §7)
 $script:InstallLogTailLines  = 2000
@@ -206,7 +226,7 @@ function Add-WinConfigSupportBundleFile {
         [int]$TailLines = 0,
 
         # Named transforms only — collectors cannot inject arbitrary scriptblocks
-        [ValidateSet('None', 'RedactNetworkXml')]
+        [ValidateSet('None', 'RedactNetworkXml', 'RedactInstallationLog')]
         [string]$Transform = 'None',
 
         [string]$ZengarRoot = $script:ZengarRootDefault
@@ -240,8 +260,21 @@ function Add-WinConfigSupportBundleFile {
         return $result
     }
 
+    # FI-007: the QtIFW installer echoes the MySQL configuration argv into
+    # InstallationLog.txt, password included, on every install. Redact the
+    # VALUES only — the surrounding lines are diagnostically load-bearing
+    # (FI-001 and FI-002 were both root-caused from this log). Values stop at
+    # ';' because the MySQL config argv uses ';' as its own separator, so the
+    # tokens after it (autostart, ports) stay readable. Composes with the tail
+    # cap below, unlike RedactNetworkXml which never tails.
+    $lines = $null
+    if ($Transform -eq 'RedactInstallationLog') {
+        $lines = @(Get-Content -LiteralPath $SourcePath -ErrorAction Stop) -replace `
+            '(?i)((?:passwd|password)\s*=\s*)(?:"[^"]*"|''[^'']*''|[^;\s"'']+)', '$1<redacted>'
+    }
+
     if ($TailLines -gt 0) {
-        $all = @(Get-Content -LiteralPath $SourcePath -ErrorAction Stop)
+        $all = if ($null -ne $lines) { $lines } else { @(Get-Content -LiteralPath $SourcePath -ErrorAction Stop) }
         if ($all.Count -gt $TailLines) {
             $dropped = $all.Count - $TailLines
             $kept = $all[$dropped..($all.Count - 1)]
@@ -252,6 +285,12 @@ function Add-WinConfigSupportBundleFile {
             $result.Truncation = @{ artifact = $safeName; droppedLines = $dropped }
             return $result
         }
+    }
+
+    if ($null -ne $lines) {
+        $lines | Out-File -FilePath $target -Encoding UTF8 -Force
+        $result.Added = $true
+        return $result
     }
 
     Copy-Item -LiteralPath $SourcePath -Destination $target -Force
@@ -552,6 +591,19 @@ function Get-WinConfigSupportCollectors {
                     $exeFacts.lastWriteTime  = $item.LastWriteTime.ToString('o')
                     $exeFacts.sizeBytes      = $item.Length
                 }
+                # The maintenancetool BINARY's own version is a third identity to
+                # reconcile: the ini ProductVersion is the original offline
+                # installer's, and the tool self-updates between releases
+                # (a staged maintenancetool.exe.new completes on a later launch).
+                $mtExe = Join-Path $Context.ZengarRoot 'maintenancetool.exe'
+                $mtFacts = @{ present = (Test-Path $mtExe) }
+                if ($mtFacts.present) {
+                    $item = Get-Item -LiteralPath $mtExe
+                    $mtFacts.fileVersion    = "$($item.VersionInfo.FileVersion)"
+                    $mtFacts.productVersion = "$($item.VersionInfo.ProductVersion)"
+                    $mtFacts.lastWriteTime  = $item.LastWriteTime.ToString('o')
+                    $mtFacts.sizeBytes      = $item.Length
+                }
                 $latestInstall = $null
                 $xmlPath = Join-Path $Context.ZengarRoot 'components.xml'
                 if (Test-Path $xmlPath) {
@@ -564,6 +616,7 @@ function Get-WinConfigSupportCollectors {
                         productVersionIni = $Context.Repository.ProductVersion
                         frameworkVersion  = $Context.Repository.FrameworkVersion
                         noExe             = $exeFacts
+                        maintenancetool   = $mtFacts
                         latestInstallDate = $latestInstall
                     }
                 }
@@ -582,8 +635,11 @@ function Get-WinConfigSupportCollectors {
                 $lineCount = 0
                 try { $lineCount = @(Get-Content -LiteralPath $logPath).Count } catch { }
                 @{
-                    Facts = @{ present = $true; totalLines = $lineCount; tailCap = $Context.Caps.InstallLogTailLines }
-                    Files = @(@{ SourcePath = $logPath; TargetName = 'InstallationLog.txt'; TailLines = $Context.Caps.InstallLogTailLines })
+                    # transform is a fact, not a verdict: it tells the engineer the
+                    # shipped file is post-redaction (FI-007), so a '<redacted>'
+                    # token in it is our doing, not the installer's.
+                    Facts = @{ present = $true; totalLines = $lineCount; tailCap = $Context.Caps.InstallLogTailLines; transform = 'RedactInstallationLog' }
+                    Files = @(@{ SourcePath = $logPath; TargetName = 'InstallationLog.txt'; TailLines = $Context.Caps.InstallLogTailLines; Transform = 'RedactInstallationLog' })
                 }
             }
         }
@@ -1135,6 +1191,96 @@ function Get-WinConfigSupportCollectors {
                 }
             }
         }
+        @{
+            Id = 'WIN-VISA-001'; Ring = 2; RequiresAdmin = $false; RequiresZengar = $false
+            Script = {
+                param($Context)
+                # FI-004: NO 4.x drives the zAmp through WinUSB + NI-VISA, but the
+                # bundle only inspected zAmpLoader\driver — a directory a healthy
+                # 4.x box does not have. These are the 4.x amp-stack facts:
+                # the VISA DLLs NO.exe loads, and whether VID_1167 device nodes
+                # are bound to the WinUSB service.
+                $sys32 = Join-Path $env:SystemRoot 'System32'
+                $dlls = @(foreach ($name in $Context.VisaSystemDlls) {
+                    $p = Join-Path $sys32 $name
+                    $d = @{ name = $name; path = $p; present = (Test-Path -LiteralPath $p) }
+                    if ($d.present) {
+                        $item = Get-Item -LiteralPath $p
+                        $d.fileVersion   = "$($item.VersionInfo.FileVersion)"
+                        $d.sizeBytes     = $item.Length
+                        $d.lastWriteTime = $item.LastWriteTime.ToString('o')
+                    }
+                    $d
+                })
+                $facts = @{
+                    dlls           = $dlls
+                    anyVisaPresent = (@($dlls | Where-Object { $_.present }).Count -gt 0)
+                    winusbVid1167  = @()
+                    enumStatus     = 'Ok'
+                }
+                try {
+                    $devices = @(Get-PnpDevice -ErrorAction Stop | Where-Object { $_.InstanceId -like $Context.ZampVidMatch })
+                    $facts.winusbVid1167 = @(foreach ($dev in $devices) {
+                        $service = $null
+                        try {
+                            $service = (Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_Service' -ErrorAction Stop).Data
+                        } catch { }
+                        @{
+                            instanceId   = "$($dev.InstanceId)"
+                            friendlyName = "$($dev.FriendlyName)"
+                            class        = "$($dev.Class)"
+                            status       = "$($dev.Status)"
+                            service      = "$service"
+                            winUsbBound  = ("$service" -eq 'WINUSB')
+                        }
+                    })
+                } catch {
+                    # Enumeration unavailability is a fact, not a failure (§3.1)
+                    $facts.enumStatus = "Unavailable: $($_.Exception.Message)"
+                }
+                @{ Facts = $facts }
+            }
+        }
+        @{
+            Id = 'WIN-ODBC-001'; Ring = 2; RequiresAdmin = $false; RequiresZengar = $false
+            Script = {
+                param($Context)
+                # MsiInstaller 1918 field lesson: ODBC "driver could not be loaded"
+                # events read as failures but are often stale; the triage move is
+                # checking the CURRENT registration. Facts per registry view:
+                # driver name, registered DLL path, whether that DLL exists, version.
+                $views = @(foreach ($v in $Context.OdbcInstRegPaths) {
+                    $view = @{ view = $v.view; regPath = $v.path; present = (Test-Path $v.path); drivers = @() }
+                    if ($view.present) {
+                        try {
+                            $listKey = Join-Path $v.path 'ODBC Drivers'
+                            $names = @()
+                            if (Test-Path $listKey) { $names = @((Get-Item $listKey).Property) }
+                            $view.drivers = @(foreach ($n in $names) {
+                                $drv = @{ name = "$n" }
+                                try { $drv.state = "$((Get-ItemProperty $listKey -ErrorAction Stop).$n)" } catch { }
+                                $dk = Join-Path $v.path $n
+                                if (Test-Path $dk) {
+                                    $props = Get-ItemProperty $dk -ErrorAction SilentlyContinue
+                                    if ($props -and $props.PSObject.Properties['Driver']) {
+                                        $drv.driverDll = "$($props.Driver)"
+                                        $drv.driverDllPresent = ($drv.driverDll -and (Test-Path -LiteralPath $drv.driverDll))
+                                        if ($drv.driverDllPresent) {
+                                            $drv.fileVersion = "$((Get-Item -LiteralPath $drv.driverDll).VersionInfo.FileVersion)"
+                                        }
+                                    }
+                                }
+                                $drv
+                            })
+                        } catch {
+                            $view.parseStatus = "Unavailable: $($_.Exception.Message)"
+                        }
+                    }
+                    $view
+                })
+                @{ Facts = @{ views = $views } }
+            }
+        }
 
         # ---------------- Ring 3 — Network layer (targeted, §5) ----------------
         @{
@@ -1450,6 +1596,8 @@ function Invoke-WinConfigSupportCollection {
         ZengarLeafThumb  = $script:ZengarLeafThumb
         SectigoE46Thumb  = $script:SectigoE46Thumb
         ZampVidMatch     = $script:ZampVidMatch
+        VisaSystemDlls   = $script:VisaSystemDlls
+        OdbcInstRegPaths = $script:OdbcInstRegPaths
         Caps             = @{
             InstallLogTailLines = $script:InstallLogTailLines
             SetupApiTailLines   = $script:SetupApiTailLines
@@ -1593,6 +1741,18 @@ function Invoke-WinConfigSupportCollection {
             }
         )
         $zengarBlock.productVersionIni = $repoInfo.ProductVersion
+        # Derived environment fact (FI-009): the repo path segments
+        # 'neuroptimal_v<N>/<Channel>' identify the box's product line and
+        # backend channel (dev/staging/released). Triage starts at the header —
+        # this answers "which environment is this box" without opening a
+        # collector file. A derived string is a fact, not a verdict (§3.4).
+        try {
+            $zengarBlock.repositoryChannels = @(
+                @($repoInfo.Repositories) | ForEach-Object { "$($_.url)" } |
+                    ForEach-Object { if ($_ -match 'repository/(neuroptimal_v\d+/[^/\s]+)') { $matches[1] } } |
+                    Where-Object { $_ } | Sort-Object -Unique
+            )
+        } catch { }
         try {
             $noExe = Join-Path $ZengarRoot 'NO.exe'
             if (Test-Path $noExe) {

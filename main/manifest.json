@@ -1,8 +1,8 @@
 {
-  "event": "push",
-  "branch": "main",
-  "source_ref": "313a6bf91e2d7c87d066a48cbf56206ce2bad781",
+  "build_id": "30034917468-1",
   "schema_version": "2.0",
+  "event": "push",
+  "source_ref": "8896d7d86dcf70adca641494fdc7490fc27d1d57",
   "artifacts": [
     {
       "sha256": "d1278321cdcd5c0759d3dfa773e964cda8d254ccdfd7f08dce12f878d317fff9",
@@ -135,9 +135,9 @@
       "size": 11178
     },
     {
-      "sha256": "20ce9aa4a6a45bd410bc4b131631689b392b19305b1c7ff3e22f3a6611f0253b",
+      "sha256": "7b08e9aa174496ae986f47d7c9c1ed51e5b0e206fc33385372b725459c0b327e",
       "path": "src/Modules/SupportBundle.psm1",
-      "size": 90784
+      "size": 100093
     },
     {
       "sha256": "d5aae56334b749b522e83e390b22851614d058bc0331f9b0ebd5e356ca274ec6",
@@ -155,6 +155,6 @@
       "size": 50850
     }
   ],
-  "timestamp": "2026-07-23T17:18:42.0721885Z",
-  "build_id": "30028834691-1"
+  "timestamp": "2026-07-23T18:43:36.2774520Z",
+  "branch": "main"
 }
