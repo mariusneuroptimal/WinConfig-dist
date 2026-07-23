@@ -33,7 +33,10 @@ Set-StrictMode -Off
 # 1.1.0 (2026-07-23): RedactInstallationLog transform (FI-007), maintenancetool
 #   facts in ZEN-VERSION-001, WIN-VISA-001 + WIN-ODBC-001 collectors,
 #   zengar.repositoryChannels manifest fact.
-$script:SupportBundleProbeVersion = '1.1.0'
+# 1.1.1 (2026-07-23): RedactInstallationLog also redacts /LICENSECODE= values
+#   (FI-011 — QtIFW echoes the G-Force installer argv, license code included,
+#   into InstallationLog.txt when the component's Execute operation fails).
+$script:SupportBundleProbeVersion = '1.1.1'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -267,10 +270,15 @@ function Add-WinConfigSupportBundleFile {
     # ';' because the MySQL config argv uses ';' as its own separator, so the
     # tokens after it (autostart, ports) stay readable. Composes with the tail
     # cap below, unlike RedactNetworkXml which never tails.
+    # FI-011: a failed component Execute (seen: com.zengar.no.gforce, exit
+    # code 2) makes QtIFW log the full child argv — including the customer's
+    # /LICENSECODE= value. Same value-only strategy: the command line and the
+    # /S flag after it stay readable.
     $lines = $null
     if ($Transform -eq 'RedactInstallationLog') {
         $lines = @(Get-Content -LiteralPath $SourcePath -ErrorAction Stop) -replace `
-            '(?i)((?:passwd|password)\s*=\s*)(?:"[^"]*"|''[^'']*''|[^;\s"'']+)', '$1<redacted>'
+            '(?i)((?:passwd|password)\s*=\s*)(?:"[^"]*"|''[^'']*''|[^;\s"'']+)', '$1<redacted>' -replace `
+            '(?i)(licensecode\s*=\s*)(?:"[^"]*"|''[^'']*''|[^;\s"'']+)', '$1<redacted>'
     }
 
     if ($TailLines -gt 0) {
