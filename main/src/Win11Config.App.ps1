@@ -3903,10 +3903,15 @@ $buttonHandlers = @{
         "INSUFFICIENT_SIGNAL"
     }
 
+    # Boundary translation: INSUFFICIENT_SIGNAL is DCTC-contract vocabulary only.
+    # The resolver and ledger speak the DiagnosticResult set, where NOT_RUN replaces it
+    # (their ValidateSet rejects the DCTC token - passing it raw crashes the click handler).
+    $ledgerStatus = if ($overallStatus -eq "INSUFFICIENT_SIGNAL") { $DiagnosticResult.NOT_RUN } else { $overallStatus }
+
     # Use Context-Aware Action resolver if available, otherwise fallback to inline logic
     $actionResult = $null
     if (Get-Command Resolve-WinConfigContextAwareActions -ErrorAction SilentlyContinue) {
-        $actionResult = Resolve-WinConfigContextAwareActions -Category "Diagnostics" -Result $overallStatus -Evidence $evidence
+        $actionResult = Resolve-WinConfigContextAwareActions -Category "Diagnostics" -Result $ledgerStatus -Evidence $evidence
     }
 
     # Determine display values from action result or fallback
@@ -3927,7 +3932,7 @@ $buttonHandlers = @{
             "PASS" { $successColor }
             "WARN" { $warningColor }
             "FAIL" { $failureColor }
-            "INSUFFICIENT_SIGNAL" { $warningColor }
+            "NOT_RUN" { $warningColor }
             default { $infoColor }
         }
     } else {
@@ -4071,7 +4076,7 @@ $buttonHandlers = @{
 
     # Update session action with classification, tier, and result
     if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
-        $result = if ($actionResult) { $actionResult.Status } else { $overallStatus }
+        $result = if ($actionResult) { $actionResult.Status } else { $ledgerStatus }
         $tier = if ($actionResult) { $actionResult.MinimumTier } else { 0 }
         $summary = if ($actionResult) { $actionResult.Classification } else { $overallResult }
         $detail = "$overallResult - DNS: $dnsSuccessCount/$($domains.Count), TLS: $tlsSuccessCount/$($tlsEndpoints.Count), Ports: $portSuccessCount/$($ports.Count)"
