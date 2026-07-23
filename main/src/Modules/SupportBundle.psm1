@@ -385,6 +385,7 @@ function Get-WinConfigSupportRepositoryInfo {
         RepositoryUrl      = $null
         RepositoryUsername = $null
         RepositoryPassword = '<redacted>'
+        Repositories       = @()
         ParseStatus        = 'IniNotFound'
     }
 
@@ -450,17 +451,31 @@ function Get-WinConfigSupportRepositoryInfo {
         if ($null -ne $value) { $decoded += ,@{ Index = $decoded.Count; Value = $value } }
     }
 
-    $urlEntry = $decoded | Where-Object { $_.Value -match '^https?://' } | Select-Object -First 1
-    if ($urlEntry) {
+    # EVERY repository, not just the first. A box can carry several lines
+    # (dev / staging / released are separate environments and the set follows
+    # whichever installer was run). Reporting only the first made a reordered
+    # list read as a rewritten one during the 2026-07-22 triage and produced a
+    # confident wrong conclusion — see FI-009.
+    $urlEntries = @($decoded | Where-Object { $_.Value -match '^https?://' })
+    $repositories = @()
+    foreach ($entry in $urlEntries) {
         # Strip userinfo if the URL embeds credentials (https://user:pass@host/...)
-        $info.RepositoryUrl = $urlEntry.Value -replace '^(https?://)[^/@]+@', '$1'
-
+        $repo = @{ url = ($entry.Value -replace '^(https?://)[^/@]+@', '$1'); username = $null }
         # Username = the very next decoded run, if it looks like an account name.
         # Runs beyond that (password, display name) are NEVER emitted.
-        $next = $decoded | Where-Object { $_.Index -eq ($urlEntry.Index + 1) } | Select-Object -First 1
-        if ($next -and $next.Value -match '^[A-Za-z0-9._@-]{1,64}$') {
-            $info.RepositoryUsername = $next.Value
+        $next = $decoded | Where-Object { $_.Index -eq ($entry.Index + 1) } | Select-Object -First 1
+        if ($next -and $next.Value -match '^[A-Za-z0-9._@-]{1,64}$' -and $next.Value -notmatch '^https?://') {
+            $repo.username = $next.Value
         }
+        $repositories += ,$repo
+    }
+    $info.Repositories = @($repositories)
+
+    if ($urlEntries.Count -gt 0) {
+        # First entry retained under the original names for backward compatibility:
+        # existing signatures and the manifest header read these.
+        $info.RepositoryUrl      = $repositories[0].url
+        $info.RepositoryUsername = $repositories[0].username
     } else {
         $info.ParseStatus = 'RepositoryUrlNotFound'
     }
@@ -584,6 +599,12 @@ function Get-WinConfigSupportCollectors {
                         repositoryUrl      = $Context.Repository.RepositoryUrl
                         repositoryUsername = $Context.Repository.RepositoryUsername
                         repositoryPassword = '<redacted>'
+                        # ALL configured repositories, not just the first (FI-009).
+                        # dev/staging/released are separate environments and the set
+                        # follows whichever installer was run, so a single value
+                        # cannot tell you whether a box's channels are consistent.
+                        repositories       = @($Context.Repository.Repositories)
+                        repositoryCount    = @($Context.Repository.Repositories).Count
                         installerFilePath  = $Context.Repository.InstallerFilePath
                         targetDir          = $Context.Repository.TargetDir
                     }
@@ -1409,7 +1430,7 @@ function Invoke-WinConfigSupportCollection {
     try {
         $repoInfo = Get-WinConfigSupportRepositoryInfo -IniPath (Join-Path $ZengarRoot 'maintenancetool.ini')
     } catch {
-        $repoInfo = @{ Present = $false; ParseStatus = "ParseError: $($_.Exception.Message)"; RepositoryUrl = $null; RepositoryUsername = $null; RepositoryPassword = '<redacted>'; ProductVersion = $null; FrameworkVersion = $null; InstallerFilePath = $null; TargetDir = $null }
+        $repoInfo = @{ Present = $false; ParseStatus = "ParseError: $($_.Exception.Message)"; RepositoryUrl = $null; RepositoryUsername = $null; RepositoryPassword = '<redacted>'; Repositories = @(); ProductVersion = $null; FrameworkVersion = $null; InstallerFilePath = $null; TargetDir = $null }
     }
 
     $context = @{
