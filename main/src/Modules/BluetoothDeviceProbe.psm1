@@ -438,6 +438,12 @@ function New-DeviceProbeSession {
         AdapterInfo              = $null
         PowerPlan                = $null
         PendingConfirmation      = $null
+        # SERIALCOMM / COM-symlink integrity, captured at session start and end.
+        # Two samples rather than one because the interesting case is a box that
+        # was healthy when recording began and corrupt when it ended -- that
+        # pins the corruption to something that happened during the session.
+        SerialPortIntegrity      = $null
+        SerialPortIntegrityEnd   = $null
     }
 }
 
@@ -690,6 +696,35 @@ function Get-DeviceProbeSessionSummary {
     )
 
     $findings = [System.Collections.ArrayList]::new()
+
+    # ── SERIALCOMM / COM-symlink integrity ────────────────────────────────────
+    # FI-012. This is the state where Device Manager shows the ports Present/OK,
+    # NO.exe resolves the command port correctly, and CreateFile still fails with
+    # ERROR_FILE_NOT_FOUND because the \GLOBAL??\COMx symlink is gone. Nothing
+    # else in the recorder can see it -- ghost-device enumeration reports zero
+    # ghosts on a box in this state -- so it goes first, above the COM-port
+    # findings, which are noise by comparison when the ports cannot be opened at
+    # all. Populated by the caller; absent on older sessions.
+    $integStart = $Session.SerialPortIntegrity
+    $integEnd   = $Session.SerialPortIntegrityEnd
+    $integ      = if ($integEnd) { $integEnd } else { $integStart }
+
+    if ($integ) {
+        if (-not $integ.Healthy -and $integ.MissingSymlinkCount -gt 0) {
+            [void]$findings.Add("[!] Bluetooth COM ports are broken at the OS level: $($integ.EntryCount) SERIALCOMM registrations for $($integ.ComNameCount) COM name(s), $($integ.CollisionCount) collided, $($integ.MissingSymlinkCount) symlink(s) absent. No process can open ANY Bluetooth COM port in this state -- expect 'Control Port not valid' / 'Arc not detected'. FIX: reboot. Re-pairing also clears it but is more disruptive and adds another COM-name generation.")
+        } elseif (-not $integ.Healthy -and $integ.CollisionCount -gt 0) {
+            [void]$findings.Add("[!] Bluetooth serial port registrations are colliding: $($integ.CollisionCount) COM name(s) claimed by more than one device object, but the symlinks still resolve. Ports work right now -- this is the state that precedes 'Control Port not valid'. A reboot clears it before it bites.")
+        } elseif ($integ.Healthy) {
+            [void]$findings.Add("[ok] Bluetooth serial port registrations are consistent ($($integ.EntryCount) entries for $($integ.ComNameCount) COM name(s), all symlinks resolve)")
+        }
+
+        # Degraded mid-session: the recorder's unique contribution. A single
+        # sample cannot tell you whether the box arrived broken or broke while
+        # you watched; this can, and it pins the trigger to this session.
+        if ($integStart -and $integEnd -and $integStart.Healthy -and -not $integEnd.Healthy) {
+            [void]$findings.Add("[!] Bluetooth serial port registrations DEGRADED during this session: healthy at start, $($integEnd.CollisionCount) collision(s) / $($integEnd.MissingSymlinkCount) absent symlink(s) at end. Whatever happened in this recording is what corrupts them -- check the session log for sleep/resume or a re-pair.")
+        }
+    }
 
     # COM port number stats
     $allPortNums = @($Session.ComPortHistory | ForEach-Object { $_.Ports } | ForEach-Object {

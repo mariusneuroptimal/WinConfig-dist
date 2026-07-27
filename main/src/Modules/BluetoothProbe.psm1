@@ -3523,6 +3523,20 @@ function Get-BluetoothCOMPorts {
                 }
             } catch { }
 
+            # DEVPKEY_Device_BusReportedDeviceDesc - the per-channel name the
+            # DEVICE reports (e.g. "NEUROPTIMAL COMMAND" / "NEUROPTIMAL DATA").
+            # FriendlyName is the generic "Standard Serial over Bluetooth link
+            # (COMx)" for every SPP channel, so this is the ONLY field that
+            # distinguishes the command port from the data port. Applications
+            # select the control port on it; without it captured, a bundle
+            # cannot show whether port selection was correct.
+            $busReportedDesc = $null
+            try {
+                $busReportedDesc = (Get-PnpDeviceProperty -InstanceId $instanceId `
+                    -KeyName '{540b947e-8b40-45bc-a8a2-6a0b894cbda2} 4' `
+                    -ErrorAction SilentlyContinue).Data
+            } catch { }
+
             # Clean device name for display
             $displayName = $friendlyName
             if ($displayName -match "^Standard Serial over Bluetooth link") {
@@ -3533,6 +3547,7 @@ function Get-BluetoothCOMPorts {
                 COMPort = $comNumber
                 DeviceName = $displayName
                 FriendlyName = $friendlyName
+                BusReportedDeviceDesc = $busReportedDesc
                 InstanceId = $instanceId
                 Status = if ($isPresent) { "Present" } else { "Ghost" }
                 IsGhost = $isGhost
@@ -3558,6 +3573,430 @@ function Get-BluetoothCOMPorts {
         $result.Error = $_.Exception.Message
     }
 
+    return $result
+}
+
+function Initialize-SerialSymlinkApi {
+    <#
+    .SYNOPSIS
+        Loads the QueryDosDevice P/Invoke used to resolve \GLOBAL??\COMx
+        symlinks. Idempotent.
+    .OUTPUTS
+        [bool] $true if the API is available, $false otherwise.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    if ($script:SerialSymlinkApiAvailable) { return $true }
+
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'WinConfigSerialSymlink').Type) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class WinConfigSerialSymlink {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, uint ucchMax);
+
+    // Returns the device object the DOS name points at, or "ERR:<win32>" when
+    // the symlink does not exist. Callers MUST treat "ERR:" as data, not as an
+    // exception - an absent COMx symlink is the exact fault this detects.
+    public static string Resolve(string dosName) {
+        var sb = new StringBuilder(4096);
+        uint n = QueryDosDevice(dosName, sb, 4096);
+        if (n == 0) { return "ERR:" + Marshal.GetLastWin32Error(); }
+        return sb.ToString();
+    }
+}
+'@ -ErrorAction Stop
+        }
+        $script:SerialSymlinkApiAvailable = $true
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-BluetoothSerialPortIntegrity {
+    <#
+    .SYNOPSIS
+        Cross-checks the three layers that must agree before a Bluetooth COM
+        port can be opened: SERIALCOMM registrations, the Object Manager
+        symlink, and PnP presence.
+    .DESCRIPTION
+        Ghost enumeration (Get-BluetoothCOMPorts) only sees non-present PnP
+        nodes. A machine can have ZERO ghosts and still be unable to open any
+        Bluetooth COM port, because the fault lives a layer below:
+
+            PnP / Device Manager            COM5, COM6 Present, Status OK
+            HKLM\HARDWARE\DEVICEMAP\
+              SERIALCOMM                    12 entries for 4 COM names
+            \GLOBAL??\COMx (QueryDosDevice) symlink ABSENT (win32err 2)
+
+        In that state CreateFile returns ERROR_FILE_NOT_FOUND and the calling
+        app reports something like "Control Port 'COM6' is not valid" - which
+        reads as a configuration problem even though port selection was
+        correct. Observed on MMEVOLD_06 2026-07-27 (NeurOptimal Arc): three
+        \Device\BthModemNN objects registered per COM name, all four symlinks
+        destroyed, every open failing.
+
+        HKLM\HARDWARE is a VOLATILE hive rebuilt from scratch at every boot,
+        so a collision there was necessarily created during the current boot
+        session - the Bluetooth serial driver re-registers COM names across
+        sleep/resume without tearing down the previous generation, and the
+        symlink is lost in the collision. A reboot clears it. Unpair/re-pair
+        does NOT - it just mints another colliding generation.
+
+        Read-only. Makes no changes.
+    .OUTPUTS
+        [hashtable] Healthy, CollisionCount, MissingSymlinkCount, Entries,
+        Findings, Summary, Recommendation, ApiAvailable, Error
+    #>
+    [CmdletBinding()]
+    param()
+
+    $registrations = @()
+    $symlinkMap    = @{}
+    $symlinksValid = $false
+    $collectError  = $null
+
+    try {
+        # --- Layer 2: SERIALCOMM registrations -------------------------------
+        $serialCommPath = 'HKLM:\HARDWARE\DEVICEMAP\SERIALCOMM'
+        if (Test-Path $serialCommPath) {
+            $raw = Get-ItemProperty -Path $serialCommPath -ErrorAction Stop
+            foreach ($p in $raw.PSObject.Properties) {
+                if ($p.Name -like 'PS*') { continue }
+                $registrations += [PSCustomObject]@{
+                    DeviceObject = $p.Name
+                    ComName      = [string]$p.Value
+                }
+            }
+        }
+
+        # --- Layer 3: Object Manager symlinks --------------------------------
+        # The 'C:' control resolve is mandatory. Without it a broken P/Invoke
+        # is indistinguishable from a machine with every symlink destroyed,
+        # and we would report a catastrophic false positive.
+        if (Initialize-SerialSymlinkApi) {
+            $control = [WinConfigSerialSymlink]::Resolve('C:')
+            if ($control -and $control -notlike 'ERR:*') {
+                $symlinksValid = $true
+                foreach ($name in @($registrations | Select-Object -ExpandProperty ComName -Unique)) {
+                    $symlinkMap[$name] = [WinConfigSerialSymlink]::Resolve($name)
+                }
+            }
+        }
+    } catch {
+        $collectError = $_.Exception.Message
+    }
+
+    $verdict = Test-BluetoothSerialPortIntegrity -Registrations $registrations `
+                   -SymlinkMap $symlinkMap -SymlinksValid:$symlinksValid
+    $verdict.Error = $collectError
+    if ($collectError) {
+        $verdict.Summary = "Serial port integrity check failed: $collectError"
+    }
+    return $verdict
+}
+
+function Test-BluetoothSerialPortIntegrity {
+    <#
+    .SYNOPSIS
+        Pure verdict function for Bluetooth serial port integrity. Correlates
+        SERIALCOMM registrations against resolved COMx symlinks.
+    .DESCRIPTION
+        Split out from Get-BluetoothSerialPortIntegrity so the detection logic
+        can be tested against captured broken-state data without needing a
+        machine in that state. Takes no live dependencies.
+    .PARAMETER Registrations
+        Array of objects with DeviceObject + ComName, as read from
+        HKLM\HARDWARE\DEVICEMAP\SERIALCOMM.
+    .PARAMETER SymlinkMap
+        Hashtable of ComName -> resolved device object, or "ERR:<win32>" when
+        QueryDosDevice failed for that name.
+    .PARAMETER SymlinksValid
+        $false when the symlink layer could not be read at all (P/Invoke
+        unavailable or the control probe failed). Symlink findings are then
+        suppressed rather than reported as absent.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$Registrations,
+        [hashtable]$SymlinkMap = @{},
+        [switch]$SymlinksValid
+    )
+
+    $result = @{
+        Healthy             = $true
+        CollisionCount      = 0
+        MissingSymlinkCount = 0
+        ComNameCount        = 0
+        EntryCount          = $Registrations.Count
+        Entries             = @()
+        Findings            = @()
+        Summary             = $null
+        Recommendation      = $null
+        SymlinksChecked     = [bool]$SymlinksValid
+        Error               = $null
+    }
+
+    if ($Registrations.Count -eq 0) {
+        $result.Summary = "No serial port registrations found"
+        return $result
+    }
+
+    $comNames = @($Registrations | Select-Object -ExpandProperty ComName -Unique)
+    $result.ComNameCount = $comNames.Count
+
+    foreach ($name in $comNames) {
+        $owners  = @($Registrations | Where-Object { $_.ComName -eq $name })
+        $symlink = if ($SymlinksValid -and $SymlinkMap.ContainsKey($name)) { $SymlinkMap[$name] } else { $null }
+        $symlinkOk = if ($SymlinksValid) { [bool]($symlink -and $symlink -notlike 'ERR:*') } else { $null }
+
+        if ($owners.Count -gt 1)              { $result.CollisionCount++ }
+        if ($SymlinksValid -and -not $symlinkOk) { $result.MissingSymlinkCount++ }
+
+        $result.Entries += [PSCustomObject]@{
+            ComName       = $name
+            OwnerCount    = $owners.Count
+            DeviceObjects = @($owners | Select-Object -ExpandProperty DeviceObject)
+            IsBluetooth   = [bool]@($owners | Where-Object { $_.DeviceObject -match 'BthModem|RFCOMM|BTHMODEM' }).Count
+            Symlink       = $symlink
+            SymlinkOk     = $symlinkOk
+            Collision     = ($owners.Count -gt 1)
+        }
+    }
+
+    foreach ($e in ($result.Entries | Where-Object { $_.Collision })) {
+        $result.Healthy = $false
+        $result.Findings += "COLLISION: $($e.ComName) claimed by $($e.OwnerCount) device objects ($($e.DeviceObjects -join ', '))"
+    }
+    foreach ($e in ($result.Entries | Where-Object { $_.SymlinkOk -eq $false })) {
+        $result.Healthy = $false
+        $result.Findings += "SYMLINK ABSENT: $($e.ComName) is registered but \GLOBAL??\$($e.ComName) does not resolve ($($e.Symlink)) - CreateFile returns ERROR_FILE_NOT_FOUND and the app reports the port as invalid"
+    }
+    if (-not $result.SymlinksChecked) {
+        $result.Findings += "NOTE: symlink layer not readable - collision findings only"
+    }
+
+    if (-not $result.Healthy) {
+        $result.Summary = "$($result.EntryCount) SERIALCOMM entries for $($result.ComNameCount) COM name(s); $($result.CollisionCount) collided, $($result.MissingSymlinkCount) symlink(s) absent"
+        $result.Recommendation = "REBOOT - do not unpair. HKLM\HARDWARE is volatile and rebuilt at boot, which clears the duplicate registrations and restores the COM symlinks. Unpairing/re-pairing does not fix this and adds another colliding generation."
+    } else {
+        $result.Summary = "$($result.EntryCount) SERIALCOMM entries for $($result.ComNameCount) COM name(s); no collisions, all symlinks resolve"
+    }
+
+    return $result
+}
+
+function Initialize-SerialOpenApi {
+    <#
+    .SYNOPSIS
+        Loads the CreateFile P/Invoke used to open a COM port and read the raw
+        win32 error. Idempotent.
+    .DESCRIPTION
+        System.IO.Ports.SerialPort cannot be used for this. It throws IOException
+        whose HResult is the generic COR_E_IO (0x80131620) -- the win32 code
+        survives only inside the LOCALIZED message text ("The port 'COM6' does
+        not exist."). Classifying on that string would silently misclassify every
+        non-English machine in the field, and the whole point of this check is to
+        tell ERROR_FILE_NOT_FOUND (reboot) apart from ERROR_SEM_TIMEOUT (toggle
+        the radio). CreateFile + GetLastError gives the number directly.
+    .OUTPUTS
+        [bool]
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    if ($script:SerialOpenApiAvailable) { return $true }
+
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'WinConfigSerialOpen').Type) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class WinConfigSerialOpen {
+    const uint GENERIC_READ  = 0x80000000;
+    const uint GENERIC_WRITE = 0x40000000;
+    const uint OPEN_EXISTING = 3;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateFile(string lpFileName, uint dwDesiredAccess,
+        uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+        uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    // Returns 0 when the port opened, otherwise the raw win32 error. The handle
+    // is closed immediately -- this establishes and tears down an RFCOMM link,
+    // it does not hold the port. No DCB/baud configuration is performed, so it
+    // disturbs the device as little as an open possibly can.
+    public static int TryOpen(string portName) {
+        string path = @"\\.\" + portName;
+        IntPtr h = CreateFile(path, GENERIC_READ | GENERIC_WRITE, 0, IntPtr.Zero,
+                              OPEN_EXISTING, 0, IntPtr.Zero);
+        if (h == IntPtr.Zero || h.ToInt64() == -1) { return Marshal.GetLastWin32Error(); }
+        CloseHandle(h);
+        return 0;
+    }
+}
+'@ -ErrorAction Stop
+        }
+        $script:SerialOpenApiAvailable = $true
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-SerialOpenClassification {
+    <#
+    .SYNOPSIS
+        Maps a raw win32 error from a COM-port open into a FI-012 verdict.
+    .DESCRIPTION
+        Pure. Split out so the mapping is testable without a Bluetooth radio.
+        The three codes that matter were all observed on MMEVOLD_06 2026-07-27:
+
+          0   opened                     -> Healthy
+          2   ERROR_FILE_NOT_FOUND       -> PortMissing        (fault 1, reboot)
+          5   ERROR_ACCESS_DENIED        -> InUse              (another process holds it)
+          121 ERROR_SEM_TIMEOUT          -> DeviceNotResponding (fault 2, toggle radio)
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][int]$Win32Error)
+
+    switch ($Win32Error) {
+        0   { return @{ Classification = 'Healthy'; Meaning = 'Port opened'; Action = $null } }
+        2   { return @{ Classification = 'PortMissing'
+                        Meaning = 'ERROR_FILE_NOT_FOUND - the COM symlink does not exist, so no process can open this port'
+                        Action  = 'Reboot. HKLM\HARDWARE is volatile and rebuilt at boot. Do not re-pair first.' } }
+        5   { return @{ Classification = 'InUse'
+                        Meaning = 'ERROR_ACCESS_DENIED - the port exists and another process holds it'
+                        Action  = 'Close the application holding the port (usually NO.exe) and retry.' } }
+        121 { return @{ Classification = 'DeviceNotResponding'
+                        Meaning = 'ERROR_SEM_TIMEOUT - the port is healthy; the device did not answer the RFCOMM connect'
+                        Action  = 'Confirm the headset is powered on, then toggle the Bluetooth radio off/on (>=10s off).' } }
+        default { return @{ Classification = 'Unknown'
+                            Meaning = "win32 error $Win32Error"
+                            Action  = $null } }
+    }
+}
+
+function Test-BluetoothSerialPortOpen {
+    <#
+    .SYNOPSIS
+        GUARDED. Attempts to open Bluetooth COM ports and classifies the result,
+        distinguishing the two FI-012 faults from each other.
+    .DESCRIPTION
+        This is the only way to observe FI-012 fault 2 (`ERROR_SEM_TIMEOUT`:
+        registrations and symlinks healthy, device not answering). Registry
+        inspection cannot see it -- the port looks perfect until something tries
+        to open it.
+
+        INTRUSIVE BY NATURE. Opening a port establishes an RFCOMM link, and if
+        NO.exe is mid-connect the open can be stolen from it, producing exactly
+        the spurious "Control Port not valid" this whole investigation was about.
+        So:
+          - it refuses to run while NO.exe is up unless -Force,
+          - it is NOT called anywhere in the Flight Recorder path. The recorder
+            runs during real client sessions; an automatic open attempt there
+            would break sessions to diagnose them.
+        Operator-initiated only.
+
+        A failing open costs ~5s per port (the RFCOMM connect timeout), and a
+        cold successful open on the command port takes ~4.5s.
+    .PARAMETER PortName
+        Ports to test. Defaults to the Bluetooth SPP ports found on the system.
+    .PARAMETER Force
+        Run even though a blocking process is up. Accepts the risk of stealing
+        the port from a live session.
+    .PARAMETER BlockingProcess
+        Process names that must not be running. Defaults to NO.
+    #>
+    [CmdletBinding()]
+    param(
+        [string[]]$PortName,
+        [switch]$Force,
+        [string[]]$BlockingProcess = @('NO')
+    )
+
+    $result = @{
+        Ran      = $false
+        Refused  = $false
+        Reason   = $null
+        Results  = @()
+        Summary  = $null
+    }
+
+    $running = @()
+    foreach ($p in $BlockingProcess) {
+        if (Get-Process -Name $p -ErrorAction SilentlyContinue) { $running += $p }
+    }
+    if ($running.Count -gt 0 -and -not $Force) {
+        $result.Refused = $true
+        $result.Reason  = "Refused: $($running -join ', ') is running. Opening a COM port can steal it from a live session and produce the very error being diagnosed. Close it, or pass -Force to accept that risk."
+        $result.Summary = $result.Reason
+        return $result
+    }
+
+    if (-not (Initialize-SerialOpenApi)) {
+        $result.Reason  = 'CreateFile P/Invoke unavailable'
+        $result.Summary = $result.Reason
+        return $result
+    }
+
+    if (-not $PortName -or $PortName.Count -eq 0) {
+        $ports = @()
+        try {
+            $bt = Get-BluetoothCOMPorts
+            $ports = @($bt.COMPorts | Where-Object { $_.COMPort } | Select-Object -ExpandProperty COMPort -Unique)
+        } catch { }
+        $PortName = $ports
+    }
+    if (-not $PortName -or $PortName.Count -eq 0) {
+        $result.Reason  = 'No Bluetooth COM ports found to test'
+        $result.Summary = $result.Reason
+        return $result
+    }
+
+    # Role labels come from BusReportedDeviceDesc -- FriendlyName is the generic
+    # "Standard Serial over Bluetooth link (COMx)" on every SPP channel.
+    $roles = @{}
+    try {
+        foreach ($p in (Get-BluetoothCOMPorts).COMPorts) {
+            if ($p.COMPort) { $roles[$p.COMPort] = $p.BusReportedDeviceDesc }
+        }
+    } catch { }
+
+    $result.Ran = $true
+    foreach ($port in $PortName) {
+        $sw  = [Diagnostics.Stopwatch]::StartNew()
+        $err = [WinConfigSerialOpen]::TryOpen($port)
+        $sw.Stop()
+        $c = Get-SerialOpenClassification -Win32Error $err
+        $result.Results += [PSCustomObject]@{
+            PortName       = $port
+            Role           = $roles[$port]
+            Opened         = ($err -eq 0)
+            Win32Error     = $err
+            ElapsedMs      = $sw.ElapsedMilliseconds
+            Classification = $c.Classification
+            Meaning        = $c.Meaning
+            Action         = $c.Action
+        }
+    }
+
+    $bad = @($result.Results | Where-Object { -not $_.Opened })
+    $result.Summary = if ($bad.Count -eq 0) {
+        "All $($result.Results.Count) Bluetooth COM port(s) opened"
+    } else {
+        "$($bad.Count) of $($result.Results.Count) port(s) failed to open: $(($bad | ForEach-Object { "$($_.PortName)=$($_.Classification)" }) -join ', ')"
+    }
     return $result
 }
 
@@ -3622,12 +4061,16 @@ function Invoke-BluetoothGhostCOMCleanup {
     .PARAMETER Force
         Skip confirmation prompt (still requires admin).
     .PARAMETER WhatIf
-        Preview which devices would be removed without making changes.
+        Preview which devices would be removed without making changes. This is
+        the standard ShouldProcess common parameter - do NOT redeclare it in
+        the param block. Declaring it alongside SupportsShouldProcess makes
+        every invocation throw "A parameter with the name 'WhatIf' was defined
+        multiple times for the command", which is what made this function
+        permanently uncallable before 2026-07-27.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
-        [switch]$Force,
-        [switch]$WhatIf
+        [switch]$Force
     )
 
     $result = @{
@@ -3639,6 +4082,7 @@ function Invoke-BluetoothGhostCOMCleanup {
         Details = @()
         RemovedDevices = @()
         FailedDevices = @()
+        Integrity = $null
     }
 
     # Precondition 1: Admin check
@@ -3670,12 +4114,32 @@ function Invoke-BluetoothGhostCOMCleanup {
     if ($ghostPorts.Count -eq 0) {
         $result.Success = $true
         $result.Message = "No ghost Bluetooth COM ports found"
+
+        # An empty ghost list does NOT mean the COM ports work. Ghost
+        # enumeration only sees non-present PnP nodes; the SERIALCOMM
+        # collision / destroyed-symlink fault leaves every node Present and
+        # OK while no process can open any Bluetooth COM port. Reporting
+        # "nothing to do" there sends the operator to unpair/re-pair, which
+        # makes it worse. See Get-BluetoothSerialPortIntegrity.
+        try {
+            $integrity = Get-BluetoothSerialPortIntegrity
+            $result.Integrity = $integrity
+            if (-not $integrity.Healthy) {
+                $result.Message = "No ghost COM ports to remove, but the serial port registrations are corrupt: $($integrity.Summary)"
+                foreach ($f in $integrity.Findings) { $result.Details += $f }
+                if ($integrity.Recommendation) { $result.Details += $integrity.Recommendation }
+            } else {
+                $result.Details += $integrity.Summary
+            }
+        } catch {
+            $result.Details += "Serial port integrity check failed: $($_.Exception.Message)"
+        }
         return $result
     }
 
     $result.Details += "Found $($ghostPorts.Count) ghost Bluetooth COM port(s)"
 
-    if ($WhatIf) {
+    if ($WhatIfPreference) {
         # Return canonical WinConfig.DryRunResult with structured plan steps
         $steps = @()
         foreach ($port in $ghostPorts) {
@@ -4821,6 +5285,12 @@ Export-ModuleMember -Function @(
     'Get-BluetoothEventLogHints',
     # Bluetooth COM port detection (state accretion)
     'Get-BluetoothCOMPorts',
+    'Get-BluetoothSerialPortIntegrity',
+    'Test-BluetoothSerialPortIntegrity',
+    'Test-BluetoothSerialPortOpen',
+    'Get-SerialOpenClassification',
+    'Initialize-SerialSymlinkApi',
+    'Initialize-SerialOpenApi',
     'Invoke-RevealHiddenBluetoothDevices',
     'Invoke-BluetoothGhostCOMCleanup',
     # Audit critical-fix helpers (exported for unit tests + downstream tooling)

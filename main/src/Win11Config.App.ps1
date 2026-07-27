@@ -4607,6 +4607,20 @@ $buttonHandlers = @{
                 $btProbeSession.BtWin32Available = $btWin32Ok
                 $btProbeSession.NoExeVersion = try { Get-NoExeVersion } catch { $null }
 
+                # FI-012 baseline. Read-only registry + QueryDosDevice; cheap
+                # enough to run inline. Guarded because the probe module may be
+                # an older copy without it (env-var override / sibling repo).
+                if (Get-Command Get-BluetoothSerialPortIntegrity -ErrorAction SilentlyContinue) {
+                    $btProbeSession.SerialPortIntegrity = try { Get-BluetoothSerialPortIntegrity } catch { $null }
+                    if ($btProbeSession.SerialPortIntegrity -and -not $btProbeSession.SerialPortIntegrity.Healthy) {
+                        Write-BtLog "  [!] $($btProbeSession.SerialPortIntegrity.Summary)" -Level "FAIL"
+                        foreach ($f in $btProbeSession.SerialPortIntegrity.Findings) { Write-BtLog "      $f" -Level "DIM" }
+                        if ($btProbeSession.SerialPortIntegrity.Recommendation) {
+                            Write-BtLog "      $($btProbeSession.SerialPortIntegrity.Recommendation)" -Level "FAIL"
+                        }
+                    }
+                }
+
                 # Auto-detect NeurOptimal device from PnP
                 $btTargetName = 'NeurOptimal Headset'
                 try {
@@ -4989,6 +5003,12 @@ $buttonHandlers = @{
             # ── Probe session summary (before final snapshot) ─────────────────────
             $btProbeSummary = $null
             if ($btDeepProbeAvailable -and $btProbeSession -and $btProbeWatch) {
+                # FI-012 second sample. Taken before the summary so a box that
+                # degraded mid-recording is reported as such rather than as
+                # "arrived broken".
+                if (Get-Command Get-BluetoothSerialPortIntegrity -ErrorAction SilentlyContinue) {
+                    $btProbeSession.SerialPortIntegrityEnd = try { Get-BluetoothSerialPortIntegrity } catch { $null }
+                }
                 $btProbeSummary = Get-DeviceProbeSessionSummary -Session $btProbeSession -WatchState $btProbeWatch
                 $btWatchReport  = New-TargetWatchReport -WatchState $btProbeWatch
 
@@ -5067,6 +5087,39 @@ $buttonHandlers = @{
                         }
                     } catch { }
                 }
+
+                # FI-012 structured evidence. The session summary carries the
+                # verdict as a sentence; this carries the table it was derived
+                # from -- every SERIALCOMM registration, which device objects
+                # collided on which COM name, and what each symlink resolved to.
+                # That is what makes a ZIP triageable remotely without the box in
+                # front of you, which is exactly what this escalation lacked.
+                # Two samples so "arrived broken" and "degraded while recording"
+                # stay distinguishable after the fact.
+                if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
+                    try {
+                        $siStart = $btProbeSession.SerialPortIntegrity
+                        $siEnd   = $btProbeSession.SerialPortIntegrityEnd
+                        if ($siStart -or $siEnd) {
+                            # Depth 8 as headroom. The nesting runs Data >
+                            # AtSessionStart > Entries > entry > DeviceObjects >
+                            # string; the default 5 does happen to serialize
+                            # that intact today (verified), but the colliding
+                            # device-object names are the entire evidentiary
+                            # value of this artifact and ConvertTo-Json flattens
+                            # silently -- a file that looks complete and proves
+                            # nothing is the worst failure mode here. Cheap
+                            # insurance against a future field being added.
+                            Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'serialcomm-integrity.json' -Depth 8 -Data @{
+                                Fault          = 'FI-012'
+                                Reference      = 'docs/FIELD-ISSUES.md'
+                                AtSessionStart = $siStart
+                                AtSessionEnd   = $siEnd
+                                DegradedInRun  = [bool]($siStart -and $siEnd -and $siStart.Healthy -and -not $siEnd.Healthy)
+                            }
+                        }
+                    } catch { }
+                }
             }
 
             # ── PHASE 3: Final snapshot, package, upload ──────────────────────────
@@ -5140,6 +5193,22 @@ $buttonHandlers = @{
                         ProbeFindingCount      = if ($btProbeSummary) { $btProbeSummary.Findings.Count   } else { $null }
                         ProbeReconnectCount    = if ($btProbeSession) { $btProbeSession.ReconnectTimes.Count } else { $null }
                         ProbeBtLinkFlapCount   = if ($btProbeSession) { $btProbeSession.BtLinkFlapCount } else { $null }
+                        # FI-012 at the top level so a ZIP can be triaged from
+                        # the manifest alone -- these ZIPs are not auto-analyzed,
+                        # so whoever opens one should not have to know which
+                        # artifact to read to find out the box could not open a
+                        # single serial port. Null on older/partial runs.
+                        SerialPortIntegrityHealthy = if ($btProbeSession -and $btProbeSession.SerialPortIntegrity) {
+                            [bool]($(if ($btProbeSession.SerialPortIntegrityEnd) { $btProbeSession.SerialPortIntegrityEnd } else { $btProbeSession.SerialPortIntegrity }).Healthy)
+                        } else { $null }
+                        SerialPortCollisionCount = if ($btProbeSession -and $btProbeSession.SerialPortIntegrity) {
+                            $(if ($btProbeSession.SerialPortIntegrityEnd) { $btProbeSession.SerialPortIntegrityEnd } else { $btProbeSession.SerialPortIntegrity }).CollisionCount
+                        } else { $null }
+                        SerialPortMissingSymlinkCount = if ($btProbeSession -and $btProbeSession.SerialPortIntegrity) {
+                            $(if ($btProbeSession.SerialPortIntegrityEnd) { $btProbeSession.SerialPortIntegrityEnd } else { $btProbeSession.SerialPortIntegrity }).MissingSymlinkCount
+                        } else { $null }
+                        SerialPortDegradedInRun = [bool]($btProbeSession -and $btProbeSession.SerialPortIntegrity -and $btProbeSession.SerialPortIntegrityEnd -and
+                                                          $btProbeSession.SerialPortIntegrity.Healthy -and -not $btProbeSession.SerialPortIntegrityEnd.Healthy)
                     }
                     Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'manifest.json' -Data $manifest
                 } catch { }
