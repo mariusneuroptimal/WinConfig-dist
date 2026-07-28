@@ -1421,6 +1421,242 @@ $buttonHandlers = @{
         [System.Windows.Forms.Clipboard]::SetText($machineInfo.FormattedVersion)
         [System.Windows.Forms.MessageBox]::Show("Windows version copied to clipboard: $($machineInfo.FormattedVersion)", "Windows Version", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     }
+    "Machine Identifiers" = {
+        # Shows the same three values the Zengar licensing app fingerprints the
+        # machine with - MAC Addresses, ProcessorID, DiskID - read from the same
+        # WMI sources, plus the cause when one of them is missing or fragile.
+        # All logic lives in MachineIdentifiers.psm1; this handler owns only UI.
+        # Read-only: nothing here mutates, so there is no dry-run path.
+        if (-not (Get-Command Get-WinConfigMachineIdentifiers -ErrorAction SilentlyContinue)) {
+            $miModulePath = Join-Path $PSScriptRoot "Modules\MachineIdentifiers.psm1"
+            if (Test-Path $miModulePath) {
+                try {
+                    Import-Module $miModulePath -Force -Global -ErrorAction Stop
+                } catch {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "Failed to load the machine identifiers module:`n$($_.Exception.Message)",
+                        "Module Load Error",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Error
+                    ) | Out-Null
+                    return
+                }
+            }
+        }
+        if (-not (Get-Command Get-WinConfigMachineIdentifiers -ErrorAction SilentlyContinue)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Machine identifiers module not found. This is unexpected for a bootstrap install - please re-run the bootstrap command to repair.",
+                "Module Not Available",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return
+        }
+
+        $miForm = New-Object System.Windows.Forms.Form
+        $miForm.Text = "Machine Identifiers"
+        $miForm.StartPosition = "CenterScreen"
+        $miForm.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+        $miForm.Size = New-Object System.Drawing.Size(780, 660)
+        $miForm.MinimumSize = New-Object System.Drawing.Size(620, 480)
+
+        # --- Identifier panel: mirrors the licensing app's layout so the tech can
+        # --- compare the two screens value-for-value without translating fields.
+        $miGroup = New-Object System.Windows.Forms.GroupBox
+        $miGroup.Text = "Machine Identifiers"
+        $miGroup.Dock = [System.Windows.Forms.DockStyle]::Top
+        $miGroup.Height = 300
+        $miGroup.Padding = New-Object System.Windows.Forms.Padding(10)
+
+        $miFields = New-Object System.Windows.Forms.FlowLayoutPanel
+        $miFields.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $miFields.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+        $miFields.WrapContents = $false
+        $miFields.AutoScroll = $true
+        $miGroup.Controls.Add($miFields)
+
+        $miMonoFont = New-Object System.Drawing.Font('Consolas', 10)
+
+        $miMacLabel = New-Object System.Windows.Forms.Label
+        $miMacLabel.Text = "MAC Addresses"
+        $miMacLabel.AutoSize = $true
+        $miMacLabel.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 2)
+        $miFields.Controls.Add($miMacLabel)
+
+        # Value display fields (not diagnostic output) - $txtValue naming per the
+        # console-wrapper contract exemption for value fields.
+        $txtValueMacAddresses = New-Object System.Windows.Forms.TextBox
+        $txtValueMacAddresses.Multiline = $true
+        $txtValueMacAddresses.ReadOnly = $true
+        $txtValueMacAddresses.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+        $txtValueMacAddresses.Width = 560
+        $txtValueMacAddresses.Height = 96
+        $txtValueMacAddresses.Font = $miMonoFont
+        $txtValueMacAddresses.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 10)
+        $txtValueMacAddresses.Text = "Reading..."
+        $miFields.Controls.Add($txtValueMacAddresses)
+
+        $miProcLabel = New-Object System.Windows.Forms.Label
+        $miProcLabel.Text = "ProcessorID"
+        $miProcLabel.AutoSize = $true
+        $miProcLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
+        $miFields.Controls.Add($miProcLabel)
+
+        $txtValueProcessorId = New-Object System.Windows.Forms.TextBox
+        $txtValueProcessorId.ReadOnly = $true
+        $txtValueProcessorId.Width = 560
+        $txtValueProcessorId.Font = $miMonoFont
+        $txtValueProcessorId.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 10)
+        $txtValueProcessorId.Text = "Reading..."
+        $miFields.Controls.Add($txtValueProcessorId)
+
+        $miDiskLabel = New-Object System.Windows.Forms.Label
+        $miDiskLabel.Text = "DiskID"
+        $miDiskLabel.AutoSize = $true
+        $miDiskLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
+        $miFields.Controls.Add($miDiskLabel)
+
+        $txtValueDiskId = New-Object System.Windows.Forms.TextBox
+        $txtValueDiskId.ReadOnly = $true
+        $txtValueDiskId.Width = 560
+        $txtValueDiskId.Font = $miMonoFont
+        $txtValueDiskId.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 4)
+        $txtValueDiskId.Text = "Reading..."
+        $miFields.Controls.Add($txtValueDiskId)
+
+        $miStatusLabel = New-Object System.Windows.Forms.Label
+        $miStatusLabel.Dock = [System.Windows.Forms.DockStyle]::Top
+        $miStatusLabel.Height = 30
+        $miStatusLabel.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 0)
+        $miStatusLabel.Text = "Reading machine identifiers..."
+
+        $miLog = New-Object System.Windows.Forms.RichTextBox
+        $miLog.Dock = [System.Windows.Forms.DockStyle]::Fill
+        Initialize-WinConfigGuiDiagnosticBox -Box $miLog
+        $miLog.Font = New-Object System.Drawing.Font('Consolas', 9)
+
+        $miButtonRow = New-Object System.Windows.Forms.FlowLayoutPanel
+        $miButtonRow.Dock = [System.Windows.Forms.DockStyle]::Bottom
+        $miButtonRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+        $miButtonRow.AutoSize = $true
+        $miButtonRow.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+        $miButtonRow.Padding = New-Object System.Windows.Forms.Padding(8)
+
+        $miCloseBtn = New-Object System.Windows.Forms.Button
+        $miCloseBtn.Text = "Close"
+        $miCloseBtn.AutoSize = $true
+        $miCloseBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
+        # EXEMPT-CONTRACT-001: dialog-local window control, no diagnostic work to wrap
+        $miCloseBtn.Add_Click({ $this.FindForm().Close() })
+        $miButtonRow.Controls.Add($miCloseBtn)
+
+        $miCopyBtn = New-Object System.Windows.Forms.Button
+        $miCopyBtn.Text = "Copy Report"
+        $miCopyBtn.AutoSize = $true
+        $miCopyBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
+        $miCopyBtn.Enabled = $false
+        $miButtonRow.Controls.Add($miCopyBtn)
+
+        # Fill first, then Top, then Bottom - WinForms resolves docking in reverse
+        # add order, so this is the order that leaves the log filling the middle.
+        $miForm.Controls.Add($miLog)
+        $miForm.Controls.Add($miGroup)
+        $miForm.Controls.Add($miStatusLabel)
+        $miForm.Controls.Add($miButtonRow)
+        $miForm.Show()
+        [System.Windows.Forms.Application]::DoEvents()
+
+        $miIds = $null
+        try {
+            $miIds = Get-WinConfigMachineIdentifiers
+        } catch {
+            Write-WinConfigGuiDiagnostic -Level FAIL -Message "Identifier collection failed: $($_.Exception.Message)" -Box $miLog
+            $miStatusLabel.Text = "Collection failed - see the log below."
+            return
+        }
+
+        $miMacValues = @($miIds.MacAddresses.Values)
+        $txtValueMacAddresses.Lines = $(if ($miMacValues.Count -gt 0) { $miMacValues } else { @("(none - see findings below)") })
+        $txtValueProcessorId.Text = $(if ($miIds.ProcessorId.Value) { $miIds.ProcessorId.Value } else { "(empty - see findings below)" })
+        $txtValueDiskId.Text = $(if ($miIds.DiskId.Value) { $miIds.DiskId.Value } else { "(empty - see findings below)" })
+
+        Write-WinConfigGuiDiagnostic -Level STEP -Message "Sources read by the licensing app" -Box $miLog
+        Write-WinConfigGuiDiagnostic -Level DIM -Message "MAC Addresses : Win32_NetworkAdapter (physical adapters only)" -Box $miLog
+        Write-WinConfigGuiDiagnostic -Level DIM -Message "ProcessorID   : Win32_Processor.ProcessorId" -Box $miLog
+        Write-WinConfigGuiDiagnostic -Level DIM -Message "DiskID        : $(if ($miIds.DiskId.Source) { $miIds.DiskId.Source } else { 'Win32_DiskDrive.SerialNumber (Index 0)' })" -Box $miLog
+
+        # Adapters Windows reports but licensing ignores. Without this list the
+        # count mismatch against ipconfig looks like a bug in one of the tools.
+        $miExcluded = @($miIds.MacAddresses.Adapters | Where-Object { -not $_.Included })
+        if ($miExcluded.Count -gt 0) {
+            Write-WinConfigGuiDiagnostic -Level STEP -Message "Adapters excluded from the licensing view ($($miExcluded.Count))" -Box $miLog
+            foreach ($miAdapter in $miExcluded) {
+                Write-WinConfigGuiDiagnostic -Level DIM -Message "$($miAdapter.Address)  $($miAdapter.Name) - $($miAdapter.ExcludedReason)" -Box $miLog
+            }
+        }
+
+        $miFindings = @($miIds.Findings)
+        $miFailures = @($miFindings | Where-Object { $_.Severity -eq 'Fail' })
+        $miWarnings = @($miFindings | Where-Object { $_.Severity -eq 'Warn' })
+
+        # Severity -> console level by lookup, not by branching: the branching ban
+        # (DiagnosticResult.BranchingBan.Tests.ps1) covers .Severity, and a map
+        # fails closed to INFO on an unknown severity instead of throwing inside
+        # the handler on Write-WinConfigGuiDiagnostic's -Level ValidateSet.
+        $miLevelMap = @{ 'Fail' = 'FAIL'; 'Warn' = 'WARN'; 'Info' = 'INFO' }
+        if ($miFindings.Count -gt 0) {
+            Write-WinConfigGuiDiagnostic -Level STEP -Message "Findings" -Box $miLog
+            foreach ($miFinding in $miFindings) {
+                $miLevel = $miLevelMap[[string]$miFinding.Severity]
+                if (-not $miLevel) { $miLevel = 'INFO' }
+                Write-WinConfigGuiDiagnostic -Level $miLevel -Message "$($miFinding.Identifier): $($miFinding.Title)" -Box $miLog
+                Write-WinConfigGuiDiagnostic -Level DIM -Message "    Cause: $($miFinding.Cause)" -Box $miLog
+                Write-WinConfigGuiDiagnostic -Level ACTION -Message "    Fix:   $($miFinding.Fix)" -Box $miLog
+            }
+        }
+
+        if ($miFailures.Count -gt 0) {
+            $miStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 50, 50)
+            $miStatusLabel.Text = "$($miFailures.Count) identifier problem(s) found - licensing will not read this machine correctly."
+        } elseif ($miWarnings.Count -gt 0) {
+            $miStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 120, 20)
+            $miStatusLabel.Text = "All three identifiers were read, but $($miWarnings.Count) of them are unstable - see findings."
+        } else {
+            $miStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(40, 120, 40)
+            $miStatusLabel.Text = "All three identifiers read successfully."
+        }
+
+        $miReport = Format-WinConfigMachineIdentifierReport -Identifiers $miIds
+        $miCopyBtn.Tag = $miReport
+        $miCopyBtn.Enabled = $true
+        # EXEMPT-CONTRACT-001: clipboard copy of an already-rendered report, no diagnostic work to wrap
+        $miCopyBtn.Add_Click({
+            try {
+                [System.Windows.Forms.Clipboard]::SetText([string]$this.Tag)
+                $this.Text = "Copied"
+            } catch {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Clipboard copy failed: $($_.Exception.Message)",
+                    "Copy Failed",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning
+                ) | Out-Null
+            }
+        })
+
+        if (Get-Command Write-WinConfigSessionOperation -ErrorAction SilentlyContinue) {
+            $miResult = if ($miFailures.Count -gt 0) { "Warning" } else { "Success" }
+            $miSummary = "MAC: $($miMacValues.Count) licensed adapter(s); ProcessorID: $($miIds.ProcessorId.Status); DiskID: $($miIds.DiskId.Status)"
+            try {
+                Write-WinConfigSessionOperation -Category "System" -OperationType "Test" `
+                    -Name "Machine Identifiers" -Source "Button:MachineIdentifiers" -MutatesSystem $false `
+                    -Result $miResult -Summary $miSummary
+            } catch {
+                # Bookkeeping must never take down a completed read.
+                Write-WinConfigGuiDiagnostic -Level WARN -Message "Session ledger write failed: $($_.Exception.Message)" -Box $miLog
+            }
+        }
+    }
     "Collect Support Bundle" = {
         # SUPPORT-PROBE-001: read-only escalation collector. All collection logic
         # lives in SupportBundle.psm1; this handler owns only UI + upload wiring.
@@ -8224,6 +8460,13 @@ No system changes were made.
             "Copy System Info"         = @{ Description = "Copy system details to clipboard"; Group = "Info" }
             "Copy Device Name"         = @{ Description = "Copy computer name"; Group = "Info" }
             "Copy Serial Number"       = @{ Description = "Copy BIOS serial number"; Group = "Info" }
+            "Machine Identifiers"      = @{
+                Description = "Show the MAC/ProcessorID/DiskID licensing reads, and why one is missing"
+                Group = "Diagnostics"
+                ToolId = "machine-identifiers"
+                SupportsDryRun = $false
+                MutatesSystem = $false
+            }
             "Device Manager"           = @{ Description = "Open device manager"; Group = "Settings" }
             "Task Manager"             = @{ Description = "Open task manager"; Group = "Settings" }
             "Control Panel"            = @{ Description = "Open control panel"; Group = "Settings" }
@@ -8272,7 +8515,7 @@ No system changes were made.
             "Network"      = @("Run Network Test", "Domain, IP && Ports Test", "Network Reset", "Flush DNS Cache", "Open Speedtest.net")
             "Audio"        = @("Remove Intel SST Audio Driver", "Restart Audio Service", "Sound Panel", "Run Bluetooth Diagnostics")
             "Bluetooth"    = @("Run Bluetooth Diagnostics", "Reset COM Port Numbers", "Clean Bluetooth Ports", "Full Bluetooth Stack Reset", "Disable USB Suspend")
-            "System"       = @("Copy System Info", "Copy Device Name", "Copy Serial Number", "Device Manager", "Task Manager", "Control Panel")
+            "System"       = @("Copy System Info", "Copy Device Name", "Copy Serial Number", "Machine Identifiers", "Device Manager", "Task Manager", "Control Panel")
             "zAmp"         = @("Uninstall zAmp Drivers", "Repair zAmp Driver Trust")
             "Zengar UI"    = @("Apply Win 11 Start Menu", "Apply branding colors", "Pin Taskbar Icons", "Apply Win Update Icon")
             "Updates"      = @("MS Store Updates", "Update Surface Drivers", "Microsoft Update Catalog", "Windows Insider")

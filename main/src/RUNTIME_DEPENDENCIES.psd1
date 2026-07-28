@@ -53,6 +53,7 @@
         @{ Path = "src/Modules/DiagnosticsPackage.psm1" }   # Diagnostic run folder + ZIP packaging
         @{ Path = "src/Modules/DiagnosticsUpload.psm1" }    # Diagnostic package upload (LocalFolder provider)
         @{ Path = "src/Modules/SupportBundle.psm1" }        # Support bundle collectors (SUPPORT-PROBE-001)
+        @{ Path = "src/Modules/MachineIdentifiers.psm1" }   # Licensing fingerprint reader (MAC / ProcessorID / DiskID)
         @{ Path = "src/Modules/BluetoothProbe.psm1" }       # Bluetooth diagnostics probe (bundled from winconfig-bluetooth)
         @{ Path = "src/Modules/TargetDeviceWatch.psm1" }    # Target device state machine (from winconfig-bluetooth)
         @{ Path = "src/Modules/BluetoothDeviceProbe.psm1" } # Deep device probe: Win32 BT API, streaming, patterns

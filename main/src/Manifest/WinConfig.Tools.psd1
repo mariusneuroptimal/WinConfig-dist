@@ -133,6 +133,15 @@
             Description    = "Opens Windows Device Manager"
         }
         @{
+            Id             = "machine-identifiers"
+            Name           = "Machine Identifiers"
+            Category       = "System"
+            ToolCategory   = "Diagnostics"
+            MutatesSystem  = $false
+            SupportsDryRun = $false  # Read-only WMI reader (blessed opt-out, DryRunContract.Tests.ps1)
+            Description    = "Reads the MAC/ProcessorID/DiskID values the licensing app fingerprints the machine with"
+        }
+        @{
             Id             = "intel-sst-removal"
             Name           = "Remove Intel SST Driver"
             Category       = "System"

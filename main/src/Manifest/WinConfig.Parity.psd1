@@ -56,6 +56,7 @@
             "Copy System Info"
             "Copy Device Name"
             "Copy Serial Number"
+            "Machine Identifiers"
             "Device Manager"
             "Task Manager"
             "Control Panel"
@@ -165,6 +166,10 @@
         "Copy Serial Number" = @{
             Description = "Copy BIOS serial number"
             Group = "Info"
+        }
+        "Machine Identifiers" = @{
+            Description = "Show the MAC/ProcessorID/DiskID licensing reads, and why one is missing"
+            Group = "Diagnostics"
         }
         "Device Manager" = @{
             Description = "Open device manager"
