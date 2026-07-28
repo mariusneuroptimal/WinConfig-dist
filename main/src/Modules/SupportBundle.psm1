@@ -36,7 +36,10 @@ Set-StrictMode -Off
 # 1.1.1 (2026-07-23): RedactInstallationLog also redacts /LICENSECODE= values
 #   (FI-011 — QtIFW echoes the G-Force installer argv, license code included,
 #   into InstallationLog.txt when the component's Execute operation fails).
-$script:SupportBundleProbeVersion = '1.1.1'
+# 1.2.0 (2026-07-28): ZEN-PROCESS-001 collector (FI-013 — processes and services
+#   whose image lives inside the install root; QtIFW refuses every component
+#   operation while one is running, which no earlier collector could see).
+$script:SupportBundleProbeVersion = '1.2.0'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -970,6 +973,80 @@ function Get-WinConfigSupportCollectors {
                 }
                 $facts.registry = $regFacts
                 @{ Facts = $facts }
+            }
+        }
+        @{
+            # RequiresZengar = $false deliberately (same reasoning as ZEN-STAGING-001):
+            # a service registration survives the install directory being removed, and a
+            # service still pointing into a missing root is itself a finding. Gating on
+            # Zengar would blind this exactly when it matters.
+            Id = 'ZEN-PROCESS-001'; Ring = 1; RequiresAdmin = $false; RequiresZengar = $false
+            Script = {
+                param($Context)
+                # FI-013: QtIFW refuses EVERY component operation while any process runs
+                # from the installation root ("Critical: Running processes found").
+                # zengardriver 2.0.0.0 installs zamp_svc.exe as an always-on service
+                # INSIDE C:\zengar\zAmpLoader, so an affected box can never install or
+                # update ANY component -- including NO's own update path -- silently and
+                # permanently. Four bundles could not see this because nothing collected
+                # running processes; it took a hand-run CLI to find.
+                #
+                # Services are the load-bearing half: Win32_Service.PathName is readable
+                # unelevated, whereas Process.Path is access-denied for other users'
+                # processes -- and the blocker runs as SYSTEM.
+                $root       = "$($Context.ZengarRoot)".TrimEnd('\')
+                $rootPrefix = "$root\"
+
+                $procs      = @()
+                $unresolved = 0
+                foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+                    $path = $null
+                    try { $path = $p.Path } catch { $path = $null }
+                    if (-not $path) { $unresolved++; continue }
+                    if ($path -like "$rootPrefix*") {
+                        $procs += @{ name = "$($p.ProcessName)"; id = $p.Id; path = "$path" }
+                    }
+                }
+
+                # PathName is a full command line ('"C:\a b\x.exe" -k net'). Take the
+                # quoted image when quoted, otherwise everything through the first
+                # '.exe' so unquoted paths containing spaces still resolve. Matching the
+                # raw string would false-positive on an argument that merely mentions
+                # the root.
+                $svcs = @()
+                foreach ($s in @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue)) {
+                    $raw = "$($s.PathName)"
+                    if (-not $raw) { continue }
+                    $image = $null
+                    if ($raw.StartsWith('"')) {
+                        $close = $raw.IndexOf('"', 1)
+                        if ($close -gt 1) { $image = $raw.Substring(1, $close - 1) }
+                    }
+                    if (-not $image) {
+                        $idx   = $raw.ToLowerInvariant().IndexOf('.exe')
+                        $image = if ($idx -ge 0) { $raw.Substring(0, $idx + 4) } else { $raw }
+                    }
+                    if ($image -like "$rootPrefix*") {
+                        $svcs += @{
+                            name        = "$($s.Name)"
+                            displayName = "$($s.DisplayName)"
+                            state       = "$($s.State)"
+                            startMode   = "$($s.StartMode)"
+                            imagePath   = "$image"
+                            pathName    = $raw
+                        }
+                    }
+                }
+
+                @{ Facts = @{
+                    installRoot           = $root
+                    processes             = @($procs)
+                    processCount          = @($procs).Count
+                    services              = @($svcs)
+                    serviceCount          = @($svcs).Count
+                    processPathUnresolved = $unresolved
+                    enumerationLimited    = (-not $Context.Elevated)
+                } }
             }
         }
 
