@@ -2,7 +2,7 @@
 #
 # Extracted from Probe-NeurOptimalDevice.ps1 (winconfig-bluetooth). Provides:
 #   - Win32 BluetoothGetDeviceInfo P/Invoke for Bluetooth radio link state
-#   - COM port in-use detection (EEG streaming detection)
+#   - COM port hold detection (a HANDLE test -- never a data-flow measurement)
 #   - Pattern recognition engine ([ok]/[~]/[!] classification)
 #   - Session state management (COM port history, reconnect times, link flaps)
 #   - Session summary generation (structured findings for dev review)
@@ -173,47 +173,303 @@ function Get-BtConnectionState {
 }
 
 # =============================================================================
-# STREAMING DETECTION
+# DATA-FLOW CORROBORATION (process I/O)
 # =============================================================================
 
-function Test-ComPortInUse {
+# Field capture 2026-07-30 15:30 (NO code 12006, "Arc Connection Lost") showed
+# why total CPU is not enough. The Bluetooth layer was clean end to end -- RFCOMM
+# link up, both COM ports Present/OK, integrity healthy, ZERO probe events across
+# the whole recording -- and NO.exe raised a lost-connection dialog anyway. The
+# session audio kept playing throughout, so NO.exe was never idle and a
+# CPU-flatline test could not fire. Only ONE of the application's jobs died.
+#
+# Read OPERATION count is the discriminator. EEG over a synchronous serial read
+# produces a high rate of small reads; audio playback is buffered and produces
+# comparatively few large ones. So when the serial path stalls, the read-op RATE
+# collapses even while CPU and byte throughput stay healthy.
+#
+# HONEST LIMIT: these counters are process-wide. Nothing here attributes a read to
+# the COM port, and nothing can -- Windows exposes no per-handle I/O counter to
+# another process. This detects "this process stopped doing the kind of I/O it was
+# doing a moment ago", which is why it is reported with the measured numbers
+# attached rather than as a diagnosis.
+#
+# MEASURED on MMEVOLD_06, NO.exe 4.0.0.5, Arc on COM3/COM6, 30 samples at the
+# probe's own 3s cadence during a live streaming session (2026-07-30):
+#
+#   streaming : median 438 read ops/tick, min 422, max 451  (+/- 3.3%)
+#               ~135 bytes per read -- a small-packet profile, which is why
+#               operation COUNT is the axis and byte throughput is not
+#   idle      : exactly 0 ops/tick, zero ticks of noise, before and after
+#
+# Two things follow. The reads ARE issued by the NO.exe process -- 4.x routes
+# serial I/O through NI-VISA and the worry was that VISA would issue them from
+# its own service, leaving this detector watching the wrong process. It does not.
+# And the separation is effectively total: streaming and idle do not overlap, and
+# in-session jitter is under 4%.
+#
+# WHY THIS IS SAFE TO RUN ON EVERY SESSION. Measured on the same box immediately
+# after a normal session stop: NO.exe keeps running and RELEASES the port -- all
+# four COM names read Free -- while its read rate goes to 0. So a routine stop
+# never presents as "port held with no reads", and the detector cannot fire on
+# it: the hold test flips to Stopped first and this block stops sampling. Had NO
+# kept the port open between sessions, every clinic stopping a session would have
+# raised a FAIL. That ordering is load-bearing, so it is pinned by tests rather
+# than assumed.
+
+# Samples needed before a baseline is trusted. Ticks are ~3s, so ~15s of history.
+# With IoCollapseTicks that means no verdict before ~27s of streaming.
+$script:IoBaselineMinTicks = 5
+# Below this median read-op rate there is nothing to collapse FROM, and claiming a
+# collapse would be noise. Reported as "no baseline", never as healthy. A real
+# session measured 438, so this floor sits ~22x below normal.
+$script:IoBaselineMinOpsPerTick = 20
+# Fraction of baseline that counts as collapsed. Measured in-session jitter is
+# ~3.3%, so 0.25 sits roughly 7x outside normal variation while still catching a
+# PARTIAL stall -- a headset transmitting intermittently, not only one that has
+# gone completely silent. The original 0.1 only caught near-total silence and
+# would have missed a 60% degradation entirely.
+$script:IoCollapseFraction = 0.25
+# Consecutive collapsed ticks required (~12s) so a scheduling hiccup cannot fire it.
+$script:IoCollapseTicks = 4
+
+$script:ProcessIoApiAvailable = $false
+
+function Initialize-ProcessIoApi {
     <#
     .SYNOPSIS
-        Tests whether a COM port is held open by another process.
-        UnauthorizedAccessException = port in use (streaming active).
+        Loads the GetProcessIoCounters P/Invoke. Idempotent.
+    .DESCRIPTION
+        System.Diagnostics.Process exposes CPU and working set but NOT I/O
+        counters, so this is the only way to see read activity from outside the
+        process.
+    .OUTPUTS
+        [bool]
     #>
     [CmdletBinding()]
     [OutputType([bool])]
+    param()
+
+    if ($script:ProcessIoApiAvailable) { return $true }
+
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'WinConfigProcessIo').Type) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class WinConfigProcessIo {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct IO_COUNTERS {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetProcessIoCounters(IntPtr hProcess, out IO_COUNTERS counters);
+
+    // Returns null rather than throwing when the handle cannot be queried -- a
+    // recording must never die because one counter read was denied.
+    public static ulong[] Read(IntPtr hProcess) {
+        try {
+            IO_COUNTERS c;
+            if (!GetProcessIoCounters(hProcess, out c)) { return null; }
+            return new ulong[] { c.ReadOperationCount, c.ReadTransferCount };
+        } catch { return null; }
+    }
+}
+'@ -ErrorAction Stop
+        }
+        $script:ProcessIoApiAvailable = $true
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-ProcessIoSample {
+    <#
+    .SYNOPSIS
+        Reads cumulative read-operation and read-byte counts for a process.
+    .OUTPUTS
+        [hashtable] ReadOps / ReadBytes, or $null when unavailable.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Process)
+
+    if (-not $script:ProcessIoApiAvailable) { return $null }
+    try {
+        $h = $Process.Handle
+        if (-not $h -or $h -eq [IntPtr]::Zero) { return $null }
+        $r = [WinConfigProcessIo]::Read($h)
+        if ($null -eq $r) { return $null }
+        return @{ ReadOps = [double]$r[0]; ReadBytes = [double]$r[1] }
+    } catch {
+        # Access denied on the handle, or the process exited between calls.
+        return $null
+    }
+}
+
+function Test-IoReadCollapse {
+    <#
+    .SYNOPSIS
+        Pure. Decides whether a series of per-tick read-operation deltas shows a
+        collapse against its own established baseline.
+    .DESCRIPTION
+        Relative, not absolute. An absolute ops/sec threshold would need
+        calibrating per box, per NO build and per session type; a box's own
+        recent history is the only reference that travels. The baseline is the
+        MEDIAN of the samples before the collapse window, so one scheduling
+        outlier cannot move it.
+
+        Returns Verdict:
+          Collapsed     rate fell below the fraction of baseline and stayed there
+          Streaming     a baseline is established and the rate is holding
+          NoBaseline    not enough samples, or the baseline rate is too low to
+                        collapse from -- explicitly NOT a clean bill of health
+    .PARAMETER Deltas
+        Per-tick read-operation deltas, oldest first.
+    .OUTPUTS
+        [hashtable] Verdict, BaselineOpsPerTick, RecentOpsPerTick, CollapsedTicks.
+    #>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][array]$Deltas = @())
+
+    $d = @($Deltas | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ })
+    $result = @{
+        Verdict            = 'NoBaseline'
+        BaselineOpsPerTick = 0
+        RecentOpsPerTick   = 0
+        CollapsedTicks     = 0
+    }
+    if ($d.Count -lt ($script:IoBaselineMinTicks + $script:IoCollapseTicks)) { return $result }
+
+    # Everything before the trailing window is the reference period.
+    $window   = @($d[($d.Count - $script:IoCollapseTicks) .. ($d.Count - 1)])
+    $baseline = @($d[0 .. ($d.Count - $script:IoCollapseTicks - 1)])
+    if ($baseline.Count -lt $script:IoBaselineMinTicks) { return $result }
+
+    $sorted = @($baseline | Sort-Object)
+    $median = if ($sorted.Count % 2 -eq 1) {
+        $sorted[[int](($sorted.Count - 1) / 2)]
+    } else {
+        ($sorted[($sorted.Count / 2) - 1] + $sorted[$sorted.Count / 2]) / 2
+    }
+    $result.BaselineOpsPerTick = [math]::Round($median, 0)
+
+    $recentAvg = ($window | Measure-Object -Average).Average
+    $result.RecentOpsPerTick = [math]::Round($recentAvg, 0)
+
+    if ($median -lt $script:IoBaselineMinOpsPerTick) { return $result }
+
+    $limit = $median * $script:IoCollapseFraction
+    $collapsed = @($window | Where-Object { $_ -lt $limit }).Count
+    $result.CollapsedTicks = $collapsed
+
+    if ($collapsed -ge $script:IoCollapseTicks) {
+        $result.Verdict = 'Collapsed'
+    } else {
+        $result.Verdict = 'Streaming'
+    }
+    return $result
+}
+
+# =============================================================================
+# STREAMING DETECTION
+# =============================================================================
+
+function Get-ComPortHoldState {
+    <#
+    .SYNOPSIS
+        Classifies whether a COM port is currently held open by another process.
+    .DESCRIPTION
+        This is a HANDLE test, not a data test. It answers "can this port be
+        opened right now", which is a proxy for "does some process already have
+        it". It says NOTHING about whether bytes are flowing -- NO.exe holds the
+        Arc's port from connect to disconnect whether or not the headset is
+        actually delivering EEG. Every caller must preserve that distinction;
+        conflating the two is what let a stalled Arc read as a healthy stream in
+        the field (2026-07-30: probe reported streaming while NO.exe showed
+        "Arc Not Detected").
+
+        States:
+          Held         UnauthorizedAccessException -- someone owns the handle.
+          Free         opened cleanly -- nobody owns it, so nothing is streaming.
+          Unavailable  IOException -- the port exists in SERIALCOMM but cannot be
+                       opened. Cause is NOT determined here: an absent symlink
+                       (FI-012 fault 1) and a stale one produce DIFFERENT win32
+                       errors, and SerialPort collapses both into IOException
+                       with COR_E_IO -- the win32 code survives only in the
+                       LOCALIZED message text, so classifying further from here
+                       would misclassify every non-English box. See
+                       Initialize-SerialOpenApi for the CreateFile path that CAN
+                       split them; it is operator-initiated only.
+          Unknown      anything else.
+
+        The old bool form folded Unavailable and Free together, so a box whose
+        serial stack was broken read identically to a healthy idle one.
+    .OUTPUTS
+        [string] Held / Free / Unavailable / Unknown
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
     param([string]$PortName)
 
-    if ([string]::IsNullOrWhiteSpace($PortName)) { return $false }
+    if ([string]::IsNullOrWhiteSpace($PortName)) { return 'Unknown' }
     $sp = $null
     try {
         $sp = New-Object System.IO.Ports.SerialPort $PortName
         $sp.Open()
         $sp.Close()
-        return $false
+        return 'Free'
     } catch [System.UnauthorizedAccessException] {
-        return $true
+        return 'Held'
+    } catch [System.IO.IOException] {
+        return 'Unavailable'
     } catch {
-        return $false
+        return 'Unknown'
     } finally {
         if ($sp) { try { $sp.Dispose() } catch { } }
     }
 }
 
+function Test-ComPortInUse {
+    <#
+    .SYNOPSIS
+        Back-compat bool wrapper over Get-ComPortHoldState. $true only for 'Held'.
+        Prefer Get-ComPortHoldState: this form cannot tell an unopenable port
+        apart from a free one.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([string]$PortName)
+
+    return ((Get-ComPortHoldState -PortName $PortName) -eq 'Held')
+}
+
 function Get-StreamingState {
     <#
     .SYNOPSIS
-        Returns 'Active' if any target COM ports are held open, 'Stopped' otherwise.
+        Reports whether the target's COM ports are HELD OPEN. Despite the name
+        this is not a measure of EEG data flow -- see Get-ComPortHoldState.
+    .DESCRIPTION
+        State stays 'Active'/'Stopped' because it drives the session transition
+        machine, but it means "a port is held" / "no port is held". The extra
+        fields carry what the operator-facing text needs to stay honest:
+          HeldPorts         ports someone has open
+          UnavailablePorts  ports that exist but would not open (serial stack)
     .OUTPUTS
-        [hashtable] with State ('Active'/'Stopped'/'Unknown') and ActivePort.
+        [hashtable] State ('Active'/'Stopped'/'Unknown'), ActivePort, HeldPorts,
+        UnavailablePorts.
     #>
     [CmdletBinding()]
     param([hashtable]$WatchState)
 
     if ($WatchState.ComPortState -notin @('ComPortFound', 'ComPortAmbiguous')) {
-        return @{ State = 'Stopped'; ActivePort = $null }
+        return @{ State = 'Stopped'; ActivePort = $null; HeldPorts = @(); UnavailablePorts = @() }
     }
 
     $ports = @()
@@ -224,17 +480,272 @@ function Get-StreamingState {
         $ports += $WatchState.AmbiguousComPortMatches | ForEach-Object { $_.PortName }
     }
     $ports = @($ports | Where-Object { $_ } | Select-Object -Unique)
-    if ($ports.Count -eq 0) { return @{ State = 'Unknown'; ActivePort = $null } }
+    if ($ports.Count -eq 0) { return @{ State = 'Unknown'; ActivePort = $null; HeldPorts = @(); UnavailablePorts = @() } }
 
     $activePorts = @()
+    $deadPorts   = @()
     foreach ($p in $ports) {
-        if (Test-ComPortInUse -PortName $p) { $activePorts += $p }
+        switch (Get-ComPortHoldState -PortName $p) {
+            'Held'        { $activePorts += $p }
+            'Unavailable' { $deadPorts   += $p }
+        }
     }
 
     if ($activePorts.Count -gt 0) {
-        return @{ State = 'Active'; ActivePort = ($activePorts -join ', ') }
+        return @{
+            State            = 'Active'
+            ActivePort       = ($activePorts -join ', ')
+            HeldPorts        = @($activePorts)
+            UnavailablePorts = @($deadPorts)
+        }
     }
-    return @{ State = 'Stopped'; ActivePort = $null }
+    return @{ State = 'Stopped'; ActivePort = $null; HeldPorts = @(); UnavailablePorts = @($deadPorts) }
+}
+
+function Get-ProbeStateConsistency {
+    <#
+    .SYNOPSIS
+        Pure. Cross-checks the probe's state fields against each other and
+        returns the combinations that cannot all be true of a healthy box.
+    .DESCRIPTION
+        Every other alarm in this module is TRANSITION-driven: it fires when a
+        field CHANGES. That leaves a hole the field walked straight into
+        (2026-07-30) -- a box that is ALREADY in a bad combination when the
+        operator hits Record produces no transitions at all, so the startup
+        snapshot printed each field on its own line, each individually
+        unremarkable, and nothing was flagged while NO.exe was showing
+        "Arc Not Detected" on the other monitor.
+
+        This runs on the snapshot itself, so the arrival state is judged as a
+        whole rather than field by field.
+
+        FI-012 TRAP -- read before strengthening the no-link rule. "Not
+        connected" is NOT on its own a finding: SPP devices hold no profile
+        open, so a perfectly healthy idle Arc reads Disconnected, and during the
+        FI-012 field case IsConnected read False while both ports opened fine.
+        The rule below therefore fires on the CONJUNCTION (a port is held AND
+        there is no link) and still reports at [~], because a process holding
+        the port means something believes it has a session -- strictly more
+        evidence than no-link alone, but not proof. It escalates to [!] only
+        when the caller has independently corroborated a stall (flat NO.exe CPU
+        while the port is held); that is what CpuStalled is for.
+    .PARAMETER StreamState
+        'Active' (a port is held) / 'Stopped' / 'Unknown'.
+    .PARAMETER CpuStalled
+        $true when NO.exe CPU has been observed flat while the port was held.
+        Escalates the held-port-without-link rule from evidence to a finding.
+    .PARAMETER IoStalled
+        $true when NO.exe's read-operation rate collapsed against its own
+        baseline while the port was held. Escalates the same way as CpuStalled,
+        and catches the case CpuStalled cannot: an application still busy with
+        its other work while only its serial path is dead.
+    .OUTPUTS
+        [hashtable[]] each with Level ('FAIL'/'WARN'/'INFO') and Text. Wrap call
+        sites in @() -- a single finding unrolls on return.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$DeviceState,
+        [string]$ComPortState,
+        [string]$BtLinkState,
+        [string]$StreamState,
+        [AllowEmptyCollection()][array]$HeldPorts = @(),
+        [AllowEmptyCollection()][array]$UnavailablePorts = @(),
+        [System.Nullable[bool]]$AppRunning,
+        [bool]$CpuStalled = $false,
+        [bool]$IoStalled = $false
+    )
+
+    $out = @()
+    $held     = @($HeldPorts | Where-Object { $_ })
+    $dead     = @($UnavailablePorts | Where-Object { $_ })
+    $heldStr  = if ($held.Count -gt 0) { $held -join ', ' } else { 'a COM port' }
+    $isHeld   = ($StreamState -eq 'Active')
+    # Either corroborator is enough. They observe different failure shapes and a
+    # box only has to be in one of them.
+    $stalled  = ($CpuStalled -or $IoStalled)
+
+    # Ports that exist but will not open. Independent of everything else: no
+    # process can talk to the headset in this state, whatever the other fields say.
+    if ($dead.Count -gt 0) {
+        $out += @{
+            Level = 'FAIL'
+            Text  = "[!] $($dead -join ', ') is registered as a Bluetooth serial port but will not open. NO.exe cannot receive EEG through a port in this state -- expect 'Control Port not valid' or 'Arc not detected'. The probe deliberately does not guess the cause here: an absent symlink and a stale one give different win32 errors and need different fixes. Run the serial port integrity check (operator-initiated, with NO.exe closed) to split them."
+        }
+    }
+
+    # The combination that was missing. A held port with no radio link underneath
+    # it means something owns the serial handle while the wireless pipe is down.
+    if ($isHeld -and $BtLinkState -eq 'NotConnected') {
+        if ($stalled) {
+            $evidence = if ($CpuStalled -and $IoStalled) {
+                "NO.exe's CPU has stayed flat and its read rate has collapsed"
+            } elseif ($IoStalled) {
+                "NO.exe's read rate has collapsed"
+            } else {
+                "NO.exe's CPU has stayed flat"
+            }
+            $out += @{
+                Level = 'FAIL'
+                Text  = "[!] $heldStr is held open but the Bluetooth radio has no link to the headset, and $evidence while holding it. Nothing is arriving: the application is sitting on a serial port with no live connection under it. This is what 'Arc not detected' looks like from the OS side."
+            }
+        } else {
+            $out += @{
+                Level = 'WARN'
+                Text  = "[~] $heldStr is held open, but the Bluetooth radio reports no active link to the headset. A held port means something (normally NO.exe) believes it has a session, so this pairing is worth capturing -- but it is NOT proof on its own: SPP devices hold no profile open, so a healthy Arc can also read disconnected. Check whether NeurOptimal is showing an error right now."
+            }
+        }
+    }
+
+    # The 12006 shape. Field capture 2026-07-30 15:30: RFCOMM link up, both ports
+    # Present/OK, integrity healthy, zero probe events for the whole recording --
+    # and NO.exe raised "Arc Connection Lost" anyway. Nothing in the Bluetooth
+    # layer contradicts anything, which is precisely the finding: a clean
+    # transport with dead reads localizes the fault ABOVE Bluetooth, and the
+    # recorder used to have no way to say that.
+    if ($isHeld -and $IoStalled -and $BtLinkState -ne 'NotConnected') {
+        $out += @{
+            Level = 'FAIL'
+            Text  = "[!] $heldStr is held open and the Bluetooth link is up, but NO.exe has stopped reading from it. The transport is intact -- device paired, ports present, link established -- so this is not a Bluetooth failure. Either the headset stopped transmitting while its baseband link stayed up, or NeurOptimal's read path stalled. Expect 'Arc Connection Lost' on screen with nothing wrong on the Windows side."
+        }
+    }
+
+    # Something holds the headset's port and it is not NO.exe.
+    if ($isHeld -and $AppRunning -eq $false) {
+        $out += @{
+            Level = 'WARN'
+            Text  = "[~] $heldStr is held open while NeurOptimal is not running. Another process owns the headset's serial port; NO.exe will not be able to open it until that process releases it."
+        }
+    }
+
+    # A port cannot honestly be held for a device Windows does not consider paired.
+    if ($isHeld -and $DeviceState -and $DeviceState -ne 'PairedCandidate') {
+        $out += @{
+            Level = 'FAIL'
+            Text  = "[!] $heldStr is held open but Windows does not report the headset as paired (device state: $(Get-ProbeStateUserText -Kind device -State $DeviceState -Short)). The port and the pairing record disagree -- one of them is stale."
+        }
+    }
+
+    return $out
+}
+
+# =============================================================================
+# OPERATOR MARKERS
+# =============================================================================
+
+function New-ProbeStateMarker {
+    <#
+    .SYNOPSIS
+        Pure. Builds a timestamped, LABELLED snapshot of every probe state field,
+        tagged with whatever NeurOptimal was telling the operator at that moment.
+    .DESCRIPTION
+        The recorder captures state continuously but has never captured what the
+        APPLICATION said about that state. That gap matters more than it looks:
+        NO's error codes are still being mapped, and several dialogs that look
+        identical on screen are different failures underneath. Without a label,
+        a recording is an unlabelled state vector -- it cannot help separate one
+        12005 from another.
+
+        A marker is the operator pressing "this is happening right now, and here
+        is the code on my screen". One marker is a labelled sample; enough of
+        them across enough boxes is what lets a code that means two things come
+        apart into two clusters.
+
+        Deliberately NOT clustered or hashed here. PpfFingerprint exists for
+        that, but its contract is one fingerprint per session computed at
+        finalization, and a bucketing scheme frozen now would be frozen while
+        the code mapping is still moving. Record the raw vector; cluster it
+        offline in the analyzer, where the scheme can change without
+        invalidating the archive.
+    .PARAMETER Label
+        Raw operator input. Any leading digit run is also surfaced as NoCode so
+        a typed "12005" or "NO Code 12005" both key correctly, while free text
+        ("headset light on, no trace") is preserved intact.
+    .OUTPUTS
+        [hashtable] one marker record.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Label,
+        [datetime]$At = (Get-Date),
+        [int]$ElapsedSeconds = 0,
+        [string]$DeviceState,
+        [string]$ComPortState,
+        [string]$BtLinkState,
+        [string]$StreamState,
+        [AllowEmptyCollection()][array]$HeldPorts = @(),
+        [AllowEmptyCollection()][array]$UnavailablePorts = @(),
+        [System.Nullable[bool]]$AppRunning,
+        [string]$NoExeVersion,
+        [string]$IoVerdict,
+        [int]$IoBaselineOpsPerTick = 0,
+        [int]$IoRecentOpsPerTick = 0
+    )
+
+    $clean = if ($Label) { ([string]$Label).Trim() } else { '' }
+    $code  = $null
+    if ($clean) {
+        $m = [regex]::Match($clean, '\d{3,}')
+        if ($m.Success) { $code = $m.Value }
+    }
+
+    # The cross-check verdict at the marked instant, carried WITH the label. This
+    # is what makes the sample worth having: not just "the operator saw 12005"
+    # but "the operator saw 12005 while the port was held with no link under it".
+    $contradictions = @(Get-ProbeStateConsistency `
+        -DeviceState $DeviceState -ComPortState $ComPortState `
+        -BtLinkState $BtLinkState -StreamState $StreamState `
+        -HeldPorts $HeldPorts -UnavailablePorts $UnavailablePorts `
+        -AppRunning $AppRunning -IoStalled ($IoVerdict -eq 'Collapsed'))
+
+    return @{
+        At               = $At
+        AtIso            = $At.ToString('o')
+        ElapsedSeconds   = $ElapsedSeconds
+        Label            = $clean
+        NoCode           = $code
+        DeviceState      = $DeviceState
+        ComPortState     = $ComPortState
+        BtLinkState      = $BtLinkState
+        StreamState      = $StreamState
+        HeldPorts        = @($HeldPorts | Where-Object { $_ })
+        UnavailablePorts = @($UnavailablePorts | Where-Object { $_ })
+        AppRunning       = $AppRunning
+        NoExeVersion     = if ($NoExeVersion) { [string]$NoExeVersion } else { $null }
+        # Read-rate state at the marked instant. This is the field that turns a
+        # marker into evidence about NO's own read path rather than only about
+        # the Bluetooth layer.
+        IoVerdict            = if ($IoVerdict) { $IoVerdict } else { 'NoBaseline' }
+        IoBaselineOpsPerTick = $IoBaselineOpsPerTick
+        IoRecentOpsPerTick   = $IoRecentOpsPerTick
+        Contradictions   = @($contradictions | ForEach-Object { $_.Text })
+    }
+}
+
+function Format-ProbeStateMarker {
+    <#
+    .SYNOPSIS
+        Pure. Renders one marker as a single operator-readable line.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][hashtable]$Marker)
+
+    $what = if ($Marker.NoCode) { "NO code $($Marker.NoCode)" } else { 'an issue' }
+    $extra = if ($Marker.Label -and $Marker.Label -ne $Marker.NoCode) { " (`"$($Marker.Label)`")" } else { '' }
+    $mins  = [int][math]::Floor($Marker.ElapsedSeconds / 60)
+    $secs  = $Marker.ElapsedSeconds % 60
+    $when  = '{0}  {1}m{2:00}s into the recording' -f $Marker.At.ToString('HH:mm:ss'), $mins, $secs
+
+    $ports = if (@($Marker.HeldPorts).Count -gt 0) { "held $(@($Marker.HeldPorts) -join ', ')" } else { 'no port held' }
+    $state = @(
+        "device=$(Get-ProbeStateUserText -Kind device -State $Marker.DeviceState -Short)"
+        "radio=$(Get-ProbeStateUserText -Kind btlink -State $Marker.BtLinkState -Short)"
+        $ports
+        "NO.exe=$(if ($Marker.AppRunning -eq $true) { 'running' } elseif ($Marker.AppRunning -eq $false) { 'not running' } else { 'unknown' })"
+    ) -join ', '
+
+    return "Operator marked $what$extra at $when -- $state"
 }
 
 # =============================================================================
@@ -428,10 +939,45 @@ function New-DeviceProbeSession {
         BtLinkEverConnected      = $false
         StreamingState           = 'Stopped'
         ActiveStreamPort         = $null
+        # Last tick's port classification. HeldPorts drives the honest operator
+        # text; UnavailablePorts is the FI-012 signal the old bool test erased by
+        # folding "would not open" in with "nobody has it open".
+        HeldPorts                = @()
+        UnavailablePorts         = @()
         StreamPeakCpuS           = 0.0
         StreamPeakWorkingSetMB   = 0
+        # Data-flow corroboration. The probe cannot read the EEG bytes -- the port
+        # is held by NO.exe, and opening it to look would steal it. NO.exe's own
+        # CPU is the honest proxy available from outside: a live stream keeps
+        # burning CPU, a stalled one flatlines while still holding the handle.
+        StreamCpuFirstSample     = $null
+        StreamCpuLastSample      = $null
+        StreamFlatCpuTicks       = 0
+        StreamCpuStalled         = $false
+        StreamCpuStallReported   = $false
+        # Read-operation rate. Catches the case CPU cannot: only ONE of the
+        # application's jobs dies, so it stays busy (audio kept playing through
+        # the 12006 capture) while its serial reads stop. Relative to the box's
+        # own recent history -- no absolute rate would survive a different NO
+        # build or a different session type.
+        IoApiAvailable           = $false
+        IoLastReadOps            = $null
+        IoReadOpDeltas           = [System.Collections.ArrayList]::new()
+        IoVerdict                = 'NoBaseline'
+        IoBaselineOpsPerTick     = 0
+        IoRecentOpsPerTick       = 0
+        IoStalled                = $false
+        IoStallReported          = $false
         AppNotRespondingTicks    = 0
         AppHangReported          = $false
+        # Cross-field contradictions present in the arrival snapshot, before any
+        # transition could fire. Populated by the caller at startup.
+        StartupConsistency       = @()
+        # Operator-labelled state vectors: what NeurOptimal was reporting on
+        # screen, bound to what the machine looked like at that instant. The
+        # recorder is blind to the application's own error dialogs, so without
+        # these the archive is a pile of unlabelled samples.
+        OperatorMarkers          = [System.Collections.ArrayList]::new()
         StartupSppChannelCount   = 0
         BtWin32Available         = $false
         NoExeVersion             = $null
@@ -444,6 +990,10 @@ function New-DeviceProbeSession {
         # pins the corruption to something that happened during the session.
         SerialPortIntegrity      = $null
         SerialPortIntegrityEnd   = $null
+        # FI-012 fault 2 fingerprint (paired, ports clean, no link). Derived
+        # without opening a port, because the open collector must never run
+        # inside a live recording session.
+        SerialFaultFingerprint   = $null
     }
 }
 
@@ -483,9 +1033,21 @@ function Invoke-DeviceProbeTick {
     $events = @()
     $now = Get-Date
 
-    # ── Streaming detection ──────────────────────────────────────────────
+    # ── Port-hold detection (NOT a data-flow measurement) ────────────────
     $streamResult = Get-StreamingState -WatchState $WatchState
     $newStreamState = $streamResult.State
+    # Tolerate a result without the port lists: Get-StreamingState is mocked in
+    # tests and may be replaced by an older caller, and a missing list must not
+    # take the whole tick down.
+    $Session.HeldPorts = @(
+        if ($streamResult -is [hashtable] -and $streamResult.ContainsKey('HeldPorts')) { $streamResult.HeldPorts } else { @() }
+    )
+    $newDeadPorts = @(
+        if ($streamResult -is [hashtable] -and $streamResult.ContainsKey('UnavailablePorts')) { $streamResult.UnavailablePorts } else { @() }
+    )
+    # Union across the session: a port that failed to open at any point stays in
+    # the record even if it opens later.
+    $Session.UnavailablePorts = @(@($Session.UnavailablePorts) + $newDeadPorts | Where-Object { $_ } | Select-Object -Unique)
 
     if ($newStreamState -ne $Session.StreamingState) {
         $prevStreaming = $Session.StreamingState
@@ -494,9 +1056,24 @@ function Invoke-DeviceProbeTick {
         if ($newStreamState -eq 'Active') {
             $Session.StreamPeakCpuS         = 0.0
             $Session.StreamPeakWorkingSetMB = 0
+            $Session.StreamCpuFirstSample   = $null
+            $Session.StreamCpuLastSample    = $null
+            $Session.StreamFlatCpuTicks     = 0
+            $Session.StreamCpuStalled       = $false
+            $Session.StreamCpuStallReported = $false
+            $Session.IoLastReadOps          = $null
+            $Session.IoReadOpDeltas.Clear()
+            $Session.IoVerdict              = 'NoBaseline'
+            $Session.IoBaselineOpsPerTick   = 0
+            $Session.IoRecentOpsPerTick     = 0
+            $Session.IoStalled              = $false
+            $Session.IoStallReported        = $false
             $portInfo = if ($streamResult.ActivePort) { " on $($streamResult.ActivePort)" } else { '' }
             $Session.ActiveStreamPort = $streamResult.ActivePort
-            $evt = @{ Kind = 'STREAM'; State = 'Active'; Reason = "NO.exe has COM port open (EEG data streaming)$portInfo"; Annotation = $null; Level = 'OK'; Timestamp = $now }
+            # Deliberately does not say "EEG data streaming" -- this event fires on
+            # a handle being taken, which NO.exe does at connect whether or not the
+            # headset ever delivers a sample.
+            $evt = @{ Kind = 'STREAM'; State = 'Active'; Reason = "NO.exe has the COM port open$portInfo (data flow not verified -- the probe cannot read the port while it is held)"; Annotation = $null; Level = 'OK'; Timestamp = $now }
             if ($WatchState.DeviceState -ne 'PairedCandidate') {
                 $evt.Annotation = "[!] Streaming started but device state is '$($WatchState.DeviceState)' -- unexpected"
                 $evt.Level = 'FAIL'
@@ -571,6 +1148,90 @@ function Invoke-DeviceProbeTick {
                 $wsMB = [math]::Round($noProc.WorkingSet64 / 1MB, 0)
                 if ($cpuS -gt $Session.StreamPeakCpuS)        { $Session.StreamPeakCpuS = $cpuS }
                 if ($wsMB -gt $Session.StreamPeakWorkingSetMB) { $Session.StreamPeakWorkingSetMB = $wsMB }
+
+                # Data-flow corroboration. "Port held" alone cannot distinguish a
+                # live session from NO.exe sitting on a port that never delivers a
+                # sample -- the exact case that reported healthy in the field while
+                # NO.exe showed "Arc Not Detected". Cumulative process CPU is the
+                # proxy: real EEG processing keeps accumulating it, a stall does
+                # not. The threshold is deliberately slack (< 0.06s of CPU per ~3s
+                # tick, i.e. under ~2% of one core) and needs 8 consecutive flat
+                # ticks (~24s), so a momentarily quiet but working session resets
+                # the counter long before this fires.
+                $rawCpu = try { [double]$noProc.CPU } catch { $null }
+                if ($null -ne $rawCpu) {
+                    if ($null -eq $Session.StreamCpuFirstSample) { $Session.StreamCpuFirstSample = $rawCpu }
+                    if ($null -ne $Session.StreamCpuLastSample) {
+                        $cpuDelta = $rawCpu - [double]$Session.StreamCpuLastSample
+                        if ($cpuDelta -lt 0.06) {
+                            $Session.StreamFlatCpuTicks++
+                        } else {
+                            $Session.StreamFlatCpuTicks = 0
+                        }
+                    }
+                    $Session.StreamCpuLastSample = $rawCpu
+
+                    if ($Session.StreamFlatCpuTicks -ge 8 -and -not $Session.StreamCpuStallReported) {
+                        $Session.StreamCpuStalled       = $true
+                        $Session.StreamCpuStallReported = $true
+                        $flatSec  = $Session.StreamFlatCpuTicks * 3
+                        $totalCpu = [math]::Round($rawCpu - [double]$Session.StreamCpuFirstSample, 2)
+                        $portStr  = if ($Session.ActiveStreamPort) { $Session.ActiveStreamPort } else { 'the COM port' }
+                        $linkNote = if ($Session.BtLinkState -eq 'NotConnected') {
+                            ' The radio also reports no active link, so there is nothing underneath the port to deliver data.'
+                        } else { '' }
+                        $events += @{
+                            Kind = 'ANOMALY'; State = 'StreamStalled'
+                            Reason = "NO.exe is holding $portStr but has used only ${totalCpu}s of CPU over the last ${flatSec}s"
+                            Annotation = "[!] Port held, no data flow: a live EEG session keeps NO.exe busy, and this one is idle while still owning the port.$linkNote Expect 'Arc not detected' on screen even though the headset's light suggests it is streaming."
+                            Level = 'FAIL'; Timestamp = $now
+                        }
+                    }
+                }
+
+                # Read-operation rate. Sampled independently of CPU -- the two
+                # catch different shapes and neither should be able to suppress
+                # the other. CPU flatline catches an application doing nothing at
+                # all; a read collapse catches one still busy with its other work
+                # while only the serial path is dead. The 12005 and 12006 field
+                # captures are one of each.
+                $ioSample = Get-ProcessIoSample -Process $noProc
+                if ($ioSample) {
+                    if ($null -ne $Session.IoLastReadOps) {
+                        $opsDelta = $ioSample.ReadOps - [double]$Session.IoLastReadOps
+                        # Counters are monotonic within a process. A negative
+                        # delta means this is a different NO.exe, so drop the
+                        # history rather than baseline across two processes.
+                        if ($opsDelta -lt 0) {
+                            $Session.IoReadOpDeltas.Clear()
+                        } else {
+                            [void]$Session.IoReadOpDeltas.Add($opsDelta)
+                        }
+                    }
+                    $Session.IoLastReadOps = $ioSample.ReadOps
+
+                    $ioVerdict = Test-IoReadCollapse -Deltas @($Session.IoReadOpDeltas)
+                    $Session.IoVerdict            = $ioVerdict.Verdict
+                    $Session.IoBaselineOpsPerTick = $ioVerdict.BaselineOpsPerTick
+                    $Session.IoRecentOpsPerTick   = $ioVerdict.RecentOpsPerTick
+
+                    if ($ioVerdict.Verdict -eq 'Collapsed' -and -not $Session.IoStallReported) {
+                        $Session.IoStalled       = $true
+                        $Session.IoStallReported = $true
+                        $ioPort = if ($Session.ActiveStreamPort) { $Session.ActiveStreamPort } else { 'the COM port' }
+                        # Distinguishes this from the CPU-flatline case in the
+                        # operator's own terms: the app is visibly still working.
+                        $busyNote = if ($Session.StreamFlatCpuTicks -lt 4) {
+                            ' NO.exe is still busy with its other work, so this is not the application freezing -- one of its jobs died and the rest kept running.'
+                        } else { '' }
+                        $events += @{
+                            Kind = 'ANOMALY'; State = 'ReadRateCollapsed'
+                            Reason = "NO.exe read rate collapsed from ~$($ioVerdict.BaselineOpsPerTick) to ~$($ioVerdict.RecentOpsPerTick) read operations per tick while still holding $ioPort"
+                            Annotation = "[!] The application stopped reading while keeping the port open.$busyNote Windows can still show the Bluetooth link as connected here: the baseband link stays up while the headset stops delivering data, which is what 'Arc Connection Lost' looks like from outside."
+                            Level = 'FAIL'; Timestamp = $now
+                        }
+                    }
+                }
 
                 # Sync-VISA hang detection. NO.exe >= 4.0 does synchronous serial
                 # (VISA) read/write, so a stalled Arc blocks the UI thread and the
@@ -718,12 +1379,127 @@ function Get-DeviceProbeSessionSummary {
             [void]$findings.Add("[ok] Bluetooth serial port registrations are consistent ($($integ.EntryCount) entries for $($integ.ComNameCount) COM name(s), all symlinks resolve)")
         }
 
+        # Stale symlink: resolves, but to an abandoned device object. Reported
+        # separately from the absent-symlink case because the two produce
+        # DIFFERENT win32 errors and an operator who sees the timeout will
+        # otherwise be sent to toggle the radio, which cannot fix this.
+        $dangling = 0
+        try { if ($null -ne $integ.DanglingSymlinkCount) { $dangling = [int]$integ.DanglingSymlinkCount } } catch { }
+        if ($dangling -gt 0) {
+            [void]$findings.Add("[!] $dangling Bluetooth COM symlink(s) point at a device object that is no longer registered. Opens against them time out (ERROR_SEM_TIMEOUT) and look like a headset that is not answering -- it is not, the serial stack is stale. FIX: reboot. A radio toggle will NOT clear this.")
+        }
+
+        # The causal claim, carried as a number. 'Unexplained' is the interesting
+        # one: it means resumes do not account for the extra registrations on
+        # this box and the FI-012 story is incomplete for it.
+        $corr = $null
+        try { $corr = $integ.Correlation } catch { }
+        if ($corr -and $corr.Assessment -eq 'Unexplained') {
+            [void]$findings.Add("[!] $($corr.Summary). Worth capturing: FI-012 assumes sleep/resume is the trigger, and this box contradicts that.")
+        } elseif ($corr -and $corr.Assessment -eq 'Consistent') {
+            [void]$findings.Add("[i] $($corr.Summary)")
+        }
+
         # Degraded mid-session: the recorder's unique contribution. A single
         # sample cannot tell you whether the box arrived broken or broke while
         # you watched; this can, and it pins the trigger to this session.
         if ($integStart -and $integEnd -and $integStart.Healthy -and -not $integEnd.Healthy) {
             [void]$findings.Add("[!] Bluetooth serial port registrations DEGRADED during this session: healthy at start, $($integEnd.CollisionCount) collision(s) / $($integEnd.MissingSymlinkCount) absent symlink(s) at end. Whatever happened in this recording is what corrupts them -- check the session log for sleep/resume or a re-pair.")
         }
+    }
+
+    # ── FI-012 fault 2, without opening a port ────────────────────────────────
+    # Test-BluetoothSerialPortOpen is the only thing that can CONFIRM fault 2 and
+    # it must never run here -- an open during a live client session can steal
+    # the port from NO.exe and manufacture the very error being diagnosed. So the
+    # recorder reports the fingerprint instead, explicitly as unconfirmed.
+    # Populated by the caller; absent on older sessions and when the radio or
+    # device state could not be read.
+    # NoActiveLink is reported as [i], not [!]: a healthy idle Arc reads
+    # disconnected too, so raising it as a problem would cry wolf on every box
+    # whose device happens to be off. RadioOff IS actionable and is a [!].
+    $fp = $Session.SerialFaultFingerprint
+    if ($fp -and $fp.Fault -eq 'RadioOff') {
+        [void]$findings.Add("[!] $($fp.Summary) NEXT: $($fp.Action)")
+    } elseif ($fp -and $fp.Fault -eq 'NoActiveLink') {
+        [void]$findings.Add("[i] $($fp.Summary) NEXT: $($fp.Action)")
+    }
+
+    # ── Arrival-state contradictions ──────────────────────────────────────────
+    # Carried from the startup snapshot, because a box that was ALREADY in a bad
+    # combination when Record was pressed generates no transitions and would
+    # otherwise reach the uploaded record with nothing said about it.
+    foreach ($c in @($Session.StartupConsistency)) {
+        if ($c -and $c.Text) { [void]$findings.Add("$($c.Text) (state on arrival, before recording began)") }
+    }
+
+    # ── Port held with no data flowing ────────────────────────────────────────
+    # The finding the recorder previously could not produce: it reported "EEG
+    # streaming: Active" for any held handle, so a stalled Arc looked healthy.
+    if ($Session.StreamCpuStalled) {
+        $portStr = if ($Session.ActiveStreamPort) { $Session.ActiveStreamPort } else { 'the headset COM port' }
+        [void]$findings.Add("[!] Port held without data flow: NO.exe kept $portStr open while its CPU stayed flat, which a live EEG session does not do. The handle being open is NOT evidence of streaming -- this is the state that shows 'Arc not detected' on screen while the headset's own light suggests it is transmitting.")
+    }
+
+    # ── Read-rate collapse ────────────────────────────────────────────────────
+    # The signal for the fault CPU cannot see: the application stays busy while
+    # only its serial path dies. Reported with the measured numbers because it is
+    # a process-wide counter -- nothing here attributes a read to the COM port.
+    if ($Session.IoStalled) {
+        $portStr = if ($Session.ActiveStreamPort) { $Session.ActiveStreamPort } else { 'the headset COM port' }
+        $linkNote = if ($Session.BtLinkState -eq 'Connected') {
+            " The Bluetooth link was UP at the same time, so this is not a transport failure -- either the headset stopped transmitting while its baseband link stayed alive, or NeurOptimal's read path stalled."
+        } else { '' }
+        [void]$findings.Add("[!] Read rate collapsed while the port stayed open: NO.exe went from ~$($Session.IoBaselineOpsPerTick) to ~$($Session.IoRecentOpsPerTick) read operations per tick on $portStr.$linkNote Note this counter is process-wide, so it shows the application stopped doing the I/O it had been doing, not specifically that the port went quiet.")
+    } elseif ($Session.IoVerdict -eq 'NoBaseline' -and $Session.StreamingState -eq 'Active') {
+        # Explicitly NOT a clean bill of health. Saying nothing here would let an
+        # unmeasurable session read as a measured-healthy one.
+        #
+        # Zero is called out separately from merely-low because the two mean
+        # different things. Measured on the dev box 2026-07-30: an idle NO.exe
+        # reports exactly 0 read operations per tick while its CPU keeps
+        # climbing. If that stays 0 through a session that IS streaming, the
+        # reads are not being issued by NO.exe at all -- NO 4.x does its serial
+        # I/O through NI-VISA, and if VISA proxies the port through its own
+        # service process the counters land there instead. That would mean this
+        # detector is watching the wrong process, which is a fixable thing to
+        # know and an invisible one if the summary just stays quiet.
+        if ([int]$Session.IoBaselineOpsPerTick -eq 0) {
+            [void]$findings.Add("[info] No read activity was visible on NO.exe at all this session, so data flow was NOT assessed. If the headset WAS streaming during this recording, the reads are not being issued by the NO.exe process -- on 4.x the serial I/O goes through NI-VISA, which may issue them from its own service process. Worth checking before trusting any read-rate result from this box.")
+        } else {
+            [void]$findings.Add("[info] Read-rate monitoring could not establish a baseline for NO.exe this session (observed ~$($Session.IoBaselineOpsPerTick) read operations per tick, below the floor needed to call a collapse). Data flow was NOT assessed -- the absence of a read-collapse finding means nothing was measured, not that nothing was wrong.")
+        }
+    } elseif ($Session.IoVerdict -eq 'Streaming') {
+        [void]$findings.Add("[ok] NO.exe read rate held steady at ~$($Session.IoBaselineOpsPerTick) read operations per tick while the port was open -- consistent with data actually flowing")
+    }
+
+    # ── Operator-marked moments ───────────────────────────────────────────────
+    # These go near the top of the findings on purpose: an operator marker is the
+    # only place in the record where the APPLICATION's own verdict appears. It
+    # outranks anything the probe inferred, because the probe cannot see NO's
+    # dialogs at all.
+    $markers = @($Session.OperatorMarkers)
+    foreach ($mk in $markers) {
+        if (-not $mk) { continue }
+        $line = Format-ProbeStateMarker -Marker $mk
+        $contra = @($mk.Contradictions)
+        if ($contra.Count -gt 0) {
+            [void]$findings.Add("[!] $line. Cross-check at that moment: $($contra -join ' ')")
+        } else {
+            # No contradiction found does NOT mean nothing was wrong -- it means
+            # the fault is above anything the probe measures. Say so, because
+            # this is exactly the case the code mapping needs to hear about.
+            [void]$findings.Add("[!] $line. The probe found no contradiction in the Bluetooth layer at that moment, so whatever NeurOptimal was reporting originates above it -- capture this one.")
+        }
+    }
+    if ($markers.Count -eq 0) {
+        [void]$findings.Add('[info] No operator markers in this recording. If NeurOptimal showed an error during it, the record cannot say which machine state produced it.')
+    }
+
+    # Ports that exist but refuse to open, seen at any point in the session.
+    $deadPorts = @($Session.UnavailablePorts | Where-Object { $_ })
+    if ($deadPorts.Count -gt 0) {
+        [void]$findings.Add("[!] $($deadPorts -join ', ') registered as a Bluetooth serial port but would not open during this session. No process can reach the headset through it. Cause not classified here (an absent symlink and a stale one need different fixes) -- run the serial port integrity check with NO.exe closed.")
     }
 
     # COM port number stats
@@ -872,6 +1648,7 @@ function Get-DeviceProbeSessionSummary {
         BtLinkFlapCount = $Session.BtLinkFlapCount
         BtLinkEverConnected = $Session.BtLinkEverConnected
         ObservationCount = $WatchState.Observations.Count
+        OperatorMarkers = @($Session.OperatorMarkers)
     }
 }
 
@@ -1004,8 +1781,9 @@ function Get-ProbeStateUserText {
         'btlink.Connected'            = 'Connected'
         'btlink.NotConnected'         = 'Disconnected'
         'btlink.Unknown'              = 'Unknown'
-        'stream.Active'               = 'Active'
-        'stream.Stopped'              = 'Idle'
+        # "Port open", not "Active": the probe measures a handle, not data flow.
+        'stream.Active'               = 'Port open'
+        'stream.Stopped'              = 'Port idle'
     }
     $longText = @{
         'device.Missing'              = 'Not found -- Windows has not discovered the headset yet. Turn it on and put it in pairing mode.'
@@ -1016,13 +1794,21 @@ function Get-ProbeStateUserText {
         'device.Unconfigured'         = 'Not configured -- device is paired but has no COM ports assigned yet'
         'comport.ComPortMissing'      = 'No COM port -- COM ports are virtual serial connections that NeurOptimal uses to talk to the headset. They appear after successful pairing.'
         'comport.ComPortFound'        = 'COM port assigned -- the headset has a virtual serial port for NeurOptimal communication'
-        'comport.ComPortAmbiguous'    = 'Multiple COM ports found -- usually means old ghost ports from previous pairings still exist'
+        # Two ports is the NORMAL, healthy shape for this headset -- it exposes a
+        # DATA and a COMMAND SPP channel, and TargetDeviceWatch counts this state
+        # as "seen" for exactly that reason. The old text called it ghost ports,
+        # which sent operators hunting for a problem that was not there.
+        'comport.ComPortAmbiguous'    = 'Two COM ports found -- normal for this headset, which exposes a data channel and a command channel. More than two can mean leftovers from previous pairings.'
         'comport.ComPortUnconfigured' = 'N/A -- COM ports only apply when a device is paired'
         'btlink.Connected'            = 'Radio connected -- the Bluetooth radio has an active wireless link to the headset'
         'btlink.NotConnected'         = 'Radio disconnected -- no active Bluetooth wireless link to the headset'
         'btlink.Unknown'              = 'Radio unknown -- cannot determine Bluetooth radio link status (requires admin rights and a discovered device)'
-        'stream.Active'               = 'EEG streaming -- NeurOptimal is actively receiving data from the headset over the COM port'
-        'stream.Stopped'              = 'EEG idle -- no data is flowing between the headset and NeurOptimal'
+        # These used to assert that data was flowing. The probe cannot see that:
+        # it detects a HELD HANDLE, which NO.exe takes at connect and keeps
+        # whether or not the headset delivers a single sample. Saying otherwise
+        # is what made a stalled Arc read as a healthy session in the field.
+        'stream.Active'               = 'COM port open -- NeurOptimal is holding the headset''s serial port. This does NOT confirm EEG data is arriving; the probe cannot read the port while another process owns it.'
+        'stream.Stopped'              = 'COM port idle -- no process is holding the headset''s serial port, so NeurOptimal is not connected to it right now'
     }
 
     $key = "$Kind.$State"
@@ -1068,7 +1854,14 @@ Export-ModuleMember -Function @(
     'Test-NoUsesMacResolve',
     'Get-BtConnectionState',
     'Test-ComPortInUse',
+    'Get-ComPortHoldState',
     'Get-StreamingState',
+    'Get-ProbeStateConsistency',
+    'Initialize-ProcessIoApi',
+    'Get-ProcessIoSample',
+    'Test-IoReadCollapse',
+    'New-ProbeStateMarker',
+    'Format-ProbeStateMarker',
     'Get-PatternAnnotation',
     'Get-EstimatedScanCycles',
     'New-DeviceProbeSession',

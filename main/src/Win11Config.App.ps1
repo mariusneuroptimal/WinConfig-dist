@@ -4684,7 +4684,10 @@ $buttonHandlers = @{
                 @{ Key = 'Device';  Text = 'Device: --' }
                 @{ Key = 'COM';     Text = 'COM: --' }
                 @{ Key = 'Link';    Text = 'Radio: --' }
-                @{ Key = 'Stream';  Text = 'Stream: --' }
+                # Reads "Port open" / "Port idle" -- the short state text is already
+                # self-describing, so no "Stream:" prefix (which asserted data flow
+                # the probe never measured).
+                @{ Key = 'Stream';  Text = 'Port: --' }
                 @{ Key = 'App';     Text = 'NO.exe: --' }
             )
             foreach ($ind in $stateIndicators) {
@@ -4807,6 +4810,42 @@ $buttonHandlers = @{
             $btButtonRow.Controls.Add($btStopBtn)
             $btButtonRow.Controls.SetChildIndex($btStopBtn, 0)
 
+            # Operator marker. The recorder can see the machine but not what
+            # NeurOptimal is telling the person in front of it, and NO's error
+            # codes are still being mapped -- several dialogs that look identical
+            # are different failures underneath. Typing the code here binds it to
+            # the full machine state at that instant, which is what turns a
+            # recording into a labelled sample instead of an anonymous one.
+            $script:BtRec_MarkRequested = $false
+            $btMarkBox = New-Object System.Windows.Forms.TextBox
+            $btMarkBox.Width = 110
+            $btMarkBox.Margin = New-Object System.Windows.Forms.Padding(16, 3, 0, 0)
+            $btMarkBox.BackColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
+            $btMarkBox.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+            $btMarkBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+            $btMarkBox.Text = "NO code"
+            $btMarkBox.Tag = 'placeholder'
+            $btMarkBox.Add_Enter({
+                if ($this.Tag -eq 'placeholder') { $this.Text = ''; $this.Tag = $null; $this.ForeColor = [System.Drawing.Color]::White }
+            })
+            $btMarkBox.Add_Leave({
+                if ([string]::IsNullOrWhiteSpace($this.Text)) { $this.Text = 'NO code'; $this.Tag = 'placeholder'; $this.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220) }
+            })
+            $btButtonRow.Controls.Add($btMarkBox)
+
+            $btMarkBtn = New-Object System.Windows.Forms.Button
+            $btMarkBtn.Text = "Mark what NO is showing"
+            $btMarkBtn.AutoSize = $true
+            $btMarkBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btMarkBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
+            $btMarkBtn.Margin = New-Object System.Windows.Forms.Padding(6, 0, 0, 0)
+            $btMarkBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btMarkBtn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(120, 120, 120)
+            $btMarkBtn.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+            $btMarkBtn.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+            $btMarkBtn.Add_Click({ $script:BtRec_MarkRequested = $true })
+            $btButtonRow.Controls.Add($btMarkBtn)
+
             $script:BtRec_AbortClicked = $false
             $btAbortBtn = New-Object System.Windows.Forms.Button
             $btAbortBtn.Text = "Abort"
@@ -4901,6 +4940,17 @@ $buttonHandlers = @{
                 $sppPorts = @($initCom.Ports | Where-Object { $_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000' })
                 $btProbeSession.StartupSppChannelCount = $sppPorts.Count
 
+                # Read-rate monitoring. Optional: if the P/Invoke will not load or
+                # NO.exe's handle cannot be queried, the session still records
+                # everything else and the summary says data flow was not assessed
+                # rather than implying it was assessed and found healthy.
+                if (Get-Command Initialize-ProcessIoApi -ErrorAction SilentlyContinue) {
+                    $btProbeSession.IoApiAvailable = try { Initialize-ProcessIoApi } catch { $false }
+                    if (-not $btProbeSession.IoApiAvailable) {
+                        Write-BtLog "  Read-rate monitoring unavailable -- data flow will not be assessed this session" -Level "WARN"
+                    }
+                }
+
                 # Adapter info + power plan (captured once)
                 try { $btProbeSession.AdapterInfo = Get-BluetoothAdapterInfo } catch { }
                 try { $btProbeSession.PowerPlan   = Get-PowerPlanInfo } catch { }
@@ -4910,10 +4960,15 @@ $buttonHandlers = @{
                 $btProbeSession.BtLinkState    = $initLink
                 $btProbeSession.BtLinkEnteredAt = Get-Date
 
-                # Streaming initial state
+                # Port-hold initial state. NOT a data-flow reading -- see
+                # Get-ComPortHoldState. The distinction matters here more than
+                # anywhere else, because this snapshot is what the operator reads
+                # before deciding whether anything is wrong.
                 $initStream = Get-StreamingState -WatchState $btProbeWatch
                 $btProbeSession.StreamingState = $initStream.State
                 $btProbeSession.ActiveStreamPort = $initStream.ActivePort
+                $btProbeSession.HeldPorts        = @($initStream.HeldPorts)
+                $btProbeSession.UnavailablePorts = @($initStream.UnavailablePorts)
                 if ($initStream.State -eq 'Active') { $btProbeSession.StateEnteredAt['streaming_Active_at'] = Get-Date }
 
                 # Show status strip and initial state
@@ -4925,12 +4980,41 @@ $buttonHandlers = @{
                 Write-BtLog "  Radio link    : $(Get-ProbeStateUserText -Kind btlink -State $initLink)" -Level (Get-ProbeStateGuiLevel $initLink)
                 if ($initStream.State -eq 'Active') {
                     $streamPort = if ($initStream.ActivePort) { " ($($initStream.ActivePort))" } else { '' }
-                    Write-BtLog "  EEG streaming : Active$streamPort" -Level "OK"
+                    Write-BtLog "  COM port open : Yes$streamPort -- a process is holding the port (this does NOT confirm data is flowing)" -Level "OK"
                 } else {
-                    Write-BtLog "  EEG streaming : $(Get-ProbeStateUserText -Kind stream -State $initStream.State)" -Level "DIM"
+                    Write-BtLog "  COM port open : $(Get-ProbeStateUserText -Kind stream -State $initStream.State)" -Level "DIM"
                 }
                 $noRunning = Test-ProcessRunningInSnapshot -ProcessNames $initProc -Name $btProbeAppName
                 Write-BtLog "  NO.exe        : $(if ($noRunning) { 'Running' } else { 'Not running' })" -Level $(if ($noRunning) { 'OK' } else { 'DIM' })
+
+                # Arrival-state cross-check. Every other alarm in the probe fires on
+                # a state CHANGE, so a box that is already broken when Record is
+                # pressed produces no transitions and used to slide through the
+                # snapshot with each line individually unremarkable (field case
+                # 2026-07-30: port held, radio link down, nothing flagged, NO.exe
+                # showing 'Arc Not Detected' on the next monitor).
+                if (Get-Command Get-ProbeStateConsistency -ErrorAction SilentlyContinue) {
+                    try {
+                        $btArrival = @(Get-ProbeStateConsistency `
+                            -DeviceState  $btProbeWatch.DeviceState `
+                            -ComPortState $btProbeWatch.ComPortState `
+                            -BtLinkState  $initLink `
+                            -StreamState  $initStream.State `
+                            -HeldPorts    @($initStream.HeldPorts) `
+                            -UnavailablePorts @($initStream.UnavailablePorts) `
+                            -AppRunning   $noRunning)
+                        $btProbeSession.StartupConsistency = $btArrival
+                        if ($btArrival.Count -gt 0) {
+                            Write-BtLog "" -Level "DIM"
+                            Write-BtLog "  State on arrival needs attention:" -Level "WARN"
+                            foreach ($c in $btArrival) {
+                                Write-BtLog "  $($c.Text)" -Level $c.Level
+                            }
+                        }
+                    } catch {
+                        Write-BtLog "  [arrival cross-check unavailable: $_]" -Level "DIM"
+                    }
+                }
                 if ($btProbeSession.NoExeVersion) {
                     if (Test-NoUsesMacResolve -Version $btProbeSession.NoExeVersion) {
                         Write-BtLog "  NO.exe version: $($btProbeSession.NoExeVersion) -- resolves COM port from MAC each connect (port-number changes are benign)" -Level "DIM"
@@ -4957,7 +5041,9 @@ $buttonHandlers = @{
                 Write-BtLog "  COM port   = Virtual serial port NeurOptimal uses to receive EEG data" -Level "DIM"
                 Write-BtLog "  Radio link = Wireless connection to headset. Normal to be 'off' when idle." -Level "DIM"
                 Write-BtLog "               Drops DURING an active stream = the mid-session disconnect event" -Level "DIM"
-                Write-BtLog "  Stream     = Is EEG data actually flowing right now?" -Level "DIM"
+                Write-BtLog "  Port open  = Is a process holding the headset's COM port right now?" -Level "DIM"
+                Write-BtLog "               NOT the same as data flowing -- NeurOptimal keeps the port open" -Level "DIM"
+                Write-BtLog "               whether or not the headset is actually sending anything" -Level "DIM"
                 Write-BtLog "  NO.exe     = Is the NeurOptimal application running?" -Level "DIM"
                 Write-BtLog "  USB suspend= Power-saving feature that can shut down the Bluetooth radio mid-session" -Level "DIM"
                 Write-BtLog "" -Level "DIM"
@@ -4967,6 +5053,10 @@ $buttonHandlers = @{
                     Write-BtLog "  Launch NeurOptimal, start a session and reproduce the Bluetooth issue" -Level "INFO"
                 }
                 Write-BtLog "  Click  Stop and Upload  when done (~10 sec to finish)" -Level "INFO"
+                Write-BtLog "  IF NEUROPTIMAL SHOWS AN ERROR: type its NO Code in the box at the bottom" -Level "ACTION"
+                Write-BtLog "  and click  Mark what NO is showing.  This stamps the exact machine state" -Level "ACTION"
+                Write-BtLog "  behind that message -- the same code can mean different things, and this" -Level "ACTION"
+                Write-BtLog "  is the only way the recording can tell them apart." -Level "ACTION"
                 Write-BtLog "  You can run the Bluetooth repair tools from the main window while recording" -Level "DIM"
                 Write-BtLog "  (except Full Bluetooth Stack Reset) -- they will be marked in this log" -Level "DIM"
                 Write-BtLog "" -Level "DIM"
@@ -4984,6 +5074,10 @@ $buttonHandlers = @{
                     Write-BtLog "  Launch NeurOptimal, start a session and reproduce the Bluetooth issue" -Level "INFO"
                 }
                 Write-BtLog "  Click  Stop and Upload  when done (~10 sec to finish)" -Level "INFO"
+                Write-BtLog "  IF NEUROPTIMAL SHOWS AN ERROR: type its NO Code in the box at the bottom" -Level "ACTION"
+                Write-BtLog "  and click  Mark what NO is showing.  This stamps the exact machine state" -Level "ACTION"
+                Write-BtLog "  behind that message -- the same code can mean different things, and this" -Level "ACTION"
+                Write-BtLog "  is the only way the recording can tell them apart." -Level "ACTION"
                 Write-BtLog "" -Level "DIM"
                 Write-BtLog "  Monitoring Bluetooth activity -- connect/disconnect events will appear here" -Level "DIM"
             }
@@ -5013,9 +5107,50 @@ $buttonHandlers = @{
                 if ($btDeepProbeAvailable -and $btProbeWatch) {
                     $devShort = Get-ProbeStateUserText -Kind device -State $btProbeWatch.DeviceState -Short
                     $streamShort = Get-ProbeStateUserText -Kind stream -State $btProbeSession.StreamingState -Short
-                    $btElapsedLabel.Text = "Recording  {0:mm\:ss}  |  {1}  |  Stream: {2}" -f $elapsed, $devShort, $streamShort
+                    $btElapsedLabel.Text = "Recording  {0:mm\:ss}  |  {1}  |  {2}" -f $elapsed, $devShort, $streamShort
                 } else {
                     $btElapsedLabel.Text = "Recording  {0:mm\:ss}  -- click Stop and Upload when done" -f $elapsed
+                }
+
+                # ── Operator marker ──────────────────────────────────────────
+                # Handled on every loop pass, not on the 3s probe tick, so the
+                # marker lands on the moment the operator saw the dialog rather
+                # than up to three seconds later.
+                if ($script:BtRec_MarkRequested) {
+                    $script:BtRec_MarkRequested = $false
+                    try {
+                        $mkLabel = if ($btMarkBox.Tag -eq 'placeholder') { '' } else { $btMarkBox.Text }
+                        if ($btDeepProbeAvailable -and $btProbeWatch -and (Get-Command New-ProbeStateMarker -ErrorAction SilentlyContinue)) {
+                            $mk = New-ProbeStateMarker -Label $mkLabel -At $now `
+                                -ElapsedSeconds ([int]$elapsed.TotalSeconds) `
+                                -DeviceState  $btProbeWatch.DeviceState `
+                                -ComPortState $btProbeWatch.ComPortState `
+                                -BtLinkState  $btProbeSession.BtLinkState `
+                                -StreamState  $btProbeSession.StreamingState `
+                                -HeldPorts    @($btProbeSession.HeldPorts) `
+                                -UnavailablePorts @($btProbeSession.UnavailablePorts) `
+                                -AppRunning   ($btProbeWatch.AppProcessState -eq 'Running') `
+                                -NoExeVersion $btProbeSession.NoExeVersion `
+                                -IoVerdict    $btProbeSession.IoVerdict `
+                                -IoBaselineOpsPerTick ([int]$btProbeSession.IoBaselineOpsPerTick) `
+                                -IoRecentOpsPerTick   ([int]$btProbeSession.IoRecentOpsPerTick)
+                            [void]$btProbeSession.OperatorMarkers.Add($mk)
+                            Write-BtLog "  $($now.ToString('HH:mm:ss'))  [MARK    ]  $(Format-ProbeStateMarker -Marker $mk)" -Level "ACTION"
+                            foreach ($cx in @($mk.Contradictions)) {
+                                Write-BtLog "             $cx" -Level "WARN"
+                            }
+                            if (@($mk.Contradictions).Count -eq 0) {
+                                Write-BtLog "             [~] Bluetooth layer looks consistent at this moment -- whatever NeurOptimal is showing comes from above it. Marked for follow-up." -Level "WARN"
+                            }
+                        } else {
+                            Write-BtLog "  $($now.ToString('HH:mm:ss'))  [MARK    ]  Operator marked '$mkLabel' (limited monitoring -- no machine state captured with it)" -Level "ACTION"
+                        }
+                        $btMarkBox.Text = 'NO code'
+                        $btMarkBox.Tag  = 'placeholder'
+                        $btMarkBox.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+                    } catch {
+                        Write-BtLog "  Could not record the marker: $_" -Level "WARN"
+                    }
                 }
 
                 # ── Deep probe tick (every 3s, main thread) ──────────────────
@@ -5088,7 +5223,7 @@ $buttonHandlers = @{
                         $btStateLabels['COM'].ForeColor = Get-ProbeStateColor $btProbeWatch.ComPortState
                         $btStateLabels['Link'].Text = "Radio: $(Get-ProbeStateUserText -Kind btlink -State $btProbeSession.BtLinkState -Short)"
                         $btStateLabels['Link'].ForeColor = Get-ProbeStateColor $btProbeSession.BtLinkState
-                        $btStateLabels['Stream'].Text = "Stream: $(Get-ProbeStateUserText -Kind stream -State $btProbeSession.StreamingState -Short)"
+                        $btStateLabels['Stream'].Text = "$(Get-ProbeStateUserText -Kind stream -State $btProbeSession.StreamingState -Short)"
                         $btStateLabels['Stream'].ForeColor = Get-ProbeStateColor $btProbeSession.StreamingState
                         $appState = $btProbeWatch.AppProcessState
                         $btStateLabels['App'].Text = "NO.exe: $(if ($appState -eq 'Running') { 'Running' } else { 'Off' })"
@@ -5140,7 +5275,7 @@ $buttonHandlers = @{
                         $elSec = [int]$elapsed.TotalSeconds
                         $hbDevice = Get-ProbeStateUserText -Kind device -State $btProbeWatch.DeviceState -Short
                         $hbStream = Get-ProbeStateUserText -Kind stream -State $btProbeSession.StreamingState -Short
-                        Write-BtLog "  ... watching  [${elSec}s]  Device: $hbDevice  |  Stream: $hbStream" -Level "DIM"
+                        Write-BtLog "  ... watching  [${elSec}s]  Device: $hbDevice  |  $hbStream" -Level "DIM"
                     }
 
                     $btNextProbeTick = $now.AddSeconds(3)
@@ -5232,6 +5367,8 @@ $buttonHandlers = @{
             # Recording is over — free the bottom row for the saved-file path + Open Folder.
             $btStopBtn.Visible  = $false
             $btAbortBtn.Visible = $false
+            $btMarkBtn.Visible  = $false
+            $btMarkBox.Visible  = $false
 
             Write-BtLog ""
             Write-BtLog "Step 3 of 3: Stopping - taking final snapshot..." -Level "STEP"
@@ -5245,6 +5382,33 @@ $buttonHandlers = @{
                 if (Get-Command Get-BluetoothSerialPortIntegrity -ErrorAction SilentlyContinue) {
                     $btProbeSession.SerialPortIntegrityEnd = try { Get-BluetoothSerialPortIntegrity } catch { $null }
                 }
+
+                # FI-012 fault 2 fingerprint. Read-only: radio State (never
+                # SetStateAsync) plus the paired-device link state WinRT already
+                # exposes. Deliberately NOT an open attempt -- see
+                # Test-BluetoothSerialPortOpen for why that cannot run here.
+                if (Get-Command Get-SerialFaultFingerprint -ErrorAction SilentlyContinue) {
+                    try {
+                        $btRadio = try { Get-BluetoothRadioState } catch { $null }
+                        $btPaired = try { @(Get-BluetoothDevicesWinRT) } catch { @() }
+                        $btIntegForFp = if ($btProbeSession.SerialPortIntegrityEnd) {
+                            $btProbeSession.SerialPortIntegrityEnd
+                        } else { $btProbeSession.SerialPortIntegrity }
+                        # LastConnectedTime for the target: the passive signal
+                        # that actually discriminated during the field case.
+                        $btTarget = @($btPaired | Where-Object { $_.Name -and $_.Name -match 'NeurOptimal|Arc' })
+                        $btLinkHist = $null
+                        if ($btTarget.Count -gt 0 -and $btTarget[0].Address) {
+                            $btLinkHist = try { Get-BluetoothLinkHistory -Address $btTarget[0].Address } catch { $null }
+                        }
+                        $btProbeSession.SerialFaultFingerprint = Get-SerialFaultFingerprint `
+                            -Integrity $btIntegForFp -PairedDevices $btPaired `
+                            -RadioOn $(if ($btRadio) { $btRadio.BluetoothOn } else { $null }) `
+                            -LinkHistory $btLinkHist
+                        if ($btRadio) { $btProbeSession.SerialFaultFingerprint.RadioState = $btRadio }
+                    } catch { }
+                }
+
                 $btProbeSummary = Get-DeviceProbeSessionSummary -Session $btProbeSession -WatchState $btProbeWatch
                 $btWatchReport  = New-TargetWatchReport -WatchState $btProbeWatch
 
@@ -5324,6 +5488,39 @@ $buttonHandlers = @{
                     } catch { }
                 }
 
+                # Operator-labelled state vectors, as their own artifact rather
+                # than only inside the summary prose. These are the only records
+                # that pair NeurOptimal's own message with the machine state that
+                # produced it, so they need to be machine-readable: mapping a code
+                # that means two different things means clustering these across
+                # many boxes, not reading them one at a time.
+                if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
+                    try {
+                        $mkAll = @($btProbeSession.OperatorMarkers)
+                        Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'operator-markers.json' -Data @{
+                            MarkerCount = $mkAll.Count
+                            NoExeVersion = if ($btProbeSession.NoExeVersion) { [string]$btProbeSession.NoExeVersion } else { $null }
+                            Markers     = @($mkAll | ForEach-Object { @{
+                                At               = $_.AtIso
+                                ElapsedSeconds   = $_.ElapsedSeconds
+                                Label            = $_.Label
+                                NoCode           = $_.NoCode
+                                DeviceState      = $_.DeviceState
+                                ComPortState     = $_.ComPortState
+                                BtLinkState      = $_.BtLinkState
+                                StreamState      = $_.StreamState
+                                HeldPorts        = @($_.HeldPorts)
+                                UnavailablePorts = @($_.UnavailablePorts)
+                                AppRunning       = $_.AppRunning
+                                IoVerdict            = $_.IoVerdict
+                                IoBaselineOpsPerTick = $_.IoBaselineOpsPerTick
+                                IoRecentOpsPerTick   = $_.IoRecentOpsPerTick
+                                Contradictions   = @($_.Contradictions)
+                            } })
+                        }
+                    } catch { }
+                }
+
                 # FI-012 structured evidence. The session summary carries the
                 # verdict as a sentence; this carries the table it was derived
                 # from -- every SERIALCOMM registration, which device objects
@@ -5352,6 +5549,11 @@ $buttonHandlers = @{
                                 AtSessionStart = $siStart
                                 AtSessionEnd   = $siEnd
                                 DegradedInRun  = [bool]($siStart -and $siEnd -and $siStart.Healthy -and -not $siEnd.Healthy)
+                                # Fault 2 cannot be confirmed without opening a
+                                # port, which is barred here. This is the
+                                # unconfirmed fingerprint plus the radio state
+                                # that makes it interpretable.
+                                Fingerprint    = $btProbeSession.SerialFaultFingerprint
                             }
                         }
                     } catch { }
@@ -5445,6 +5647,53 @@ $buttonHandlers = @{
                         } else { $null }
                         SerialPortDegradedInRun = [bool]($btProbeSession -and $btProbeSession.SerialPortIntegrity -and $btProbeSession.SerialPortIntegrityEnd -and
                                                           $btProbeSession.SerialPortIntegrity.Healthy -and -not $btProbeSession.SerialPortIntegrityEnd.Healthy)
+                        SerialPortDanglingSymlinkCount = if ($btProbeSession -and $btProbeSession.SerialPortIntegrity) {
+                            $(if ($btProbeSession.SerialPortIntegrityEnd) { $btProbeSession.SerialPortIntegrityEnd } else { $btProbeSession.SerialPortIntegrity }).DanglingSymlinkCount
+                        } else { $null }
+                        # Which FI-012 fault, and how strongly. 'DeviceNotLinked'
+                        # is Suspected by construction -- confirming it needs an
+                        # open attempt, which never runs during a recording.
+                        SerialFault           = if ($btProbeSession -and $btProbeSession.SerialFaultFingerprint) { $btProbeSession.SerialFaultFingerprint.Fault } else { $null }
+                        SerialFaultConfidence = if ($btProbeSession -and $btProbeSession.SerialFaultFingerprint) { $btProbeSession.SerialFaultFingerprint.Confidence } else { $null }
+                        # Tests the FI-012 sleep/resume hypothesis on this box.
+                        # 'Unexplained' means resumes do not account for the
+                        # extra registrations and the story is incomplete.
+                        SerialRegistrationCorrelation = if ($btProbeSession -and $btProbeSession.SerialPortIntegrity) {
+                            $c = $(if ($btProbeSession.SerialPortIntegrityEnd) { $btProbeSession.SerialPortIntegrityEnd } else { $btProbeSession.SerialPortIntegrity }).Correlation
+                            if ($c) { $c.Assessment } else { $null }
+                        } else { $null }
+                        SerialResumeCountSinceBoot = if ($btProbeSession -and $btProbeSession.SerialPortIntegrity) {
+                            $p = $(if ($btProbeSession.SerialPortIntegrityEnd) { $btProbeSession.SerialPortIntegrityEnd } else { $btProbeSession.SerialPortIntegrity }).PowerContext
+                            if ($p) { $p.ResumeCount } else { $null }
+                        } else { $null }
+                        # Port held with no data moving through it. The recorder
+                        # could not express this before: any held handle read as
+                        # "EEG streaming: Active", so a stalled Arc uploaded as a
+                        # clean session (field case 2026-07-30).
+                        PortHeldWithoutDataFlow = [bool]($btProbeSession -and $btProbeSession.StreamCpuStalled)
+                        # Read-rate collapse: the signal for a fault where the
+                        # transport is clean end to end and only NO.exe's serial
+                        # path dies (field capture 2026-07-30, NO code 12006).
+                        # ReadRateVerdict must be read alongside it -- 'NoBaseline'
+                        # means data flow was NOT assessed, not that it was fine.
+                        ReadRateCollapsed = [bool]($btProbeSession -and $btProbeSession.IoStalled)
+                        ReadRateVerdict = if ($btProbeSession) { $btProbeSession.IoVerdict } else { $null }
+                        ReadRateBaselineOpsPerTick = if ($btProbeSession) { $btProbeSession.IoBaselineOpsPerTick } else { $null }
+                        ReadRateRecentOpsPerTick = if ($btProbeSession) { $btProbeSession.IoRecentOpsPerTick } else { $null }
+                        # Ports registered in SERIALCOMM that would not open. The
+                        # old bool port test folded these in with "free".
+                        UnopenablePortCount = if ($btProbeSession) { @($btProbeSession.UnavailablePorts | Where-Object { $_ }).Count } else { $null }
+                        # Contradictions present before recording started -- the
+                        # transition-driven alarms are blind to these by design.
+                        ArrivalContradictionCount = if ($btProbeSession) { @($btProbeSession.StartupConsistency).Count } else { $null }
+                        # Operator-labelled moments. The NO codes let triage group
+                        # recordings by what the application actually said, which
+                        # is the axis the code mapping needs and the one the
+                        # recorder could not report before.
+                        OperatorMarkerCount = if ($btProbeSession) { @($btProbeSession.OperatorMarkers).Count } else { $null }
+                        OperatorMarkedNoCodes = if ($btProbeSession) {
+                            @(@($btProbeSession.OperatorMarkers) | ForEach-Object { $_.NoCode } | Where-Object { $_ } | Select-Object -Unique)
+                        } else { @() }
                     }
                     Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'manifest.json' -Data $manifest
                 } catch { }

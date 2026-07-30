@@ -335,9 +335,23 @@ function Initialize-WinRTTypes {
         # Load WinRT interop assembly
         Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
 
-        # Helper to await WinRT async operations
-        $script:AwaitMethod = [WindowsRuntimeSystemExtensions].GetMember('GetAwaiter').
-            Where({ $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' },'First')
+        # AsTask, NOT GetAwaiter. Both are generic extension methods, but
+        # GetAwaiter cannot be late-bound: Invoke() on it throws "Late bound
+        # operations cannot be performed on types or methods for which
+        # ContainsGenericParameters is true", because PowerShell has no way to
+        # supply the type argument. AsTask can be closed explicitly with
+        # MakeGenericMethod, which is why every caller passes -ResultType.
+        #
+        # This mattered: the previous GetAwaiter form threw on EVERY call, the
+        # throw was swallowed, and Await-WinRTAsync returned $null. WinRT
+        # Bluetooth enumeration therefore reported zero devices on every box,
+        # silently, and the IsConnected/Presence/ClassOfDevice enrichment built
+        # on it never ran.
+        $script:AsTaskMethod = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+            $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+            $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+        })[0]
+        if (-not $script:AsTaskMethod) { throw 'AsTask(IAsyncOperation<T>) not found' }
 
         $script:WinRTInitialized = $true
         return $true
@@ -351,27 +365,55 @@ function Initialize-WinRTTypes {
 function Await-WinRTAsync {
     <#
     .SYNOPSIS
-        Awaits a WinRT IAsyncOperation and returns the result.
+        Awaits a WinRT IAsyncOperation and returns the result, or $null.
+    .PARAMETER AsyncOp
+        The IAsyncOperation. Under PowerShell 5.1 this arrives as a bare
+        System.__ComObject, which is why the result type cannot be inferred and
+        must be supplied.
+    .PARAMETER ResultType
+        The T of IAsyncOperation<T>. Required: it closes the generic AsTask
+        method. Passing the wrong type surfaces as a marshalling failure, i.e.
+        $null, not as silently wrong data.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         $AsyncOp,
+        [Parameter(Mandatory)][type]$ResultType,
         [int]$TimeoutMs = 5000
     )
 
+    if (-not $AsyncOp) { return $null }
+    if (-not $script:AsTaskMethod) {
+        if (-not (Initialize-WinRTTypes)) { return $null }
+    }
+
     try {
-        $awaiter = $script:AwaitMethod.Invoke($null, @($AsyncOp))
-        $start = [DateTime]::Now
-        while (-not $awaiter.IsCompleted) {
-            if (([DateTime]::Now - $start).TotalMilliseconds -gt $TimeoutMs) {
-                throw "WinRT async operation timed out after ${TimeoutMs}ms"
-            }
-            [System.Threading.Thread]::Sleep(50)
+        $task = $script:AsTaskMethod.MakeGenericMethod($ResultType).Invoke($null, @($AsyncOp))
+
+        # Apartment matters. On MTA (background jobs) Task.Wait behaves normally
+        # and the timeout is real.
+        if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+            if (-not $task.Wait($TimeoutMs)) { return $null }
+            return $task.Result
         }
-        return $awaiter.GetResult()
+
+        # On STA -- which is what the GUI runs on -- a blocking Task.Wait cannot
+        # observe completion at all: the WinRT continuation needs the COM message
+        # pump, and the pump is not running while the thread is blocked. Measured:
+        # Wait(10000), AsyncWaitHandle.WaitOne(10000) and IsCompleted polling ALL
+        # report "not finished" on an operation that has in fact completed.
+        # Reading .Result does complete, so that is what we use here, and the
+        # $TimeoutMs is advisory on this path.
+        #
+        # This is only safe because every call site uses a fast API: the paired
+        # device enumeration below measures ~34ms and FromIdAsync ~10ms per
+        # device. It is specifically NOT safe for DeviceInformation AEP queries,
+        # which block for a fixed 30s -- see Get-BluetoothDevicesWinRT.
+        return $task.Result
     }
     catch {
+        Write-Verbose "WinRT await failed for [$($ResultType.Name)]: $($_.Exception.Message)"
         return $null
     }
 }
@@ -412,16 +454,6 @@ function Get-BluetoothDevicesWinRT {
             return @()
         }
 
-        # AQS query for paired Bluetooth devices
-        $btSelector = "System.Devices.Aep.ProtocolId:=""{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}"" AND System.Devices.Aep.IsPaired:=System.StructuredQueryType.Boolean#True"
-
-        # Request additional properties
-        $requestedProps = [System.Collections.Generic.List[string]]::new()
-        $requestedProps.Add("System.Devices.Aep.DeviceAddress")
-        $requestedProps.Add("System.Devices.Aep.IsConnected")
-        $requestedProps.Add("System.Devices.Aep.Bluetooth.Le.IsConnectable")
-        $requestedProps.Add("System.Devices.Aep.SignalStrength")
-
         # Get DeviceInformation type
         $deviceInfoType = [Type]::GetType("Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType=WindowsRuntime")
 
@@ -431,11 +463,37 @@ function Get-BluetoothDevicesWinRT {
             $deviceInfoType = [Windows.Devices.Enumeration.DeviceInformation]
         }
 
-        # FindAllAsync with selector and properties
-        $findAllMethod = $deviceInfoType.GetMethod('FindAllAsync', @([string], [System.Collections.Generic.IEnumerable[string]]))
-        $asyncOp = $findAllMethod.Invoke($null, @($btSelector, $requestedProps))
+        # BluetoothDevice.GetDeviceSelector(), NOT a hand-written AQS query over
+        # System.Devices.Aep.*. Both return the same paired devices here, but
+        # they are not equivalent in practice:
+        #
+        #   GetDeviceSelector()  DeviceInterface kind        ~34ms
+        #   AEP AQS filter       AssociationEndpoint kind    ~30s, every time
+        #
+        # The AEP form also requires the three-argument FindAllAsync overload
+        # (the one- and two-argument ones default to DeviceInterface, against
+        # which an AEP filter silently matches nothing) and its whole reason for
+        # existing was to request System.Devices.Aep.IsConnected -- which cannot
+        # be read anyway, because DeviceInformation.Properties is an
+        # IMapView<string,object> that PowerShell 5.1 surfaces as an opaque
+        # System.__ComObject. So the slow path bought nothing. Connection status
+        # comes from BluetoothDevice.ConnectionStatus below instead, which is
+        # authoritative and costs ~10ms per device.
+        $btDeviceTypeForSelector = [Windows.Devices.Bluetooth.BluetoothDevice, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
+        $btSelector = $btDeviceTypeForSelector::GetDeviceSelector()
 
-        $deviceInfoCollection = Await-WinRTAsync -AsyncOp $asyncOp -TimeoutMs 10000
+        # [type[]] cast is required: without it PowerShell binds @(...) as
+        # Object[] and resolves GetMethod(string, BindingFlags) instead of
+        # GetMethod(string, Type[]), returning $null.
+        $findAllMethod = $deviceInfoType.GetMethod('FindAllAsync', [type[]]@([string]))
+        if (-not $findAllMethod) {
+            Write-Verbose "FindAllAsync(String) not found"
+            return @()
+        }
+        $asyncOp = $findAllMethod.Invoke($null, @($btSelector))
+
+        $deviceInfoCollection = Await-WinRTAsync -AsyncOp $asyncOp `
+            -ResultType ([Windows.Devices.Enumeration.DeviceInformationCollection]) -TimeoutMs 10000
 
         if (-not $deviceInfoCollection) {
             Write-Verbose "No devices returned from WinRT enumeration"
@@ -461,22 +519,30 @@ function Get-BluetoothDevicesWinRT {
                 if (Test-IsTransportOrServiceNode -Name $name) { continue }
                 if ($name -match "^Microsoft|Enumerator|^Generic") { continue }
 
-                # Extract properties
-                $props = $devInfo.Properties
+                # Extract properties. DeviceInformation.Properties is an
+                # IMapView<string,object>, which PowerShell 5.1 surfaces as a
+                # bare System.__ComObject: ContainsKey/indexing are not
+                # projected, Keys enumerates empty, and indexing throws. So this
+                # is best-effort only and MUST NOT be the source of truth --
+                # BluetoothDevice.ConnectionStatus below is, and it is read for
+                # every device rather than only as a fallback.
                 $address = $null
                 $isConnectedProp = $false
                 $signalStrength = $null
 
-                if ($props) {
-                    if ($props.ContainsKey("System.Devices.Aep.DeviceAddress")) {
+                try {
+                    $props = $devInfo.Properties
+                    if ($props -and $props.ContainsKey("System.Devices.Aep.DeviceAddress")) {
                         $address = $props["System.Devices.Aep.DeviceAddress"]
                     }
-                    if ($props.ContainsKey("System.Devices.Aep.IsConnected")) {
+                    if ($props -and $props.ContainsKey("System.Devices.Aep.IsConnected")) {
                         $isConnectedProp = $props["System.Devices.Aep.IsConnected"] -eq $true
                     }
-                    if ($props.ContainsKey("System.Devices.Aep.SignalStrength")) {
+                    if ($props -and $props.ContainsKey("System.Devices.Aep.SignalStrength")) {
                         $signalStrength = $props["System.Devices.Aep.SignalStrength"]
                     }
+                } catch {
+                    Write-Verbose "AEP property map not readable for '$name' (expected on PS 5.1)"
                 }
 
                 # Resolve live connection status via BluetoothDevice.FromIdAsync
@@ -485,14 +551,24 @@ function Get-BluetoothDevicesWinRT {
 
                 if ($btDeviceType) {
                     try {
-                        $fromIdMethod = $btDeviceType.GetMethod('FromIdAsync', @([string]))
+                        $fromIdMethod = $btDeviceType.GetMethod('FromIdAsync', [type[]]@([string]))
                         $btAsyncOp = $fromIdMethod.Invoke($null, @($deviceId))
-                        $btDevice = Await-WinRTAsync -AsyncOp $btAsyncOp -TimeoutMs 3000
+                        $btDevice = Await-WinRTAsync -AsyncOp $btAsyncOp `
+                            -ResultType ([Windows.Devices.Bluetooth.BluetoothDevice]) -TimeoutMs 3000
 
                         if ($btDevice) {
                             # Connection status from BluetoothDevice is authoritative
                             $connStatus = $btDevice.ConnectionStatus
                             $isConnected = $connStatus -eq [Windows.Devices.Bluetooth.BluetoothConnectionStatus]::Connected
+
+                            # The only reliable MAC source here: the AEP property
+                            # map that would otherwise carry it is not readable
+                            # from PS 5.1. Formatted to match the colon-separated
+                            # form used everywhere else in this module.
+                            if (-not $address -and $btDevice.BluetoothAddress) {
+                                $hex = '{0:X12}' -f $btDevice.BluetoothAddress
+                                $address = ($hex -replace '(.{2})(?!$)', '$1:')
+                            }
 
                             # Class of Device (for audio detection)
                             $cod = $btDevice.ClassOfDevice
@@ -3699,6 +3775,20 @@ function Get-BluetoothSerialPortIntegrity {
     if ($collectError) {
         $verdict.Summary = "Serial port integrity check failed: $collectError"
     }
+
+    # Boot/resume context, so the "re-registers on resume" hypothesis is carried
+    # as a number in every capture rather than re-argued from memory each time.
+    # Never allowed to fail the integrity check itself.
+    $verdict.PowerContext = $null
+    $verdict.Correlation  = $null
+    try {
+        $power = Get-BluetoothPowerCycleContext
+        $verdict.PowerContext = $power
+        $verdict.Correlation  = Get-SerialRegistrationCorrelation `
+            -EntryCount $verdict.EntryCount -ComNameCount $verdict.ComNameCount `
+            -ResumeCount $power.ResumeCount
+    } catch { }
+
     return $verdict
 }
 
@@ -3711,6 +3801,13 @@ function Test-BluetoothSerialPortIntegrity {
         Split out from Get-BluetoothSerialPortIntegrity so the detection logic
         can be tested against captured broken-state data without needing a
         machine in that state. Takes no live dependencies.
+
+        Three defects are reported, all of which make a port unopenable or about
+        to become so:
+          COLLISION      one COM name claimed by several device objects
+          SYMLINK ABSENT the COM name has no \GLOBAL??\ entry at all
+          SYMLINK STALE  the entry resolves, but to a device object that is no
+                         longer registered for that name
     .PARAMETER Registrations
         Array of objects with DeviceObject + ComName, as read from
         HKLM\HARDWARE\DEVICEMAP\SERIALCOMM.
@@ -3730,17 +3827,18 @@ function Test-BluetoothSerialPortIntegrity {
     )
 
     $result = @{
-        Healthy             = $true
-        CollisionCount      = 0
-        MissingSymlinkCount = 0
-        ComNameCount        = 0
-        EntryCount          = $Registrations.Count
-        Entries             = @()
-        Findings            = @()
-        Summary             = $null
-        Recommendation      = $null
-        SymlinksChecked     = [bool]$SymlinksValid
-        Error               = $null
+        Healthy              = $true
+        CollisionCount       = 0
+        MissingSymlinkCount  = 0
+        DanglingSymlinkCount = 0
+        ComNameCount         = 0
+        EntryCount           = $Registrations.Count
+        Entries              = @()
+        Findings             = @()
+        Summary              = $null
+        Recommendation       = $null
+        SymlinksChecked      = [bool]$SymlinksValid
+        Error                = $null
     }
 
     if ($Registrations.Count -eq 0) {
@@ -3756,17 +3854,37 @@ function Test-BluetoothSerialPortIntegrity {
         $symlink = if ($SymlinksValid -and $SymlinkMap.ContainsKey($name)) { $SymlinkMap[$name] } else { $null }
         $symlinkOk = if ($SymlinksValid) { [bool]($symlink -and $symlink -notlike 'ERR:*') } else { $null }
 
-        if ($owners.Count -gt 1)              { $result.CollisionCount++ }
+        $deviceObjects = @($owners | Select-Object -ExpandProperty DeviceObject)
+
+        # A symlink that RESOLVES is not necessarily a symlink that resolves to
+        # the right place. \GLOBAL??\COM6 -> \Device\BthModem3 while SERIALCOMM
+        # currently registers COM6 to BthModem7 means every open reaches a stale
+        # device object: CreateFile succeeds or times out against something the
+        # driver has already abandoned. Symptomatically that is ERROR_SEM_TIMEOUT,
+        # i.e. it is indistinguishable from FI-012 fault 2 (device not answering)
+        # unless this comparison is made -- and the remedy is the opposite one
+        # (reboot, not a radio toggle). Only meaningful when the symlink layer was
+        # actually read AND the name resolved; otherwise $null, not $false.
+        $targetRegistered = $null
+        if ($symlinkOk) {
+            $targetRegistered = [bool]@($deviceObjects | Where-Object {
+                $_ -and $symlink -and ($_.Trim() -ieq $symlink.Trim())
+            }).Count
+        }
+
+        if ($owners.Count -gt 1)                 { $result.CollisionCount++ }
         if ($SymlinksValid -and -not $symlinkOk) { $result.MissingSymlinkCount++ }
+        if ($targetRegistered -eq $false)        { $result.DanglingSymlinkCount++ }
 
         $result.Entries += [PSCustomObject]@{
-            ComName       = $name
-            OwnerCount    = $owners.Count
-            DeviceObjects = @($owners | Select-Object -ExpandProperty DeviceObject)
-            IsBluetooth   = [bool]@($owners | Where-Object { $_.DeviceObject -match 'BthModem|RFCOMM|BTHMODEM' }).Count
-            Symlink       = $symlink
-            SymlinkOk     = $symlinkOk
-            Collision     = ($owners.Count -gt 1)
+            ComName                 = $name
+            OwnerCount              = $owners.Count
+            DeviceObjects           = $deviceObjects
+            IsBluetooth             = [bool]@($owners | Where-Object { $_.DeviceObject -match 'BthModem|RFCOMM|BTHMODEM' }).Count
+            Symlink                 = $symlink
+            SymlinkOk               = $symlinkOk
+            SymlinkTargetRegistered = $targetRegistered
+            Collision               = ($owners.Count -gt 1)
         }
     }
 
@@ -3778,17 +3896,753 @@ function Test-BluetoothSerialPortIntegrity {
         $result.Healthy = $false
         $result.Findings += "SYMLINK ABSENT: $($e.ComName) is registered but \GLOBAL??\$($e.ComName) does not resolve ($($e.Symlink)) - CreateFile returns ERROR_FILE_NOT_FOUND and the app reports the port as invalid"
     }
+    foreach ($e in ($result.Entries | Where-Object { $_.SymlinkTargetRegistered -eq $false })) {
+        $result.Healthy = $false
+        $result.Findings += "SYMLINK STALE: $($e.ComName) resolves to $($e.Symlink), which is NOT among the $($e.OwnerCount) device object(s) currently registered for it ($($e.DeviceObjects -join ', ')) - opens reach an abandoned device object and time out (ERROR_SEM_TIMEOUT), which looks exactly like a device that is not answering. It is not: the serial stack is stale and the fix is a reboot, NOT a radio toggle."
+    }
     if (-not $result.SymlinksChecked) {
         $result.Findings += "NOTE: symlink layer not readable - collision findings only"
     }
 
     if (-not $result.Healthy) {
-        $result.Summary = "$($result.EntryCount) SERIALCOMM entries for $($result.ComNameCount) COM name(s); $($result.CollisionCount) collided, $($result.MissingSymlinkCount) symlink(s) absent"
+        $result.Summary = "$($result.EntryCount) SERIALCOMM entries for $($result.ComNameCount) COM name(s); $($result.CollisionCount) collided, $($result.MissingSymlinkCount) symlink(s) absent, $($result.DanglingSymlinkCount) symlink(s) stale"
         $result.Recommendation = "REBOOT - do not unpair. HKLM\HARDWARE is volatile and rebuilt at boot, which clears the duplicate registrations and restores the COM symlinks. Unpairing/re-pairing does not fix this and adds another colliding generation."
     } else {
-        $result.Summary = "$($result.EntryCount) SERIALCOMM entries for $($result.ComNameCount) COM name(s); no collisions, all symlinks resolve"
+        $result.Summary = "$($result.EntryCount) SERIALCOMM entries for $($result.ComNameCount) COM name(s); no collisions, all symlinks resolve to a registered device object"
     }
 
+    return $result
+}
+
+function Initialize-RegistryKeyTimeApi {
+    <#
+    .SYNOPSIS
+        Loads the RegQueryInfoKey P/Invoke used to read a registry key's
+        last-write time. Idempotent.
+    .DESCRIPTION
+        PowerShell exposes no last-write time for a registry key, yet that one
+        value is what separates "this pairing record was just written by a
+        successful pair" from "this is a stale record an unpair left behind".
+        See Get-BluetoothOrphanPairingRecord for why the distinction decides the
+        diagnosis.
+    .OUTPUTS
+        [bool] $true if the API is available, $false otherwise.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    if ($script:RegistryKeyTimeApiAvailable) { return $true }
+
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'WinConfigRegKeyTime').Type) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32;
+public static class WinConfigRegKeyTime {
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    private static extern int RegQueryInfoKey(
+        IntPtr hKey, IntPtr cls, IntPtr clsLen, IntPtr reserved,
+        IntPtr subKeys, IntPtr maxSubKeyLen, IntPtr maxClassLen,
+        IntPtr values, IntPtr maxValueNameLen, IntPtr maxValueLen,
+        IntPtr securityDescriptor, out long lastWriteTime);
+
+    // Returns a DateTime, or null when the key cannot be interrogated. Never
+    // throws - an unreadable timestamp must degrade the report, not fail it.
+    public static object Get(string subKeyPath) {
+        RegistryKey key = null;
+        try {
+            key = Registry.LocalMachine.OpenSubKey(subKeyPath);
+            if (key == null) { return null; }
+            long ft;
+            int rc = RegQueryInfoKey(key.Handle.DangerousGetHandle(),
+                IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero,
+                IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out ft);
+            if (rc != 0) { return null; }
+            return DateTime.FromFileTime(ft);
+        } catch {
+            return null;
+        } finally {
+            if (key != null) { key.Close(); }
+        }
+    }
+}
+'@ -ErrorAction Stop
+        }
+        $script:RegistryKeyTimeApiAvailable = $true
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Test-BluetoothOrphanPairingRecord {
+    <#
+    .SYNOPSIS
+        Pure verdict function. Correlates BTHPORT pairing records against PnP
+        device nodes and reports records that exist in the registry but have no
+        device node anywhere.
+    .DESCRIPTION
+        Split out from Get-BluetoothOrphanPairingRecord so the detection logic
+        can be tested against captured data without needing a machine in the
+        broken state. Takes no live dependencies.
+
+        FI-014. An unpair deletes the PnP nodes but can leave
+        HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\<mac>
+        behind. bthport then treats the device as already-known: a subsequent
+        pairing attempt rewrites the record's VALUES but the association half
+        never runs, so no BTHENUM node is ever created - no DEV_ node, no SPP
+        nodes, no COM port. Windows shows the device as not paired while the
+        registry says otherwise, and the user can "pair" it forever with no
+        effect.
+
+        Neither of the two FI-012 remedies touches this. A reboot does not clear
+        a non-volatile registry record, and a radio toggle does not either. The
+        only fix is deleting the record. That is why this check must run BEFORE
+        the FI-012 triage tree, not after it.
+
+        LOW ENERGY DEVICES ARE NOT ORPHANS. An LE device only materialises
+        BTHLEDEVICE/BTHLE nodes while it is connected, so a remembered LE device
+        that is merely out of range legitimately has a record and no node.
+        Observed on the dev box 2026-07-30: a paired iPhone (7880363030a5) had
+        no node and was perfectly healthy. Classic devices behave the opposite
+        way - they keep their BTHENUM DEV_ node whether connected or not, which
+        the same capture confirms: the Satechi keyboard read Connected=False and
+        still had a Status OK DEV_ node. So a classic record with zero nodes is
+        a real defect; an LE record with zero nodes is merely dormant.
+    .PARAMETER Records
+        Array of objects with Mac (12 hex chars, no separators), Name,
+        IsLowEnergy, and optionally LastWrite, as read from BTHPORT.
+    .PARAMETER PnpInstanceIds
+        Every PnP instance ID on the box, including non-present devices. Must be
+        the unfiltered set: filtering to present devices would report every
+        powered-off classic device as an orphan.
+    .OUTPUTS
+        [hashtable] Healthy, OrphanCount, DormantCount, RecordCount, Records,
+        Findings, Summary, Recommendation, Error
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$Records,
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$PnpInstanceIds
+    )
+
+    $result = @{
+        Healthy        = $true
+        OrphanCount    = 0
+        DormantCount   = 0
+        RecordCount    = $Records.Count
+        Records        = @()
+        Findings       = @()
+        Summary        = $null
+        Recommendation = $null
+        Error          = $null
+    }
+
+    if ($Records.Count -eq 0) {
+        $result.Summary = "No Bluetooth pairing records found"
+        return $result
+    }
+
+    foreach ($rec in $Records) {
+        $mac = ([string]$rec.Mac) -replace '[^0-9A-Fa-f]', ''
+
+        # Instance IDs carry the MAC uppercase and unseparated, in several
+        # shapes: BTHENUM\DEV_<mac>\..., BTHLE\DEV_<mac>\..., and the service
+        # children BTHENUM\{guid}_VID&..\7&<radio>&0&<mac>_C0000000N. A
+        # substring match covers all of them. The radio instance fragment is
+        # only 8 hex characters so it cannot collide with a 12-character MAC.
+        $nodes = @()
+        if ($mac) {
+            $nodes = @($PnpInstanceIds | Where-Object { $_ -and ([string]$_) -like "*$mac*" })
+        }
+
+        $isLe    = [bool]$rec.IsLowEnergy
+        $hasNode = ($nodes.Count -gt 0)
+        $state   = if ($hasNode) { 'Paired' } elseif ($isLe) { 'Dormant' } else { 'Orphan' }
+
+        if ($state -eq 'Orphan')  { $result.OrphanCount++ }
+        if ($state -eq 'Dormant') { $result.DormantCount++ }
+
+        $result.Records += [PSCustomObject]@{
+            Mac         = $mac
+            Name        = $rec.Name
+            IsLowEnergy = $isLe
+            NodeCount   = $nodes.Count
+            Nodes       = $nodes
+            LastWrite   = $rec.LastWrite
+            State       = $state
+        }
+    }
+
+    foreach ($r in @($result.Records | Where-Object { $_.State -eq 'Orphan' })) {
+        $result.Healthy = $false
+        $stamp = if ($r.LastWrite) { " Record last written $($r.LastWrite)." } else { '' }
+        $result.Findings += "ORPHAN PAIRING RECORD: '$($r.Name)' ($($r.Mac)) has a BTHPORT record but NO PnP device node.$stamp Windows will show it as not paired, and pairing attempts will rewrite this record without ever creating a BTHENUM node - so no SPP nodes and no COM port. Reboot and radio toggle both leave this untouched; the record must be deleted."
+    }
+
+    if (-not $result.Healthy) {
+        $result.Summary = "$($result.RecordCount) pairing record(s); $($result.OrphanCount) orphaned (registry record with no device node)"
+        $result.Recommendation = "DELETE the orphaned record(s) under HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices, then toggle the Bluetooth radio and pair again. BUILTIN\Administrators has FullControl on those keys, so this needs elevation but not SYSTEM. Export the key first. Do NOT reboot or toggle the radio expecting either to help - neither clears a non-volatile registry record."
+    } else {
+        $dormant = if ($result.DormantCount -gt 0) { "; $($result.DormantCount) dormant LE record(s), which is normal" } else { '' }
+        $result.Summary = "$($result.RecordCount) pairing record(s); every classic record has a device node$dormant"
+    }
+
+    return $result
+}
+
+function Get-BluetoothOrphanPairingRecord {
+    <#
+    .SYNOPSIS
+        Detects FI-014: BTHPORT pairing records that have no corresponding PnP
+        device node, which silently block re-pairing.
+    .DESCRIPTION
+        Reads every subkey of
+        HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices and
+        cross-checks each MAC against the unfiltered PnP device list. See
+        Test-BluetoothOrphanPairingRecord for the fault mechanism and for why LE
+        records are exempt.
+
+        The per-record LastWrite timestamp is best-effort and worth having: a
+        child key's timestamp moves when its VALUES change, a parent's only when
+        a subkey is added or removed. On the dev box 2026-07-30 the child read
+        "written today" while the parent read "yesterday", which proved the
+        subkey was a pre-existing orphan being rewritten rather than a fresh
+        pairing - the single observation that identified the fault.
+
+        Requires elevation to read the Devices subtree. Read-only; makes no
+        changes.
+    .OUTPUTS
+        [hashtable] As Test-BluetoothOrphanPairingRecord, plus ParentLastWrite.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $devicesPath = 'SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices'
+    $records      = @()
+    $instanceIds  = @()
+    $parentWrite  = $null
+    $collectError = $null
+
+    $haveTimeApi = Initialize-RegistryKeyTimeApi
+
+    try {
+        if ($haveTimeApi) { $parentWrite = [WinConfigRegKeyTime]::Get($devicesPath) }
+
+        $hive = "HKLM:\$devicesPath"
+        if (Test-Path $hive) {
+            foreach ($key in @(Get-ChildItem $hive -ErrorAction Stop)) {
+                $mac   = $key.PSChildName
+                $props = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+
+                # Name is REG_BINARY UTF8 with a trailing NUL on most stacks, but
+                # a plain string on some. Handle both rather than printing a byte
+                # array into a finding.
+                $name = $null
+                if ($props) {
+                    $name = $props.Name
+                    if ($name -is [byte[]]) {
+                        $name = [Text.Encoding]::UTF8.GetString($name).Trim([char]0)
+                    }
+                }
+                if (-not $name) { $name = "(unnamed $mac)" }
+
+                # LE pairings carry LE-specific values. Classic ones do not.
+                $valueNames = @()
+                if ($props) {
+                    $valueNames = @($props.PSObject.Properties |
+                        Where-Object { $_.Name -notlike 'PS*' } |
+                        Select-Object -ExpandProperty Name)
+                }
+                $isLe = [bool]@($valueNames | Where-Object {
+                    $_ -in @('LEName', 'LEAddressType', 'LEAppearance', 'LocalEvaldIoCapLE', 'LeContainerId')
+                }).Count
+
+                $records += [PSCustomObject]@{
+                    Mac         = $mac
+                    Name        = [string]$name
+                    IsLowEnergy = $isLe
+                    LastWrite   = $(if ($haveTimeApi) { [WinConfigRegKeyTime]::Get("$devicesPath\$mac") } else { $null })
+                }
+            }
+        }
+
+        # Unfiltered on purpose. Get-PnpDevice with no -Status returns present
+        # and non-present nodes alike; narrowing to present would report every
+        # powered-off classic device as an orphan.
+        $instanceIds = @(Get-PnpDevice -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty InstanceId)
+    } catch {
+        $collectError = $_.Exception.Message
+    }
+
+    $verdict = Test-BluetoothOrphanPairingRecord -Records $records -PnpInstanceIds $instanceIds
+    $verdict.ParentLastWrite = $parentWrite
+    $verdict.Error = $collectError
+    if ($collectError) {
+        $verdict.Summary = "Orphan pairing record check failed: $collectError"
+    }
+
+    return $verdict
+}
+
+function Get-BluetoothPowerCycleContext {
+    <#
+    .SYNOPSIS
+        Boot time and the number of sleep/resume transitions since that boot.
+    .DESCRIPTION
+        FI-012's causal claim is that the Bluetooth serial driver re-registers
+        its COM names on resume without tearing down the previous generation,
+        so each resume leaves another SERIALCOMM entry behind and eventually
+        the \GLOBAL??\COMx symlink is lost in the collision.
+
+        That is currently a STORY, told from one box. It only becomes evidence
+        if the resume count is captured next to the collision count on every
+        run: if excess registrations track resumes across the fleet, the claim
+        holds; if a box collides at zero resumes, the trigger is something else
+        and the reboot advice needs a different rationale. HKLM\HARDWARE is
+        volatile, so both numbers are scoped to the same boot session and are
+        directly comparable.
+
+        Read-only. Returns nulls rather than throwing when the event log is
+        unreadable (non-admin, cleared log, rolled over).
+    .OUTPUTS
+        [hashtable] Available, LastBootTime, UptimeHours, ResumeCount,
+        SleepCount, EventsRead, Error
+    #>
+    [CmdletBinding()]
+    param()
+
+    $ctx = @{
+        Available    = $false
+        LastBootTime = $null
+        UptimeHours  = $null
+        ResumeCount  = $null
+        SleepCount   = $null
+        EventsRead   = $false
+        Error        = $null
+    }
+
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        if ($os -and $os.LastBootUpTime) {
+            $ctx.LastBootTime = $os.LastBootUpTime
+            $ctx.UptimeHours  = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalHours, 2)
+            $ctx.Available    = $true
+        }
+    } catch {
+        $ctx.Error = $_.Exception.Message
+        return $ctx
+    }
+
+    # Kernel-Power 107 = resume from sleep/hibernate, 42 = entering sleep. Scoped
+    # to the current boot because that is the window SERIALCOMM covers. A failure
+    # here leaves the counts $null (unknown), which is NOT the same as 0 and must
+    # not be reported as "no resumes" -- the correlation below treats them apart.
+    try {
+        $filter = @{
+            LogName      = 'System'
+            ProviderName = 'Microsoft-Windows-Kernel-Power'
+            StartTime    = $ctx.LastBootTime
+        }
+        $events = @(Get-WinEvent -FilterHashtable $filter -ErrorAction Stop |
+                    Where-Object { $_.Id -in @(42, 107) })
+        $ctx.ResumeCount = @($events | Where-Object { $_.Id -eq 107 }).Count
+        $ctx.SleepCount  = @($events | Where-Object { $_.Id -eq 42  }).Count
+        $ctx.EventsRead  = $true
+    } catch {
+        # No matching events is thrown as an error by Get-WinEvent, not returned
+        # as an empty set. That case is a real zero, not an unknown.
+        if ($_.Exception.Message -match 'No events were found') {
+            $ctx.ResumeCount = 0
+            $ctx.SleepCount  = 0
+            $ctx.EventsRead  = $true
+        } else {
+            $ctx.Error = $_.Exception.Message
+        }
+    }
+
+    return $ctx
+}
+
+function Get-SerialRegistrationCorrelation {
+    <#
+    .SYNOPSIS
+        Pure. Tests the FI-012 causal hypothesis against one box's numbers.
+    .DESCRIPTION
+        SERIALCOMM holds one entry per registration made during the current boot.
+        A clean box has exactly one per COM name. Every extra generation is an
+        un-torn-down re-registration, and the hypothesis says each of those comes
+        from a resume.
+
+        Assessment values -- deliberately NOT called a Verdict, which in this
+        codebase means a DiagnosticResult (PASS/WARN/FAIL/NOT_RUN) governed by
+        the DCTC contract. This is a hypothesis test, not a diagnostic verdict:
+          Consistent    excess generations <= resumes; hypothesis survives
+          Unexplained   excess generations > resumes; something ELSE is
+                        re-registering COM names, and reboot-only advice is
+                        treating a symptom
+          Clean         no excess generations
+          Unknown       resume count unavailable (non-admin, cleared log)
+    .PARAMETER EntryCount
+        Total SERIALCOMM entries.
+    .PARAMETER ComNameCount
+        Distinct COM names among them.
+    .PARAMETER ResumeCount
+        Kernel-Power 107 events since boot, or $null when unknown.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$EntryCount,
+        [Parameter(Mandatory)][int]$ComNameCount,
+        [System.Nullable[int]]$ResumeCount
+    )
+
+    $result = @{
+        Assessment         = 'Unknown'
+        ExcessGenerations  = $null
+        GenerationsPerName = $null
+        ResumeCount        = $ResumeCount
+        Summary            = $null
+    }
+
+    if ($ComNameCount -le 0) {
+        $result.Summary = 'No COM names registered; nothing to correlate'
+        return $result
+    }
+
+    # Round UP: 5 entries over 2 names means some name is on its third
+    # generation, and rounding down would hide it.
+    $perName = [math]::Ceiling($EntryCount / [double]$ComNameCount)
+    $excess  = [math]::Max(0, $perName - 1)
+    $result.GenerationsPerName = $perName
+    $result.ExcessGenerations  = $excess
+
+    if ($excess -eq 0) {
+        $result.Assessment = 'Clean'
+        $result.Summary = "1 registration per COM name; no stale generations"
+        return $result
+    }
+
+    if ($null -eq $ResumeCount) {
+        $result.Summary = "$excess excess registration generation(s) per COM name; resume count unavailable, so the sleep/resume hypothesis could not be tested"
+        return $result
+    }
+
+    if ($excess -le $ResumeCount) {
+        $result.Assessment = 'Consistent'
+        $result.Summary = "$excess excess registration generation(s) per COM name against $ResumeCount resume(s) since boot - consistent with the driver re-registering on resume without tearing down the previous generation"
+    } else {
+        $result.Assessment = 'Unexplained'
+        $result.Summary = "$excess excess registration generation(s) per COM name but only $ResumeCount resume(s) since boot - sleep/resume does NOT account for these registrations; something else is re-registering COM names on this box"
+    }
+
+    return $result
+}
+
+function Get-BluetoothRadioState {
+    <#
+    .SYNOPSIS
+        Reads the Bluetooth radio on/off state via WinRT.
+    .DESCRIPTION
+        FI-012 fault 2's remedy is a radio toggle, so whether the radio was ON
+        at collection time is part of the evidence: "device not answering" means
+        something different on a box whose radio is off, and telling an operator
+        to toggle a radio that is already off wastes a field visit.
+
+        Read-only -- reads Radio.State, never calls SetStateAsync.
+    .OUTPUTS
+        [hashtable] Available, BluetoothOn (nullable bool), Radios, Error
+    #>
+    [CmdletBinding()]
+    param([int]$TimeoutMs = 5000)
+
+    $result = @{
+        Available   = $false
+        BluetoothOn = $null
+        Radios      = @()
+        Error       = $null
+    }
+
+    try {
+        if (-not (Initialize-WinRTTypes)) {
+            $result.Error = 'WinRT unavailable'
+            return $result
+        }
+
+        $radioType  = [Windows.Devices.Radios.Radio, Windows.Devices.Radios, ContentType = WindowsRuntime]
+        $statusType = [Windows.Devices.Radios.RadioAccessStatus, Windows.Devices.Radios, ContentType = WindowsRuntime]
+        $access     = Await-WinRTAsync -AsyncOp ($radioType::RequestAccessAsync()) `
+                          -ResultType $statusType -TimeoutMs $TimeoutMs
+        if ("$access" -ne 'Allowed') {
+            $result.Error = "Radio access not granted: $access"
+            return $result
+        }
+
+        $radios = Await-WinRTAsync -AsyncOp ($radioType::GetRadiosAsync()) `
+                      -ResultType ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]]) `
+                      -TimeoutMs $TimeoutMs
+        if ($null -eq $radios) {
+            $result.Error = 'Radio enumeration timed out'
+            return $result
+        }
+
+        foreach ($r in $radios) {
+            $result.Radios += [PSCustomObject]@{
+                Name  = $r.Name
+                Kind  = "$($r.Kind)"
+                State = "$($r.State)"
+            }
+        }
+        $result.Available = $true
+
+        $bt = @($result.Radios | Where-Object { $_.Kind -eq 'Bluetooth' })
+        if ($bt.Count -gt 0) {
+            $result.BluetoothOn = [bool]@($bt | Where-Object { $_.State -eq 'On' }).Count
+        }
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
+
+    return $result
+}
+
+function Get-BluetoothLinkHistory {
+    <#
+    .SYNOPSIS
+        Reads DEVPKEY_Bluetooth_LastConnectedTime for a device MAC.
+    .DESCRIPTION
+        Intended as the one non-intrusive way to ask "did anything actually
+        connect to this device, and when", which an open attempt answers only by
+        taking the port away from whatever is using it.
+
+        ⚠️ DO NOT TRUST THIS VALUE WITHOUT THE PredatesBoot CHECK. On
+        MMEVOLD_06 (2026-07-27) it behaved as documented: frozen through the
+        broken window, advancing the instant an open succeeded. On the dev box
+        (2026-07-30) it was stale for EVERY paired device, measured as a
+        deliberate control:
+
+            NeurOptimal Arc   connected 12:27-13:00   reported 08:58:16
+            MX Master 4       in active use           reported 07:55:43
+            ORA by Kanto      IsConnected True        reported 08:09:32
+            Keychron Q3 Pro   IsConnected True        no value at all
+            Satechi           idle                    reported 20 days earlier
+
+        Boot was 08:58:35, so three of those PREDATE THE BOOT they are being
+        read in. A timestamp earlier than last boot cannot describe link
+        activity in the current boot session, so PredatesBoot marks it unusable
+        and callers must not render it as "last RFCOMM link-up". That guard
+        catches the demonstrable case only; a post-boot value is not thereby
+        proven correct, so this stays evidence and never a diagnosis.
+
+        Reading the newest across all matching nodes is deliberate. On
+        MMEVOLD_06 the property sat on the service child nodes (..._C0000000N);
+        on the dev box it sat on the parent BLUETOOTHDEVICE node with the
+        children blank. Neither placement is safe to assume.
+    .PARAMETER Address
+        MAC, with or without separators.
+    .PARAMETER BootTime
+        Last boot. Injectable so the staleness rule can be tested against
+        captured data. Queried from Win32_OperatingSystem when omitted; if that
+        fails, PredatesBoot is $null rather than $false - unknown, not clean.
+    .OUTPUTS
+        [hashtable] Address, LastConnectedTime, AgeHours, Found, BootTime,
+        PredatesBoot, Error
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Address,
+        [datetime]$BootTime
+    )
+
+    $result = @{
+        Address           = $Address
+        LastConnectedTime = $null
+        AgeHours          = $null
+        Found             = $false
+        BootTime          = $null
+        PredatesBoot      = $null
+        Error             = $null
+    }
+
+    if ($PSBoundParameters.ContainsKey('BootTime')) {
+        $result.BootTime = $BootTime
+    } else {
+        try {
+            $result.BootTime = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+        } catch { }
+    }
+
+    # Must be a full 12-hex-digit address. A partial one is worse than none:
+    # it is used as a regex against every Bluetooth InstanceId, so a 2-character
+    # fragment happily matches unrelated device nodes and reports some other
+    # device's LastConnectedTime as this one's.
+    $bare = ($Address -replace '[^0-9A-Fa-f]', '')
+    if ($bare.Length -ne 12) {
+        $result.Error = "Not a usable Bluetooth address: '$Address' reduces to $($bare.Length) hex digit(s), expected 12"
+        return $result
+    }
+
+    try {
+        $nodes = @(Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue |
+                   Where-Object { $_.InstanceId -match $bare })
+        $times = @()
+        foreach ($n in $nodes) {
+            try {
+                $p = Get-PnpDeviceProperty -InstanceId $n.InstanceId `
+                        -KeyName '{2BD67D8B-8BEB-48D5-87E0-6CDA3428040A} 11' -ErrorAction Stop
+                if ($p -and $p.Data) { $times += [datetime]$p.Data }
+            } catch { }
+        }
+        if ($times.Count -gt 0) {
+            $newest = ($times | Sort-Object -Descending)[0]
+            $result.LastConnectedTime = $newest
+            $result.AgeHours = [math]::Round(((Get-Date) - $newest).TotalHours, 2)
+            $result.Found = $true
+
+            # Stays $null when boot time is unknown. Unknown must not read as
+            # "not stale" - that is the failure mode this whole guard exists to
+            # stop.
+            if ($result.BootTime) {
+                $result.PredatesBoot = ($newest -lt $result.BootTime)
+            }
+        }
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
+
+    return $result
+}
+
+function Get-SerialFaultFingerprint {
+    <#
+    .SYNOPSIS
+        Pure. Classifies which FI-012 fault a box is in WITHOUT opening a port.
+    .DESCRIPTION
+        Test-BluetoothSerialPortOpen is the only thing that can CONFIRM fault 2,
+        and it is operator-initiated only -- it must never run inside the Flight
+        Recorder, which records live client sessions. That leaves the recorder
+        reporting nothing at all for fault 2 today.
+
+        This closes that gap as far as it honestly can, by joining the serial
+        integrity verdict, the target's link state, the radio state, and
+        LastConnectedTime.
+
+        IMPORTANT -- read the FI-012 trap before strengthening any of this:
+        "not connected" is NOT on its own a finding. SPP devices hold no profile
+        open, so a perfectly healthy idle Arc reads Disconnected; during the
+        field case IsConnected read False while both ports opened fine. So
+        NoActiveLink is reported as EVIDENCE at 'Weak' confidence, never as a
+        diagnosis, and LastConnectedTime is carried alongside it because that is
+        the signal that actually discriminated during the field case (frozen
+        through the broken window, advancing the instant an open succeeded).
+
+        Faults:
+          SerialStackBroken   fault 1 - integrity unhealthy; reboot. Confirmed.
+          RadioOff            radio is off; nothing else can be concluded.
+          NoActiveLink        no ACL link. CONSISTENT with fault 2 and equally
+                              consistent with an idle or powered-off device.
+                              Weak. Needs an open attempt to become a diagnosis.
+          Healthy             ports consistent and the target is linked.
+          Unknown             not enough data.
+    .PARAMETER Integrity
+        Result of Test-/Get-BluetoothSerialPortIntegrity, or $null.
+    .PARAMETER PairedDevices
+        Objects with Name / IsConnected, e.g. from Get-BluetoothDevicesWinRT.
+    .PARAMETER RadioOn
+        $true/$false/$null (unknown).
+    .PARAMETER LinkHistory
+        Result of Get-BluetoothLinkHistory for the target, or $null.
+    .PARAMETER TargetNamePattern
+        Regex picking the device that matters out of PairedDevices.
+    #>
+    [CmdletBinding()]
+    param(
+        $Integrity,
+        [AllowEmptyCollection()][array]$PairedDevices = @(),
+        [System.Nullable[bool]]$RadioOn,
+        $LinkHistory,
+        [string]$TargetNamePattern = 'NeurOptimal|Arc'
+    )
+
+    $result = @{
+        Fault             = 'Unknown'
+        Confidence        = 'None'
+        Summary           = $null
+        Action            = $null
+        TargetName        = $null
+        LastConnectedTime = $null
+        LastConnectedAgeHours = $null
+        Intrusive         = $false
+    }
+    if ($LinkHistory) {
+        $result.LastConnectedTime     = $LinkHistory.LastConnectedTime
+        $result.LastConnectedAgeHours = $LinkHistory.AgeHours
+    }
+
+    if ($Integrity -and -not $Integrity.Healthy) {
+        $result.Fault      = 'SerialStackBroken'
+        $result.Confidence = 'Confirmed'
+        $result.Summary    = "FI-012 fault 1: $($Integrity.Summary)"
+        $result.Action     = 'Reboot. Do not unpair.'
+        return $result
+    }
+
+    if ($RadioOn -eq $false) {
+        $result.Fault      = 'RadioOff'
+        $result.Confidence = 'Confirmed'
+        $result.Summary    = 'The Bluetooth radio is off, so no device can link. Nothing further can be concluded about the serial ports until it is on.'
+        $result.Action     = 'Turn the Bluetooth radio on, then re-run.'
+        return $result
+    }
+
+    $targets = @($PairedDevices | Where-Object { $_.Name -and $_.Name -match $TargetNamePattern })
+    if ($targets.Count -eq 0) {
+        $result.Summary = 'No paired target device found to assess; serial port registrations look consistent'
+        if ($Integrity) { $result.Fault = 'Unknown' }
+        return $result
+    }
+
+    $target = $targets[0]
+    $result.TargetName = $target.Name
+
+    if ($target.IsConnected) {
+        # NOT 'Healthy/Confirmed'. An ACL link plus consistent registrations means
+        # the transport is up -- it does not mean data is reaching NO.exe. The
+        # 2026-07-30 field case sat in exactly this state (paired, ports clean,
+        # integrity healthy, radio linked) while NO.exe showed "Arc Not Detected":
+        # the port was held and nothing was arriving through it. Reporting
+        # Confirmed Healthy there is worse than reporting nothing, because it is
+        # the verdict that tells an operator to stop capturing evidence.
+        $result.Fault      = 'LinkUp'
+        $result.Confidence = 'Weak'
+        $result.Summary    = "Serial port registrations are consistent and '$($target.Name)' has an active link. That clears the transport layer only -- it does NOT establish that EEG data is reaching NeurOptimal. A held COM port with no data flowing presents exactly like this."
+        $result.Action     = 'If NeurOptimal is still reporting a missing or undetected Arc in this state, capture it: the fault is above the Bluetooth transport and is not one this fingerprint can classify.'
+        return $result
+    }
+
+    $result.Fault      = 'NoActiveLink'
+    $result.Confidence = 'Weak'
+    # A LastConnectedTime older than the boot it is read in cannot describe link
+    # activity in this boot session. Rendering it as "last RFCOMM link-up" states
+    # a falsehood as fact and points the tech at "asleep or off" - measured on
+    # the dev box 2026-07-30, where the Arc had just run a 33 minute connected
+    # session and the property still read 19 seconds BEFORE boot. This branch is
+    # the common one for SPP, not an edge case: FI-012 records that SPP devices
+    # always read IsConnected False, so a healthy Arc reaches it every time.
+    $lastSeen = if ($LinkHistory -and $LinkHistory.Found -and $LinkHistory.PredatesBoot -eq $true) {
+        "A LastConnectedTime of $($LinkHistory.LastConnectedTime) is recorded, but it PREDATES the last boot ($($LinkHistory.BootTime)) - it is carried over from an earlier boot session and says NOTHING about whether this device has linked since. Ignore it."
+    } elseif ($LinkHistory -and $LinkHistory.Found -and $null -eq $LinkHistory.PredatesBoot) {
+        "A LastConnectedTime of $($LinkHistory.LastConnectedTime) is recorded, but boot time was unavailable so its freshness could not be checked - do not rely on it."
+    } elseif ($LinkHistory -and $LinkHistory.Found) {
+        "Last RFCOMM link-up was $($LinkHistory.LastConnectedTime) ($($LinkHistory.AgeHours)h ago), which is after the last boot. Corroborate before relying on it: this property was completely stale for every paired device on the dev box."
+    } else {
+        'No LastConnectedTime recorded for it.'
+    }
+    $result.Summary = "Serial port registrations and symlinks are clean and the radio is on, but '$($target.Name)' has no active link. $lastSeen This is CONSISTENT with FI-012 fault 2 and equally consistent with the device simply being idle or powered off - SPP devices hold no profile open, so a healthy Arc reads disconnected too. It is evidence, not a diagnosis."
+    $result.Action  = 'Confirm the device is POWERED ON first - that is the step that makes everything after it meaningful. Then, with NO.exe closed, run Test-BluetoothSerialPortOpen. ERROR_SEM_TIMEOUT on a device you have confirmed is on means fault 2 (toggle the radio, >=10s off); the same error on a device that is off means nothing at all. FI-012 records that the two are indistinguishable from the error alone.'
     return $result
 }
 
@@ -3926,11 +4780,12 @@ function Test-BluetoothSerialPortOpen {
     )
 
     $result = @{
-        Ran      = $false
-        Refused  = $false
-        Reason   = $null
-        Results  = @()
-        Summary  = $null
+        Ran       = $false
+        Refused   = $false
+        Reason    = $null
+        Results   = @()
+        Isolation = $null
+        Summary   = $null
     }
 
     $running = @()
@@ -3991,11 +4846,33 @@ function Test-BluetoothSerialPortOpen {
         }
     }
 
-    $bad = @($result.Results | Where-Object { -not $_.Opened })
+    $bad  = @($result.Results | Where-Object { -not $_.Opened })
+    $good = @($result.Results | Where-Object { $_.Opened })
+
+    # Which layer is broken. Other Bluetooth SPP ports opening normally while the
+    # target's time out is a real discriminator: it proves CreateFile, the
+    # symlinks and the serial stack are all working on this box, so the fault is
+    # specific to that device or its channels rather than system-wide. The
+    # converse -- every port failing -- points back at the stack itself.
+    # Observed 2026-07-28: COM3/COM4 opened in 0-2ms while COM5 (DATA) and COM6
+    # (COMMAND) both returned 121 at ~5.13s.
+    $result.Isolation = if ($bad.Count -eq 0) {
+        'AllOpened'
+    } elseif ($good.Count -gt 0) {
+        'DeviceSpecific'
+    } else {
+        'AllPortsFailed'
+    }
+
     $result.Summary = if ($bad.Count -eq 0) {
         "All $($result.Results.Count) Bluetooth COM port(s) opened"
     } else {
-        "$($bad.Count) of $($result.Results.Count) port(s) failed to open: $(($bad | ForEach-Object { "$($_.PortName)=$($_.Classification)" }) -join ', ')"
+        $base = "$($bad.Count) of $($result.Results.Count) port(s) failed to open: $(($bad | ForEach-Object { "$($_.PortName)=$($_.Classification)" }) -join ', ')"
+        if ($good.Count -gt 0) {
+            "$base. The other $($good.Count) Bluetooth COM port(s) opened normally, so CreateFile, the COM symlinks and the serial stack are all working - the fault is specific to this device or its channels, not system-wide."
+        } else {
+            "$base. EVERY Bluetooth COM port failed, which points at the serial stack rather than at one device - check Get-BluetoothSerialPortIntegrity."
+        }
     }
     return $result
 }
@@ -5287,6 +6164,21 @@ Export-ModuleMember -Function @(
     'Get-BluetoothCOMPorts',
     'Get-BluetoothSerialPortIntegrity',
     'Test-BluetoothSerialPortIntegrity',
+    # FI-014: pairing records left behind by an unpair, which block re-pairing.
+    # Must be checked BEFORE the FI-012 triage tree - neither a reboot nor a
+    # radio toggle clears a non-volatile registry record.
+    'Get-BluetoothOrphanPairingRecord',
+    'Test-BluetoothOrphanPairingRecord',
+    'Initialize-RegistryKeyTimeApi',
+    'Get-BluetoothPowerCycleContext',
+    'Get-SerialRegistrationCorrelation',
+    'Get-BluetoothRadioState',
+    'Get-SerialFaultFingerprint',
+    'Get-BluetoothLinkHistory',
+    # Paired-device link state. Exported because the FI-012 fault-2 fingerprint
+    # needs IsConnected, and the recorder builds that fingerprint outside this
+    # module.
+    'Get-BluetoothDevicesWinRT',
     'Test-BluetoothSerialPortOpen',
     'Get-SerialOpenClassification',
     'Initialize-SerialSymlinkApi',
