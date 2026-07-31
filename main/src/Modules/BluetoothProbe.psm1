@@ -3136,6 +3136,10 @@ function Invoke-BluetoothAdapterReset {
         return $result
     }
 
+    # Tracked outside the try so the catch can roll back a half-finished reset.
+    $targetInstanceId = $null
+    $adapterDisabled = $false
+
     try {
         # Find the primary Bluetooth adapter (exclude transport nodes)
         $btAdapter = Get-PnpDevice -Class Bluetooth -ErrorAction Stop |
@@ -3164,21 +3168,24 @@ function Invoke-BluetoothAdapterReset {
 
         $result.Details += "Target adapter: $($btAdapter.FriendlyName)"
         $result.Details += "InstanceId: $($btAdapter.InstanceId)"
+        $targetInstanceId = $btAdapter.InstanceId
 
         # Disable adapter
-        Disable-PnpDevice -InstanceId $btAdapter.InstanceId -Confirm:$false -ErrorAction Stop
+        Disable-PnpDevice -InstanceId $targetInstanceId -Confirm:$false -ErrorAction Stop
+        $adapterDisabled = $true
         $result.Details += "Adapter disabled at $(Get-Date -Format 'HH:mm:ss')"
 
         Start-Sleep -Seconds 2
 
         # Re-enable adapter
-        Enable-PnpDevice -InstanceId $btAdapter.InstanceId -Confirm:$false -ErrorAction Stop
+        Enable-PnpDevice -InstanceId $targetInstanceId -Confirm:$false -ErrorAction Stop
+        $adapterDisabled = $false
         $result.Details += "Adapter re-enabled"
 
         Start-Sleep -Seconds 1
 
         # Check if adapter came back
-        $adapterCheck = Get-PnpDevice -InstanceId $btAdapter.InstanceId -ErrorAction SilentlyContinue
+        $adapterCheck = Get-PnpDevice -InstanceId $targetInstanceId -ErrorAction SilentlyContinue
         if ($adapterCheck.Status -eq 'OK') {
             $result.Success = $true
             $result.TerminalState = "ResetCompleted"
@@ -3200,7 +3207,45 @@ function Invoke-BluetoothAdapterReset {
         $result.Message = "Failed to reset adapter: $($_.Exception.Message)"
         $result.Details += $_.Exception.Message
         $result.RebootRequired = $true
-        # F7: Disable may have succeeded before Enable failed — assume state changed.
+
+        # Rollback. If the disable landed and the enable did not, the radio is
+        # left in CM_PROB_DISABLED, and Windows does not merely grey out the
+        # Bluetooth toggle in that state - it removes it from Settings and Quick
+        # Settings entirely. An operator sees "Bluetooth is gone", with no
+        # in-Settings way back. Recovery is mandatory here, not best effort.
+        if ($adapterDisabled -and $targetInstanceId) {
+            $result.Details += "Disable succeeded but enable did not; rolling back"
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                try {
+                    Enable-PnpDevice -InstanceId $targetInstanceId -Confirm:$false -ErrorAction Stop
+                    Start-Sleep -Seconds 2
+                    $rollbackState = Get-PnpDevice -InstanceId $targetInstanceId -ErrorAction SilentlyContinue
+                    if ($rollbackState -and $rollbackState.Status -eq 'OK') {
+                        $adapterDisabled = $false
+                        $result.Details += "Rollback succeeded on attempt ${attempt}; adapter re-enabled"
+                        break
+                    }
+                    $result.Details += "Rollback attempt ${attempt}: adapter status is '$($rollbackState.Status)'"
+                }
+                catch {
+                    $result.Details += "Rollback attempt ${attempt} failed: $($_.Exception.Message)"
+                }
+                Start-Sleep -Seconds 2
+            }
+        }
+
+        # Rollback itself can fail. Say so loudly and hand over the exact
+        # recovery command rather than reporting a generic reset failure.
+        if ($adapterDisabled) {
+            $result.TerminalState = "ResetFailedAdapterDisabled"
+            $result.Message = "Reset failed and the Bluetooth adapter is STILL DISABLED. " +
+                "Windows will not show a Bluetooth toggle until it is re-enabled. " +
+                "Recover in Device Manager (Bluetooth > adapter > Enable device), or run as admin: " +
+                "Enable-PnpDevice -InstanceId '$targetInstanceId' -Confirm:`$false"
+            $result.Details += "ADAPTER LEFT DISABLED - manual recovery required"
+        }
+
+        # F7: Disable may have succeeded before Enable failed - assume state changed.
         Clear-BluetoothDiagnosticsCache
     }
 
@@ -4354,7 +4399,7 @@ function Get-BluetoothRadioState {
 
         Read-only -- reads Radio.State, never calls SetStateAsync.
     .OUTPUTS
-        [hashtable] Available, BluetoothOn (nullable bool), Radios, Error
+        [hashtable] Available, BluetoothOn (nullable bool), Radios, Adapter, Error
     #>
     [CmdletBinding()]
     param([int]$TimeoutMs = 5000)
@@ -4363,7 +4408,24 @@ function Get-BluetoothRadioState {
         Available   = $false
         BluetoothOn = $null
         Radios      = @()
+        Adapter     = $null
         Error       = $null
+    }
+
+    # PnP first, because it answers when WinRT cannot. A radio sitting in
+    # CM_PROB_DISABLED is dropped from Radio.GetRadiosAsync() enumeration
+    # altogether, so WinRT alone describes it exactly the way it describes a
+    # box with no Bluetooth hardware at all. That is also the one state in
+    # which Windows removes the Bluetooth toggle from Settings rather than
+    # greying it out, so the operator reports "Bluetooth disappeared" and the
+    # probe would have agreed with them instead of naming the cause.
+    $result.Adapter = Get-BluetoothRadioPnpState
+    if ($result.Adapter.Disabled) {
+        $result.BluetoothOn = $false
+        $result.Error = "Bluetooth adapter '$($result.Adapter.FriendlyName)' is DISABLED " +
+            "(CM_PROB_DISABLED). Windows hides the Bluetooth toggle entirely in this state, " +
+            "so this is not missing hardware. Recover with: $($result.Adapter.Recovery)"
+        return $result
     }
 
     try {
@@ -4407,6 +4469,95 @@ function Get-BluetoothRadioState {
     }
 
     return $result
+}
+
+function ConvertTo-BluetoothRadioPnpState {
+    <#
+    .SYNOPSIS
+        Classifies a Bluetooth host radio PnP device object into a state record.
+    .DESCRIPTION
+        Split out from the live collector so the classification is testable
+        without depending on the state of the machine running the tests. The
+        case that matters is CM_PROB_DISABLED: it is an administrative disable
+        that survives reboot, so "reboot and retry" -- the usual first advice --
+        cannot clear it, and the operator has no toggle in Settings to undo it.
+
+        Read-only. Takes an already-read device object, touches nothing.
+    .PARAMETER Device
+        A Get-PnpDevice result for the host radio, or $null if none was found.
+    .OUTPUTS
+        [hashtable] Present, InstanceId, FriendlyName, Status, Problem,
+        Disabled, Recovery, Error
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        $Device
+    )
+
+    $state = @{
+        Present      = $false
+        InstanceId   = $null
+        FriendlyName = $null
+        Status       = $null
+        Problem      = $null
+        Disabled     = $false
+        Recovery     = $null
+        Error        = $null
+    }
+
+    if ($null -eq $Device) { return $state }
+
+    $state.Present      = $true
+    $state.InstanceId   = $Device.InstanceId
+    $state.FriendlyName = $Device.FriendlyName
+    $state.Status       = "$($Device.Status)"
+    $state.Problem      = "$($Device.Problem)"
+
+    if ($state.Problem -eq 'CM_PROB_DISABLED') {
+        $state.Disabled = $true
+        $state.Recovery = "Enable-PnpDevice -InstanceId '$($Device.InstanceId)' -Confirm:`$false (run as administrator)"
+    }
+
+    return $state
+}
+
+function Get-BluetoothRadioPnpState {
+    <#
+    .SYNOPSIS
+        Reads the host Bluetooth radio's PnP state (read-only).
+    .DESCRIPTION
+        Answers "is there a radio, and is Windows willing to use it", which
+        WinRT cannot answer for a disabled radio because it stops enumerating
+        one. Selects the host controller rather than a peripheral by instance
+        id prefix: the radio enumerates under USB\ or PCI\, while paired
+        devices and protocol nodes enumerate under BTHENUM\, BTHLE\,
+        BTHLEDEVICE\ or BTH\MS_*.
+
+        Read-only -- Get-PnpDevice only, never Enable/Disable.
+    .OUTPUTS
+        [hashtable] see ConvertTo-BluetoothRadioPnpState
+    #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        $radio = @(
+            Get-PnpDevice -Class Bluetooth -ErrorAction Stop |
+                Where-Object {
+                    $_.InstanceId -match '^(USB|PCI)\\' -and
+                    -not (Test-IsTransportOrServiceNode -Name $_.FriendlyName)
+                }
+        ) | Select-Object -First 1
+
+        return ConvertTo-BluetoothRadioPnpState -Device $radio
+    }
+    catch {
+        $state = ConvertTo-BluetoothRadioPnpState -Device $null
+        $state.Error = $_.Exception.Message
+        return $state
+    }
 }
 
 function Get-BluetoothLinkHistory {
@@ -6173,6 +6324,8 @@ Export-ModuleMember -Function @(
     'Get-BluetoothPowerCycleContext',
     'Get-SerialRegistrationCorrelation',
     'Get-BluetoothRadioState',
+    'Get-BluetoothRadioPnpState',
+    'ConvertTo-BluetoothRadioPnpState',
     'Get-SerialFaultFingerprint',
     'Get-BluetoothLinkHistory',
     # Paired-device link state. Exported because the FI-012 fault-2 fingerprint
