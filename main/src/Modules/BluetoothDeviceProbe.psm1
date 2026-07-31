@@ -1058,6 +1058,13 @@ function New-DeviceProbeSession {
         IoWorstFractionOfBaseline = $null
         IoStalled                = $false
         IoStallReported          = $false
+        # One-shot: has the operator been told a read baseline exists? Without
+        # this the recorder is silent during a healthy stretch and silent during
+        # a dead one, so nobody can tell "reads are at 440/tick" from "reads are
+        # at 0/tick" until the ZIP is decoded. Field capture BD54BA02FE25
+        # (Surface Pro 6, 2026-07-31) uploaded 'NoBaseline' with zero reads all
+        # session and the operator had no way to know while it was happening.
+        IoBaselineReported       = $false
         AppNotRespondingTicks    = 0
         AppHangReported          = $false
         # Cross-field contradictions present in the arrival snapshot, before any
@@ -1159,6 +1166,7 @@ function Invoke-DeviceProbeTick {
             $Session.IoFractionOfBaseline   = $null
             $Session.IoStalled              = $false
             $Session.IoStallReported        = $false
+            $Session.IoBaselineReported     = $false
             $portInfo = if ($streamResult.ActivePort) { " on $($streamResult.ActivePort)" } else { '' }
             $Session.ActiveStreamPort = $streamResult.ActivePort
             # Deliberately does not say "EEG data streaming" -- this event fires on
@@ -1318,6 +1326,31 @@ function Invoke-DeviceProbeTick {
                         ($null -eq $Session.IoWorstFractionOfBaseline -or
                          $ioVerdict.FractionOfBaseline -lt $Session.IoWorstFractionOfBaseline)) {
                         $Session.IoWorstFractionOfBaseline = $ioVerdict.FractionOfBaseline
+                    }
+
+                    # Baseline established -- the ONLY positive confirmation the
+                    # operator ever gets that read-rate monitoring is working on
+                    # this box. Every other read-rate event is a failure event,
+                    # so their absence was indistinguishable from the detector
+                    # watching the wrong process: NO 4.x does its serial I/O
+                    # through NI-VISA, and if VISA proxied the port through its
+                    # own service the counters would land there and NO.exe would
+                    # read zero forever. This line settles that live, in seconds,
+                    # instead of after an upload and a decode.
+                    #
+                    # Fires on 'Streaming' only, which already requires
+                    # IoBaselineMinTicks samples above IoBaselineMinOpsPerTick --
+                    # so it cannot announce a baseline that is too thin to judge
+                    # a collapse against. One-shot per streaming period; the
+                    # reset above re-arms it when a new port hold begins.
+                    if ($ioVerdict.Verdict -eq 'Streaming' -and -not $Session.IoBaselineReported) {
+                        $Session.IoBaselineReported = $true
+                        $events += @{
+                            Kind = 'STREAM'; State = 'ReadBaseline'
+                            Reason = "NO.exe read baseline established at ~$($ioVerdict.BaselineOpsPerTick) read operations per tick"
+                            Annotation = "[ok] Data flow is measurable on this machine, so a stall later in this recording will be caught. The number is this session's own normal -- it varies by box and by build, and only the ratio against it means anything."
+                            Level = 'OK'; Timestamp = $now
+                        }
                     }
 
                     if ($ioVerdict.Verdict -eq 'Collapsed' -and -not $Session.IoStallReported) {
