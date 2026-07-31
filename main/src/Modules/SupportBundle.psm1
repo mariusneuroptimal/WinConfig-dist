@@ -39,7 +39,11 @@ Set-StrictMode -Off
 # 1.2.0 (2026-07-28): ZEN-PROCESS-001 collector (FI-013 — processes and services
 #   whose image lives inside the install root; QtIFW refuses every component
 #   operation while one is running, which no earlier collector could see).
-$script:SupportBundleProbeVersion = '1.2.0'
+# 1.3.0 (2026-07-28): ZEN-EXTCOMPONENT-001 collector — components.xml can record a
+#   component as installed when the third-party installer its Execute operation
+#   shells out to never wrote anything. Six bundles across two boxes agreed with
+#   that false record because nothing checked the product's own disk footprint.
+$script:SupportBundleProbeVersion = '1.3.0'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -65,6 +69,38 @@ $script:WebView2KeyBinaries    = @(
     'runtime\x64\EBWebView\x64\EmbeddedBrowserWebView.dll',  # loaded by NO.exe itself
     'runtime\x64\msedgewebview2.exe'                         # the browser process
 )
+# Some components never install into C:\zengar at all: their QtIFW 'Execute'
+# operation shells out to a third-party installer that writes elsewhere. G-Force
+# is the observed case — QtIFW runs
+#   cmd /c <staging>\G-Force_NeurOptimal.exe /LICENSECODE=<code> /S
+# and that child performs an ONLINE license check before writing anything. Where
+# the check cannot reach SoundSpectrum the child aborts (exit 2); if anyone then
+# clicks Ignore, QtIFW records the component installed regardless. The result is a
+# components.xml entry for a product that is not on disk, and NOTHING else in the
+# bundle contradicts it (INST013255 + LDANDREA_01, 2026-07-28 — six bundles across
+# two boxes all agreed with the false record).
+#
+# installerResources\<component>\*.txt cannot close this gap: for these components
+# it lists the STAGED payload (@RELOCATABLE_PATH@ = the ProgramData staging dir),
+# which is present precisely when the real install failed.
+#
+# So the check is table-driven, exactly like ZEN-WEBVIEW2-001's key-binary list.
+# Admission criterion (§5): add an entry only for a component we have actually
+# watched install out-of-root, and record the evidence. No install path is
+# hardcoded — InstallLocation is read from the product's own uninstall entry.
+$script:ExternalComponentTargets = @(
+    @{
+        ComponentId = 'com.zengar.no.gforce'
+        DisplayName = 'G-Force for NeurOptimal'   # Uninstall entry DisplayName (32-bit view)
+        Evidence    = 'INST013255 2026-07-28: components.xml recorded 5.8.1.5 installed while Program Files held nothing'
+    }
+)
+# HKLM Uninstall is world-readable, so both views resolve unelevated.
+$script:UninstallRegPaths = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+)
+
 $script:ZampLoaderRelDir  = 'zAmpLoader\driver'
 $script:ZengarLeafThumb   = 'E2DF802CEF9C3C3EE6DCF4842812DB03E0E5C00F'
 $script:SectigoE46Thumb   = 'BBEF5C4C11489770F586FB307D143291307F119A'
@@ -583,6 +619,101 @@ function Get-WinConfigSupportCollectors {
                     Facts = @{ packageCount = $packages.Count; packages = $packages }
                     Files = @(@{ SourcePath = $xmlPath; TargetName = 'components.xml' })
                 }
+            }
+        }
+        @{
+            # RequiresZengar = $true: without components.xml there is no
+            # installed-claim to falsify, so this collector has nothing to say on a
+            # wiped box. That is the opposite of ZEN-STAGING-001's FI-005 reasoning
+            # and is deliberate -- here the CLAIM is the subject, not the leftovers.
+            Id = 'ZEN-EXTCOMPONENT-001'; Ring = 1; RequiresAdmin = $false; RequiresZengar = $true
+            Script = {
+                param($Context)
+                # Does a component QtIFW installs OUT OF ROOT actually exist on disk?
+                #
+                # FACTS ONLY (§3.4): what components.xml claims, what the product's
+                # uninstall entry says, and what is on disk. Never a verdict -- the
+                # comparison belongs to SIG-ZEN-COMPONENT-PHANTOM. Counts and sizes
+                # only; no file names from the product tree enter the bundle.
+                $facts = @{}
+                $xmlPath = Join-Path $Context.ZengarRoot 'components.xml'
+                $facts.componentsXmlPresent = [bool](Test-Path -LiteralPath $xmlPath)
+
+                $claims = @{}
+                if ($facts.componentsXmlPresent) {
+                    try {
+                        [xml]$xml = Get-Content -LiteralPath $xmlPath -Raw
+                        foreach ($pkg in $xml.SelectNodes('//Package')) {
+                            $claims["$($pkg.Name)"] = @{
+                                version     = "$($pkg.Version)"
+                                installDate = "$($pkg.InstallDate)"
+                            }
+                        }
+                    } catch {
+                        # A components.xml we cannot parse is a fact, not a collector
+                        # failure -- the bundle should still ship everything else.
+                        $facts.componentsXmlError = "$($_.Exception.Message)"
+                    }
+                }
+
+                # Uninstall inventory, both registry views. Only the entries we are
+                # asked about are emitted; the full list would bloat the bundle and
+                # is none of our business.
+                $installed = @{}
+                foreach ($root in $Context.UninstallRegPaths) {
+                    foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
+                        $p = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+                        if (-not $p -or -not $p.DisplayName) { continue }
+                        $name = "$($p.DisplayName)"
+                        if (-not $installed.ContainsKey($name)) {
+                            $installed[$name] = @{
+                                displayVersion  = "$($p.DisplayVersion)"
+                                publisher       = "$($p.Publisher)"
+                                installLocation = "$($p.InstallLocation)"
+                            }
+                        }
+                    }
+                }
+                $facts.uninstallEntryCount = $installed.Count
+
+                $checked = [System.Collections.ArrayList]::new()
+                foreach ($target in $Context.ExternalComponents) {
+                    $entry = @{
+                        componentId = "$($target.ComponentId)"
+                        displayName = "$($target.DisplayName)"
+                        claimed     = [bool]$claims.ContainsKey($target.ComponentId)
+                    }
+                    if ($entry.claimed) {
+                        $entry.claimedVersion     = $claims[$target.ComponentId].version
+                        $entry.claimedInstallDate = $claims[$target.ComponentId].installDate
+                    }
+                    $reg = $installed["$($target.DisplayName)"]
+                    $entry.registryPresent = [bool]$reg
+                    if ($reg) {
+                        $entry.registryVersion  = $reg.displayVersion
+                        $entry.publisher        = $reg.publisher
+                        $entry.installLocation  = $reg.installLocation
+                    }
+                    # Disk truth. The path comes from the product's own uninstall
+                    # entry, so nothing is hardcoded here -- and when that entry is
+                    # missing there is nothing to measure, which is itself the signal.
+                    # Guard against a drive root or a one-segment path: a bad
+                    # InstallLocation must not turn into a recursive walk of C:\.
+                    $dir = "$($entry.installLocation)".TrimEnd('\')
+                    if ($dir -and $dir -match '^[A-Za-z]:\\[^\\]+\\[^\\]') {
+                        $entry.dirPresent = [bool](Test-Path -LiteralPath $dir)
+                        if ($entry.dirPresent) {
+                            $files = @(Get-ChildItem -LiteralPath $dir -Recurse -File -Force -ErrorAction SilentlyContinue)
+                            $entry.fileCount  = $files.Count
+                            $entry.totalBytes = [int64](($files | Measure-Object -Property Length -Sum).Sum)
+                        }
+                    } elseif ($dir) {
+                        $entry.installLocationRejected = $true
+                    }
+                    [void]$checked.Add($entry)
+                }
+                $facts.checked = @($checked)
+                @{ Facts = $facts }
             }
         }
         @{
@@ -1683,6 +1814,8 @@ function Invoke-WinConfigSupportCollection {
         ZampVidMatch     = $script:ZampVidMatch
         VisaSystemDlls   = $script:VisaSystemDlls
         OdbcInstRegPaths = $script:OdbcInstRegPaths
+        ExternalComponents = $script:ExternalComponentTargets
+        UninstallRegPaths  = $script:UninstallRegPaths
         Caps             = @{
             InstallLogTailLines = $script:InstallLogTailLines
             SetupApiTailLines   = $script:SetupApiTailLines
