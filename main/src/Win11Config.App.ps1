@@ -5610,7 +5610,24 @@ $buttonHandlers = @{
             # Manifest artifact — machine identity + run summary for triage
             if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
                 try {
-                    $osCaption = try { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').ProductName } catch { $null }
+                    # OS identity: CIM Caption reports Windows 11 correctly. The registry
+                    # ProductName value is stale on Win11 (always "Windows 10 Pro"), so it is
+                    # only a fallback and is build-corrected (>= 22000 == Windows 11).
+                    $osCaption = $null; $osBuild = $null; $osDisplayVersion = $null
+                    try {
+                        $cimOs     = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+                        $osCaption = "$($cimOs.Caption)"
+                        $osBuild   = "$($cimOs.BuildNumber)"
+                    } catch {
+                        try {
+                            $cv      = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+                            $osBuild = "$($cv.CurrentBuild)"
+                            $pn      = $cv.ProductName
+                            if ([int]$osBuild -ge 22000) { $pn = $pn -replace 'Windows 10', 'Windows 11' }
+                            $osCaption = $pn
+                        } catch { }
+                    }
+                    try { $osDisplayVersion = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).DisplayVersion } catch { }
                     $manifest = [ordered]@{
                         RunId                = $btDiagRun.RunId
                         StartedAtUtc         = $btDiagRun.StartedAtUtc
@@ -5621,6 +5638,8 @@ $buttonHandlers = @{
                         SystemModel          = $systemModel
                         PSVersion            = $PSVersionTable.PSVersion.ToString()
                         OSCaption            = $osCaption
+                        OSBuild              = $osBuild
+                        OSDisplayVersion     = $osDisplayVersion
                         BaselineVerdict      = if ($baselineResult) { $baselineResult.VerdictStatus } else { $null }
                         BaselineFindingCount = if ($baselineResult) { $baselineResult.FindingCount  } else { $null }
                         BaselineStatus       = if ($baselineResult) { $baselineResult.Status        } else { $null }
