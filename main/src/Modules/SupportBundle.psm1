@@ -43,7 +43,13 @@ Set-StrictMode -Off
 #   component as installed when the third-party installer its Execute operation
 #   shells out to never wrote anything. Six bundles across two boxes agreed with
 #   that false record because nothing checked the product's own disk footprint.
-$script:SupportBundleProbeVersion = '1.3.0'
+# 1.4.0 (2026-07-31): WIN-NIPKG-001 collector (FI-016 — NI Package Manager feeds
+#   outlive the install root and make a reinstall fail -125006); maintenancetool
+#   sha256 + Authenticode status and installer.dat facts in ZEN-VERSION-001, and
+#   the live runtime root's mtime in ZEN-WEBVIEW2-001 (FI-015 — a maintenancetool
+#   that cannot initialize, where "is the binary damaged?" was unanswerable from
+#   the bundle and the gutted WebView2 tree was undatable).
+$script:SupportBundleProbeVersion = '1.4.0'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -126,6 +132,12 @@ $script:OdbcInstRegPaths = @(
     @{ view = '64-bit'; path = 'HKLM:\SOFTWARE\ODBC\ODBCINST.INI' }
     @{ view = '32-bit'; path = 'HKLM:\SOFTWARE\WOW6432Node\ODBC\ODBCINST.INI' }
 )
+
+# FI-016: NI Package Manager's feed list is GLOBAL state that lives outside
+# C:\zengar, so wiping the install root does not clear it. The lvrte/nivisa
+# components run `nipkg feed-add` unconditionally; a surviving feed of the same
+# name makes that fail (-125006) and blocks the whole install behind a dialog.
+$script:NipkgPath = Join-Path $env:ProgramFiles 'National Instruments\NI Package Manager\nipkg.exe'
 
 # Caps (size target for the whole bundle: < 10 MB — §7)
 $script:InstallLogTailLines  = 2000
@@ -745,6 +757,30 @@ function Get-WinConfigSupportCollectors {
                     $mtFacts.productVersion = "$($item.VersionInfo.ProductVersion)"
                     $mtFacts.lastWriteTime  = $item.LastWriteTime.ToString('o')
                     $mtFacts.sizeBytes      = $item.Length
+                    # FI-015: when the tool will not start, "is the binary damaged?" has to
+                    # be answerable from the bundle. NO.exe already shipped a hash; this did
+                    # not, and the gap cost a field round-trip. Authenticode is the fact that
+                    # actually settles it — Valid means the bytes are what Zengar signed, so
+                    # the fault is state or appended payload, never file damage. (Authenticode
+                    # does NOT cover data appended after the signature block, which is exactly
+                    # where QtIFW keeps its resource payload — see installerDat below.)
+                    $mtFacts.sha256 = (Get-FileHash -LiteralPath $mtExe -Algorithm SHA256).Hash
+                    try {
+                        $mtFacts.signatureStatus = "$((Get-AuthenticodeSignature -LiteralPath $mtExe -ErrorAction Stop).Status)"
+                    } catch {
+                        $mtFacts.signatureStatus = "Unavailable: $($_.Exception.Message)"
+                    }
+                }
+                # installer.dat holds QtIFW's binary-layout markers. It is a SEPARATE file
+                # that no signature vouches for, so it can be wrong while maintenancetool.exe
+                # verifies clean. Metadata only — never contents (§3.4).
+                $datPath  = Join-Path $Context.ZengarRoot 'installer.dat'
+                $datFacts = @{ present = (Test-Path $datPath) }
+                if ($datFacts.present) {
+                    $dat = Get-Item -LiteralPath $datPath
+                    $datFacts.sizeBytes     = $dat.Length
+                    $datFacts.lastWriteTime = $dat.LastWriteTime.ToString('o')
+                    $datFacts.sha256        = (Get-FileHash -LiteralPath $datPath -Algorithm SHA256).Hash
                 }
                 $latestInstall = $null
                 $xmlPath = Join-Path $Context.ZengarRoot 'components.xml'
@@ -759,6 +795,7 @@ function Get-WinConfigSupportCollectors {
                         frameworkVersion  = $Context.Repository.FrameworkVersion
                         noExe             = $exeFacts
                         maintenancetool   = $mtFacts
+                        installerDat      = $datFacts
                         latestInstallDate = $latestInstall
                     }
                 }
@@ -966,6 +1003,11 @@ function Get-WinConfigSupportCollectors {
                 $facts = @{ runtimeRoot = $root; present = [bool](Test-Path -LiteralPath $root) }
 
                 if ($facts.present) {
+                    # mtime of the LIVE root, not just of siblings. On MCAJOLAIS_05 the
+                    # gutted directory's mtime matched components.xml to the SECOND, which
+                    # is what pinned the emptying to one component batch instead of leaving
+                    # it undated and unattributable (FI-015).
+                    $facts.mtime = (Get-Item -LiteralPath $root).LastWriteTime.ToString('o')
                     $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)
                     $facts.fileCount  = $files.Count
                     $facts.totalBytes = [int64](($files | Measure-Object -Property Length -Sum).Sum)
@@ -1497,6 +1539,57 @@ function Get-WinConfigSupportCollectors {
                 @{ Facts = @{ views = $views } }
             }
         }
+        @{
+            # RequiresZengar = $false deliberately: NI Package Manager survives a wipe of
+            # C:\zengar, and its stale state is exactly what breaks the REINSTALL. Gating
+            # on Zengar would blind this collector on the box that needs it most (FI-005).
+            Id = 'WIN-NIPKG-001'; Ring = 2; RequiresAdmin = $false; RequiresZengar = $false
+            Script = {
+                param($Context)
+                # FI-016: `com.zengar.no.lvrte` and `com.zengar.no.nivisa` install by
+                # running `nipkg feed-add --name=<name> <local staging path>`. NI Package
+                # Manager's feed list is global and OUTLIVES the install root, so on a
+                # reinstall the name is already taken, feed-add returns -125006, and the
+                # QtIFW dialog blocks the entire install. Observed MCAJOLAIS_05 2026-07-31.
+                #
+                # FACTS ONLY (§3.4): the feed table plus whether each LOCAL feed's target
+                # still exists. A local feed whose target is gone is the precondition —
+                # the signature decides what that means, not this collector.
+                $facts = @{ nipkgPath = $Context.NipkgPath; present = [bool](Test-Path -LiteralPath $Context.NipkgPath) }
+                if (-not $facts.present) { return @{ Facts = $facts } }
+
+                $raw = ''
+                try {
+                    $raw = & $Context.NipkgPath feed-list 2>&1 | Out-String
+                    $facts.exitCode = $LASTEXITCODE
+                } catch {
+                    $facts.enumStatus = "Unavailable: $($_.Exception.Message)"
+                    return @{ Facts = $facts }
+                }
+
+                # Output is '<name><TAB><uri>'. Feed names may contain spaces
+                # ('ni-labview-2024-runtime-engine-2024 Q3-released'), so never split on
+                # single whitespace — prefer the tab, and fall back to the LAST token.
+                $feeds = @(foreach ($line in ($raw -split "`r?`n")) {
+                    if (-not $line.Trim()) { continue }
+                    $name = $null; $uri = $null
+                    if ($line -match "`t") {
+                        $parts = @($line -split "`t+", 2)
+                        $name = $parts[0].Trim(); $uri = $parts[1].Trim()
+                    } elseif ($line -match '^(?<n>.*\S)\s+(?<u>\S+)$') {
+                        $name = $Matches['n'].Trim(); $uri = $Matches['u'].Trim()
+                    }
+                    if (-not $name -or -not $uri) { continue }
+                    $isLocal = ($uri -notmatch '^[a-z][a-z0-9+.-]*://')
+                    $feed = @{ name = $name; uri = $uri; isLocal = $isLocal }
+                    if ($isLocal) { $feed.targetPresent = [bool](Test-Path -LiteralPath $uri -ErrorAction SilentlyContinue) }
+                    $feed
+                })
+                $facts.feeds     = @($feeds)
+                $facts.feedCount = @($feeds).Count
+                @{ Facts = $facts }
+            }
+        }
 
         # ---------------- Ring 3 — Network layer (targeted, §5) ----------------
         @{
@@ -1816,6 +1909,7 @@ function Invoke-WinConfigSupportCollection {
         OdbcInstRegPaths = $script:OdbcInstRegPaths
         ExternalComponents = $script:ExternalComponentTargets
         UninstallRegPaths  = $script:UninstallRegPaths
+        NipkgPath          = $script:NipkgPath
         Caps             = @{
             InstallLogTailLines = $script:InstallLogTailLines
             SetupApiTailLines   = $script:SetupApiTailLines
