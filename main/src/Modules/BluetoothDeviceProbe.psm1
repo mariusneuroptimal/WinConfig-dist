@@ -327,13 +327,31 @@ function Test-IoReadCollapse {
 
         Returns Verdict:
           Collapsed     rate fell below the fraction of baseline and stayed there
+          Degrading     at least one tick has fallen below the collapse limit but
+                        the debounce is not satisfied yet -- a collapse in
+                        progress, or an intermittent one
           Streaming     a baseline is established and the rate is holding
           NoBaseline    not enough samples, or the baseline rate is too low to
                         collapse from -- explicitly NOT a clean bill of health
+
+        WHY 'Degrading' EXISTS. Field capture C2FB1FD51A35 (2026-07-31): the
+        operator marked NO code 12006 while the read rate was at 56 ops/tick
+        against a 444 baseline -- 13%, already far under the 25% collapse limit.
+        The verdict still read 'Streaming' because only two or three of the four
+        trailing ticks had dropped, so the marker recorded "Streaming" at the
+        exact instant of the fault and the cross-check that keys on a stalled
+        read path never ran. The debounce is right for FIRING a fault; it is
+        wrong as a description of a moment. Collapsed keeps its old meaning
+        exactly -- all four ticks below the limit -- so nothing that used to fire
+        fires differently. Degrading only fills the silence in between.
+
+        A single tick under the limit is not noise: measured in-session jitter is
+        ~3.3% and the limit sits at 25% of baseline, ~7x outside that.
     .PARAMETER Deltas
         Per-tick read-operation deltas, oldest first.
     .OUTPUTS
-        [hashtable] Verdict, BaselineOpsPerTick, RecentOpsPerTick, CollapsedTicks.
+        [hashtable] Verdict, BaselineOpsPerTick, RecentOpsPerTick, CollapsedTicks,
+        FractionOfBaseline.
     #>
     [CmdletBinding()]
     param([AllowEmptyCollection()][array]$Deltas = @())
@@ -344,6 +362,11 @@ function Test-IoReadCollapse {
         BaselineOpsPerTick = 0
         RecentOpsPerTick   = 0
         CollapsedTicks     = 0
+        # Recent rate as a percentage of the session's own baseline. Carried as a
+        # number so triage can rank severity without re-deriving it from two
+        # counters, and so a marker stays readable if the verdict wording changes.
+        # $null (not 0) whenever there is no baseline to be a fraction OF.
+        FractionOfBaseline = $null
     }
     if ($d.Count -lt ($script:IoBaselineMinTicks + $script:IoCollapseTicks)) { return $result }
 
@@ -365,12 +388,19 @@ function Test-IoReadCollapse {
 
     if ($median -lt $script:IoBaselineMinOpsPerTick) { return $result }
 
+    $result.FractionOfBaseline = [math]::Round(($recentAvg / $median) * 100, 0)
+
     $limit = $median * $script:IoCollapseFraction
     $collapsed = @($window | Where-Object { $_ -lt $limit }).Count
     $result.CollapsedTicks = $collapsed
 
     if ($collapsed -ge $script:IoCollapseTicks) {
         $result.Verdict = 'Collapsed'
+    } elseif ($collapsed -gt 0) {
+        # Some of the window is already under the limit. Not enough to fire a
+        # fault -- deliberately, so a scheduling hiccup cannot -- but saying
+        # "Streaming" here is what let a marked 12006 record itself as healthy.
+        $result.Verdict = 'Degrading'
     } else {
         $result.Verdict = 'Streaming'
     }
@@ -539,6 +569,14 @@ function Get-ProbeStateConsistency {
         baseline while the port was held. Escalates the same way as CpuStalled,
         and catches the case CpuStalled cannot: an application still busy with
         its other work while only its serial path is dead.
+    .PARAMETER IoDegrading
+        $true when the read rate has begun falling under the collapse limit but
+        the debounce has not been satisfied. Fires the same clean-transport rule
+        as IoStalled at WARN instead of FAIL. This exists because an operator
+        marks the instant the dialog appears, which is BEFORE the four-tick
+        debounce completes -- see Test-IoReadCollapse and field capture
+        C2FB1FD51A35. Without it the most informative moment in a recording
+        cross-checks as clean.
     .OUTPUTS
         [hashtable[]] each with Level ('FAIL'/'WARN'/'INFO') and Text. Wrap call
         sites in @() -- a single finding unrolls on return.
@@ -553,13 +591,18 @@ function Get-ProbeStateConsistency {
         [AllowEmptyCollection()][array]$UnavailablePorts = @(),
         [System.Nullable[bool]]$AppRunning,
         [bool]$CpuStalled = $false,
-        [bool]$IoStalled = $false
+        [bool]$IoStalled = $false,
+        [bool]$IoDegrading = $false
     )
 
     $out = @()
     $held     = @($HeldPorts | Where-Object { $_ })
     $dead     = @($UnavailablePorts | Where-Object { $_ })
     $heldStr  = if ($held.Count -gt 0) { $held -join ', ' } else { 'a COM port' }
+    # The Arc exposes two SPP channels, so a held-port list is routinely plural.
+    # These findings are read by clinic techs; "COM3, COM6 is held open" reads as
+    # a bug in the tool and costs the sentence its authority.
+    $heldVerb = if ($held.Count -gt 1) { 'are' } else { 'is' }
     $isHeld   = ($StreamState -eq 'Active')
     # Either corroborator is enough. They observe different failure shapes and a
     # box only has to be in one of them.
@@ -587,12 +630,12 @@ function Get-ProbeStateConsistency {
             }
             $out += @{
                 Level = 'FAIL'
-                Text  = "[!] $heldStr is held open but the Bluetooth radio has no link to the headset, and $evidence while holding it. Nothing is arriving: the application is sitting on a serial port with no live connection under it. This is what 'Arc not detected' looks like from the OS side."
+                Text  = "[!] $heldStr $heldVerb held open but the Bluetooth radio has no link to the headset, and $evidence while holding it. Nothing is arriving: the application is sitting on a serial port with no live connection under it. This is what 'Arc not detected' looks like from the OS side."
             }
         } else {
             $out += @{
                 Level = 'WARN'
-                Text  = "[~] $heldStr is held open, but the Bluetooth radio reports no active link to the headset. A held port means something (normally NO.exe) believes it has a session, so this pairing is worth capturing -- but it is NOT proof on its own: SPP devices hold no profile open, so a healthy Arc can also read disconnected. Check whether NeurOptimal is showing an error right now."
+                Text  = "[~] $heldStr $heldVerb held open, but the Bluetooth radio reports no active link to the headset. A held port means something (normally NO.exe) believes it has a session, so this pairing is worth capturing -- but it is NOT proof on its own: SPP devices hold no profile open, so a healthy Arc can also read disconnected. Check whether NeurOptimal is showing an error right now."
             }
         }
     }
@@ -603,10 +646,22 @@ function Get-ProbeStateConsistency {
     # layer contradicts anything, which is precisely the finding: a clean
     # transport with dead reads localizes the fault ABOVE Bluetooth, and the
     # recorder used to have no way to say that.
-    if ($isHeld -and $IoStalled -and $BtLinkState -ne 'NotConnected') {
-        $out += @{
-            Level = 'FAIL'
-            Text  = "[!] $heldStr is held open and the Bluetooth link is up, but NO.exe has stopped reading from it. The transport is intact -- device paired, ports present, link established -- so this is not a Bluetooth failure. Either the headset stopped transmitting while its baseband link stayed up, or NeurOptimal's read path stalled. Expect 'Arc Connection Lost' on screen with nothing wrong on the Windows side."
+    #
+    # Confirmed again by C2FB1FD51A35 (2026-07-31), which is also why IoDegrading
+    # is here: at the marked instant the rate was 13% of baseline and still
+    # classified 'Streaming', so this rule -- already written, already correct --
+    # was gated off at the one moment it existed for.
+    if ($isHeld -and ($IoStalled -or $IoDegrading) -and $BtLinkState -ne 'NotConnected') {
+        if ($IoStalled) {
+            $out += @{
+                Level = 'FAIL'
+                Text  = "[!] $heldStr $heldVerb held open and the Bluetooth link is up, but NO.exe has stopped reading from it. The transport is intact -- device paired, ports present, link established -- so this is not a Bluetooth failure. Either the headset stopped transmitting while its baseband link stayed up, or NeurOptimal's read path stalled. Expect 'Arc Connection Lost' on screen with nothing wrong on the Windows side."
+            }
+        } else {
+            $out += @{
+                Level = 'WARN'
+                Text  = "[~] $heldStr $heldVerb held open and the Bluetooth link is up, but NO.exe's read rate is already falling below the level this session established for itself. The transport is intact, so this is not a Bluetooth failure -- it is the first part of a read-path stall, caught before it finished. If NeurOptimal is showing 'Arc Connection Lost' right now, this is what it looks like from outside."
+            }
         }
     }
 
@@ -614,7 +669,7 @@ function Get-ProbeStateConsistency {
     if ($isHeld -and $AppRunning -eq $false) {
         $out += @{
             Level = 'WARN'
-            Text  = "[~] $heldStr is held open while NeurOptimal is not running. Another process owns the headset's serial port; NO.exe will not be able to open it until that process releases it."
+            Text  = "[~] $heldStr $heldVerb held open while NeurOptimal is not running. Another process owns the headset's serial port; NO.exe will not be able to open it until that process releases it."
         }
     }
 
@@ -622,7 +677,7 @@ function Get-ProbeStateConsistency {
     if ($isHeld -and $DeviceState -and $DeviceState -ne 'PairedCandidate') {
         $out += @{
             Level = 'FAIL'
-            Text  = "[!] $heldStr is held open but Windows does not report the headset as paired (device state: $(Get-ProbeStateUserText -Kind device -State $DeviceState -Short)). The port and the pairing record disagree -- one of them is stale."
+            Text  = "[!] $heldStr $heldVerb held open but Windows does not report the headset as paired (device state: $(Get-ProbeStateUserText -Kind device -State $DeviceState -Short)). The port and the pairing record disagree -- one of them is stale."
         }
     }
 
@@ -692,11 +747,23 @@ function New-ProbeStateMarker {
     # The cross-check verdict at the marked instant, carried WITH the label. This
     # is what makes the sample worth having: not just "the operator saw 12005"
     # but "the operator saw 12005 while the port was held with no link under it".
+    # Both read-rate states are passed through. A marker is placed at the instant
+    # a dialog appeared, which is systematically EARLIER than the four-tick
+    # debounce behind 'Collapsed' -- so keying the cross-check on 'Collapsed'
+    # alone made the cross-check blindest exactly when it mattered most.
     $contradictions = @(Get-ProbeStateConsistency `
         -DeviceState $DeviceState -ComPortState $ComPortState `
         -BtLinkState $BtLinkState -StreamState $StreamState `
         -HeldPorts $HeldPorts -UnavailablePorts $UnavailablePorts `
-        -AppRunning $AppRunning -IoStalled ($IoVerdict -eq 'Collapsed'))
+        -AppRunning $AppRunning -IoStalled ($IoVerdict -eq 'Collapsed') `
+        -IoDegrading ($IoVerdict -eq 'Degrading'))
+
+    # Recomputed here rather than passed in so a marker is self-describing: the
+    # archive is read long after the fact, and a raw pair of counters makes the
+    # reader do arithmetic to see that 56-against-444 is a fault.
+    $fraction = if ($IoBaselineOpsPerTick -gt 0) {
+        [math]::Round(($IoRecentOpsPerTick / $IoBaselineOpsPerTick) * 100, 0)
+    } else { $null }
 
     return @{
         At               = $At
@@ -718,6 +785,7 @@ function New-ProbeStateMarker {
         IoVerdict            = if ($IoVerdict) { $IoVerdict } else { 'NoBaseline' }
         IoBaselineOpsPerTick = $IoBaselineOpsPerTick
         IoRecentOpsPerTick   = $IoRecentOpsPerTick
+        IoFractionOfBaseline = $fraction
         Contradictions   = @($contradictions | ForEach-Object { $_.Text })
     }
 }
@@ -738,11 +806,27 @@ function Format-ProbeStateMarker {
     $when  = '{0}  {1}m{2:00}s into the recording' -f $Marker.At.ToString('HH:mm:ss'), $mins, $secs
 
     $ports = if (@($Marker.HeldPorts).Count -gt 0) { "held $(@($Marker.HeldPorts) -join ', ')" } else { 'no port held' }
+
+    # The read rate belongs on this line. Without it the marker for capture
+    # C2FB1FD51A35 rendered as a tidy all-green state vector -- device paired,
+    # radio connected, ports held, NO.exe running -- while the one number that
+    # showed the fault (56 against a 444 baseline) sat unread in the record.
+    $io = switch ($Marker.IoVerdict) {
+        'Collapsed'  { "reads COLLAPSED to $($Marker.IoRecentOpsPerTick)/tick from a $($Marker.IoBaselineOpsPerTick) baseline" }
+        'Degrading'  { "reads FALLING at $($Marker.IoRecentOpsPerTick)/tick against a $($Marker.IoBaselineOpsPerTick) baseline" }
+        'Streaming'  { "reads steady at ~$($Marker.IoRecentOpsPerTick)/tick" }
+        default      { 'read rate not assessed' }
+    }
+    if ($null -ne $Marker.IoFractionOfBaseline -and $Marker.IoVerdict -ne 'Streaming' -and $Marker.IoVerdict -ne 'NoBaseline') {
+        $io += " ($($Marker.IoFractionOfBaseline)% of normal)"
+    }
+
     $state = @(
         "device=$(Get-ProbeStateUserText -Kind device -State $Marker.DeviceState -Short)"
         "radio=$(Get-ProbeStateUserText -Kind btlink -State $Marker.BtLinkState -Short)"
         $ports
         "NO.exe=$(if ($Marker.AppRunning -eq $true) { 'running' } elseif ($Marker.AppRunning -eq $false) { 'not running' } else { 'unknown' })"
+        $io
     ) -join ', '
 
     return "Operator marked $what$extra at $when -- $state"
@@ -966,6 +1050,12 @@ function New-DeviceProbeSession {
         IoVerdict                = 'NoBaseline'
         IoBaselineOpsPerTick     = 0
         IoRecentOpsPerTick       = 0
+        IoFractionOfBaseline     = $null
+        # An intermittent stall never satisfies the four-tick debounce, so it
+        # used to summarise as "held steady" -- the reading a dropout-every-
+        # 30-seconds headset would produce. These two remember the dips.
+        IoDegradedTicks          = 0
+        IoWorstFractionOfBaseline = $null
         IoStalled                = $false
         IoStallReported          = $false
         AppNotRespondingTicks    = 0
@@ -1066,6 +1156,7 @@ function Invoke-DeviceProbeTick {
             $Session.IoVerdict              = 'NoBaseline'
             $Session.IoBaselineOpsPerTick   = 0
             $Session.IoRecentOpsPerTick     = 0
+            $Session.IoFractionOfBaseline   = $null
             $Session.IoStalled              = $false
             $Session.IoStallReported        = $false
             $portInfo = if ($streamResult.ActivePort) { " on $($streamResult.ActivePort)" } else { '' }
@@ -1214,6 +1305,20 @@ function Invoke-DeviceProbeTick {
                     $Session.IoVerdict            = $ioVerdict.Verdict
                     $Session.IoBaselineOpsPerTick = $ioVerdict.BaselineOpsPerTick
                     $Session.IoRecentOpsPerTick   = $ioVerdict.RecentOpsPerTick
+                    $Session.IoFractionOfBaseline = $ioVerdict.FractionOfBaseline
+
+                    # Session-long memory of dips. A headset that drops out
+                    # briefly and recovers never satisfies the debounce, so
+                    # without this the summary would call the whole recording
+                    # steady -- the exact reading an intermittent Arc produces.
+                    if ($Session.IoVerdict -in @('Degrading', 'Collapsed')) {
+                        $Session.IoDegradedTicks++
+                    }
+                    if ($null -ne $ioVerdict.FractionOfBaseline -and
+                        ($null -eq $Session.IoWorstFractionOfBaseline -or
+                         $ioVerdict.FractionOfBaseline -lt $Session.IoWorstFractionOfBaseline)) {
+                        $Session.IoWorstFractionOfBaseline = $ioVerdict.FractionOfBaseline
+                    }
 
                     if ($ioVerdict.Verdict -eq 'Collapsed' -and -not $Session.IoStallReported) {
                         $Session.IoStalled       = $true
@@ -1446,7 +1551,17 @@ function Get-DeviceProbeSessionSummary {
     # only its serial path dies. Reported with the measured numbers because it is
     # a process-wide counter -- nothing here attributes a read to the COM port.
     if ($Session.IoStalled) {
-        $portStr = if ($Session.ActiveStreamPort) { $Session.ActiveStreamPort } else { 'the headset COM port' }
+        # Do NOT name a single port when several are held. The counter is
+        # process-wide, so with COM3 and COM6 both open (the Arc's normal
+        # two-channel shape) picking ActiveStreamPort asserts an attribution the
+        # measurement cannot support -- capture C2FB1FD51A35 reported "on COM6"
+        # on exactly that evidence.
+        $heldNow = @($Session.HeldPorts | Where-Object { $_ })
+        $portStr = if ($heldNow.Count -gt 1) {
+            "$($heldNow -join ' / ') (held together; the counter cannot say which)"
+        } elseif ($Session.ActiveStreamPort) { $Session.ActiveStreamPort }
+        elseif ($heldNow.Count -eq 1) { $heldNow[0] }
+        else { 'the headset COM port' }
         $linkNote = if ($Session.BtLinkState -eq 'Connected') {
             " The Bluetooth link was UP at the same time, so this is not a transport failure -- either the headset stopped transmitting while its baseband link stayed alive, or NeurOptimal's read path stalled."
         } else { '' }
@@ -1469,6 +1584,23 @@ function Get-DeviceProbeSessionSummary {
         } else {
             [void]$findings.Add("[info] Read-rate monitoring could not establish a baseline for NO.exe this session (observed ~$($Session.IoBaselineOpsPerTick) read operations per tick, below the floor needed to call a collapse). Data flow was NOT assessed -- the absence of a read-collapse finding means nothing was measured, not that nothing was wrong.")
         }
+    } elseif ($Session.IoVerdict -eq 'Degrading' -and $Session.StreamingState -eq 'Active') {
+        # The recording ended mid-decay WITH THE PORT STILL HELD. That last
+        # condition is the whole safety argument: a normal session stop also
+        # ends on a falling read rate, but it RELEASES the port on the way out,
+        # so it lands on 'Stopped' and never reaches this branch. Held-and-
+        # falling is the fault shape; released-and-falling is a clinic finishing
+        # a session. Without the gate every stop in the field would warn.
+        [void]$findings.Add("[!] NO.exe's read rate was FALLING when the recording ended, with the port still open: ~$($Session.IoRecentOpsPerTick) read operations per tick against the ~$($Session.IoBaselineOpsPerTick) this session established for itself$(if ($null -ne $Session.IoFractionOfBaseline) { " ($($Session.IoFractionOfBaseline)% of normal)" }). It had not stayed down long enough to call a collapse, so this is a stall caught in progress. Record for longer if this repeats -- a few more seconds would have settled it.")
+    } elseif ([int]$Session.IoDegradedTicks -gt $script:IoCollapseTicks) {
+        # Dips that recovered. An intermittent dropout looks exactly like this
+        # and used to summarise as a clean "[ok] held steady".
+        #
+        # The threshold is deliberately ABOVE IoCollapseTicks: the tail of a
+        # normal session stop can contribute up to three degraded ticks in the
+        # gap before the port is released, so anything at or below that budget
+        # would fire on routine stops.
+        [void]$findings.Add("[~] NO.exe's read rate dipped below a quarter of its own baseline on $($Session.IoDegradedTicks) tick(s) during this recording, recovering each time (worst point ~$($Session.IoWorstFractionOfBaseline)% of normal). No single dip lasted long enough to call a collapse, but a healthy stream does not do this -- suspect an intermittent link or an Arc dropping out briefly.")
     } elseif ($Session.IoVerdict -eq 'Streaming') {
         [void]$findings.Add("[ok] NO.exe read rate held steady at ~$($Session.IoBaselineOpsPerTick) read operations per tick while the port was open -- consistent with data actually flowing")
     }
@@ -1485,11 +1617,17 @@ function Get-DeviceProbeSessionSummary {
         $contra = @($mk.Contradictions)
         if ($contra.Count -gt 0) {
             [void]$findings.Add("[!] $line. Cross-check at that moment: $($contra -join ' ')")
+        } elseif ($mk.IoVerdict -eq 'NoBaseline') {
+            # "No contradiction" is a much weaker statement when the read rate
+            # was never measurable: the one layer most likely to hold the answer
+            # was not being watched. Saying "originates above Bluetooth" here
+            # would dress an unmeasured moment up as a localised one.
+            [void]$findings.Add("[!] $line. Nothing in the Bluetooth layer contradicted itself at that moment -- but the read rate was not being measured either, so this marker cannot localise the fault. Treat it as unclassified, not as clean.")
         } else {
             # No contradiction found does NOT mean nothing was wrong -- it means
             # the fault is above anything the probe measures. Say so, because
             # this is exactly the case the code mapping needs to hear about.
-            [void]$findings.Add("[!] $line. The probe found no contradiction in the Bluetooth layer at that moment, so whatever NeurOptimal was reporting originates above it -- capture this one.")
+            [void]$findings.Add("[!] $line. The probe found no contradiction in the Bluetooth layer at that moment, and reads were still flowing normally, so whatever NeurOptimal was reporting originates above both -- capture this one.")
         }
     }
     if ($markers.Count -eq 0) {

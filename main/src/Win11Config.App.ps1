@@ -5680,6 +5680,14 @@ $buttonHandlers = @{
                         ReadRateVerdict = if ($btProbeSession) { $btProbeSession.IoVerdict } else { $null }
                         ReadRateBaselineOpsPerTick = if ($btProbeSession) { $btProbeSession.IoBaselineOpsPerTick } else { $null }
                         ReadRateRecentOpsPerTick = if ($btProbeSession) { $btProbeSession.IoRecentOpsPerTick } else { $null }
+                        # Percent of the session's own baseline, so triage can
+                        # rank severity from the manifest alone.
+                        ReadRateFractionOfBaseline = if ($btProbeSession) { $btProbeSession.IoFractionOfBaseline } else { $null }
+                        # Dips that recovered. A collapse that never completes is
+                        # invisible in ReadRateCollapsed but is exactly what an
+                        # intermittent Arc produces, so it gets its own counter.
+                        ReadRateDegradedTicks = if ($btProbeSession) { [int]$btProbeSession.IoDegradedTicks } else { $null }
+                        ReadRateWorstFractionOfBaseline = if ($btProbeSession) { $btProbeSession.IoWorstFractionOfBaseline } else { $null }
                         # Ports registered in SERIALCOMM that would not open. The
                         # old bool port test folded these in with "free".
                         UnopenablePortCount = if ($btProbeSession) { @($btProbeSession.UnavailablePorts | Where-Object { $_ }).Count } else { $null }
@@ -5691,9 +5699,34 @@ $buttonHandlers = @{
                         # is the axis the code mapping needs and the one the
                         # recorder could not report before.
                         OperatorMarkerCount = if ($btProbeSession) { @($btProbeSession.OperatorMarkers).Count } else { $null }
-                        OperatorMarkedNoCodes = if ($btProbeSession) {
+                        # The @( ) around the WHOLE if-expression is load-bearing.
+                        # Without it a single-element result unrolls to a bare
+                        # string on assignment and ConvertTo-Json emits
+                        # "OperatorMarkedNoCodes": "12006" instead of ["12006"] --
+                        # which is what shipped, and what every consumer that
+                        # iterates the field then reads one character at a time.
+                        # Casting to [string[]] does NOT help; only the wrap does.
+                        OperatorMarkedNoCodes = @(if ($btProbeSession) {
                             @(@($btProbeSession.OperatorMarkers) | ForEach-Object { $_.NoCode } | Where-Object { $_ } | Select-Object -Unique)
-                        } else { @() }
+                        } else { @() })
+                        # The read-rate state AT each marked instant. This is the
+                        # axis the code mapping actually needs: it separates a
+                        # 12006 raised over a dead read path from a 12006 raised
+                        # while data was still flowing, which are different faults
+                        # wearing the same dialog.
+                        OperatorMarkerIoVerdicts = @(if ($btProbeSession) {
+                            @(@($btProbeSession.OperatorMarkers) | ForEach-Object { $_.IoVerdict } | Where-Object { $_ })
+                        } else { @() })
+                        # Markers whose moment had corroborating read-path evidence.
+                        OperatorMarkersWithIoFault = if ($btProbeSession) {
+                            @(@($btProbeSession.OperatorMarkers) | Where-Object { $_.IoVerdict -eq 'Collapsed' -or $_.IoVerdict -eq 'Degrading' }).Count
+                        } else { $null }
+                        # Markers whose cross-check produced at least one
+                        # contradiction -- a labelled moment the probe could
+                        # independently corroborate, the highest-value sample there is.
+                        OperatorMarkersWithContradiction = if ($btProbeSession) {
+                            @(@($btProbeSession.OperatorMarkers) | Where-Object { @($_.Contradictions).Count -gt 0 }).Count
+                        } else { $null }
                     }
                     Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'manifest.json' -Data $manifest
                 } catch { }
