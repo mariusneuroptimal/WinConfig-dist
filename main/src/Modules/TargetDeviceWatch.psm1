@@ -47,6 +47,73 @@ $script:TargetWatchStates = @(
 # evidence; 'none' = no candidate.
 $script:ComPortConfidenceValues = @('none', 'low', 'medium', 'high')
 
+function Resolve-ComPortRole {
+    <#
+    .SYNOPSIS
+        Pure. Decides whether a Bluetooth SPP COM port is the headset's DATA or
+        COMMAND channel, from two independent sources that must agree.
+    .DESCRIPTION
+        The Arc exposes two SPP channels, so a MAC lookup legitimately returns
+        two ports and the recorder had no way to say which was which. Both
+        sources below already existed; neither was on the path that produces a
+        bundle.
+
+        SOURCE 1 (authoritative) -- DEVPKEY_Device_BusReportedDeviceDesc, the
+        name the DEVICE reports for the channel: "NEUROPTIMAL DATA" /
+        "NEUROPTIMAL COMMAND". FriendlyName is the generic "Standard Serial over
+        Bluetooth link (COMx)" on every channel and cannot distinguish them.
+
+        SOURCE 2 (corroborating) -- the RFCOMM channel suffix on the InstanceId.
+        FI-012 established this as INVARIANT and it is not a guess: the failing
+        port was COM5 one week and COM6 the next, and both were `_C00000001`.
+        `_C00000000` = DATA, `_C00000001` = COMMAND. The COM NUMBER moves on
+        every re-pair; the channel does not.
+
+        WHY BOTH, WHEN SOURCE 1 IS AUTHORITATIVE. A wrong role label is worse
+        than an honest "unknown" -- it would send a tech to the wrong port with
+        confidence. Requiring agreement means this can never be quietly wrong,
+        only loudly uncertain. It also turns every capture into a standing test
+        of the FI-012 invariant: if the two ever disagree, that is a finding
+        about the invariant itself, not a labelling detail to paper over.
+    .OUTPUTS
+        [hashtable] Role ('Data'/'Command'/$null), Source
+        ('both'/'device'/'channel'/'none'), Conflict [bool]
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$InstanceId,
+        [string]$BusReportedDeviceDesc
+    )
+
+    $deviceRole = $null
+    if ($BusReportedDeviceDesc) {
+        # Match on the role word alone: the vendor prefix is not ours to depend
+        # on, and a renamed product must not silently stop resolving.
+        if ($BusReportedDeviceDesc -match '(?i)\bCOMMAND\b') { $deviceRole = 'Command' }
+        elseif ($BusReportedDeviceDesc -match '(?i)\bDATA\b') { $deviceRole = 'Data' }
+    }
+
+    $channelRole = $null
+    if ($InstanceId -match '_C([0-9A-Fa-f]{8})$') {
+        switch ([Convert]::ToInt64($Matches[1], 16)) {
+            0 { $channelRole = 'Data' }
+            1 { $channelRole = 'Command' }
+        }
+    }
+
+    if ($deviceRole -and $channelRole) {
+        if ($deviceRole -eq $channelRole) {
+            return @{ Role = $deviceRole; Source = 'both'; Conflict = $false }
+        }
+        # The FI-012 invariant just failed on this box. Say nothing about the
+        # role and let the caller surface it.
+        return @{ Role = $null; Source = 'none'; Conflict = $true }
+    }
+    if ($deviceRole)  { return @{ Role = $deviceRole;  Source = 'device';  Conflict = $false } }
+    if ($channelRole) { return @{ Role = $channelRole; Source = 'channel'; Conflict = $false } }
+    return @{ Role = $null; Source = 'none'; Conflict = $false }
+}
+
 function Get-TargetWatchStateValues {
     [CmdletBinding()]
     param()
@@ -647,6 +714,10 @@ function New-TargetWatchState {
         LastComPortMatch      = $null
         ServiceSurfaceSummary = $null
         ComPortUnresolved     = New-Object System.Collections.ArrayList
+        # Set when the device's own channel name and the FI-012 channel-suffix
+        # invariant disagree about which port is DATA and which is COMMAND.
+        # See Resolve-ComPortRole.
+        ComPortRoleConflict   = $false
     }
 }
 
@@ -841,7 +912,11 @@ function Update-TargetComPortState {
     # latest evidence, but only ADD a timeline entry on actual state changes.
     $WatchState.ComPortConfidence = $cpMatch.Confidence
     $WatchState.ComPortMatches.Clear()
+    $roleConflict = $false
     foreach ($m in @($cpMatch.Matches)) {
+        $busDesc = if ($m.PSObject.Properties.Name -contains 'BusReportedDeviceDesc') { $m.BusReportedDeviceDesc } else { $null }
+        $role = Resolve-ComPortRole -InstanceId $m.InstanceId -BusReportedDeviceDesc $busDesc
+        if ($role.Conflict) { $roleConflict = $true }
         [void]$WatchState.ComPortMatches.Add([pscustomobject]@{
             InstanceId               = $m.InstanceId
             FriendlyName             = $m.FriendlyName
@@ -851,8 +926,15 @@ function Update-TargetComPortState {
             ParentBluetoothInstanceId= if ($m.PSObject.Properties.Name -contains 'ParentBluetoothInstanceId') { $m.ParentBluetoothInstanceId } else { $null }
             AssociatedBluetoothMac   = if ($m.PSObject.Properties.Name -contains 'AssociatedBluetoothMac')    { $m.AssociatedBluetoothMac }    else { $null }
             Confidence               = $cpMatch.Confidence
+            # Which SPP channel this port is. See Resolve-ComPortRole: two
+            # independent sources that must agree, so this is never quietly
+            # wrong -- only null when it cannot be established.
+            ChannelRole              = $role.Role
+            ChannelRoleSource        = $role.Source
+            BusReportedDeviceDesc    = $busDesc
         })
     }
+    $WatchState.ComPortRoleConflict = $roleConflict
 
     $WatchState.ComPortUnresolved.Clear()
     foreach ($u in @($cpMatch.Unresolved)) { [void]$WatchState.ComPortUnresolved.Add($u) }
@@ -979,8 +1061,17 @@ function New-TargetWatchReport {
     if ($cfg.IsConfigured -and -not $WatchState.FirstComPortSeenTime) {
         $unresolved += 'Target never exposed a Bluetooth COM port during the session.'
     }
+    # Two COM ports for one MAC is the Arc's NORMAL shape (a data channel and a
+    # command channel), so this is only genuinely unresolved when the roles could
+    # not be established. Reporting it unconditionally put an "unresolved" line
+    # in every healthy capture, which teaches readers to skip the field.
     if ($WatchState.AmbiguousComPortMatches.Count -gt 0) {
-        $unresolved += "Ambiguous COM-port matches recorded (count=$($WatchState.AmbiguousComPortMatches.Count))."
+        $roled = @($WatchState.ComPortMatches | Where-Object { $_.ChannelRole })
+        if ($WatchState.ComPortRoleConflict) {
+            $unresolved += "COM-port channel roles CONFLICT: the device's own channel name and the RFCOMM channel number disagree about which port is DATA and which is COMMAND. The FI-012 channel-to-role invariant does not hold on this machine -- do not act on a role label from this capture."
+        } elseif ($roled.Count -lt @($WatchState.ComPortMatches).Count) {
+            $unresolved += "Ambiguous COM-port matches recorded (count=$($WatchState.AmbiguousComPortMatches.Count)); channel roles could not be established for all of them."
+        }
     }
     # ComPortUnresolved holds the last snapshot's per-match reasons. Only include
     # them if a COM port was never seen -- otherwise they just reflect end-of-session
@@ -1058,6 +1149,7 @@ Export-ModuleMember -Function @(
     'New-TargetDeviceConfiguration',
     'Find-TargetDeviceInPnpSnapshot',
     'Find-TargetBluetoothComPort',
+    'Resolve-ComPortRole',
     'Get-TargetDeviceProcessSnapshot',
     'Test-ProcessRunningInSnapshot',
     'New-TargetWatchState',

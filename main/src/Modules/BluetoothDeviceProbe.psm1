@@ -514,10 +514,19 @@ function Get-StreamingState {
 
     $activePorts = @()
     $deadPorts   = @()
+    # Ports we actually OPENED and closed on this tick. This is the number the
+    # invasiveness question turns on: on a port NO.exe holds, the open fails with
+    # a sharing violation and no handle is ever acquired, but on a FREE port we
+    # really do open and close it -- once every ~3s for the length of a
+    # recording. Nothing in a bundle recorded how often that happened, so the
+    # question could only be argued, not answered. Counting it is a prerequisite
+    # for deciding whether to back the interval off; measure first.
+    $openedPorts = @()
     foreach ($p in $ports) {
         switch (Get-ComPortHoldState -PortName $p) {
             'Held'        { $activePorts += $p }
             'Unavailable' { $deadPorts   += $p }
+            'Free'        { $openedPorts += $p }
         }
     }
 
@@ -527,9 +536,14 @@ function Get-StreamingState {
             ActivePort       = ($activePorts -join ', ')
             HeldPorts        = @($activePorts)
             UnavailablePorts = @($deadPorts)
+            OpenedPorts      = @($openedPorts)
+            ProbedPorts      = @($ports)
         }
     }
-    return @{ State = 'Stopped'; ActivePort = $null; HeldPorts = @(); UnavailablePorts = @($deadPorts) }
+    return @{
+        State = 'Stopped'; ActivePort = $null; HeldPorts = @()
+        UnavailablePorts = @($deadPorts); OpenedPorts = @($openedPorts); ProbedPorts = @($ports)
+    }
 }
 
 function Get-ProbeStateConsistency {
@@ -1091,6 +1105,17 @@ function New-DeviceProbeSession {
         TickCount                = 0
         FirstTickAt              = $null
         LastTickAt               = $null
+        # How invasive the recorder actually was. Get-ComPortHoldState is the
+        # only non-admin way to learn whether a port is held, but it works by
+        # OPENING the port -- the very thing Test-BluetoothSerialPortOpen is
+        # forbidden from doing mid-session. On a port NO.exe holds, the attempt
+        # is denied and no handle is taken; on a FREE port we genuinely open and
+        # close it every ~3s. These counters say which happened and how often,
+        # so the question "is the recorder perturbing the device it is watching"
+        # is answered from a capture instead of argued from first principles.
+        PortOpenAttempts         = 0
+        PortOpenAcquired         = 0
+        PortOpenDenied           = 0
         # Cross-field contradictions present in the arrival snapshot, before any
         # transition could fire. Populated by the caller at startup.
         StartupConsistency       = @()
@@ -1173,6 +1198,19 @@ function Invoke-DeviceProbeTick {
     # Union across the session: a port that failed to open at any point stays in
     # the record even if it opens later.
     $Session.UnavailablePorts = @(@($Session.UnavailablePorts) + $newDeadPorts | Where-Object { $_ } | Select-Object -Unique)
+
+    # Invasiveness accounting. Tolerates a result without the lists for the same
+    # reason as HeldPorts above: Get-StreamingState is mocked in tests and an
+    # older caller must not take the tick down.
+    if ($streamResult -is [hashtable]) {
+        if ($streamResult.ContainsKey('ProbedPorts')) {
+            $Session.PortOpenAttempts += @($streamResult.ProbedPorts | Where-Object { $_ }).Count
+        }
+        if ($streamResult.ContainsKey('OpenedPorts')) {
+            $Session.PortOpenAcquired += @($streamResult.OpenedPorts | Where-Object { $_ }).Count
+        }
+        $Session.PortOpenDenied += @($Session.HeldPorts | Where-Object { $_ }).Count
+    }
 
     if ($newStreamState -ne $Session.StreamingState) {
         $prevStreaming = $Session.StreamingState
@@ -1715,6 +1753,24 @@ function Get-DeviceProbeSessionSummary {
     $deadPorts = @($Session.UnavailablePorts | Where-Object { $_ })
     if ($deadPorts.Count -gt 0) {
         [void]$findings.Add("[!] $($deadPorts -join ', ') registered as a Bluetooth serial port but would not open during this session. No process can reach the headset through it. Cause not classified here (an absent symlink and a stale one need different fixes) -- run the serial port integrity check with NO.exe closed.")
+    }
+
+    # Which SPP channel each port is. Two ports for one MAC is the Arc's normal
+    # shape, and the recorder used to report exactly that as an unresolved
+    # ambiguity on every healthy capture -- a permanent flag teaches readers to
+    # skip the field. Roles come from two sources that must agree, so a label
+    # here is never a guess.
+    $roleRows = @($WatchState.ComPortMatches | Where-Object { $_.PortName -and $_.ChannelRole })
+    if ($WatchState.ComPortRoleConflict) {
+        [void]$findings.Add("[!] COM port channel roles CONFLICT: the name the device reports for a channel and the RFCOMM channel number disagree about which port is DATA and which is COMMAND. FI-012 records channel-to-role as invariant, so this capture contradicts it -- do not act on a role label from this machine, and treat the invariant as unproven here.")
+    } elseif ($roleRows.Count -gt 0) {
+        $roleText = ($roleRows | ForEach-Object { "$($_.PortName) = $($_.ChannelRole.ToUpperInvariant())" }) -join ', '
+        $srcNote = if (@($roleRows | Where-Object { $_.ChannelRoleSource -eq 'both' }).Count -eq $roleRows.Count) {
+            'device-reported name and RFCOMM channel number agree'
+        } else {
+            'from a single source -- the other was unavailable'
+        }
+        [void]$findings.Add("[ok] COM port channel roles: $roleText ($srcNote). The COM NUMBER is not an identity and moves on every re-pair; the channel role does not.")
     }
 
     # COM port number stats

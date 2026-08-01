@@ -5409,6 +5409,23 @@ function Get-BluetoothComPortSnapshot {
         $present = $true
         try { $present = [bool]$c.Present } catch { $present = ($c.Status -eq 'OK') }
 
+        # DEVPKEY_Device_BusReportedDeviceDesc -- the per-channel name the DEVICE
+        # reports ("NEUROPTIMAL COMMAND" / "NEUROPTIMAL DATA"). FriendlyName is
+        # the generic "Standard Serial over Bluetooth link (COMx)" for every SPP
+        # channel, so this is the ONLY field that tells the command port from the
+        # data port. Read here (passively, no port is opened) because the Flight
+        # Recorder's watch path consumes this snapshot: the property was already
+        # being read elsewhere in this module, just never on the path that
+        # produces a bundle, so every recorder capture reported two
+        # indistinguishable ports for one MAC. Best-effort, same as the parent
+        # lookup above -- a denied property must not cost us the whole snapshot.
+        $busDesc = $null
+        try {
+            $busDesc = (Get-PnpDeviceProperty -InstanceId $instanceId `
+                -KeyName '{540b947e-8b40-45bc-a8a2-6a0b894cbda2} 4' `
+                -ErrorAction SilentlyContinue).Data
+        } catch { }
+
         $ports += [pscustomobject]@{
             Source                    = if ($c.Class -eq 'Ports') { 'Class:Ports' } else { 'InstanceId:BTHENUM' }
             InstanceId                = $instanceId
@@ -5421,6 +5438,7 @@ function Get-BluetoothComPortSnapshot {
             PortName                  = $portName
             ParentBluetoothInstanceId = $parentBt
             AssociatedBluetoothMac    = $mac
+            BusReportedDeviceDesc     = if ($busDesc) { [string]$busDesc } else { $null }
         }
     }
 

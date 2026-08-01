@@ -5704,6 +5704,33 @@ $buttonHandlers = @{
                         NoResolvesPortFromMac  = if ($btProbeSession -and $btProbeSession.NoExeVersion) {
                             try { [bool](Test-NoUsesMacResolve -Version $btProbeSession.NoExeVersion) } catch { $null }
                         } else { $null }
+                        # ── Which SPP channel each port is ───────────────────
+                        # Two ports for one MAC is the Arc's NORMAL shape, so the
+                        # recorder used to report it as an unresolved ambiguity on
+                        # every healthy capture. Roles come from two sources that
+                        # must agree (see Resolve-ComPortRole); RoleConflict means
+                        # the FI-012 channel-to-role invariant failed on this box,
+                        # which is a finding about the invariant itself.
+                        ComPortRoles = @(if ($btProbeWatch) {
+                            @(@($btProbeWatch.ComPortMatches) | Where-Object { $_.PortName } | ForEach-Object {
+                                @{
+                                    PortName = $_.PortName
+                                    Role     = $_.ChannelRole
+                                    Source   = $_.ChannelRoleSource
+                                }
+                            })
+                        } else { @() })
+                        ComPortRoleConflict = if ($btProbeWatch) { [bool]$btProbeWatch.ComPortRoleConflict } else { $null }
+                        # ── How invasive the recorder itself was ─────────────
+                        # Hold detection works by opening the port. On a port
+                        # NO.exe holds the attempt is DENIED and no handle is
+                        # taken; on a free port we really do open and close it,
+                        # every ~3s. Recorded so this is answered from a capture
+                        # rather than argued -- and so a decision to back the
+                        # interval off rests on a measured number.
+                        PortOpenAttempts = if ($btProbeSession) { [int]$btProbeSession.PortOpenAttempts } else { $null }
+                        PortOpenAcquired = if ($btProbeSession) { [int]$btProbeSession.PortOpenAcquired } else { $null }
+                        PortOpenDenied   = if ($btProbeSession) { [int]$btProbeSession.PortOpenDenied } else { $null }
                         # FI-012 at the top level so a ZIP can be triaged from
                         # the manifest alone -- these ZIPs are not auto-analyzed,
                         # so whoever opens one should not have to know which
