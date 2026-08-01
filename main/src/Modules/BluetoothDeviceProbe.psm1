@@ -1065,6 +1065,18 @@ function New-DeviceProbeSession {
         # (Surface Pro 6, 2026-07-31) uploaded 'NoBaseline' with zero reads all
         # session and the operator had no way to know while it was happening.
         IoBaselineReported       = $false
+        # ...and these two put that announcement IN THE ARCHIVE. The event above
+        # is live-only: it scrolls past the operator and is never written to
+        # probe-session.json, so reading a bundle afterwards could not tell a run
+        # that announced a baseline from one that never did -- build provenance
+        # came down to whether someone remembered seeing a green line. Capture
+        # D8EE48E60DF2 (2026-08-01) had to be confirmed that way.
+        #
+        # The RATE is stored alongside the time because the baseline is a running
+        # median: what was announced is not necessarily what the run ends on, and
+        # the announced figure is the one the operator actually saw.
+        IoBaselineAnnouncedAt    = $null
+        IoBaselineAnnouncedOpsPerTick = $null
         AppNotRespondingTicks    = 0
         AppHangReported          = $false
         # Cross-field contradictions present in the arrival snapshot, before any
@@ -1345,6 +1357,22 @@ function Invoke-DeviceProbeTick {
                     # reset above re-arms it when a new port hold begins.
                     if ($ioVerdict.Verdict -eq 'Streaming' -and -not $Session.IoBaselineReported) {
                         $Session.IoBaselineReported = $true
+                        # Persisted to the manifest so the archive says this for
+                        # itself instead of depending on operator recall.
+                        #
+                        # FIRST announcement of the RUN, deliberately: unlike
+                        # IoBaselineReported (which re-arms per streaming period
+                        # so the operator sees the line each time), this is never
+                        # reset. It answers a run-level question -- "was data
+                        # flow EVER measurable during this recording?" -- and a
+                        # later streaming period must not overwrite the earliest
+                        # yes. Still null at the end means never, which is the
+                        # BD54BA02FE25 signal, now legible without decoding the
+                        # session log.
+                        if ($null -eq $Session.IoBaselineAnnouncedAt) {
+                            $Session.IoBaselineAnnouncedAt = $now
+                            $Session.IoBaselineAnnouncedOpsPerTick = $ioVerdict.BaselineOpsPerTick
+                        }
                         $events += @{
                             Kind = 'STREAM'; State = 'ReadBaseline'
                             Reason = "NO.exe read baseline established at ~$($ioVerdict.BaselineOpsPerTick) read operations per tick"

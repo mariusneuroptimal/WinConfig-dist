@@ -5707,6 +5707,28 @@ $buttonHandlers = @{
                         # intermittent Arc produces, so it gets its own counter.
                         ReadRateDegradedTicks = if ($btProbeSession) { [int]$btProbeSession.IoDegradedTicks } else { $null }
                         ReadRateWorstFractionOfBaseline = if ($btProbeSession) { $btProbeSession.IoWorstFractionOfBaseline } else { $null }
+                        # When the recorder told the operator a read baseline
+                        # existed, and at what rate. The live STREAM/ReadBaseline
+                        # event scrolls past and is not written to
+                        # probe-session.json, so before this a bundle could not
+                        # say whether data flow was ever measurable -- capture
+                        # D8EE48E60DF2 (2026-08-01) had to be confirmed by asking
+                        # the operator what they remembered seeing.
+                        #
+                        # Two independent readings, both useful:
+                        #   FIELD ABSENT  -> pre-1.5.0 recorder build. Another
+                        #                    manifest sentinel, like ReadRateVerdict.
+                        #   FIELD null    -> this build, but no baseline was EVER
+                        #                    established. Data flow was never
+                        #                    assessed; do not read it as healthy.
+                        # The announced rate is kept separately from
+                        # ReadRateBaselineOpsPerTick because the baseline is a
+                        # running median -- what the operator saw is not
+                        # necessarily what the run ended on.
+                        ReadBaselineAnnouncedAtUtc = if ($btProbeSession -and $btProbeSession.IoBaselineAnnouncedAt) {
+                            ([datetime]$btProbeSession.IoBaselineAnnouncedAt).ToUniversalTime().ToString('o')
+                        } else { $null }
+                        ReadBaselineAnnouncedOpsPerTick = if ($btProbeSession) { $btProbeSession.IoBaselineAnnouncedOpsPerTick } else { $null }
                         # Ports registered in SERIALCOMM that would not open. The
                         # old bool port test folded these in with "free".
                         UnopenablePortCount = if ($btProbeSession) { @($btProbeSession.UnavailablePorts | Where-Object { $_ }).Count } else { $null }
