@@ -1079,6 +1079,18 @@ function New-DeviceProbeSession {
         IoBaselineAnnouncedOpsPerTick = $null
         AppNotRespondingTicks    = 0
         AppHangReported          = $false
+        # How long the recording actually ran, and how many samples are behind
+        # every verdict in it. Neither was recoverable from a bundle: a 55-second
+        # capture and a 6-hour one both report "ObservationCount 3" (observations
+        # are transitions, and an arrived-already-in-state box produces three at
+        # tick one and nothing after). Duration is what decides whether a tail of
+        # link flaps is a fault or an unattended overnight run -- D8EE48E60DF2
+        # needed StartedAtUtc subtracted from PackagedAtUtc to establish that.
+        # TickCount is the confidence denominator: a verdict off 9 ticks and one
+        # off 7000 are not the same evidence.
+        TickCount                = 0
+        FirstTickAt              = $null
+        LastTickAt               = $null
         # Cross-field contradictions present in the arrival snapshot, before any
         # transition could fire. Populated by the caller at startup.
         StartupConsistency       = @()
@@ -1141,6 +1153,10 @@ function Invoke-DeviceProbeTick {
 
     $events = @()
     $now = Get-Date
+
+    $Session.TickCount++
+    if (-not $Session.FirstTickAt) { $Session.FirstTickAt = $now }
+    $Session.LastTickAt = $now
 
     # ── Port-hold detection (NOT a data-flow measurement) ────────────────
     $streamResult = Get-StreamingState -WatchState $WatchState

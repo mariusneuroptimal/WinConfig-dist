@@ -5650,6 +5650,60 @@ $buttonHandlers = @{
                         ProbeFindingCount      = if ($btProbeSummary) { $btProbeSummary.Findings.Count   } else { $null }
                         ProbeReconnectCount    = if ($btProbeSession) { $btProbeSession.ReconnectTimes.Count } else { $null }
                         ProbeBtLinkFlapCount   = if ($btProbeSession) { $btProbeSession.BtLinkFlapCount } else { $null }
+                        # How long the recording ran and how many samples it took.
+                        # ProbeObservationCount counts TRANSITIONS, so a box that
+                        # arrived already in its final state reports 3 whether the
+                        # run lasted 55 seconds or 6 hours -- and that difference
+                        # decides whether a tail of link flaps is a fault or an
+                        # unattended overnight run.
+                        ProbeTickCount           = if ($btProbeSession) { [int]$btProbeSession.TickCount } else { $null }
+                        RecordingDurationSeconds = if ($btProbeSession -and $btProbeSession.FirstTickAt -and $btProbeSession.LastTickAt) {
+                            [int][math]::Round((([datetime]$btProbeSession.LastTickAt) - ([datetime]$btProbeSession.FirstTickAt)).TotalSeconds)
+                        } else { $null }
+                        # ── Identity of what was recorded ────────────────────
+                        # All three were already captured in the session and went
+                        # only to the console log, so reading a bundle meant
+                        # opening another artifact (NoExeVersion lives in
+                        # operator-markers.json) or regexing English prose out of
+                        # the findings list. The adapter vendor is the fact that
+                        # made the SP6-vs-MMEVOLD_06 comparison meaningful, and it
+                        # existed only as a sentence.
+                        NoExeVersion           = if ($btProbeSession -and $btProbeSession.NoExeVersion) { [string]$btProbeSession.NoExeVersion } else { $null }
+                        BtAdapterName          = if ($btProbeSession -and $btProbeSession.AdapterInfo) { $btProbeSession.AdapterInfo.FriendlyName } else { $null }
+                        BtAdapterDriverVersion = if ($btProbeSession -and $btProbeSession.AdapterInfo -and $btProbeSession.AdapterInfo.DriverInfo) {
+                            $btProbeSession.AdapterInfo.DriverInfo.Version
+                        } else { $null }
+                        PowerPlanName          = if ($btProbeSession -and $btProbeSession.PowerPlan) { $btProbeSession.PowerPlan.ActivePlan } else { $null }
+                        PowerPlanIsPowerSaver  = if ($btProbeSession -and $btProbeSession.PowerPlan) { [bool]$btProbeSession.PowerPlan.IsPowerSaver } else { $null }
+                        # ── Structured forms of prose-only findings ──────────
+                        # The dashboard derived these by regex over the findings
+                        # text, so rewording a finding silently zeroed a fleet
+                        # count -- which reads as "no machines affected" rather
+                        # than "the signal broke". Same reasoning as the FI-012
+                        # counts above, which were deliberately keyed on manifest
+                        # fields rather than text for exactly this reason.
+                        UsbSelectiveSuspendEnabled = if ($btProbeSession -and $btProbeSession.AdapterInfo) {
+                            [bool]($btProbeSession.AdapterInfo.PowerManagementEnabled -eq $true)
+                        } else { $null }
+                        AppHangDetected        = if ($btProbeSession) { [bool]$btProbeSession.AppHangReported } else { $null }
+                        BtLinkEverConnected    = if ($btProbeSession) { [bool]$btProbeSession.BtLinkEverConnected } else { $null }
+                        # Raw count, NOT the [!]-vs-[ok] judgement. Whether a
+                        # reassignment matters depends on the NO build (>= 4.0
+                        # re-resolves from the MAC, so it invalidates nothing),
+                        # and duplicating that decision here would give it two
+                        # homes that could disagree. The consumer gets both facts.
+                        ComPortChangeCount     = if ($btProbeSession) {
+                            @($btProbeSession.ComPortHistory | Where-Object { $_.Changed -and -not $_.IsFirst }).Count
+                        } else { $null }
+                        SlowReconnectCount     = if ($btProbeSession) {
+                            @($btProbeSession.ReconnectTimes | Where-Object { $_ -ge 90 }).Count
+                        } else { $null }
+                        # The other half of the reassignment judgement, so a
+                        # consumer can reach the same [!]-vs-[ok] conclusion the
+                        # summary text does without parsing the prefix.
+                        NoResolvesPortFromMac  = if ($btProbeSession -and $btProbeSession.NoExeVersion) {
+                            try { [bool](Test-NoUsesMacResolve -Version $btProbeSession.NoExeVersion) } catch { $null }
+                        } else { $null }
                         # FI-012 at the top level so a ZIP can be triaged from
                         # the manifest alone -- these ZIPs are not auto-analyzed,
                         # so whoever opens one should not have to know which
