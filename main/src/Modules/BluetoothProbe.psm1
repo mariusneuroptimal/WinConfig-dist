@@ -4183,17 +4183,25 @@ function Test-BluetoothOrphanPairingRecord {
 
         FI-014. An unpair deletes the PnP nodes but can leave
         HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\<mac>
-        behind. bthport then treats the device as already-known: a subsequent
-        pairing attempt rewrites the record's VALUES but the association half
-        never runs, so no BTHENUM node is ever created - no DEV_ node, no SPP
-        nodes, no COM port. Windows shows the device as not paired while the
-        registry says otherwise, and the user can "pair" it forever with no
-        effect.
+        behind, so the registry says the device is known while Windows shows it
+        as not paired and no DEV_ node, SPP node or COM port exists.
 
-        Neither of the two FI-012 remedies touches this. A reboot does not clear
-        a non-volatile registry record, and a radio toggle does not either. The
-        only fix is deleting the record. That is why this check must run BEFORE
-        the FI-012 triage tree, not after it.
+        WHAT THIS CHECK DOES AND DOES NOT CLAIM. The record-with-no-node state
+        is measured and real. That the record CAUSES the blockage is not: on
+        2026-08-06 a re-pair was run against an orphan of fully known
+        provenance - minted 10 minutes earlier by a device removal - with the
+        record deliberately LEFT IN PLACE, and a plain Windows Settings pair
+        restored all four nodes on the first attempt. An orphan record alone is
+        therefore NOT sufficient to block pairing. The 2026-07-30 blockage was
+        real (zero BTHENUM entries measured across a whole boot session), but
+        the missing ingredient is still unknown - candidates are record age,
+        the SYSTEM-only Parameters\Keys\<adapter>\<mac> link key, and adapter
+        stack state. So report the record, recommend pairing FIRST, and treat
+        deleting it as the fallback rather than the fix.
+
+        Detection still runs BEFORE the FI-012 triage tree, because neither
+        FI-012 remedy clears a non-volatile registry record: a reboot does not
+        (HKLM\SYSTEM survives it) and a radio toggle does not either.
 
         LOW ENERGY DEVICES ARE NOT ORPHANS. An LE device only materialises
         BTHLEDEVICE/BTHLE nodes while it is connected, so a remembered LE device
@@ -4312,7 +4320,7 @@ function Test-BluetoothOrphanPairingRecord {
     foreach ($r in @($result.Records | Where-Object { $_.State -eq 'Orphan' })) {
         $result.Healthy = $false
         $stamp = if ($r.LastWrite) { " Record last written $($r.LastWrite)." } else { '' }
-        $result.Findings += "ORPHAN PAIRING RECORD: '$($r.Name)' ($($r.Mac)) has a BTHPORT record but NO PnP device node.$stamp Windows will show it as not paired, and pairing attempts will rewrite this record without ever creating a BTHENUM node - so no SPP nodes and no COM port. Reboot and radio toggle both leave this untouched; the record must be deleted."
+        $result.Findings += "ORPHAN PAIRING RECORD: '$($r.Name)' ($($r.Mac)) has a BTHPORT record but NO PnP device node.$stamp Windows will show it as not paired, and there are no SPP nodes and no COM port. Reboot and radio toggle leave the record untouched. A record on its own does NOT always block pairing - one was re-paired successfully with the record left in place - so try pairing before deleting anything."
     }
 
     $benign = ''
@@ -4321,7 +4329,7 @@ function Test-BluetoothOrphanPairingRecord {
 
     if (-not $result.Healthy) {
         $result.Summary = "$($result.RecordCount) pairing record(s); $($result.OrphanCount) orphaned (registry record with no device node)$benign"
-        $result.Recommendation = "DELETE the orphaned record(s) under HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices, then toggle the Bluetooth radio and pair again. BUILTIN\Administrators has FullControl on those keys, so this needs elevation but not SYSTEM. Export the key first. Do NOT reboot or toggle the radio expecting either to help - neither clears a non-volatile registry record."
+        $result.Recommendation = "TRY PAIRING FIRST: power-cycle the headset, close NO.exe, and pair through Windows Settings. An orphan record does not always block pairing - one was re-paired successfully with the record left in place. ONLY IF that fails, DELETE the orphaned record(s) under HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices, then toggle the Bluetooth radio and pair again; BUILTIN\Administrators has FullControl on those keys, so this needs elevation but not SYSTEM, and export the key first. Do NOT reboot or toggle the radio expecting either to clear the record - neither touches a non-volatile registry key."
     } else {
         $result.Summary = "$($result.RecordCount) pairing record(s); every classic record has a device node$benign"
     }
@@ -4333,7 +4341,8 @@ function Get-BluetoothOrphanPairingRecord {
     <#
     .SYNOPSIS
         Detects FI-014: BTHPORT pairing records that have no corresponding PnP
-        device node, which silently block re-pairing.
+        device node. Such a record marks the FI-014 no-node state and can
+        accompany a failed re-pair; it is not proven to cause one.
     .DESCRIPTION
         Reads every subkey of
         HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices and
@@ -6889,9 +6898,10 @@ Export-ModuleMember -Function @(
     'Get-BluetoothCOMPorts',
     'Get-BluetoothSerialPortIntegrity',
     'Test-BluetoothSerialPortIntegrity',
-    # FI-014: pairing records left behind by an unpair, which block re-pairing.
-    # Must be checked BEFORE the FI-012 triage tree - neither a reboot nor a
-    # radio toggle clears a non-volatile registry record.
+    # FI-014: pairing records left behind by an unpair, which mark the no-node
+    # state and can accompany a failed re-pair. Must be checked BEFORE the
+    # FI-012 triage tree - neither a reboot nor a radio toggle clears a
+    # non-volatile registry record.
     'Get-BluetoothOrphanPairingRecord',
     'Test-BluetoothOrphanPairingRecord',
     'Initialize-RegistryKeyTimeApi',
