@@ -6196,6 +6196,14 @@ $buttonHandlers = @{
                 # 8E39860E4AF2 counted an idle headset's two findings as "2
                 # problems" and told an operator their clean 37-minute session
                 # "did NOT end clean".
+                # Session-long read-rate record, computed from the SAME function
+                # the findings are built from so the bundle and the printed
+                # summary cannot disagree about whether reads ever collapsed.
+                $btIoRecord = $null
+                if ($btProbeSession -and (Get-Command Get-IoSessionReadRateRecord -ErrorAction SilentlyContinue)) {
+                    $btIoRecord = try { Get-IoSessionReadRateRecord -Session $btProbeSession } catch { $null }
+                }
+
                 $btCoverage = $null
                 if (Get-Command Get-ProbeObservationCoverage -ErrorAction SilentlyContinue) {
                     $btCoverage = try {
@@ -6228,6 +6236,11 @@ $buttonHandlers = @{
                             SessionTarget   = $btProbeSession.SessionTarget
                             TargetMacFrozen = $btProbeSession.TargetMacFrozen
                             Coverage        = $btCoverage
+                            # Per-episode read-rate history. The live fields
+                            # describe only the last port-open episode, so this
+                            # is the only place a collapse that preceded a
+                            # re-open is recoverable from the bundle.
+                            ReadRateRecord  = $btIoRecord
                             Observations    = @($btProbeWatch.Observations)
                             # How long each tick actually took, per collector.
                             # A capture used to assert "watching every 3s" with
@@ -6636,6 +6649,26 @@ $buttonHandlers = @{
                         # intermittent Arc produces, so it gets its own counter.
                         ReadRateDegradedTicks = if ($btProbeSession) { [int]$btProbeSession.IoDegradedTicks } else { $null }
                         ReadRateWorstFractionOfBaseline = if ($btProbeSession) { $btProbeSession.IoWorstFractionOfBaseline } else { $null }
+                        # ── Session-long read-rate record ────────────────────
+                        # Every field above describes the LAST port-open episode
+                        # only, because NO.exe re-opening the port resets the live
+                        # measurement. Capture C0AE9604CDAC (Arc 000013) measured
+                        # a 776 ops/tick baseline collapse to 1%, was marked by
+                        # the operator against 12006 -- and reported
+                        # ReadRateVerdict 'NoBaseline' with baseline 0, so the
+                        # dashboard counted it as data flow UNMEASURED.
+                        #
+                        # These answer "did it ever collapse", which is the
+                        # question a bundle is read to answer.
+                        ReadRateEverCollapsed = if ($btIoRecord) { [bool]$btIoRecord.EverCollapsed } else { $null }
+                        ReadRateCollapseEpisodes = if ($btIoRecord) { [int]$btIoRecord.CollapseEpisodes } else { $null }
+                        # >0 means 'NoBaseline' at the end can mean "thrown away",
+                        # not "never found". Without it the two are identical in
+                        # the record and only one of them is benign.
+                        ReadRateBaselineResetCount = if ($btIoRecord) { [int]$btIoRecord.BaselineResetCount } else { $null }
+                        ReadRatePeakBaselineOpsPerTick = if ($btIoRecord) { [int]$btIoRecord.PeakBaselineOpsPerTick } else { $null }
+                        ReadRateWorstRecentOpsPerTick = if ($btIoRecord) { $btIoRecord.WorstRecentOpsPerTick } else { $null }
+                        ReadRateEpisodeCount = if ($btIoRecord) { [int]$btIoRecord.EpisodeCount } else { $null }
                         # When the recorder told the operator a read baseline
                         # existed, and at what rate. The live STREAM/ReadBaseline
                         # event scrolls past and is not written to

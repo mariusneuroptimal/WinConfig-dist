@@ -1115,6 +1115,25 @@ function New-DeviceProbeSession {
         IoWorstFractionOfBaseline = $null
         IoStalled                = $false
         IoStallReported          = $false
+        # Closed read-rate EPISODES.
+        #
+        # The live fields above describe one port-open episode and are wiped
+        # whenever the port is re-opened, because a baseline may not span two
+        # handles. That reset is correct for the live measurement and was
+        # catastrophic for the record: field capture C0AE9604CDAC (Arc 000013,
+        # 2026-08-07) established a 776 ops/tick baseline, collapsed to 1% of it
+        # across 12 ticks, was marked by the operator against NO code 12006 with
+        # IoVerdict=Collapsed -- and then NO.exe re-opened the port, which reset
+        # the live verdict to 'NoBaseline' and the baseline to 0. The session
+        # ended reporting verdict NoBaseline / collapsed false / baseline 0, so
+        # the bundle counted a measured collapse as "data flow unmeasured".
+        #
+        # Every episode that ends is stamped here first. Never reset.
+        IoClosedEpisodes         = [System.Collections.ArrayList]::new()
+        # How many times the live measurement restarted. A reader needs this to
+        # know that "no baseline at the end" can mean "the baseline was thrown
+        # away", not "none was ever found".
+        IoBaselineResetCount     = 0
         # One-shot: has the operator been told a read baseline exists? Without
         # this the recorder is silent during a healthy stretch and silent during
         # a dead one, so nobody can tell "reads are at 440/tick" from "reads are
@@ -1296,6 +1315,16 @@ function Invoke-DeviceProbeTick {
             $Session.StreamFlatCpuTicks     = 0
             $Session.StreamCpuStalled       = $false
             $Session.StreamCpuStallReported = $false
+            # Close out the read-rate episode BEFORE wiping it. The reset below
+            # is correct -- a baseline must not span two port handles -- but it
+            # used to be the only thing that happened, so a collapse already
+            # measured was erased by NO.exe simply re-opening the port, and the
+            # session ended claiming no baseline was ever established. See
+            # IoClosedEpisodes in New-DeviceProbeSession for the field capture.
+            $closing = New-IoEpisodeRecord -Session $Session -At $now
+            if ($closing) { [void]$Session.IoClosedEpisodes.Add($closing) }
+            if ([int]$Session.IoBaselineOpsPerTick -gt 0) { $Session.IoBaselineResetCount++ }
+
             $Session.IoLastReadOps          = $null
             $Session.IoReadOpDeltas.Clear()
             $Session.IoVerdict              = 'NoBaseline'
@@ -1783,7 +1812,11 @@ function Get-DeviceProbeSessionSummary {
     # The signal for the fault CPU cannot see: the application stays busy while
     # only its serial path dies. Reported with the measured numbers because it is
     # a process-wide counter -- nothing here attributes a read to the COM port.
-    if ($Session.IoStalled) {
+    # Session-long, not last-tick. IoStalled answers "was it collapsing when the
+    # recording ended", which a port re-open silently turns into "no". See
+    # Get-IoSessionReadRateRecord.
+    $ioRecord = Get-IoSessionReadRateRecord -Session $Session
+    if ($Session.IoStalled -or $ioRecord.EverCollapsed) {
         # Do NOT name a single port when several are held. The counter is
         # process-wide, so with COM3 and COM6 both open (the Arc's normal
         # two-channel shape) picking ActiveStreamPort asserts an attribution the
@@ -1798,7 +1831,19 @@ function Get-DeviceProbeSessionSummary {
         $linkNote = if ($Session.BtLinkState -eq 'Connected') {
             " The Bluetooth link was UP at the same time, so this is not a transport failure -- either the headset stopped transmitting while its baseband link stayed alive, or NeurOptimal's read path stalled."
         } else { '' }
-        [void]$findings.Add("[!] Read rate collapsed while the port stayed open: NO.exe went from ~$($Session.IoBaselineOpsPerTick) to ~$($Session.IoRecentOpsPerTick) read operations per tick on $portStr.$linkNote Note this counter is process-wide, so it shows the application stopped doing the I/O it had been doing, not specifically that the port went quiet.")
+        # Numbers come from the session record, so they survive a port re-open.
+        # Reading them off the live fields printed "~0 to ~0" on exactly the
+        # captures where the collapse had already been erased.
+        $fromOps = if ($Session.IoStalled) { [int]$Session.IoBaselineOpsPerTick } else { [int]$ioRecord.PeakBaselineOpsPerTick }
+        $toOps   = if ($Session.IoStalled) { [int]$Session.IoRecentOpsPerTick } else { [int]$ioRecord.WorstRecentOpsPerTick }
+        # A collapse that is over by the end of the recording is still a
+        # collapse. Saying so explicitly, because the live verdict now reads
+        # clean and a reader comparing the two needs to know which is which.
+        $endedNote = if (-not $Session.IoStalled -and $ioRecord.EverCollapsed) {
+            " The port was re-opened after this, which restarted the read-rate measurement -- so the recording ENDS looking clean and the collapse is only visible in this record. Re-opening is NOT evidence the underlying problem was fixed."
+        } else { '' }
+        $epNote = if ($ioRecord.CollapseEpisodes -gt 1) { " This happened in $($ioRecord.CollapseEpisodes) separate episodes." } else { '' }
+        [void]$findings.Add("[!] Read rate collapsed while the port stayed open: NO.exe went from ~$fromOps to ~$toOps read operations per tick on $portStr.$linkNote$endedNote$epNote Note this counter is process-wide, so it shows the application stopped doing the I/O it had been doing, not specifically that the port went quiet.")
     } elseif ($Session.IoVerdict -eq 'NoBaseline' -and $Session.StreamingState -eq 'Active') {
         # Explicitly NOT a clean bill of health. Saying nothing here would let an
         # unmeasurable session read as a measured-healthy one.
@@ -1812,7 +1857,18 @@ function Get-DeviceProbeSessionSummary {
         # service process the counters land there instead. That would mean this
         # detector is watching the wrong process, which is a fixable thing to
         # know and an invisible one if the summary just stays quiet.
-        if ([int]$Session.IoBaselineOpsPerTick -eq 0) {
+        # BaselineResetCount ONLY -- deliberately not "a peak baseline exists".
+        # Test-IoReadCollapse reports a rate even when it is below the floor
+        # needed to baseline, so a sub-floor reading makes PeakBaselineOpsPerTick
+        # nonzero without any baseline ever having been established, let alone
+        # discarded. The counter increments only when a real baseline was thrown
+        # away, which is exactly the claim being made here.
+        if ($ioRecord.BaselineResetCount -gt 0) {
+            # 'NoBaseline' here means the baseline was THROWN AWAY by a port
+            # re-open, not that none was ever found. Claiming no read activity
+            # was visible would be flatly contradicted by the record.
+            [void]$findings.Add("[i] Read-rate monitoring restarted $($ioRecord.BaselineResetCount) time(s) during this recording because the COM port was re-opened, and the last episode had not re-established a baseline when the recording ended. Data flow WAS measured earlier (peak ~$($ioRecord.PeakBaselineOpsPerTick) read operations per tick). The end-of-session read-rate figures describe only the final episode -- do not read them as the whole session.")
+        } elseif ([int]$Session.IoBaselineOpsPerTick -eq 0) {
             [void]$findings.Add("[info] No read activity was visible on NO.exe at all this session, so data flow was NOT assessed. If the headset WAS streaming during this recording, the reads are not being issued by the NO.exe process -- on 4.x the serial I/O goes through NI-VISA, which may issue them from its own service process. Worth checking before trusting any read-rate result from this box.")
         } else {
             [void]$findings.Add("[info] Read-rate monitoring could not establish a baseline for NO.exe this session (observed ~$($Session.IoBaselineOpsPerTick) read operations per tick, below the floor needed to call a collapse). Data flow was NOT assessed -- the absence of a read-collapse finding means nothing was measured, not that nothing was wrong.")
@@ -1833,7 +1889,15 @@ function Get-DeviceProbeSessionSummary {
         # normal session stop can contribute up to three degraded ticks in the
         # gap before the port is released, so anything at or below that budget
         # would fire on routine stops.
-        [void]$findings.Add("[~] NO.exe's read rate dipped below a quarter of its own baseline on $($Session.IoDegradedTicks) tick(s) during this recording, recovering each time (worst point ~$($Session.IoWorstFractionOfBaseline)% of normal). No single dip lasted long enough to call a collapse, but a healthy stream does not do this -- suspect an intermittent link or an Arc dropping out briefly.")
+        # "Recovering each time" is only true if the measurement ran continuously.
+        # A port re-open resets it, which looks identical to a recovery and is not
+        # one, so the claim is dropped when a reset could explain it.
+        $recoveryClaim = if ($ioRecord.BaselineResetCount -gt 0) {
+            "The read-rate measurement also restarted $($ioRecord.BaselineResetCount) time(s) when the port was re-opened, so these dips cannot be assumed to have recovered on their own"
+        } else {
+            'recovering each time'
+        }
+        [void]$findings.Add("[~] NO.exe's read rate dipped below a quarter of its own baseline on $($Session.IoDegradedTicks) tick(s) during this recording, $recoveryClaim (worst point ~$($Session.IoWorstFractionOfBaseline)% of normal). No single dip lasted long enough to call a collapse, but a healthy stream does not do this -- suspect an intermittent link or an Arc dropping out briefly.")
     } elseif ($Session.IoVerdict -eq 'Streaming') {
         [void]$findings.Add("[ok] NO.exe read rate held steady at ~$($Session.IoBaselineOpsPerTick) read operations per tick while the port was open -- consistent with data actually flowing")
     } elseif (@($Session.IoReadOpDeltas).Count -eq 0) {
@@ -2509,6 +2573,99 @@ function Get-ProbeStateColor {
     }
 }
 
+function New-IoEpisodeRecord {
+    <#
+    .SYNOPSIS
+        Snapshots one read-rate episode's outcome before its live state is wiped.
+    .DESCRIPTION
+        Pure. Called when a port-open episode ends, and again (without mutating)
+        for the in-flight episode when the session is summarised.
+    .OUTPUTS
+        [pscustomobject], or $null when the episode never established a baseline
+        and so has nothing to say.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Session,
+        [datetime]$At = (Get-Date)
+    )
+
+    $baseline = [int]$Session.IoBaselineOpsPerTick
+    $verdict  = [string]$Session.IoVerdict
+
+    # No baseline and no verdict worth keeping: an episode that never measured
+    # anything contributes nothing and must not dilute the ones that did.
+    if ($baseline -le 0 -and $verdict -in @('NoBaseline', '', $null)) { return $null }
+
+    return [pscustomobject]@{
+        PSTypeName          = 'WinConfig.FlightRecorder.IoEpisode'
+        Verdict             = if ($verdict) { $verdict } else { 'NoBaseline' }
+        BaselineOpsPerTick  = $baseline
+        RecentOpsPerTick    = [int]$Session.IoRecentOpsPerTick
+        FractionOfBaseline  = $Session.IoFractionOfBaseline
+        Collapsed           = ($verdict -eq 'Collapsed')
+        Degrading           = ($verdict -eq 'Degrading')
+        EndedAtIso          = $At.ToString('o')
+    }
+}
+
+function Get-IoSessionReadRateRecord {
+    <#
+    .SYNOPSIS
+        The session-long read-rate record: closed episodes plus the live one.
+    .DESCRIPTION
+        The single answer to "did data flow ever collapse during this recording?"
+
+        The live IoVerdict answers only "was it collapsing at the last tick",
+        which is a different question and the wrong one to build a bundle on. A
+        port re-open resets the live fields, so a recording can end reporting
+        'NoBaseline' minutes after a measured collapse -- and every consumer
+        downstream then reads a collapse as an unmeasured session.
+
+        Pure: reads the session, mutates nothing, so the summary and the bundle
+        can both call it and cannot disagree.
+    .OUTPUTS
+        [pscustomobject] EverCollapsed, EverDegrading, CollapseEpisodes,
+        EpisodeCount, BaselineResetCount, PeakBaselineOpsPerTick,
+        WorstRecentOpsPerTick, FirstCollapseAtIso, Episodes.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Session)
+
+    $episodes = @()
+    if ($Session.IoClosedEpisodes) { $episodes += @($Session.IoClosedEpisodes) }
+    # The episode still running has not been stamped anywhere, and on a session
+    # that ends mid-collapse it is the ONLY one that carries the collapse.
+    $live = New-IoEpisodeRecord -Session $Session
+    if ($live) { $episodes += $live }
+    $episodes = @($episodes | Where-Object { $_ })
+
+    $collapsed = @($episodes | Where-Object { $_.Collapsed })
+    $peak = 0
+    $worstRecent = $null
+    foreach ($e in $episodes) {
+        if ([int]$e.BaselineOpsPerTick -gt $peak) { $peak = [int]$e.BaselineOpsPerTick }
+    }
+    foreach ($e in $collapsed) {
+        if ($null -eq $worstRecent -or [int]$e.RecentOpsPerTick -lt $worstRecent) {
+            $worstRecent = [int]$e.RecentOpsPerTick
+        }
+    }
+
+    return [pscustomobject]@{
+        PSTypeName             = 'WinConfig.FlightRecorder.IoSessionReadRate'
+        EverCollapsed          = ($collapsed.Count -gt 0)
+        EverDegrading          = (@($episodes | Where-Object { $_.Degrading }).Count -gt 0)
+        CollapseEpisodes       = $collapsed.Count
+        EpisodeCount           = $episodes.Count
+        BaselineResetCount     = [int]$Session.IoBaselineResetCount
+        PeakBaselineOpsPerTick = $peak
+        WorstRecentOpsPerTick  = $worstRecent
+        FirstCollapseAtIso     = if ($collapsed.Count -gt 0) { $collapsed[0].EndedAtIso } else { $null }
+        Episodes               = $episodes
+    }
+}
+
 function Get-NextProbeTickDeadline {
     <#
     .SYNOPSIS
@@ -2581,6 +2738,11 @@ function Get-NextProbeTickDeadline {
 Export-ModuleMember -Function @(
     'Initialize-BtWin32Api',
     'Get-NextProbeTickDeadline',
+    # Session-long read-rate record. Exported because the bundle summary must be
+    # built from the same answer the findings are, not from the live last-tick
+    # fields that a port re-open silently resets.
+    'New-IoEpisodeRecord',
+    'Get-IoSessionReadRateRecord',
     'Get-NoExeVersion',
     'Test-NoUsesMacResolve',
     'Get-BtConnectionState',
