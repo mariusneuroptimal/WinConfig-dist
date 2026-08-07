@@ -5388,6 +5388,14 @@ $buttonHandlers = @{
                 $initLink = Get-BtConnectionState -Mac $btProbeTargetMac -BtWin32Available $btWin32Ok
                 $btProbeSession.BtLinkState    = $initLink
                 $btProbeSession.BtLinkEnteredAt = Get-Date
+                # A link that is ALREADY up when recording starts is a real
+                # observation and must be recorded as one. Only the probe ticks
+                # set BtLinkEverConnected, and the first is 3s away, so a capture
+                # stopped or aborted before then threw away a valid sighting --
+                # and everything keyed on it (observation coverage, the serial
+                # fault fingerprint, the never-linked findings) then read as
+                # though the headset had never linked at all.
+                if ($initLink -eq 'Connected') { $btProbeSession.BtLinkEverConnected = $true }
 
                 # Port-hold initial state. NOT a data-flow reading -- see
                 # Get-ComPortHoldState. The distinction matters here more than
@@ -6128,10 +6136,18 @@ $buttonHandlers = @{
                         } elseif ($btFrozenHex) {
                             $btLinkHist = try { Get-BluetoothLinkHistory -Address $btFrozenHex } catch { $null }
                         }
+                        # SessionObservedLink: this recording's own first-hand
+                        # evidence. Without it the fingerprint decides from a
+                        # post-stop IsConnected sample and a registry timestamp
+                        # FI-012 already records as untrustworthy -- and stopping
+                        # a session releases the link, so a clean capture reads
+                        # Disconnected and drew an FI-012 fault-2 finding
+                        # (capture B9F9F0EE5E21).
                         $btProbeSession.SerialFaultFingerprint = Get-SerialFaultFingerprint `
                             -Integrity $btIntegForFp -PairedDevices $btPaired `
                             -RadioOn $(if ($btRadio) { $btRadio.BluetoothOn } else { $null }) `
-                            -LinkHistory $btLinkHist -TargetMac $btFrozenHex
+                            -LinkHistory $btLinkHist -TargetMac $btFrozenHex `
+                            -SessionObservedLink ([bool]$btProbeSession.BtLinkEverConnected)
                         if ($btRadio) { $btProbeSession.SerialFaultFingerprint.RadioState = $btRadio }
                     } catch { }
                 }

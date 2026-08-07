@@ -5242,10 +5242,17 @@ function Get-SerialFaultFingerprint {
         Faults:
           SerialStackBroken   fault 1 - integrity unhealthy; reboot. Confirmed.
           RadioOff            radio is off; nothing else can be concluded.
-          NoActiveLink        no ACL link. CONSISTENT with fault 2 and equally
-                              consistent with an idle or powered-off device.
-                              Weak. Needs an open attempt to become a diagnosis.
-          Healthy             ports consistent and the target is linked.
+          LinkObservedInSession
+                              the RECORDING watched this device hold a link.
+                              Confirmed, and it retires the fault-2 question
+                              regardless of what the post-stop sample says.
+                              Clears the transport only, never data flow.
+          LinkUp              linked in the final sample, but this recording
+                              never observed a link itself. Weak.
+          NoActiveLink        no ACL link AND the session never saw one.
+                              CONSISTENT with fault 2 and equally consistent
+                              with an idle or powered-off device. Weak. Needs an
+                              open attempt to become a diagnosis.
           Unknown             not enough data.
     .PARAMETER Integrity
         Result of Test-/Get-BluetoothSerialPortIntegrity, or $null.
@@ -5262,6 +5269,25 @@ function Get-SerialFaultFingerprint {
     .PARAMETER TargetNamePattern
         Regex picking the device that matters out of PairedDevices. Fallback
         only, for when no TargetMac is known.
+    .PARAMETER SessionObservedLink
+        $true when the recording ITSELF watched the target hold an ACL link at
+        any point (Session.BtLinkEverConnected).
+
+        This is first-hand evidence from minutes ago and it outranks both of the
+        other link signals, which are the weakest things this function reads:
+
+          - PairedDevices[].IsConnected is sampled AFTER the operator presses
+            Stop. Ending a session releases the link, so a completely healthy
+            capture routinely samples Disconnected.
+          - LastConnectedTime is a registry property FI-012 records as
+            untrustworthy; on the dev box it was stale for every paired device.
+
+        Capture B9F9F0EE5E21 (SP6, Arc 000013, 2026-08-07) is the shape: the
+        recorder logged "BT radio link stable throughout session (no drops
+        observed)" across the whole run, the operator stopped early, the
+        post-stop sample read Disconnected, and the fingerprint reported
+        NoActiveLink citing a LastConnectedTime four hours old -- raising FI-012
+        fault 2 on a box whose link this very recording had just watched be up.
     #>
     [CmdletBinding()]
     param(
@@ -5270,7 +5296,8 @@ function Get-SerialFaultFingerprint {
         [System.Nullable[bool]]$RadioOn,
         $LinkHistory,
         [string]$TargetMac,
-        [string]$TargetNamePattern = 'NeurOptimal|Arc'
+        [string]$TargetNamePattern = 'NeurOptimal|Arc',
+        [System.Nullable[bool]]$SessionObservedLink
     )
 
     $result = @{
@@ -5330,6 +5357,37 @@ function Get-SerialFaultFingerprint {
 
     $target = $targets[0]
     $result.TargetName = $target.Name
+
+    # ── Session-observed link outranks both point-in-time signals ─────────────
+    # Precedence overall: integrity fault -> radio off -> SESSION-OBSERVED LINK
+    # -> current link state -> registry fallback.
+    #
+    # Deliberately NOT reported as 'LinkUp': the post-stop sample may genuinely
+    # be disconnected, and claiming a link is up when it is not would be the
+    # same class of error in the opposite direction. The claim made here is
+    # exactly what was measured -- this recording SAW a link -- which is enough
+    # to retire the FI-012 fault-2 question without asserting anything about
+    # right now.
+    #
+    # LastConnectedTime stays in the result (set above, before any branch) so
+    # the raw registry value is still archived; it simply stops driving the
+    # verdict.
+    if ($SessionObservedLink -eq $true) {
+        $nowState = if ($target.IsConnected) {
+            'It is still linked as this snapshot is taken.'
+        } else {
+            'It reads disconnected in this final snapshot, which is the NORMAL result after a session ends -- SPP devices hold no profile open, and stopping the session releases the link.'
+        }
+        $result.Fault      = 'LinkObservedInSession'
+        $result.Confidence = 'Confirmed'
+        # Same caveat 'LinkUp' carries, and it applies at least as strongly: an
+        # observed ACL link clears the transport and says nothing about whether
+        # EEG data reached NO.exe. The 2026-07-30 field case sat in exactly this
+        # state while NO.exe showed "Arc Not Detected".
+        $result.Summary    = "This recording observed '$($target.Name)' holding an active Bluetooth link during the session. $nowState That clears the transport layer only -- it does NOT establish that EEG data is reaching NeurOptimal. A held COM port with no data flowing presents exactly like this."
+        $result.Action     = 'If NeurOptimal is still reporting a missing or undetected Arc in this state, capture it: the fault is above the Bluetooth transport and is not one this fingerprint can classify.'
+        return $result
+    }
 
     if ($target.IsConnected) {
         # NOT 'Healthy/Confirmed'. An ACL link plus consistent registrations means
