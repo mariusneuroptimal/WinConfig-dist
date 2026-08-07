@@ -6701,6 +6701,21 @@ $buttonHandlers = @{
                         ReadRateSessionOutcome = if ($btIoRecord) { [string]$btIoRecord.Outcome } else { $null }
                         ReadRateMeaningfullyDegraded = if ($btIoRecord) { [bool]$btIoRecord.MeaningfullyDegraded } else { $null }
                         ReadRateBaselineEstablished = if ($btIoRecord) { [bool]$btIoRecord.BaselineEstablished } else { $null }
+                        # ── Observation coverage: category AND duration ──────
+                        # Two separate claims, kept separate. Level says whether
+                        # every channel was seen; Quality says for how long.
+                        # Captures B9F9F0EE5E21 (~17s of measurement) and
+                        # 91C5F8EB3E3F (~32 min) both score Observed and are not
+                        # the same evidence. The raw seconds are exported too, so
+                        # a consumer can apply its own bar instead of inheriting
+                        # this one.
+                        ObservationCoverageLevel = if ($btCoverage) { [string]$btCoverage.Level } else { $null }
+                        ObservationQuality = if ($btCoverage) { [string]$btCoverage.Quality } else { $null }
+                        ObservationSeconds = if ($btCoverage) { $btCoverage.ObservationSeconds } else { $null }
+                        ObservationTickCount = if ($btCoverage) { [int]$btCoverage.TickCount } else { $null }
+                        ObservationIoSampleCount = if ($btCoverage) { [int]$btCoverage.IoSampleCount } else { $null }
+                        SecondsToReadBaseline = if ($btCoverage) { $btCoverage.SecondsToReadBaseline } else { $null }
+                        PostBaselineObservationSeconds = if ($btCoverage) { $btCoverage.PostBaselineSeconds } else { $null }
                         # When the recorder told the operator a read baseline
                         # existed, and at what rate. The live STREAM/ReadBaseline
                         # event scrolls past and is not written to

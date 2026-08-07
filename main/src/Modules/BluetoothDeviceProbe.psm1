@@ -233,6 +233,15 @@ $script:IoCollapseFraction = 0.25
 # Consecutive collapsed ticks required (~12s) so a scheduling hiccup cannot fire it.
 $script:IoCollapseTicks = 4
 
+# Post-baseline seconds at or above which an Observed capture is called
+# 'Sustained' rather than 'Brief'. Five minutes: comfortably more than the ~27s
+# a baseline needs to exist at all, and short enough that it does not label
+# ordinary clinic sessions as glances. It is a FLOOR for "worth weighing", not a
+# guarantee -- the field collapses on record took 7 and 14.5 minutes to appear,
+# so a clean Sustained capture still needs repeating. Consumers wanting a
+# different bar read PostBaselineSeconds directly.
+$script:CoverageSustainedSeconds = 300
+
 $script:ProcessIoApiAvailable = $false
 
 function Initialize-ProcessIoApi {
@@ -2322,6 +2331,57 @@ function Get-ProbeObservationCoverage {
         }
     }
 
+    # ── Observation QUALITY: a separate axis from Level ──────────────────────
+    # Level answers "did we see all the channels?". It is categorical and it is
+    # NOT weakened here -- a capture that linked, held the port and measured data
+    # flow is Observed however briefly it ran, because every channel was seen.
+    #
+    # Quality answers a different question: "for how long?". Two field captures
+    # of the same headset both scored Observed and are not remotely the same
+    # evidence:
+    #   B9F9F0EE5E21  ~17 SECONDS of measurement after the baseline landed, on a
+    #                 baseline taken mid-ramp (trailing rate 152% of it).
+    #   91C5F8EB3E3F  ~32 MINUTES after the baseline, steady throughout.
+    # Collapsing that into one word is how a 17-second glance gets weighed as a
+    # clean run.
+    #
+    # Pure: every figure comes off the session, no clock is read here.
+    $firstTick = $Session.FirstTickAt
+    $lastTick  = $Session.LastTickAt
+    $baselineAt = $Session.IoBaselineAnnouncedAt
+
+    $observationSeconds = if ($firstTick -and $lastTick) {
+        [int]([math]::Max(0, ($lastTick - $firstTick).TotalSeconds))
+    } else { $null }
+    $secondsToBaseline = if ($firstTick -and $baselineAt) {
+        [int]([math]::Max(0, ($baselineAt - $firstTick).TotalSeconds))
+    } else { $null }
+    $postBaselineSeconds = if ($baselineAt -and $lastTick) {
+        [int]([math]::Max(0, ($lastTick - $baselineAt).TotalSeconds))
+    } else { $null }
+
+    # The threshold is a FLOOR for "worth weighing", never a guarantee. In this
+    # investigation the read collapse fired 7 and 14.5 minutes into a recording,
+    # so even a Sustained capture that ends clean has to be repeated before a
+    # clean result means anything. Consumers that want a different bar have the
+    # raw seconds; this label is convenience, not the evidence.
+    $quality =
+        if ($null -eq $postBaselineSeconds)                          { 'None' }
+        elseif ($postBaselineSeconds -ge $script:CoverageSustainedSeconds) { 'Sustained' }
+        else                                                          { 'Brief' }
+
+    $qualitySummary = switch ($quality) {
+        'Sustained' {
+            "Data flow was measured for $([int]($postBaselineSeconds / 60)) minute(s) after the read baseline was established. That is long enough for this capture to carry weight -- though a clean result still wants repeating, because the collapses on record took 7 and 14.5 minutes to appear."
+        }
+        'Brief' {
+            "Data flow was measured for only $postBaselineSeconds second(s) after the read baseline was established. Every channel was seen, so this capture is not invalid -- but it is a glance, not a watch, and 'nothing went wrong' over this window is very weak evidence."
+        }
+        default {
+            'No read baseline was ever established, so there is no measured window to size.'
+        }
+    }
+
     return [pscustomobject]@{
         PSTypeName        = 'WinConfig.FlightRecorder.ObservationCoverage'
         Level             = $level
@@ -2333,6 +2393,15 @@ function Get-ProbeObservationCoverage {
         TargetComPortSeen = $sawPort
         RivalCandidates   = $rivals.Count
         RivalWasActive    = $rivalActive
+        # Quality axis. Deliberately separate from Level so that "did we see all
+        # channels?" and "for how long?" stay separate claims.
+        Quality              = $quality
+        QualitySummary       = $qualitySummary
+        ObservationSeconds   = $observationSeconds
+        TickCount            = [int]$Session.TickCount
+        SecondsToReadBaseline = $secondsToBaseline
+        PostBaselineSeconds  = $postBaselineSeconds
+        SustainedThresholdSeconds = $script:CoverageSustainedSeconds
     }
 }
 
