@@ -1898,8 +1898,23 @@ function Get-DeviceProbeSessionSummary {
             'recovering each time'
         }
         [void]$findings.Add("[~] NO.exe's read rate dipped below a quarter of its own baseline on $($Session.IoDegradedTicks) tick(s) during this recording, $recoveryClaim (worst point ~$($Session.IoWorstFractionOfBaseline)% of normal). No single dip lasted long enough to call a collapse, but a healthy stream does not do this -- suspect an intermittent link or an Arc dropping out briefly.")
-    } elseif ($Session.IoVerdict -eq 'Streaming') {
-        [void]$findings.Add("[ok] NO.exe read rate held steady at ~$($Session.IoBaselineOpsPerTick) read operations per tick while the port was open -- consistent with data actually flowing")
+    } elseif ($ioRecord.Outcome -eq 'Stable') {
+        # Was `$Session.IoVerdict -eq 'Streaming'` -- the LAST tick's verdict.
+        # Capture 91C5F8EB3E3F: 33 minutes, a 446 ops/tick baseline held across
+        # 667 ticks, nothing degraded beyond one teardown tick -- and because the
+        # terminal verdict landed on 'Degrading' rather than 'Streaming' it
+        # matched no arm of this chain at all and the capture said NOTHING about
+        # data flow. Silence is the one thing a diagnostic must never emit about
+        # a measurement it successfully took: a reader fills it in with "fine",
+        # which is right by luck here and would be wrong the next time.
+        #
+        # Baseline reported from the session record, not the terminal field, so
+        # a port re-open cannot zero the number in the sentence.
+        $steadyOps = if ($ioRecord.PeakBaselineOpsPerTick -gt 0) { $ioRecord.PeakBaselineOpsPerTick } else { $Session.IoBaselineOpsPerTick }
+        $steadyNote = if ($Session.IoDegradedTicks -gt 0) {
+            " (one brief dip, within the allowance a normal session stop accounts for)"
+        } else { '' }
+        [void]$findings.Add("[ok] NO.exe read rate held steady at ~$steadyOps read operations per tick while the port was open$steadyNote -- consistent with data actually flowing")
     } elseif (@($Session.IoReadOpDeltas).Count -eq 0) {
         # THE SILENT CASE. Every branch above is gated, directly or indirectly,
         # on the target's port having been held: read sampling only runs while
@@ -2652,6 +2667,41 @@ function Get-IoSessionReadRateRecord {
         }
     }
 
+    # ── Session-level outcome ────────────────────────────────────────────────
+    # Derived ONCE, here, so the findings and the bundle manifest cannot answer
+    # "how did data flow behave this session?" differently. Field capture
+    # 91C5F8EB3E3F (SP6, Arc 013, 33 min, clean) is why: its TERMINAL verdict was
+    # 'Degrading' because the trailing 4-tick window straddled port teardown --
+    # one near-zero tick as the port closed -- while the trailing AVERAGE was
+    # 2627 ops/tick against a 446 baseline, i.e. 589% of baseline and rising.
+    # The findings chain already guards this correctly (Degrading only counts
+    # with the port still held; dips only count above the teardown allowance);
+    # the dashboard read the bare verdict and badged a clean 33-minute capture as
+    # degraded, alongside the genuine 013 collapse.
+    #
+    # Test-IoReadCollapse is deliberately NOT changed: 'Degrading' remains a
+    # useful INSTANTANEOUS state for operator markers, and trimming trailing
+    # samples could hide a real failure that happens near teardown.
+    #
+    # 'Stable' requires a baseline to have actually been ESTABLISHED, which is
+    # what an episode verdict other than NoBaseline means. A sub-floor read rate
+    # leaves BaselineOpsPerTick nonzero while the verdict stays NoBaseline, so
+    # peak alone would call an unmeasurable session stable.
+    $baselineEstablished = @($episodes | Where-Object {
+        $_.Verdict -in @('Streaming', 'Degrading', 'Collapsed')
+    }).Count -gt 0
+
+    # Held-and-falling is the fault shape; released-and-falling is a clinic
+    # finishing a session. Same gate the findings use.
+    $terminalDegrading = ($Session.IoVerdict -eq 'Degrading' -and $Session.StreamingState -eq 'Active')
+    $dipsBeyondTeardown = ([int]$Session.IoDegradedTicks -gt $script:IoCollapseTicks)
+
+    $outcome =
+        if ($collapsed.Count -gt 0)                        { 'Collapsed' }
+        elseif ($terminalDegrading -or $dipsBeyondTeardown) { 'Degraded' }
+        elseif ($baselineEstablished)                       { 'Stable' }
+        else                                                { 'Unassessed' }
+
     return [pscustomobject]@{
         PSTypeName             = 'WinConfig.FlightRecorder.IoSessionReadRate'
         EverCollapsed          = ($collapsed.Count -gt 0)
@@ -2663,6 +2713,12 @@ function Get-IoSessionReadRateRecord {
         WorstRecentOpsPerTick  = $worstRecent
         FirstCollapseAtIso     = if ($collapsed.Count -gt 0) { $collapsed[0].EndedAtIso } else { $null }
         Episodes               = $episodes
+        # Collapsed | Degraded | Stable | Unassessed
+        Outcome                = $outcome
+        BaselineEstablished    = $baselineEstablished
+        # The claim a badge should be built from. A terminal 'Degrading' caused
+        # by teardown is NOT this.
+        MeaningfullyDegraded   = ($outcome -eq 'Degraded')
     }
 }
 

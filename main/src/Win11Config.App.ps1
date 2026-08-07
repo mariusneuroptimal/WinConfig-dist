@@ -6685,6 +6685,22 @@ $buttonHandlers = @{
                         ReadRatePeakBaselineOpsPerTick = if ($btIoRecord) { [int]$btIoRecord.PeakBaselineOpsPerTick } else { $null }
                         ReadRateWorstRecentOpsPerTick = if ($btIoRecord) { $btIoRecord.WorstRecentOpsPerTick } else { $null }
                         ReadRateEpisodeCount = if ($btIoRecord) { [int]$btIoRecord.EpisodeCount } else { $null }
+                        # ── The session-level answer ─────────────────────────
+                        # Collapsed | Degraded | Stable | Unassessed, derived once
+                        # in Get-IoSessionReadRateRecord and shared with the
+                        # findings so the bundle and the printed summary cannot
+                        # disagree.
+                        #
+                        # ReadRateVerdict above is the LAST TICK's instantaneous
+                        # state and is kept for operator markers, where it is the
+                        # right thing. It is NOT a session verdict: on capture
+                        # 91C5F8EB3E3F a clean 33-minute run ended 'Degrading'
+                        # purely because the trailing window straddled port
+                        # teardown, and the dashboard badged it as degraded next
+                        # to a genuine collapse.
+                        ReadRateSessionOutcome = if ($btIoRecord) { [string]$btIoRecord.Outcome } else { $null }
+                        ReadRateMeaningfullyDegraded = if ($btIoRecord) { [bool]$btIoRecord.MeaningfullyDegraded } else { $null }
+                        ReadRateBaselineEstablished = if ($btIoRecord) { [bool]$btIoRecord.BaselineEstablished } else { $null }
                         # When the recorder told the operator a read baseline
                         # existed, and at what rate. The live STREAM/ReadBaseline
                         # event scrolls past and is not written to
