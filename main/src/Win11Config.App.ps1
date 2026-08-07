@@ -5575,17 +5575,16 @@ $buttonHandlers = @{
                     Write-BtLog "  $f" -Level $fLevel
                 }
 
-                $realIssues = @($btWatchReport.Unresolved | Where-Object {
-                    $_ -notmatch 'Ambiguous COM-port matches' -and $_ -notmatch 'Multiple COM-port entries share MAC'
-                })
-                if ($realIssues.Count -gt 0) {
-                    Write-BtLog "" -Level "DIM"
-                    Write-BtLog "UNRESOLVED ISSUES" -Level "FAIL"
-                    foreach ($u in $realIssues) { Write-BtLog "  - $u" -Level "WARN" }
-                } else {
-                    Write-BtLog "" -Level "DIM"
-                    Write-BtLog "  No unresolved issues." -Level "OK"
-                }
+                # The closing verdict must see BOTH issue channels. It used to read
+                # $btWatchReport.Unresolved alone, which is COM-port matching only and
+                # therefore empty by construction whenever the ports are present -- that
+                # is how capture B499E903C68C ended on a green "No unresolved issues."
+                # with a collapsed read rate and two operator-marked 12006s in Findings.
+                $btVerdict = Get-ProbeSessionVerdict -Findings @($btProbeSummary.Findings) `
+                    -Unresolved @($btWatchReport.Unresolved)
+                Write-BtLog "" -Level "DIM"
+                if ($btVerdict.Header) { Write-BtLog $btVerdict.Header -Level $btVerdict.Level }
+                foreach ($vl in $btVerdict.Lines) { Write-BtLog "  $($vl.Text)" -Level $vl.Level }
                 Write-BtLog "" -Level "DIM"
 
                 # Save probe session artifact
@@ -5594,6 +5593,7 @@ $buttonHandlers = @{
                         Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'probe-session.json' -Data @{
                             SessionSummary  = $btProbeSummary
                             WatchReport     = $btWatchReport
+                            SessionVerdict  = $btVerdict
                             Observations    = @($btProbeWatch.Observations)
                             OperatorActions = @($script:BtRecOperatorActions | ForEach-Object { @{
                                 Tool        = $_.Tool

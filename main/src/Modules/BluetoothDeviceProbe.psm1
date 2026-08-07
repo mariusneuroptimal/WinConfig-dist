@@ -2068,6 +2068,100 @@ function Invoke-AnomalyDiagnosticSnapshot {
 # GUI HELPERS
 # =============================================================================
 
+function Get-ProbeSessionVerdict {
+    <#
+    .SYNOPSIS
+        Derives the recorder's closing verdict from EVERY issue channel, not one.
+    .DESCRIPTION
+        Field bug (capture B499E903C68C, 2026-08-07): the recorder printed
+        "No unresolved issues." in green at the end of a session that carried 12
+        findings, 3 of them [!] -- including a read-rate collapse (479 -> 2
+        ops/tick) and two operator-marked NO error codes (12006).
+
+        Cause: the closing line consulted the watch report's Unresolved list and
+        nothing else. That list is built exclusively from COM-port matching
+        (never exposed a port / roles conflict / roles unestablished), so on any
+        box whose ports are present it is empty BY CONSTRUCTION. It can never
+        hold a read collapse, an operator marker, port-held-without-data, FI-012
+        degradation, FI-014 residue or link flaps -- those live only in the
+        session summary's Findings.
+
+        So the verdict is derived from Findings, with Unresolved folded in as
+        one MORE source and never as the sole one. Same failure class as
+        BaselineVerdict/FinalVerdict being audio-domain only.
+
+        Pure transform: no I/O. The caller only renders what comes back.
+    .PARAMETER Findings
+        Get-DeviceProbeSessionSummary's Findings, prefixed [!] / [~] / [ok] /
+        [i] / [info].
+    .PARAMETER Unresolved
+        New-TargetWatchReport's Unresolved list.
+    .OUTPUTS
+        [pscustomobject] with Level (FAIL|WARN|OK), Header, Lines
+        (Text/Level pairs to print in order), and the counts behind them.
+    #>
+    [CmdletBinding()]
+    param(
+        [string[]]$Findings,
+        [string[]]$Unresolved
+    )
+
+    # Two COM ports for one MAC is the Arc's NORMAL shape (a DATA channel and a
+    # COMMAND channel), so these two messages are not faults. The filter lives
+    # here rather than at the call site so the whole verdict is testable.
+    $realUnresolved = @($Unresolved | Where-Object {
+        $_ -and $_ -notmatch 'Ambiguous COM-port matches' -and $_ -notmatch 'Multiple COM-port entries share MAC'
+    })
+
+    $critical = @($Findings | Where-Object { $_ -and $_.StartsWith('[!]') })
+    $warnings = @($Findings | Where-Object { $_ -and $_.StartsWith('[~]') })
+
+    $level =
+        if ($critical.Count -gt 0 -or $realUnresolved.Count -gt 0) { 'FAIL' }
+        elseif ($warnings.Count -gt 0) { 'WARN' }
+        else { 'OK' }
+
+    $lines = [System.Collections.ArrayList]::new()
+
+    if ($level -eq 'OK') {
+        [void]$lines.Add([pscustomobject]@{ Text = 'No unresolved issues.'; Level = 'OK' })
+        $header = $null
+    } else {
+        # Not "UNRESOLVED ISSUES": under the fix most FAILs come from the
+        # findings, not from the COM-port unresolved list, and that header over
+        # an empty list read as a rendering bug.
+        $header = if ($level -eq 'FAIL') { 'PROBLEMS FOUND' } else { 'WARNINGS' }
+
+        # Unresolved lines are printed nowhere else, so they go in full.
+        foreach ($u in $realUnresolved) {
+            [void]$lines.Add([pscustomobject]@{ Text = "- $u"; Level = 'WARN' })
+        }
+
+        # The findings themselves were just printed above in FINDINGS; repeating
+        # whole paragraphs here would bury the verdict. Count them and point.
+        $parts = @()
+        if ($critical.Count -gt 0) { $parts += "$($critical.Count) problem(s) marked [!]" }
+        if ($warnings.Count -gt 0) { $parts += "$($warnings.Count) warning(s) marked [~]" }
+        if ($parts.Count -gt 0) {
+            [void]$lines.Add([pscustomobject]@{
+                Text  = "$($parts -join ' and ') in FINDINGS above. This session did NOT end clean."
+                Level = $level
+            })
+        }
+    }
+
+    return [pscustomobject]@{
+        PSTypeName      = 'WinConfig.FlightRecorder.SessionVerdict'
+        Level           = $level
+        Header          = $header
+        Lines           = @($lines)
+        CriticalCount   = $critical.Count
+        WarningCount    = $warnings.Count
+        UnresolvedCount = $realUnresolved.Count
+        Unresolved      = $realUnresolved
+    }
+}
+
 function Get-ProbeStateGuiLevel {
     <#
     .SYNOPSIS
@@ -2203,6 +2297,7 @@ Export-ModuleMember -Function @(
     'Invoke-DeviceProbeTick',
     'Get-DeviceProbeSessionSummary',
     'Invoke-AnomalyDiagnosticSnapshot',
+    'Get-ProbeSessionVerdict',
     'Get-ProbeStateGuiLevel',
     'Get-ProbeStateColor',
     'Get-ProbeStateUserText'
