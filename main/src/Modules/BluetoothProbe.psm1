@@ -4174,17 +4174,35 @@ function Test-BluetoothOrphanPairingRecord {
     <#
     .SYNOPSIS
         Pure verdict function. Correlates BTHPORT pairing records against PnP
-        device nodes and reports records that exist in the registry but have no
-        device node anywhere.
+        device nodes and reports classic records that exist in the registry but
+        have no device node anywhere. Evidence about a named target device, not
+        a fleet health verdict.
     .DESCRIPTION
         Split out from Get-BluetoothOrphanPairingRecord so the detection logic
         can be tested against captured data without needing a machine in the
         broken state. Takes no live dependencies.
 
-        FI-014. An unpair deletes the PnP nodes but can leave
+        FI-014. A device removal deletes the PnP nodes but can leave
         HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\<mac>
         behind, so the registry says the device is known while Windows shows it
         as not paired and no DEV_ node, SPP node or COM port exists.
+
+        A NODELESS RECORD IS ORDINARY REMOVAL RESIDUE, NOT A FAULT. Measured on
+        the dev box 2026-08-06: removing the headset in NO.exe's own device
+        panel left a nodeless record (n=2), and the CONTROL - removing it
+        through Windows Settings instead - left the same residue. Both routes
+        go through DeviceAssociationService, so this is what a removal does on
+        this box and stack, not something an application did wrong. Anyone who
+        has ever removed a Bluetooth device has such a record. Reporting that
+        as unhealthy marks a healthy box broken.
+
+        So the verdict is SCOPED. Without -TargetMac/-TargetName this function
+        reports nodeless classic records as State='Residue' and stays
+        Healthy - it is describing the box, and it cannot know which device the
+        operator expects to be paired. Given a target, a nodeless record for
+        THAT device is State='Orphan' and turns the verdict unhealthy, because
+        that is the actual FI-014 incident shape: someone believes a device is
+        paired and it has no node.
 
         WHAT THIS CHECK DOES AND DOES NOT CLAIM. The record-with-no-node state
         is measured and real. That the record CAUSES the blockage is not: on
@@ -4244,19 +4262,46 @@ function Test-BluetoothOrphanPairingRecord {
         Every PnP instance ID on the box, including non-present devices. Must be
         the unfiltered set: filtering to present devices would report every
         powered-off classic device as an orphan.
+    .PARAMETER TargetMac
+        The device the operator expects to be paired, as a MAC in any
+        separator style. Only a nodeless record for this device is treated as
+        a fault; everything else nodeless stays Residue.
+    .PARAMETER TargetName
+        Same, matched against the record Name instead. A pattern containing
+        *, ? or [ is used verbatim as a -like pattern; anything else is matched
+        as a substring, so -TargetName 'Arc' finds 'NeurOptimal Arc - 000019'.
     .OUTPUTS
-        [hashtable] Healthy, OrphanCount, DormantCount, SightingCount,
-        RecordCount, Records, Findings, Summary, Recommendation, Error
+        [hashtable] Healthy, Scoped, TargetMac, TargetName, TargetState,
+        OrphanCount, ResidueCount, DormantCount, SightingCount, RecordCount,
+        Records, Findings, Summary, Recommendation, Error
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][array]$Records,
-        [Parameter(Mandatory)][AllowEmptyCollection()][array]$PnpInstanceIds
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$PnpInstanceIds,
+        [string]$TargetMac,
+        [string]$TargetName
     )
+
+    # Normalise the target once. A MAC arrives in any separator style; a name
+    # without wildcard characters is matched as a substring so a tech can pass
+    # the word they know rather than the exact registry Name.
+    $targetHex   = ''
+    if ($TargetMac) { $targetHex = (([string]$TargetMac) -replace '[^0-9A-Fa-f]', '').ToUpperInvariant() }
+    $namePattern = ''
+    if ($TargetName) {
+        $namePattern = if ($TargetName -match '[\*\?\[]') { $TargetName } else { "*$TargetName*" }
+    }
+    $scoped = [bool]($targetHex -or $namePattern)
 
     $result = @{
         Healthy        = $true
+        Scoped         = $scoped
+        TargetMac      = $(if ($targetHex) { $targetHex } else { $null })
+        TargetName     = $(if ($TargetName) { $TargetName } else { $null })
+        TargetState    = $(if ($scoped) { 'NoRecord' } else { $null })
         OrphanCount    = 0
+        ResidueCount   = 0
         DormantCount   = 0
         SightingCount  = 0
         RecordCount    = $Records.Count
@@ -4295,14 +4340,32 @@ function Test-BluetoothOrphanPairingRecord {
         $neverConnected = ($rec.EverConnected -eq $false)
         $isSighting     = ($neverNamed -and $neverConnected)
 
+        # A record is the operator's target if either signal names it. Matching
+        # on the record we are already walking keeps MAC and name scoping in
+        # one place, so a caller can pass whichever identifier they have.
+        $isTarget = $false
+        if ($scoped) {
+            if ($targetHex -and $mac.ToUpperInvariant() -eq $targetHex) { $isTarget = $true }
+            if (-not $isTarget -and $namePattern -and (([string]$rec.Name) -like $namePattern)) { $isTarget = $true }
+        }
+
+        # Orphan is reserved for the scoped target. Every other nodeless classic
+        # record is Residue: measured, reported, and not a fault, because the
+        # Settings-removal control produces exactly the same thing.
         $state = if ($hasNode)   { 'Paired' }
                  elseif ($isLe)  { 'Dormant' }
                  elseif ($isSighting) { 'Sighting' }
-                 else            { 'Orphan' }
+                 elseif ($isTarget)   { 'Orphan' }
+                 else            { 'Residue' }
 
         if ($state -eq 'Orphan')   { $result.OrphanCount++ }
+        if ($state -eq 'Residue')  { $result.ResidueCount++ }
         if ($state -eq 'Dormant')  { $result.DormantCount++ }
         if ($state -eq 'Sighting') { $result.SightingCount++ }
+
+        if ($isTarget -and ($result.TargetState -eq 'NoRecord' -or $state -eq 'Orphan')) {
+            $result.TargetState = $state
+        }
 
         $result.Records += [PSCustomObject]@{
             Mac           = $mac
@@ -4313,6 +4376,7 @@ function Test-BluetoothOrphanPairingRecord {
             LastWrite     = $rec.LastWrite
             HasName       = $rec.HasName
             EverConnected = $rec.EverConnected
+            IsTarget      = $isTarget
             State         = $state
         }
     }
@@ -4327,9 +4391,29 @@ function Test-BluetoothOrphanPairingRecord {
     if ($result.DormantCount -gt 0)  { $benign += "; $($result.DormantCount) dormant LE record(s), which is normal" }
     if ($result.SightingCount -gt 0) { $benign += "; $($result.SightingCount) inquiry sighting(s) - devices this box merely saw, never paired with, which block nothing" }
 
+    $residue = ''
+    if ($result.ResidueCount -gt 0) {
+        $names = @($result.Records | Where-Object { $_.State -eq 'Residue' } |
+            ForEach-Object { "'$($_.Name)' ($($_.Mac))" }) -join ', '
+        $residue = "; $($result.ResidueCount) classic record(s) with no current device node - $names - which is the ordinary residue of removing a device and needs no action unless one of them is the device you are trying to pair"
+    }
+
     if (-not $result.Healthy) {
-        $result.Summary = "$($result.RecordCount) pairing record(s); $($result.OrphanCount) orphaned (registry record with no device node)$benign"
+        $result.Summary = "$($result.RecordCount) pairing record(s); the target device has a BTHPORT record but no device node$benign$residue"
         $result.Recommendation = "TRY PAIRING FIRST: power-cycle the headset, close NO.exe, and pair through Windows Settings. An orphan record does not always block pairing - one was re-paired successfully with the record left in place. ONLY IF that fails, DELETE the orphaned record(s) under HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices, then toggle the Bluetooth radio and pair again; BUILTIN\Administrators has FullControl on those keys, so this needs elevation but not SYSTEM, and export the key first. Do NOT reboot or toggle the radio expecting either to clear the record - neither touches a non-volatile registry key."
+    } elseif ($scoped) {
+        $who = if ($TargetName) { "'$TargetName'" } else { $targetHex }
+        $lead = switch ($result.TargetState) {
+            'Paired'   { "target $who has a device node" }
+            'Dormant'  { "target $who is a remembered LE device with no node, which is normal for LE" }
+            'Sighting' { "target $who was only ever seen in an inquiry, never paired with this box" }
+            default    { "no BTHPORT pairing record for target $who" }
+        }
+        $result.Summary = "$($result.RecordCount) pairing record(s); $lead$benign$residue"
+    } elseif ($result.ResidueCount -gt 0) {
+        # No target was named, so there is nothing to call a fault. Say what is
+        # there and say what would make it matter.
+        $result.Summary = "$($result.RecordCount) pairing record(s); no target device given, so nothing here is a fault$benign$residue"
     } else {
         $result.Summary = "$($result.RecordCount) pairing record(s); every classic record has a device node$benign"
     }
@@ -4342,13 +4426,15 @@ function Get-BluetoothOrphanPairingRecord {
     .SYNOPSIS
         Detects FI-014: BTHPORT pairing records that have no corresponding PnP
         device node. Such a record marks the FI-014 no-node state and can
-        accompany a failed re-pair; it is not proven to cause one.
+        accompany a failed re-pair; it is not proven to cause one. Pass
+        -TargetMac/-TargetName to get a verdict rather than an inventory.
     .DESCRIPTION
         Reads every subkey of
         HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices and
         cross-checks each MAC against the unfiltered PnP device list. See
-        Test-BluetoothOrphanPairingRecord for the fault mechanism and for why LE
-        records are exempt.
+        Test-BluetoothOrphanPairingRecord for the fault mechanism, for why LE
+        records are exempt, and for why an unscoped run reports Residue and
+        stays Healthy.
 
         The per-record LastWrite timestamp is best-effort and worth having: a
         child key's timestamp moves when its VALUES change, a parent's only when
@@ -4359,11 +4445,20 @@ function Get-BluetoothOrphanPairingRecord {
 
         Requires elevation to read the Devices subtree. Read-only; makes no
         changes.
+    .PARAMETER TargetMac
+        The device the operator expects to be paired. See
+        Test-BluetoothOrphanPairingRecord.
+    .PARAMETER TargetName
+        Same, matched against the record Name. Substring unless it carries a
+        wildcard character.
     .OUTPUTS
         [hashtable] As Test-BluetoothOrphanPairingRecord, plus ParentLastWrite.
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [string]$TargetMac,
+        [string]$TargetName
+    )
 
     $devicesPath = 'SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices'
     $records      = @()
@@ -4442,7 +4537,8 @@ function Get-BluetoothOrphanPairingRecord {
         $collectError = $_.Exception.Message
     }
 
-    $verdict = Test-BluetoothOrphanPairingRecord -Records $records -PnpInstanceIds $instanceIds
+    $verdict = Test-BluetoothOrphanPairingRecord -Records $records -PnpInstanceIds $instanceIds `
+        -TargetMac $TargetMac -TargetName $TargetName
     $verdict.ParentLastWrite = $parentWrite
     $verdict.Error = $collectError
     if ($collectError) {
@@ -6898,10 +6994,11 @@ Export-ModuleMember -Function @(
     'Get-BluetoothCOMPorts',
     'Get-BluetoothSerialPortIntegrity',
     'Test-BluetoothSerialPortIntegrity',
-    # FI-014: pairing records left behind by an unpair, which mark the no-node
-    # state and can accompany a failed re-pair. Must be checked BEFORE the
-    # FI-012 triage tree - neither a reboot nor a radio toggle clears a
-    # non-volatile registry record.
+    # FI-014: pairing records left behind by a device removal, which mark the
+    # no-node state and can accompany a failed re-pair. Only a fault when
+    # scoped to a device the operator expects to be paired - unscoped they are
+    # ordinary removal residue. Must be checked BEFORE the FI-012 triage tree -
+    # neither a reboot nor a radio toggle clears a non-volatile registry record.
     'Get-BluetoothOrphanPairingRecord',
     'Test-BluetoothOrphanPairingRecord',
     'Initialize-RegistryKeyTimeApi',
