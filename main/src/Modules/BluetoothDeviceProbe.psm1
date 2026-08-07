@@ -606,7 +606,9 @@ function Get-ProbeStateConsistency {
         [System.Nullable[bool]]$AppRunning,
         [bool]$CpuStalled = $false,
         [bool]$IoStalled = $false,
-        [bool]$IoDegrading = $false
+        [bool]$IoDegrading = $false,
+        [bool]$SerialIntegrityFault = $false,
+        [bool]$TargetEverActive = $false
     )
 
     $out = @()
@@ -622,12 +624,44 @@ function Get-ProbeStateConsistency {
     # box only has to be in one of them.
     $stalled  = ($CpuStalled -or $IoStalled)
 
-    # Ports that exist but will not open. Independent of everything else: no
-    # process can talk to the headset in this state, whatever the other fields say.
+    # Ports that exist but will not open.
+    #
+    # This was unconditionally FAIL, and that is wrong for the commonest reason a
+    # port will not open: the headset is switched off. The open fails with
+    # ERROR_SEM_TIMEOUT either way -- FI-012 records that a broken serial stack
+    # and an absent device are INDISTINGUISHABLE from the error alone. Capture
+    # 8E39860E4AF2 turned an Arc sitting in a drawer into two [!] problems and a
+    # failed verdict on a session that had gone perfectly.
+    #
+    # So it stays FAIL only where something else corroborates a real fault:
+    #   - the serial integrity check found an OS-level fault (fault 1), or
+    #   - this target WAS working earlier in the recording and then went
+    #     unavailable, which no power switch explains.
+    # Otherwise it is unavailability, reported as evidence with the power state
+    # named first -- the same hedge Get-SerialFaultFingerprint already applies to
+    # NoActiveLink, and for exactly the same reason.
     if ($dead.Count -gt 0) {
-        $out += @{
-            Level = 'FAIL'
-            Text  = "[!] $($dead -join ', ') is registered as a Bluetooth serial port but will not open. NO.exe cannot receive EEG through a port in this state -- expect 'Control Port not valid' or 'Arc not detected'. The probe deliberately does not guess the cause here: an absent symlink and a stale one give different win32 errors and need different fixes. Run the serial port integrity check (operator-initiated, with NO.exe closed) to split them."
+        $corroborated = ($SerialIntegrityFault -or $TargetEverActive)
+        if ($corroborated) {
+            $why = if ($SerialIntegrityFault) {
+                'The serial port integrity check independently reports an OS-level fault, so this is not simply a device that is switched off.'
+            } else {
+                'This headset was reachable earlier in the same recording and then stopped opening, which being switched off does not explain.'
+            }
+            $out += @{
+                Level = 'FAIL'
+                Text  = "[!] $($dead -join ', ') is registered as a Bluetooth serial port but will not open. $why NO.exe cannot receive EEG through a port in this state -- expect 'Control Port not valid' or 'Arc not detected'. The probe deliberately does not guess the cause here: an absent symlink and a stale one give different win32 errors and need different fixes. Run the serial port integrity check (operator-initiated, with NO.exe closed) to split them."
+            }
+        } elseif ($BtLinkState -ne 'Connected') {
+            $out += @{
+                Level = 'INFO'
+                Text  = "[i] $($dead -join ', ') is registered as a Bluetooth serial port and did not open, and the radio reports no link to this headset. The most likely reason by far is that the headset is switched off or out of range -- a port with nothing on the other end times out exactly like a broken one, and FI-012 records that the two are indistinguishable from the error alone. This is NOT evidence of a fault. To turn it into one: power the headset on, confirm it connects, then run the serial port integrity check with NO.exe closed."
+            }
+        } else {
+            $out += @{
+                Level = 'WARN'
+                Text  = "[~] $($dead -join ', ') is registered as a Bluetooth serial port but will not open, even though the radio reports an active link to this headset. A linked device whose port refuses to open is worth capturing. The probe deliberately does not guess the cause here: an absent symlink and a stale one give different win32 errors and need different fixes. Run the serial port integrity check with NO.exe closed to classify it."
+            }
         }
     }
 
@@ -748,7 +782,12 @@ function New-ProbeStateMarker {
         [string]$NoExeVersion,
         [string]$IoVerdict,
         [int]$IoBaselineOpsPerTick = 0,
-        [int]$IoRecentOpsPerTick = 0
+        [int]$IoRecentOpsPerTick = 0,
+        # Corroboration for the dead-port rule. Without these a marker placed
+        # while the headset happened to be off would cross-check as a hard port
+        # fault; with them the same instant reads as an unreachable device.
+        [bool]$SerialIntegrityFault = $false,
+        [bool]$TargetEverActive = $false
     )
 
     $clean = if ($Label) { ([string]$Label).Trim() } else { '' }
@@ -770,7 +809,8 @@ function New-ProbeStateMarker {
         -BtLinkState $BtLinkState -StreamState $StreamState `
         -HeldPorts $HeldPorts -UnavailablePorts $UnavailablePorts `
         -AppRunning $AppRunning -IoStalled ($IoVerdict -eq 'Collapsed') `
-        -IoDegrading ($IoVerdict -eq 'Degrading'))
+        -IoDegrading ($IoVerdict -eq 'Degrading') `
+        -SerialIntegrityFault $SerialIntegrityFault -TargetEverActive $TargetEverActive)
 
     # Recomputed here rather than passed in so a marker is self-describing: the
     # archive is read long after the fact, and a raw pair of counters makes the
@@ -1036,6 +1076,9 @@ function New-DeviceProbeSession {
         BtLinkFlapCount          = 0
         BtLinkEverConnected      = $false
         StreamingState           = 'Stopped'
+        # Ever-held, as opposed to held-on-the-last-tick. Drives observation
+        # coverage; see Get-ProbeObservationCoverage.
+        StreamEverActive         = $false
         ActiveStreamPort         = $null
         # Last tick's port classification. HeldPorts drives the honest operator
         # text; UnavailablePorts is the FI-012 signal the old bool test erased by
@@ -1149,6 +1192,12 @@ function New-DeviceProbeSession {
         # Source='None' means nothing could be scoped to, and an unscoped
         # verdict is Healthy by construction. A reader must not take that for a
         # clean bill of health.
+        # The canonical target identity for this recording, from
+        # Select-BluetoothSessionTarget, plus the MAC frozen from it. Every
+        # target-scoped consumer reads TargetMacFrozen so one capture can never
+        # describe two different headsets (capture 8E39860E4AF2 did).
+        SessionTarget            = $null
+        TargetMacFrozen          = $null
         PairingRecord            = $null
         PairingRecordEnd         = $null
         PairingTargetMac         = $null
@@ -1235,6 +1284,11 @@ function Invoke-DeviceProbeTick {
         $Session.StreamingState = $newStreamState
 
         if ($newStreamState -eq 'Active') {
+            # Session-long memory. StreamingState is the LAST tick only, so
+            # without this nothing can answer "was the target's port ever held
+            # at any point?" -- the question that separates "the session had a
+            # problem" from "this recording never saw the session".
+            $Session.StreamEverActive       = $true
             $Session.StreamPeakCpuS         = 0.0
             $Session.StreamPeakWorkingSetMB = 0
             $Session.StreamCpuFirstSample   = $null
@@ -1782,6 +1836,23 @@ function Get-DeviceProbeSessionSummary {
         [void]$findings.Add("[~] NO.exe's read rate dipped below a quarter of its own baseline on $($Session.IoDegradedTicks) tick(s) during this recording, recovering each time (worst point ~$($Session.IoWorstFractionOfBaseline)% of normal). No single dip lasted long enough to call a collapse, but a healthy stream does not do this -- suspect an intermittent link or an Arc dropping out briefly.")
     } elseif ($Session.IoVerdict -eq 'Streaming') {
         [void]$findings.Add("[ok] NO.exe read rate held steady at ~$($Session.IoBaselineOpsPerTick) read operations per tick while the port was open -- consistent with data actually flowing")
+    } elseif (@($Session.IoReadOpDeltas).Count -eq 0) {
+        # THE SILENT CASE. Every branch above is gated, directly or indirectly,
+        # on the target's port having been held: read sampling only runs while
+        # StreamingState is 'Active'. So a recording where that never happened
+        # said NOTHING AT ALL about data flow -- the guard against unmeasured
+        # sessions was itself behind the condition that fails. Capture
+        # 8E39860E4AF2 ran 37 minutes and its 13 findings did not contain one
+        # word about whether data was flowing.
+        #
+        # An absent measurement must be visible as an absent measurement, never
+        # as silence a reader will fill in with "fine".
+        $whyNot = if (-not $Session.BtLinkEverConnected) {
+            "the headset never linked to the radio, so its port was never held and there was nothing to sample"
+        } else {
+            "the target's COM port was never held by any process, and read sampling only runs while it is"
+        }
+        [void]$findings.Add("[info] Data flow was NOT assessed in this recording: $whyNot. This is not a clean result -- nothing was measured. If NeurOptimal was running a session during this recording, it was not using the headset this recording watched.")
     }
 
     # ── Operator-marked moments ───────────────────────────────────────────────
@@ -1814,9 +1885,28 @@ function Get-DeviceProbeSessionSummary {
     }
 
     # Ports that exist but refuse to open, seen at any point in the session.
+    #
+    # Same narrowing as the arrival cross-check, and for the same reason: a
+    # switched-off headset produces this exact symptom, and calling it a fault
+    # is how capture 8E39860E4AF2 failed a session that had gone perfectly.
+    # FAIL survives only with corroboration -- an OS-level integrity fault, or a
+    # target that WAS working in this recording and then went unavailable.
     $deadPorts = @($Session.UnavailablePorts | Where-Object { $_ })
     if ($deadPorts.Count -gt 0) {
-        [void]$findings.Add("[!] $($deadPorts -join ', ') registered as a Bluetooth serial port but would not open during this session. No process can reach the headset through it. Cause not classified here (an absent symlink and a stale one need different fixes) -- run the serial port integrity check with NO.exe closed.")
+        $integForDead = if ($Session.SerialPortIntegrityEnd) { $Session.SerialPortIntegrityEnd } else { $Session.SerialPortIntegrity }
+        $integBad     = [bool]($integForDead -and -not $integForDead.Healthy)
+        if ($integBad -or $Session.StreamEverActive) {
+            $why = if ($integBad) {
+                'The serial port integrity check independently reports an OS-level fault, so this is not simply a device that was switched off.'
+            } else {
+                'This headset was reachable earlier in the same recording and then stopped opening, which being switched off does not explain.'
+            }
+            [void]$findings.Add("[!] $($deadPorts -join ', ') registered as a Bluetooth serial port but would not open during this session. $why No process can reach the headset through it. Cause not classified here (an absent symlink and a stale one need different fixes) -- run the serial port integrity check with NO.exe closed.")
+        } elseif (-not $Session.BtLinkEverConnected) {
+            [void]$findings.Add("[i] $($deadPorts -join ', ') registered as a Bluetooth serial port and never opened during this session, and the headset never linked to the radio either. The likeliest explanation by far is that it was switched off or out of range for the whole recording -- a port with nothing behind it times out exactly like a broken one, and FI-012 records that the two cannot be told apart from the error alone. This is NOT evidence of a fault. Power the headset on, confirm it connects, then run the serial port integrity check with NO.exe closed if you want it classified.")
+        } else {
+            [void]$findings.Add("[~] $($deadPorts -join ', ') registered as a Bluetooth serial port but would not open during this session, although the headset did link to the radio at some point. Worth capturing, but not classified: the probe cannot tell an absent symlink from a stale one. Run the serial port integrity check with NO.exe closed.")
+        }
     }
 
     # Which SPP channel each port is. Two ports for one MAC is the Arc's normal
@@ -2068,6 +2158,105 @@ function Invoke-AnomalyDiagnosticSnapshot {
 # GUI HELPERS
 # =============================================================================
 
+function Get-ProbeObservationCoverage {
+    <#
+    .SYNOPSIS
+        Pure. Says how much of the session this recording actually observed.
+    .DESCRIPTION
+        Field bug (capture 8E39860E4AF2): a clean 37-minute session on Arc
+        000013 was recorded against Arc 000019, which sat powered off in a
+        drawer. Every finding was true of 019; none was about the session. The
+        capture reported "2 problems" and "did NOT end clean" -- confidently
+        wrong, in a way indistinguishable from a real fault.
+
+        "This session had problems" and "this recording never saw your session"
+        are different claims, and nothing in the record could express the
+        second. That is what this adds: coverage is a first-class, structured
+        property of a capture, not an inference a reader makes from silence.
+
+          Observed      the target linked, its port was held, and reads were
+                        sampled -- the record can speak to the session
+          Partial       some evidence, not all. Findings stand, but the record
+                        is thinner than it looks
+          NotObserved   no link, no held port, no reads. The record says
+                        NOTHING about the session that ran, whatever findings
+                        it happens to contain about the device it watched
+
+        NotObserved is strengthened, not created, by a rival candidate: two
+        Arcs paired and the watched one silent is the signature of watching the
+        wrong device. But a single powered-off Arc is equally NotObserved --
+        coverage is about what was measured, never about blame.
+    .PARAMETER Session
+        The probe session (BtLinkEverConnected, StreamEverActive, IoReadOpDeltas).
+    .PARAMETER WatchState
+        The target watch state (FirstComPortSeenTime).
+    .PARAMETER Target
+        Optional Select-BluetoothSessionTarget result, for rival-candidate
+        evidence.
+    .OUTPUTS
+        [pscustomobject] Level, Reasons, Summary and the raw evidence booleans.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Session,
+        $WatchState,
+        $Target
+    )
+
+    $linked     = [bool]$Session.BtLinkEverConnected
+    $heldPort   = [bool]$Session.StreamEverActive
+    $ioSamples  = @($Session.IoReadOpDeltas).Count
+    $sawPort    = if ($WatchState) { [bool]$WatchState.FirstComPortSeenTime } else { $false }
+
+    # A rival is any OTHER candidate the selector saw. Activity on the rival is
+    # the strongest single indicator that the recording is pointed at the wrong
+    # headset, so it is tracked separately from mere presence.
+    $rivals = @()
+    $rivalActive = $false
+    if ($Target -and $Target.Candidates) {
+        $rivals = @($Target.Candidates | Where-Object { $_ -and $_.Mac -and $_.Mac -ne $Target.Mac })
+        $rivalActive = @($rivals | Where-Object { @($_.HeldPorts).Count -gt 0 }).Count -gt 0
+    }
+
+    $reasons = @()
+    if (-not $linked)        { $reasons += 'The target headset never linked to the radio during this recording.' }
+    if (-not $heldPort)      { $reasons += 'No process ever held the target headset''s COM port during this recording.' }
+    if ($ioSamples -eq 0)    { $reasons += 'No read-rate samples were taken, so data flow was never measured.' }
+    if ($rivalActive)        { $reasons += "Another paired NeurOptimal headset WAS holding a COM port while this one was idle -- this recording is very likely pointed at the wrong headset." }
+    elseif ($rivals.Count -gt 0) { $reasons += "$($rivals.Count) other NeurOptimal headset(s) are paired on this box, so the recording may have watched the wrong one." }
+
+    $level =
+        if (-not $linked -and -not $heldPort -and $ioSamples -eq 0) { 'NotObserved' }
+        elseif ($linked -and $heldPort -and $ioSamples -gt 0)       { 'Observed' }
+        else                                                        { 'Partial' }
+
+    $summary = switch ($level) {
+        'NotObserved' {
+            $who = if ($Target -and $Target.Name) { "'$($Target.Name)'" } else { 'the target headset' }
+            "This recording did not observe a session. $who never linked, its COM port was never held, and no data flow was measured, so nothing here describes what NeurOptimal was doing."
+        }
+        'Partial' {
+            'This recording observed the session only partly, so its findings rest on less evidence than a full capture.'
+        }
+        default {
+            'This recording observed the session: the headset linked, its port was held, and data flow was measured.'
+        }
+    }
+
+    return [pscustomobject]@{
+        PSTypeName        = 'WinConfig.FlightRecorder.ObservationCoverage'
+        Level             = $level
+        Reasons           = @($reasons)
+        Summary           = $summary
+        TargetEverLinked  = $linked
+        TargetPortEverHeld = $heldPort
+        IoSampleCount     = $ioSamples
+        TargetComPortSeen = $sawPort
+        RivalCandidates   = $rivals.Count
+        RivalWasActive    = $rivalActive
+    }
+}
+
 function Get-ProbeSessionVerdict {
     <#
     .SYNOPSIS
@@ -2096,14 +2285,26 @@ function Get-ProbeSessionVerdict {
         [i] / [info].
     .PARAMETER Unresolved
         New-TargetWatchReport's Unresolved list.
+    .PARAMETER Coverage
+        Get-ProbeObservationCoverage's result. When coverage is NotObserved the
+        verdict is INCONCLUSIVE regardless of what the findings say: a recording
+        that never saw the session cannot pass OR fail it, and reporting "2
+        problems found" about a headset that was not in the session is the same
+        class of confident-but-wrong as the green line this function replaced.
     .OUTPUTS
-        [pscustomobject] with Level (FAIL|WARN|OK), Header, Lines
-        (Text/Level pairs to print in order), and the counts behind them.
+        [pscustomobject] with Level (FAIL|WARN|OK|INCONCLUSIVE), GuiLevel,
+        Header, Lines (Text/Level pairs to print in order), and the counts.
+
+        ⚠️ Level is SEMANTIC and INCONCLUSIVE is not a Console -Level value --
+        that ValidateSet is OK/WARN/FAIL/INFO/STEP/ACTION/DIM and throws at
+        runtime on anything else. Render with GuiLevel; never pass Level to
+        Write-WinConfigGuiDiagnostic.
     #>
     [CmdletBinding()]
     param(
         [string[]]$Findings,
-        [string[]]$Unresolved
+        [string[]]$Unresolved,
+        $Coverage
     )
 
     # Two COM ports for one MAC is the Arc's NORMAL shape (a DATA channel and a
@@ -2116,14 +2317,41 @@ function Get-ProbeSessionVerdict {
     $critical = @($Findings | Where-Object { $_ -and $_.StartsWith('[!]') })
     $warnings = @($Findings | Where-Object { $_ -and $_.StartsWith('[~]') })
 
+    $notObserved = ($Coverage -and $Coverage.Level -eq 'NotObserved')
+
     $level =
-        if ($critical.Count -gt 0 -or $realUnresolved.Count -gt 0) { 'FAIL' }
+        if ($notObserved) { 'INCONCLUSIVE' }
+        elseif ($critical.Count -gt 0 -or $realUnresolved.Count -gt 0) { 'FAIL' }
         elseif ($warnings.Count -gt 0) { 'WARN' }
         else { 'OK' }
 
     $lines = [System.Collections.ArrayList]::new()
 
-    if ($level -eq 'OK') {
+    if ($notObserved) {
+        # Deliberately NOT a pass and NOT a failure. The findings below are real
+        # observations of the watched device; what is missing is any evidence
+        # they describe the session the operator ran. Counting them as problems
+        # is how capture 8E39860E4AF2 told an operator their clean 37-minute
+        # session "did NOT end clean".
+        $header = 'RECORDING DID NOT OBSERVE A SESSION'
+        [void]$lines.Add([pscustomobject]@{ Text = $Coverage.Summary; Level = 'WARN' })
+        foreach ($r in @($Coverage.Reasons)) {
+            [void]$lines.Add([pscustomobject]@{ Text = "- $r"; Level = 'WARN' })
+        }
+        if ($critical.Count -gt 0 -or $warnings.Count -gt 0) {
+            $seen = @()
+            if ($critical.Count -gt 0) { $seen += "$($critical.Count) marked [!]" }
+            if ($warnings.Count -gt 0) { $seen += "$($warnings.Count) marked [~]" }
+            [void]$lines.Add([pscustomobject]@{
+                Text  = "FINDINGS above ($($seen -join ', ')) describe the headset that was WATCHED, which this recording cannot show was in your session. Do not read them as a verdict on the session."
+                Level = 'WARN'
+            })
+        }
+        [void]$lines.Add([pscustomobject]@{
+            Text  = 'To get a usable capture: confirm the headset you are using is powered on and connected, make sure the recorder selected THAT headset, and record again.'
+            Level = 'ACTION'
+        })
+    } elseif ($level -eq 'OK') {
         [void]$lines.Add([pscustomobject]@{ Text = 'No unresolved issues.'; Level = 'OK' })
         $header = $null
     } else {
@@ -2153,12 +2381,16 @@ function Get-ProbeSessionVerdict {
     return [pscustomobject]@{
         PSTypeName      = 'WinConfig.FlightRecorder.SessionVerdict'
         Level           = $level
+        # Renderable equivalent. INCONCLUSIVE has no Console -Level and would
+        # throw; it prints as WARN because it is neither a pass nor a fault.
+        GuiLevel        = if ($level -eq 'INCONCLUSIVE') { 'WARN' } else { $level }
         Header          = $header
         Lines           = @($lines)
         CriticalCount   = $critical.Count
         WarningCount    = $warnings.Count
         UnresolvedCount = $realUnresolved.Count
         Unresolved      = $realUnresolved
+        Coverage        = if ($Coverage) { $Coverage.Level } else { $null }
     }
 }
 
@@ -2297,6 +2529,7 @@ Export-ModuleMember -Function @(
     'Invoke-DeviceProbeTick',
     'Get-DeviceProbeSessionSummary',
     'Invoke-AnomalyDiagnosticSnapshot',
+    'Get-ProbeObservationCoverage',
     'Get-ProbeSessionVerdict',
     'Get-ProbeStateGuiLevel',
     'Get-ProbeStateColor',

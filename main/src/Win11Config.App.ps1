@@ -4720,6 +4720,64 @@ $buttonHandlers = @{
                 $btForm.Refresh()
             }
 
+            # Modal chooser shown ONLY when Select-BluetoothSessionTarget refuses
+            # to guess between several paired headsets. Returns the chosen MAC, or
+            # $null if the operator closed it -- and $null must block the
+            # recording, never fall back to a guess. Modal is safe here: the
+            # recorder host is STA and this runs on its UI thread.
+            function Show-BtTargetChooser {
+                param([array]$Candidates = @(), $Owner)
+                $cands = @($Candidates | Where-Object { $_ -and $_.Mac })
+                if ($cands.Count -eq 0) { return $null }
+
+                $dlg = New-Object System.Windows.Forms.Form
+                $dlg.Text = "Which headset is this session using?"
+                $dlg.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+                $dlg.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+                $dlg.MinimizeBox = $false; $dlg.MaximizeBox = $false
+                $dlg.ClientSize = New-Object System.Drawing.Size(560, 210)
+
+                $msg = New-Object System.Windows.Forms.Label
+                $msg.Text = "More than one NeurOptimal headset is paired on this computer, and none of them is clearly the one in use. Choose the headset you are about to run the session with. Recording against the wrong one produces a capture that describes a headset that was never in the session."
+                $msg.SetBounds(14, 12, 532, 72)
+                $dlg.Controls.Add($msg)
+
+                $list = New-Object System.Windows.Forms.ComboBox
+                $list.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+                $list.SetBounds(14, 92, 532, 24)
+                foreach ($c in $cands) {
+                    $act = if (@($c.HeldPorts).Count -gt 0) { "  [in use: $(@($c.HeldPorts) -join ', ')]" }
+                           elseif (@($c.ComPorts).Count -gt 0) { "  [ports: $(@($c.ComPorts) -join ', ')]" }
+                           else { '  [no COM ports]' }
+                    [void]$list.Items.Add("$($c.Name)  --  $($c.Mac)$act")
+                }
+                $list.SelectedIndex = 0
+                $dlg.Controls.Add($list)
+
+                $hint = New-Object System.Windows.Forms.Label
+                $hint.Text = "If you are not sure, power on the headset you are about to use, wait for it to connect, then close this and start the recording again."
+                $hint.SetBounds(14, 122, 532, 34)
+                $dlg.Controls.Add($hint)
+
+                $ok = New-Object System.Windows.Forms.Button
+                $ok.Text = "Use this headset"; $ok.SetBounds(300, 166, 130, 30)
+                $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+                $dlg.Controls.Add($ok); $dlg.AcceptButton = $ok
+
+                $cancel = New-Object System.Windows.Forms.Button
+                $cancel.Text = "Cancel recording"; $cancel.SetBounds(436, 166, 110, 30)
+                $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+                $dlg.Controls.Add($cancel); $dlg.CancelButton = $cancel
+
+                $res = if ($Owner) { $dlg.ShowDialog($Owner) } else { $dlg.ShowDialog() }
+                $picked = $null
+                if ($res -eq [System.Windows.Forms.DialogResult]::OK -and $list.SelectedIndex -ge 0) {
+                    $picked = $cands[$list.SelectedIndex].Mac
+                }
+                $dlg.Dispose()
+                return $picked
+            }
+
             # ── Diagnostic run folder ─────────────────────────────────────────────
             $btDiagRun = $null
             if (Get-Command New-WinConfigDiagnosticRun -ErrorAction SilentlyContinue) {
@@ -4896,19 +4954,86 @@ $buttonHandlers = @{
                     }
                 }
 
-                # Auto-detect NeurOptimal device from PnP
-                $btTargetName = 'NeurOptimal Headset'
+                # ── Target selection ──────────────────────────────────────────
+                # This used to be `... -match 'NeurOptimal' | Select-Object -First 1`.
+                # With two Arcs paired, first-match won over an unordered
+                # enumeration and nobody was told a choice had been made: capture
+                # 8E39860E4AF2 watched Arc 000019 (switched off, in a drawer) for
+                # the whole of a clean 37-minute session run on Arc 000013, then
+                # reported two problems and a session that "did NOT end clean".
+                #
+                # Selection is now evidence-based and refuses to guess. The MAC it
+                # produces is FROZEN for the recording and is the single identity
+                # every consumer below is scoped to.
+                $btTargetName    = 'NeurOptimal Headset'
+                $btSessionTarget = $null
                 try {
                     $initPnp = Get-BluetoothPnpSnapshot
-                    $noDevice = $initPnp.Devices | Where-Object { $_.FriendlyName -match 'NeurOptimal' } | Select-Object -First 1
-                    if ($noDevice) {
-                        $btTargetName = $noDevice.FriendlyName
-                        $detectedMac = Get-MacFromPnpInstanceId -InstanceId $noDevice.InstanceId
-                        if ($detectedMac) { $btProbeTargetMac = $detectedMac }
-                        Write-BtLog "  Target detected: $btTargetName  MAC: $(if ($btProbeTargetMac) { $btProbeTargetMac } else { '(name match only)' })" -Level "OK"
-                    } else {
-                        Write-BtLog "  No NeurOptimal device found in PnP -- watching for any changes" -Level "DIM"
+                    $btComForSelect = try { Get-BluetoothComPortSnapshot } catch { $null }
+                    $btCandidates = @()
+                    foreach ($cd in @($initPnp.Devices | Where-Object { $_.FriendlyName -match 'NeurOptimal' })) {
+                        $cdMac = try { Get-MacFromPnpInstanceId -InstanceId $cd.InstanceId } catch { $null }
+                        $cdHex = ([string]$cdMac -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+                        $cdPorts = @()
+                        if ($cdHex -and $btComForSelect) {
+                            $cdPorts = @($btComForSelect.Ports | Where-Object {
+                                $_.PortName -and $_.AssociatedBluetoothMac -and
+                                (([string]$_.AssociatedBluetoothMac -replace '[^0-9A-Fa-f]', '').ToUpperInvariant() -eq $cdHex)
+                            } | ForEach-Object { $_.PortName } | Select-Object -Unique)
+                        }
+                        # A HELD port is the positive-activity signal. Reading it
+                        # steals nothing: on a port NO.exe owns the open fails with
+                        # a sharing violation and no handle is ever acquired. This
+                        # is the same call the probe already makes every tick.
+                        $cdHeld = @()
+                        if (Get-Command Get-ComPortHoldState -ErrorAction SilentlyContinue) {
+                            foreach ($cdP in $cdPorts) {
+                                if ((try { Get-ComPortHoldState -PortName $cdP } catch { $null }) -eq 'Held') { $cdHeld += $cdP }
+                            }
+                        }
+                        $btCandidates += [pscustomobject]@{
+                            Mac = $cdHex; Name = $cd.FriendlyName; Present = $cd.Present
+                            ComPorts = $cdPorts; HeldPorts = $cdHeld; HasPairingRecord = $false
+                        }
                     }
+
+                    if (Get-Command Select-BluetoothSessionTarget -ErrorAction SilentlyContinue) {
+                        $btSessionTarget = Select-BluetoothSessionTarget -Candidates $btCandidates
+                    }
+
+                    if ($btSessionTarget -and $btSessionTarget.RequiresOperatorChoice) {
+                        # Refuse to guess. Recording against the wrong headset
+                        # produces a confident capture about a device that was not
+                        # in the session, which is worse than no capture at all.
+                        Write-BtLog "" -Level "DIM"
+                        Write-BtLog "  [!] $($btSessionTarget.Summary)" -Level "FAIL"
+                        $btPick = $null
+                        try {
+                            $btPick = Show-BtTargetChooser -Candidates @($btSessionTarget.Candidates) -Owner $btForm
+                        } catch { $btPick = $null }
+                        if ($btPick) {
+                            $btSessionTarget = Select-BluetoothSessionTarget -Candidates $btCandidates -ExplicitMac $btPick
+                            Write-BtLog "  Target chosen: $($btSessionTarget.Summary)" -Level "OK"
+                        } else {
+                            Write-BtLog "  Recording cancelled: no headset was chosen, so this capture would have described the wrong device." -Level "FAIL"
+                            $script:BtRec_AbortClicked = $true
+                            $script:BtRec_StopClicked  = $true
+                        }
+                    }
+
+                    if ($btSessionTarget -and $btSessionTarget.IsResolved) {
+                        $btProbeTargetMac = $btSessionTarget.Mac
+                        if ($btSessionTarget.Name) { $btTargetName = $btSessionTarget.Name }
+                        Write-BtLog "  Target: $btTargetName  MAC: $btProbeTargetMac" -Level "OK"
+                        Write-BtLog "    $($btSessionTarget.Summary)" -Level "DIM"
+                    } elseif (-not $script:BtRec_AbortClicked) {
+                        $btWhy = if ($btSessionTarget) { $btSessionTarget.Summary } else { 'No NeurOptimal device found in PnP' }
+                        Write-BtLog "  $btWhy -- watching for any changes" -Level "DIM"
+                    }
+                    # Frozen from here on. Every consumer below is scoped to this
+                    # one MAC so a capture can never describe two devices at once.
+                    $btProbeSession.SessionTarget    = $btSessionTarget
+                    $btProbeSession.TargetMacFrozen  = $btProbeTargetMac
                 } catch {
                     $initPnp = [pscustomobject]@{ Devices = @(); Failures = @() }
                 }
@@ -4929,7 +5054,21 @@ $buttonHandlers = @{
                 if (Get-Command Get-BluetoothOrphanPairingRecord -ErrorAction SilentlyContinue) {
                     try {
                         $btPairInv = Get-BluetoothOrphanPairingRecord
-                        $btPairTarget = Resolve-BluetoothTargetMac -PnpMac $btProbeTargetMac -Records @($btPairInv.Records)
+                        # The frozen MAC wins when there is one. Resolve-Bluetooth-
+                        # TargetMac is the right tool ONLY once the session device
+                        # is known: its fallback deliberately ranks the NODELESS
+                        # record first, which is the FI-014 device of interest and
+                        # precisely NOT the headset in a live clinical session.
+                        # With a selection made, that ranking must not get a vote.
+                        $btPairTarget = if ($btProbeSession.TargetMacFrozen) {
+                            [pscustomobject]@{
+                                Mac    = $btProbeSession.TargetMacFrozen
+                                Source = 'SessionTarget'
+                                Summary = "Scoped to the headset selected for this recording ($($btProbeSession.TargetMacFrozen))"
+                            }
+                        } else {
+                            Resolve-BluetoothTargetMac -PnpMac $btProbeTargetMac -Records @($btPairInv.Records)
+                        }
                         $btProbeSession.PairingTargetMac    = $btPairTarget.Mac
                         $btProbeSession.PairingTargetSource = $btPairTarget.Source
                         $btProbeSession.PairingTargetSummary = $btPairTarget.Summary
@@ -5043,7 +5182,8 @@ $buttonHandlers = @{
                             -StreamState  $initStream.State `
                             -HeldPorts    @($initStream.HeldPorts) `
                             -UnavailablePorts @($initStream.UnavailablePorts) `
-                            -AppRunning   $noRunning)
+                            -AppRunning   $noRunning `
+                            -SerialIntegrityFault ([bool]($btProbeSession.SerialPortIntegrity -and -not $btProbeSession.SerialPortIntegrity.Healthy)))
                         $btProbeSession.StartupConsistency = $btArrival
                         if ($btArrival.Count -gt 0) {
                             Write-BtLog "" -Level "DIM"
@@ -5174,7 +5314,9 @@ $buttonHandlers = @{
                                 -NoExeVersion $btProbeSession.NoExeVersion `
                                 -IoVerdict    $btProbeSession.IoVerdict `
                                 -IoBaselineOpsPerTick ([int]$btProbeSession.IoBaselineOpsPerTick) `
-                                -IoRecentOpsPerTick   ([int]$btProbeSession.IoRecentOpsPerTick)
+                                -IoRecentOpsPerTick   ([int]$btProbeSession.IoRecentOpsPerTick) `
+                                -SerialIntegrityFault ([bool]($btProbeSession.SerialPortIntegrity -and -not $btProbeSession.SerialPortIntegrity.Healthy)) `
+                                -TargetEverActive     ([bool]$btProbeSession.StreamEverActive)
                             [void]$btProbeSession.OperatorMarkers.Add($mk)
                             Write-BtLog "  $($now.ToString('HH:mm:ss'))  [MARK    ]  $(Format-ProbeStateMarker -Marker $mk)" -Level "ACTION"
                             foreach ($cx in @($mk.Contradictions)) {
@@ -5210,14 +5352,29 @@ $buttonHandlers = @{
                         # generic "Standard Serial over Bluetooth link" -- can't
                         # be tied to this headset, so it would read COM: none
                         # for the whole session even after it reconnects.
+                        #
+                        # Only ever runs when NO MAC was frozen at startup, so it
+                        # cannot retarget a recording mid-flight. And it will not
+                        # guess between several headsets for the same reason the
+                        # startup selector will not: `-First 1` over an unordered
+                        # PnP enumeration is what produced capture 8E39860E4AF2.
                         if (-not $btProbeTargetMac -and $pnpNow -and $pnpNow.Devices) {
-                            $lateDev = $pnpNow.Devices | Where-Object { $_.FriendlyName -match 'NeurOptimal' } | Select-Object -First 1
-                            if ($lateDev) {
+                            $lateAll = @($pnpNow.Devices | Where-Object { $_.FriendlyName -match 'NeurOptimal' })
+                            if ($lateAll.Count -gt 1) {
+                                if (-not $script:BtRec_LateAmbiguityReported) {
+                                    $script:BtRec_LateAmbiguityReported = $true
+                                    Write-BtLog "  [!] $($lateAll.Count) NeurOptimal headsets appeared and none was selected at startup -- not guessing which one this session is about. This recording will not be scoped to a headset. Stop, power on only the headset you are using, and record again." -Level "FAIL"
+                                }
+                            } elseif ($lateAll.Count -eq 1) {
+                                $lateDev = $lateAll[0]
                                 $lateMac = Get-MacFromPnpInstanceId -InstanceId $lateDev.InstanceId
                                 $btProbeConfig = New-TargetDeviceConfiguration -TargetName $lateDev.FriendlyName -TargetMac $lateMac -AppProcessName $btProbeAppName
                                 $btProbeWatch.Configuration = $btProbeConfig
                                 if ($lateMac) {
                                     $btProbeTargetMac = $lateMac
+                                    # Freeze it now, so every consumer downstream
+                                    # scopes to the same device the watch does.
+                                    $btProbeSession.TargetMacFrozen = $lateMac
                                     Write-BtLog "  Target acquired: $($lateDev.FriendlyName)  MAC: $lateMac" -Level "OK"
                                 }
                             }
@@ -5432,7 +5589,11 @@ $buttonHandlers = @{
                 if (Get-Command Get-BluetoothOrphanPairingRecord -ErrorAction SilentlyContinue) {
                     try {
                         $btPairInvEnd = Get-BluetoothOrphanPairingRecord
-                        $btPairMacEnd = $btProbeSession.PairingTargetMac
+                        # Frozen MAC first: the end sample must describe the SAME
+                        # headset as the start sample, or the pair of them cannot
+                        # show that anything changed during the recording.
+                        $btPairMacEnd = $btProbeSession.TargetMacFrozen
+                        if (-not $btPairMacEnd) { $btPairMacEnd = $btProbeSession.PairingTargetMac }
                         if (-not $btPairMacEnd) {
                             $btPairMacEnd = (Resolve-BluetoothTargetMac -PnpMac '' -Records @($btPairInvEnd.Records)).Mac
                         }
@@ -5513,15 +5674,32 @@ $buttonHandlers = @{
                         } else { $btProbeSession.SerialPortIntegrity }
                         # LastConnectedTime for the target: the passive signal
                         # that actually discriminated during the field case.
-                        $btTarget = @($btPaired | Where-Object { $_.Name -and $_.Name -match 'NeurOptimal|Arc' })
+                        #
+                        # Scoped to the FROZEN MAC, not to a name regex. This
+                        # block used to run its own `-match 'NeurOptimal|Arc'`
+                        # over every paired device and take [0] -- a second,
+                        # independent selector. On capture 8E39860E4AF2 it landed
+                        # on Arc 000013 while the recording watched Arc 000019, so
+                        # one artifact described two headsets and said neither.
+                        $btFrozenMac = $btProbeSession.TargetMacFrozen
+                        $btFrozenHex = ([string]$btFrozenMac -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+                        $btTarget = if ($btFrozenHex) {
+                            @($btPaired | Where-Object {
+                                $_ -and (([string]$_.Address -replace '[^0-9A-Fa-f]', '').ToUpperInvariant() -eq $btFrozenHex)
+                            })
+                        } else {
+                            @($btPaired | Where-Object { $_.Name -and $_.Name -match 'NeurOptimal|Arc' })
+                        }
                         $btLinkHist = $null
                         if ($btTarget.Count -gt 0 -and $btTarget[0].Address) {
                             $btLinkHist = try { Get-BluetoothLinkHistory -Address $btTarget[0].Address } catch { $null }
+                        } elseif ($btFrozenHex) {
+                            $btLinkHist = try { Get-BluetoothLinkHistory -Address $btFrozenHex } catch { $null }
                         }
                         $btProbeSession.SerialFaultFingerprint = Get-SerialFaultFingerprint `
                             -Integrity $btIntegForFp -PairedDevices $btPaired `
                             -RadioOn $(if ($btRadio) { $btRadio.BluetoothOn } else { $null }) `
-                            -LinkHistory $btLinkHist
+                            -LinkHistory $btLinkHist -TargetMac $btFrozenHex
                         if ($btRadio) { $btProbeSession.SerialFaultFingerprint.RadioState = $btRadio }
                     } catch { }
                 }
@@ -5580,10 +5758,25 @@ $buttonHandlers = @{
                 # therefore empty by construction whenever the ports are present -- that
                 # is how capture B499E903C68C ended on a green "No unresolved issues."
                 # with a collapsed read rate and two operator-marked 12006s in Findings.
+                #
+                # Coverage goes in as well, so a recording that never observed the
+                # session reads INCONCLUSIVE instead of failing it. Capture
+                # 8E39860E4AF2 counted an idle headset's two findings as "2
+                # problems" and told an operator their clean 37-minute session
+                # "did NOT end clean".
+                $btCoverage = $null
+                if (Get-Command Get-ProbeObservationCoverage -ErrorAction SilentlyContinue) {
+                    $btCoverage = try {
+                        Get-ProbeObservationCoverage -Session $btProbeSession -WatchState $btProbeWatch `
+                            -Target $btProbeSession.SessionTarget
+                    } catch { $null }
+                }
                 $btVerdict = Get-ProbeSessionVerdict -Findings @($btProbeSummary.Findings) `
-                    -Unresolved @($btWatchReport.Unresolved)
+                    -Unresolved @($btWatchReport.Unresolved) -Coverage $btCoverage
                 Write-BtLog "" -Level "DIM"
-                if ($btVerdict.Header) { Write-BtLog $btVerdict.Header -Level $btVerdict.Level }
+                # GuiLevel, never Level: INCONCLUSIVE is not in the Console
+                # -Level ValidateSet and throws at runtime.
+                if ($btVerdict.Header) { Write-BtLog $btVerdict.Header -Level $btVerdict.GuiLevel }
                 foreach ($vl in $btVerdict.Lines) { Write-BtLog "  $($vl.Text)" -Level $vl.Level }
                 Write-BtLog "" -Level "DIM"
 
@@ -5594,6 +5787,15 @@ $buttonHandlers = @{
                             SessionSummary  = $btProbeSummary
                             WatchReport     = $btWatchReport
                             SessionVerdict  = $btVerdict
+                            # Which headset this capture is about, why it was
+                            # chosen, and what else it could have been. Without
+                            # the rejected candidates a reader cannot tell a
+                            # correct choice from a lucky one -- and capture
+                            # 8E39860E4AF2 read as authoritative precisely
+                            # because the alternative was invisible.
+                            SessionTarget   = $btProbeSession.SessionTarget
+                            TargetMacFrozen = $btProbeSession.TargetMacFrozen
+                            Coverage        = $btCoverage
                             Observations    = @($btProbeWatch.Observations)
                             OperatorActions = @($script:BtRecOperatorActions | ForEach-Object { @{
                                 Tool        = $_.Tool

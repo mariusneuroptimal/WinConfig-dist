@@ -4548,11 +4548,159 @@ function Get-BluetoothOrphanPairingRecord {
     return $verdict
 }
 
+function Select-BluetoothSessionTarget {
+    <#
+    .SYNOPSIS
+        Pure. Picks THE headset a recording is about, or refuses to pick.
+    .DESCRIPTION
+        Field bug (capture 8E39860E4AF2, 2026-08-07): the operator ran a clean
+        37-minute session on Arc 000013 while the recorder watched Arc 000019 --
+        powered off, in a drawer -- for the entire recording. It reported two
+        problems and "this session did NOT end clean". Every statement in that
+        capture was true of 019 and none of it was about the session.
+
+        Cause: the recorder took `$pnp.Devices | Where FriendlyName -match
+        'NeurOptimal' | Select -First 1`. With two Arcs paired, first-match wins
+        over an unordered enumeration and the operator is never told a choice
+        was made. A second selector (the FI-012 fingerprint) ran its own
+        name-regex over the WinRT device list and picked the OTHER Arc, so one
+        capture disagreed with itself about which headset it described.
+
+        This is deliberately NOT a stable sort. A stable sort still silently
+        chooses, and choosing wrong is the failure being fixed -- it just makes
+        the wrong choice reproducible. Automatic selection requires POSITIVE
+        EVIDENCE that exactly one candidate is the session device:
+
+          exactly one candidate                  -> Automatic  (nothing to confuse)
+          exactly one holds a COM port           -> Automatic  (the session device)
+          anything else                          -> AmbiguousRequiresChoice
+
+        A held COM port is the evidence used because it is the only signal that
+        means "a process is talking to this headset right now". WinRT
+        IsConnected is NOT used and must not be: SPP devices hold no profile
+        open, so a healthy idle Arc reads Disconnected, and during the FI-012
+        field case IsConnected read False while both ports opened fine. Ranking
+        on it would reintroduce this bug with a confident-looking tie-break.
+
+        Never silently narrows: every candidate and its evidence is returned
+        whatever the outcome, so a capture records the choice that was available
+        and not merely the one that was taken.
+    .PARAMETER Candidates
+        Objects carrying Mac, Name, and the per-candidate evidence:
+        Present, HeldPorts, ComPorts, HasPairingRecord. The caller gathers these
+        (it is I/O); this function only decides.
+    .PARAMETER ExplicitMac
+        An operator-chosen MAC. Wins over everything -- an explicit choice is
+        not second-guessed, and it is recorded as Explicit so a reader can tell
+        a human decision from an inference.
+    .OUTPUTS
+        [pscustomobject] Mac, Name, Mode, Reason, Candidates, IsResolved,
+        RequiresOperatorChoice, Summary.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][array]$Candidates = @(),
+        [string]$ExplicitMac
+    )
+
+    $norm = { param($m) ([string]$m -replace '[^0-9A-Fa-f]', '').ToUpperInvariant() }
+
+    $cands = @($Candidates | Where-Object { $_ } | ForEach-Object {
+        [pscustomobject]@{
+            Mac              = & $norm $_.Mac
+            Name             = [string]$_.Name
+            Present          = [bool]$_.Present
+            HeldPorts        = @($_.HeldPorts | Where-Object { $_ })
+            ComPorts         = @($_.ComPorts  | Where-Object { $_ })
+            HasPairingRecord = [bool]$_.HasPairingRecord
+        }
+    })
+
+    $result = [pscustomobject]@{
+        PSTypeName             = 'WinConfig.FlightRecorder.SessionTarget'
+        Mac                    = $null
+        Name                   = $null
+        Mode                   = 'None'
+        Reason                 = $null
+        Candidates             = $cands
+        CandidateCount         = $cands.Count
+        IsResolved             = $false
+        RequiresOperatorChoice = $false
+        Summary                = $null
+    }
+
+    # An explicit choice is a decision, not a hypothesis. Honour it even if the
+    # device looks idle -- an operator about to power a headset on knows
+    # something the evidence cannot show yet.
+    $explicit = & $norm $ExplicitMac
+    if ($explicit) {
+        $match = @($cands | Where-Object { $_.Mac -eq $explicit })[0]
+        $result.Mac        = $explicit
+        $result.Name       = if ($match) { $match.Name } else { $null }
+        $result.Mode       = 'Explicit'
+        $result.Reason     = 'OperatorSelected'
+        $result.IsResolved = $true
+        $result.Summary    = "Target chosen by the operator: $(if ($result.Name) { "'$($result.Name)' " })$explicit"
+        return $result
+    }
+
+    if ($cands.Count -eq 0) {
+        $result.Reason  = 'NoCandidates'
+        $result.Summary = 'No NeurOptimal headset found on this box, so no target could be selected.'
+        return $result
+    }
+
+    if ($cands.Count -eq 1) {
+        $result.Mac        = $cands[0].Mac
+        $result.Name       = $cands[0].Name
+        $result.Mode       = 'Automatic'
+        $result.Reason     = 'SingleCandidate'
+        $result.IsResolved = [bool]$cands[0].Mac
+        $result.Summary    = "Target '$($cands[0].Name)' ($($cands[0].Mac)) -- the only NeurOptimal headset on this box."
+        if (-not $result.IsResolved) {
+            $result.Reason  = 'SingleCandidateNoMac'
+            $result.Summary = "Found '$($cands[0].Name)' but could not read its MAC address, so the target cannot be pinned."
+        }
+        return $result
+    }
+
+    # More than one. Only a held COM port earns an automatic choice.
+    $active = @($cands | Where-Object { $_.HeldPorts.Count -gt 0 })
+    if ($active.Count -eq 1 -and $active[0].Mac) {
+        $result.Mac        = $active[0].Mac
+        $result.Name       = $active[0].Name
+        $result.Mode       = 'Automatic'
+        $result.Reason     = 'SoleActiveComPort'
+        $result.IsResolved = $true
+        $result.Summary    = "$($cands.Count) NeurOptimal headsets are paired; selected '$($active[0].Name)' ($($active[0].Mac)) because it is the only one whose COM port ($($active[0].HeldPorts -join ', ')) is currently held by a process."
+        return $result
+    }
+
+    $result.Mode                   = 'AmbiguousRequiresChoice'
+    $result.RequiresOperatorChoice = $true
+    $names = @($cands | ForEach-Object { "'$($_.Name)' ($($_.Mac))" }) -join ', '
+    $result.Reason = if ($active.Count -gt 1) { 'MultipleActive' } else { 'NoActiveCandidate' }
+    $result.Summary = if ($active.Count -gt 1) {
+        "$($cands.Count) NeurOptimal headsets are paired and $($active.Count) of them are holding COM ports ($names). The recording cannot tell which one this session is about -- choose it, or the capture will describe the wrong headset."
+    } else {
+        "$($cands.Count) NeurOptimal headsets are paired and NONE is holding a COM port ($names). Nothing distinguishes them, so the recording cannot tell which one this session is about. Power on and connect the headset you are about to use, or choose it explicitly."
+    }
+    return $result
+}
+
 function Resolve-BluetoothTargetMac {
     <#
     .SYNOPSIS
         Picks the MAC to scope a target-context check to, preferring the live
         PnP node and falling back to the BTHPORT pairing record.
+
+        ⛔ NOT A MULTI-DEVICE SESSION RESOLVER. Use Select-BluetoothSessionTarget
+        to decide WHICH headset a recording is about; use this only to scope a
+        check once that decision has been made. Two reasons it cannot do the
+        session job: it trusts the PnpMac it is handed without validating it
+        against anything, and when it does fall back it deliberately ranks the
+        NODELESS record first -- the device most interesting for FI-014, which is
+        precisely the device NOT in a live clinical session.
     .DESCRIPTION
         The Flight Recorder resolves its target from the PnP device list, which
         works right up to the moment it matters: FI-014's whole signature is a
@@ -5107,8 +5255,13 @@ function Get-SerialFaultFingerprint {
         $true/$false/$null (unknown).
     .PARAMETER LinkHistory
         Result of Get-BluetoothLinkHistory for the target, or $null.
+    .PARAMETER TargetMac
+        The MAC the recording selected. Pins the assessment to that one device.
+        Prefer this always: without it the function runs its own name match and
+        can describe a DIFFERENT headset than the rest of the capture.
     .PARAMETER TargetNamePattern
-        Regex picking the device that matters out of PairedDevices.
+        Regex picking the device that matters out of PairedDevices. Fallback
+        only, for when no TargetMac is known.
     #>
     [CmdletBinding()]
     param(
@@ -5116,6 +5269,7 @@ function Get-SerialFaultFingerprint {
         [AllowEmptyCollection()][array]$PairedDevices = @(),
         [System.Nullable[bool]]$RadioOn,
         $LinkHistory,
+        [string]$TargetMac,
         [string]$TargetNamePattern = 'NeurOptimal|Arc'
     )
 
@@ -5150,9 +5304,26 @@ function Get-SerialFaultFingerprint {
         return $result
     }
 
-    $targets = @($PairedDevices | Where-Object { $_.Name -and $_.Name -match $TargetNamePattern })
+    # TargetMac pins this to the device the recording actually selected. Without
+    # it this ran its own name regex over every paired device and took [0] --
+    # a SECOND selector, independent of the recorder's. On capture 8E39860E4AF2
+    # the two disagreed: the recording watched Arc 000019 while this fingerprint
+    # described Arc 000013, inside one artifact, with nothing flagging it.
+    # The name pattern remains only as the single-Arc fallback.
+    $wantMac = ([string]$TargetMac -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+    $targets = if ($wantMac) {
+        @($PairedDevices | Where-Object {
+            $_ -and (([string]$_.Address -replace '[^0-9A-Fa-f]', '').ToUpperInvariant() -eq $wantMac)
+        })
+    } else {
+        @($PairedDevices | Where-Object { $_.Name -and $_.Name -match $TargetNamePattern })
+    }
     if ($targets.Count -eq 0) {
-        $result.Summary = 'No paired target device found to assess; serial port registrations look consistent'
+        $result.Summary = if ($wantMac) {
+            "The selected target ($wantMac) is not in the paired device list, so its link state could not be assessed."
+        } else {
+            'No paired target device found to assess; serial port registrations look consistent'
+        }
         if ($Integrity) { $result.Fault = 'Unknown' }
         return $result
     }
@@ -7089,6 +7260,7 @@ Export-ModuleMember -Function @(
     # Resolves the MAC the orphan check is scoped to. Needed because the
     # recorder's PnP-based target lookup returns nothing in exactly the FI-014
     # case, which would leave every real capture unscoped and therefore Healthy.
+    'Select-BluetoothSessionTarget',
     'Resolve-BluetoothTargetMac',
     'Test-BluetoothOrphanPairingRecord',
     'Initialize-RegistryKeyTimeApi',
