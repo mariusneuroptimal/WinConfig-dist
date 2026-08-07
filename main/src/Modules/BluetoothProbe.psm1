@@ -4548,6 +4548,92 @@ function Get-BluetoothOrphanPairingRecord {
     return $verdict
 }
 
+function Resolve-BluetoothTargetMac {
+    <#
+    .SYNOPSIS
+        Picks the MAC to scope a target-context check to, preferring the live
+        PnP node and falling back to the BTHPORT pairing record.
+    .DESCRIPTION
+        The Flight Recorder resolves its target from the PnP device list, which
+        works right up to the moment it matters: FI-014's whole signature is a
+        device with a pairing record and NO PnP node, so the PnP lookup returns
+        nothing precisely when the orphan check has something to say. Scoping on
+        the PnP MAC alone would leave every real FI-014 capture unscoped, and an
+        unscoped scan is Healthy by construction.
+
+        So when PnP has no MAC, fall back to the pairing records themselves and
+        match on name. A nodeless candidate is preferred over one with nodes -
+        that is the device in trouble - and ties break on the most recently
+        written record.
+
+        ⚠️ A SIGHTING CANNOT BE RESOLVED BY NAME. Windows writes no Name value
+        for a device it has merely seen in an inquiry, so a never-paired headset
+        has a record whose Name this function can never match. Verified live
+        2026-08-07: Arc 000013's sighting record 8c1f6471000d resolves to
+        NoRecord by name and to Sighting by MAC. If the caller knows the MAC
+        from elsewhere - an operator typed it, or an inquiry scan found it -
+        pass it as PnpMac; there is no name-based route to that record.
+    .PARAMETER PnpMac
+        MAC read from the PnP instance id, when the device has a node.
+    .PARAMETER Records
+        Records array from Get-BluetoothOrphanPairingRecord, carrying Mac, Name,
+        State and LastWrite.
+    .PARAMETER NamePattern
+        Regex matched against the record Name. Defaults to the NeurOptimal
+        headset family.
+    .OUTPUTS
+        [hashtable] Mac, Source (PnpNode|PairingRecord|None), Candidates,
+        Summary
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$PnpMac,
+        [array]$Records = @(),
+        [string]$NamePattern = 'NeurOptimal|Arc'
+    )
+
+    $result = @{
+        Mac        = $null
+        Source     = 'None'
+        Candidates = @()
+        Summary    = $null
+    }
+
+    $hex = ([string]$PnpMac) -replace '[^0-9A-Fa-f]', ''
+    if ($hex) {
+        $result.Mac     = $hex.ToUpperInvariant()
+        $result.Source  = 'PnpNode'
+        $result.Summary = "Target resolved from its live PnP node ($($result.Mac))"
+        return $result
+    }
+
+    # No node. This is the FI-014 shape, so look in the records themselves.
+    $named = @($Records | Where-Object {
+        $_ -and $_.Name -and ([string]$_.Name) -match $NamePattern
+    })
+    $result.Candidates = @($named | ForEach-Object {
+        [PSCustomObject]@{ Mac = $_.Mac; Name = $_.Name; State = $_.State; LastWrite = $_.LastWrite }
+    })
+
+    if ($named.Count -eq 0) {
+        $result.Summary = "No PnP node and no pairing record matching '$NamePattern'. Nothing to scope to - the check will run unscoped and report an inventory only. A never-paired device is expected to land here: its record carries no Name."
+        return $result
+    }
+
+    # The nodeless one is the interesting one; among equals, the freshest.
+    $ranked = @($named | Sort-Object `
+        @{ Expression = { if ($_.State -eq 'Paired') { 1 } else { 0 } } }, `
+        @{ Expression = { $_.LastWrite }; Descending = $true })
+
+    $pick = $ranked[0]
+    $result.Mac    = ([string]$pick.Mac -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+    $result.Source = 'PairingRecord'
+    $extra = if ($named.Count -gt 1) { " ($($named.Count) records matched; picked the nodeless/most recent)" } else { '' }
+    $result.Summary = "Target has no PnP node; resolved from its BTHPORT pairing record '$($pick.Name)' ($($result.Mac))$extra"
+
+    return $result
+}
+
 function Get-BluetoothPowerCycleContext {
     <#
     .SYNOPSIS
@@ -7000,6 +7086,10 @@ Export-ModuleMember -Function @(
     # ordinary removal residue. Must be checked BEFORE the FI-012 triage tree -
     # neither a reboot nor a radio toggle clears a non-volatile registry record.
     'Get-BluetoothOrphanPairingRecord',
+    # Resolves the MAC the orphan check is scoped to. Needed because the
+    # recorder's PnP-based target lookup returns nothing in exactly the FI-014
+    # case, which would leave every real capture unscoped and therefore Healthy.
+    'Resolve-BluetoothTargetMac',
     'Test-BluetoothOrphanPairingRecord',
     'Initialize-RegistryKeyTimeApi',
     'Get-BluetoothPowerCycleContext',

@@ -1140,6 +1140,24 @@ function New-DeviceProbeSession {
         # without opening a port, because the open collector must never run
         # inside a live recording session.
         SerialFaultFingerprint   = $null
+        # FI-014: BTHPORT pairing record vs PnP node, target-scoped, at session
+        # start and end. Two samples for the same reason as the pair above --
+        # only the transition tells you the node was torn down DURING this
+        # recording rather than at some point before it.
+        #
+        # The MAC and its source are stored because they qualify the verdict:
+        # Source='None' means nothing could be scoped to, and an unscoped
+        # verdict is Healthy by construction. A reader must not take that for a
+        # clean bill of health.
+        PairingRecord            = $null
+        PairingRecordEnd         = $null
+        PairingTargetMac         = $null
+        PairingTargetSource      = 'None'
+        PairingTargetSummary     = $null
+        # Discovery scan, only run when the target has no node AND NO.exe is
+        # closed. Carries its own not-collected reason, because "no devices
+        # found" and "never scanned" are opposite conclusions.
+        InquiryScan              = $null
     }
 }
 
@@ -1626,6 +1644,52 @@ function Get-DeviceProbeSessionSummary {
         if ($integStart -and $integEnd -and $integStart.Healthy -and -not $integEnd.Healthy) {
             [void]$findings.Add("[!] Bluetooth serial port registrations DEGRADED during this session: healthy at start, $($integEnd.CollisionCount) collision(s) / $($integEnd.MissingSymlinkCount) absent symlink(s) at end. Whatever happened in this recording is what corrupts them -- check the session log for sleep/resume or a re-pair.")
         }
+    }
+
+    # ── FI-014: pairing record vs device node, for the target ─────────────────
+    # Above the FI-012 material for the same reason the integrity check is:
+    # if the headset has no device node there is no COM port to reason about,
+    # and every finding below it is downstream noise.
+    $prStart = $Session.PairingRecord
+    $prEnd   = $Session.PairingRecordEnd
+    $pr      = if ($prEnd) { $prEnd } else { $prStart }
+
+    if ($pr) {
+        if ($prStart -and $prEnd -and $prStart.TargetState -eq 'Paired' -and $prEnd.TargetState -eq 'Orphan') {
+            [void]$findings.Add("[!] The headset LOST its device node during this recording: it had one when recording began and only a BTHPORT registry record at the end. Something removed the device while you watched -- a removal in NO.exe's device panel and one in Windows Settings both do this. That is the trigger, and this capture contains it.")
+        } elseif ($pr.TargetState -eq 'Orphan') {
+            foreach ($f in @($pr.Findings)) { [void]$findings.Add("[!] $f") }
+            if ($pr.Recommendation) { [void]$findings.Add("[!] $($pr.Recommendation)") }
+        } elseif ($pr.TargetState -eq 'Sighting') {
+            [void]$findings.Add("[!] This box has only ever SEEN the target headset in a scan, never paired with it. There is a registry record, but it is a sighting -- no pairing was ever completed. Pair it through Windows Settings.")
+        } elseif ($pr.TargetState -eq 'NoRecord') {
+            [void]$findings.Add("[i] No BTHPORT pairing record for the target headset at all -- this box has no memory of it. Nothing to clean up; it simply needs pairing.")
+        } elseif ($pr.Scoped -and $pr.TargetState -eq 'Paired') {
+            [void]$findings.Add("[ok] The target headset has both a BTHPORT pairing record and a live device node -- no FI-014 residue for this device")
+        }
+
+        # An unscoped verdict is Healthy by construction. Saying nothing here
+        # would let "we could not identify the target" read as "the target is
+        # fine", which is the same silent-pass shape the read-rate NoBaseline
+        # branch exists to prevent.
+        if (-not $pr.Scoped) {
+            [void]$findings.Add("[info] The headset could not be identified on this box (no device node and no pairing record matching it), so the pairing-record check ran unscoped and reports an inventory only -- it did NOT assess any specific device. A never-paired headset lands here: Windows stores no name for a device it has merely seen, so only its MAC address could scope the check.")
+        }
+        if ($pr.ResidueCount -gt 0) {
+            [void]$findings.Add("[i] $($pr.ResidueCount) other Bluetooth device(s) on this box have a pairing record with no device node. That is the ordinary residue of removing a device and needs no action.")
+        }
+    }
+
+    # ── Discovery: can this box hear the headset at all? ──────────────────────
+    $inq = $Session.InquiryScan
+    if ($inq -and $inq.Collected -and $inq.Result) {
+        if ([int]$inq.Result.Count -gt 0) {
+            [void]$findings.Add("[ok] A discovery scan heard $($inq.Result.Count) unpaired device(s), so this box's radio can discover devices -- the headset can be paired from here")
+        } else {
+            [void]$findings.Add("[~] A discovery scan heard NOTHING. INCONCLUSIVE on its own: an Arc that has idled itself off answers no inquiry at all. Power-cycle the headset and scan again before treating this as a discovery fault.")
+        }
+    } elseif ($inq -and $inq.Reason) {
+        [void]$findings.Add("[info] Discovery scan not run. $($inq.Reason)")
     }
 
     # ── FI-012 fault 2, without opening a port ────────────────────────────────

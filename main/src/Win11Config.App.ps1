@@ -4913,6 +4913,47 @@ $buttonHandlers = @{
                     $initPnp = [pscustomobject]@{ Devices = @(); Failures = @() }
                 }
 
+                # ── FI-014 baseline: BTHPORT pairing record vs PnP node ──────
+                # Read-only (registry + PnP enumeration), so unlike the serial
+                # OPEN probes this is safe on the automatic path during a live
+                # client session.
+                #
+                # Scoped on purpose. An unscoped scan is Healthy by
+                # construction -- a nodeless record is ordinary removal residue
+                # -- so it would put an inventory in every ZIP and a verdict in
+                # none. The MAC comes from the PnP node when there is one and
+                # from the pairing record when there is not, which is the case
+                # that matters: FI-014 IS "record present, node absent", so the
+                # PnP lookup above returns nothing exactly when this check has
+                # something to say.
+                if (Get-Command Get-BluetoothOrphanPairingRecord -ErrorAction SilentlyContinue) {
+                    try {
+                        $btPairInv = Get-BluetoothOrphanPairingRecord
+                        $btPairTarget = Resolve-BluetoothTargetMac -PnpMac $btProbeTargetMac -Records @($btPairInv.Records)
+                        $btProbeSession.PairingTargetMac    = $btPairTarget.Mac
+                        $btProbeSession.PairingTargetSource = $btPairTarget.Source
+                        $btProbeSession.PairingTargetSummary = $btPairTarget.Summary
+
+                        $btProbeSession.PairingRecord = if ($btPairTarget.Mac) {
+                            Get-BluetoothOrphanPairingRecord -TargetMac $btPairTarget.Mac
+                        } else { $btPairInv }
+
+                        # A MAC recovered from a record when PnP had none is the
+                        # headline, not a detail: it means the headset is known
+                        # to this box and has no device node right now.
+                        if ($btPairTarget.Source -eq 'PairingRecord') {
+                            Write-BtLog "  [!] $($btPairTarget.Summary)" -Level "WARN"
+                        }
+                        if ($btProbeSession.PairingRecord -and -not $btProbeSession.PairingRecord.Healthy) {
+                            Write-BtLog "  [!] $($btProbeSession.PairingRecord.Summary)" -Level "FAIL"
+                            foreach ($f in @($btProbeSession.PairingRecord.Findings)) { Write-BtLog "      $f" -Level "DIM" }
+                            if ($btProbeSession.PairingRecord.Recommendation) {
+                                Write-BtLog "      $($btProbeSession.PairingRecord.Recommendation)" -Level "FAIL"
+                            }
+                        }
+                    } catch { }
+                }
+
                 Write-BtLog "  Gathering system state (adapters, COM ports, power settings)..." -Level "DIM"
                 [System.Windows.Forms.Application]::DoEvents()
 
@@ -5383,6 +5424,82 @@ $buttonHandlers = @{
                     $btProbeSession.SerialPortIntegrityEnd = try { Get-BluetoothSerialPortIntegrity } catch { $null }
                 }
 
+                # FI-014 second sample, same reasoning as the FI-012 pair above:
+                # it separates "arrived with no node" from "lost its node while
+                # we watched", and only the second pins the trigger to this
+                # recording. Re-resolves the MAC because a device removed DURING
+                # the session loses the PnP node the start sample resolved from.
+                if (Get-Command Get-BluetoothOrphanPairingRecord -ErrorAction SilentlyContinue) {
+                    try {
+                        $btPairInvEnd = Get-BluetoothOrphanPairingRecord
+                        $btPairMacEnd = $btProbeSession.PairingTargetMac
+                        if (-not $btPairMacEnd) {
+                            $btPairMacEnd = (Resolve-BluetoothTargetMac -PnpMac '' -Records @($btPairInvEnd.Records)).Mac
+                        }
+                        $btProbeSession.PairingRecordEnd = if ($btPairMacEnd) {
+                            Get-BluetoothOrphanPairingRecord -TargetMac $btPairMacEnd
+                        } else { $btPairInvEnd }
+                    } catch { }
+                }
+
+                # ── "Can this box see the headset at all?" ───────────────────
+                # CONDITIONAL, and deliberately not part of every capture. A real
+                # BR/EDR inquiry drives the radio for tens of seconds, so running
+                # it on every recording would perturb the very link being
+                # measured. It is only run when it is both SAFE and the only
+                # thing that can answer:
+                #   - the target has no device node (nothing else can tell a
+                #     headset this box cannot discover from one merely unpaired),
+                #   - and NO.exe is closed, so there is no live client session to
+                #     disturb.
+                # Runs in a background job because Start-Job is MTA: the scan
+                # refuses on STA by design, and this form is what keeps the GUI
+                # message pump alive rather than freezing it for the whole scan.
+                $btInquiry = @{
+                    Collected = $false
+                    Reason    = $null
+                    Result    = $null
+                }
+                try {
+                    $btPairEndVerdict = $btProbeSession.PairingRecordEnd
+                    $btTargetNodeless = [bool]($btPairEndVerdict -and
+                        $btPairEndVerdict.TargetState -in @('Orphan', 'Sighting', 'NoRecord'))
+                    $btNoRunning = [bool](Get-Process -Name 'NO' -ErrorAction SilentlyContinue)
+
+                    if (-not $btTargetNodeless) {
+                        $btInquiry.Reason = 'Skipped: the target has a device node, so discovery is not in question. An inquiry would only perturb the radio.'
+                    } elseif ($btNoRunning) {
+                        $btInquiry.Reason = 'Skipped: NO.exe is running. A radio inquiry during a live client session can disturb the link being measured.'
+                    } else {
+                        Write-BtLog "  Target has no device node -- running a discovery scan to see whether this box can hear it at all..." -Level "STEP"
+                        [System.Windows.Forms.Application]::DoEvents()
+                        $btScanJob = Start-Job -ScriptBlock {
+                            param($mp)
+                            Import-Module $mp -Force -ErrorAction Stop
+                            Get-BluetoothInquiryScan -TimeoutMs 45000
+                        } -ArgumentList $btModPath
+                        $btScanDeadline = (Get-Date).AddSeconds(75)
+                        while ($btScanJob.State -in @('Running','NotStarted') -and (Get-Date) -lt $btScanDeadline) {
+                            [System.Windows.Forms.Application]::DoEvents()
+                            Start-Sleep -Milliseconds 200
+                        }
+                        if ($btScanJob.State -in @('Running','NotStarted')) {
+                            Stop-Job $btScanJob -ErrorAction SilentlyContinue
+                            $btInquiry.Reason = 'Scan exceeded its deadline and was stopped.'
+                        } else {
+                            $btInquiry.Result    = Receive-Job $btScanJob -ErrorAction SilentlyContinue
+                            $btInquiry.Collected = [bool]$btInquiry.Result
+                            if ($btInquiry.Result -and $btInquiry.Result.Summary) {
+                                Write-BtLog "  $($btInquiry.Result.Summary)" -Level $(if ($btInquiry.Result.Count -gt 0) { 'OK' } else { 'WARN' })
+                            }
+                        }
+                        Remove-Job $btScanJob -Force -ErrorAction SilentlyContinue
+                    }
+                } catch {
+                    $btInquiry.Reason = "Scan failed: $($_.Exception.Message)"
+                }
+                $btProbeSession.InquiryScan = $btInquiry
+
                 # FI-012 fault 2 fingerprint. Read-only: radio State (never
                 # SetStateAsync) plus the paired-device link state WinRT already
                 # exposes. Deliberately NOT an open attempt -- see
@@ -5554,6 +5671,57 @@ $buttonHandlers = @{
                                 # unconfirmed fingerprint plus the radio state
                                 # that makes it interpretable.
                                 Fingerprint    = $btProbeSession.SerialFaultFingerprint
+                            }
+                        }
+                    } catch { }
+                }
+
+                # FI-014 structured evidence, kept as its own artifact rather
+                # than folded into the Bluetooth blob -- same reasoning as
+                # serialcomm-integrity.json above. A reader triaging "the
+                # headset is not there" needs the registry-vs-node table and
+                # what the target actually resolved to, not a verdict sentence.
+                #
+                # Every not-collected case carries its REASON. A missing field
+                # reads as "nothing found" and that is the failure this artifact
+                # exists to prevent: the check was corrected twice and until now
+                # it never ran in a field capture at all.
+                if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
+                    try {
+                        $prStart = $btProbeSession.PairingRecord
+                        $prEnd   = $btProbeSession.PairingRecordEnd
+                        if ($prStart -or $prEnd) {
+                            Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'pairing-target-evidence.json' -Depth 8 -Data @{
+                                Fault        = 'FI-014'
+                                Reference    = 'docs/FIELD-ISSUES.md'
+                                Target       = @{
+                                    Mac     = $btProbeSession.PairingTargetMac
+                                    # PnpNode | PairingRecord | None. 'None'
+                                    # means the verdict below is unscoped and
+                                    # therefore Healthy by construction -- read
+                                    # it as an inventory, not a clean bill.
+                                    Source  = $btProbeSession.PairingTargetSource
+                                    Summary = $btProbeSession.PairingTargetSummary
+                                }
+                                AtSessionStart = $prStart
+                                AtSessionEnd   = $prEnd
+                                # The transition that pins a teardown to THIS
+                                # recording rather than to some earlier removal.
+                                LostNodeInRun  = [bool]($prStart -and $prEnd -and
+                                    $prStart.TargetState -eq 'Paired' -and $prEnd.TargetState -eq 'Orphan')
+                                Discovery      = $btProbeSession.InquiryScan
+                                # Not collected, and this says why rather than
+                                # leaving a hole. Get-BluetoothDeviceReachability
+                                # OPENS a COM port; its own contract bars it from
+                                # the recorder path because an automatic open can
+                                # steal the port from a live NO.exe session and
+                                # manufacture the error being diagnosed. It is
+                                # also useless in the case that would be safe: a
+                                # target with no node has no port to open.
+                                Reachability   = @{
+                                    Collected = $false
+                                    Reason    = 'Not run automatically: this probe opens a COM port, which can steal it from a live session. Operator-initiated only -- run Get-BluetoothDeviceReachability with NO.exe closed.'
+                                }
                             }
                         }
                     } catch { }
