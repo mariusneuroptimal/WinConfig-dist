@@ -4703,6 +4703,90 @@ $buttonHandlers = @{
                 $btStateLabels[$ind.Key] = $lbl
             }
 
+            # Glossary for the five indicators above, on demand. These are the
+            # terms operators misread -- particularly "Port open", which does NOT
+            # mean data is flowing, and a radio link that is legitimately off
+            # while idle. Kept next to the thing it explains rather than dumped
+            # into the timeline at startup where it scrolls away unread.
+            $btGlossaryBtn = New-Object System.Windows.Forms.Button
+            $btGlossaryBtn.Text = "What do these mean?"
+            $btGlossaryBtn.AutoSize = $true
+            $btGlossaryBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btGlossaryBtn.Margin = New-Object System.Windows.Forms.Padding(12, 2, 4, 2)
+            $btGlossaryBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btGlossaryBtn.BackColor = [System.Drawing.Color]::FromArgb(45, 45, 52)
+            $btGlossaryBtn.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
+            $btGlossaryBtn.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+            $btGlossaryBtn.Add_Click({
+                $g = @(
+                    "Device      Is the Bluetooth headset visible to Windows?"
+                    ""
+                    "COM port    The virtual serial port NeurOptimal uses to receive EEG data."
+                    ""
+                    "Radio link  The wireless connection to the headset."
+                    "            It is NORMAL for this to be off while idle."
+                    "            Dropping DURING an active session is the mid-session"
+                    "            disconnect event we are looking for."
+                    ""
+                    "Port open   Is some process holding the headset's COM port right now?"
+                    "            This is NOT the same as data flowing. NeurOptimal keeps"
+                    "            the port open whether or not the headset is sending"
+                    "            anything, so a held port on its own proves nothing about"
+                    "            EEG data."
+                    ""
+                    "NO.exe      Is the NeurOptimal application running?"
+                    ""
+                    "USB suspend A Windows power-saving feature that can shut down the"
+                    "            Bluetooth radio mid-session."
+                ) -join "`r`n"
+                [void][System.Windows.Forms.MessageBox]::Show($g, "What these indicators mean",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Information)
+            })
+            $btStateStrip.Controls.Add($btGlossaryBtn)
+
+            # ── Always-visible "what am I watching, and am I seeing it?" strip ──
+            #
+            # Added last among the Top-docked controls, so it docks closest to the
+            # top edge and is the first thing read.
+            #
+            # Capture 8E39860E4AF2 (2026-08-07) measured Arc 019 -- switched off, in
+            # a drawer -- while the operator ran a 37-minute session on Arc 013. The
+            # selected target WAS printed, once, at startup, and had scrolled out of
+            # view long before the session began; observation coverage was computed
+            # only for the closing report. Both facts existed the whole time. Neither
+            # was in front of the person who could have stopped the recording and
+            # fixed it. Keeping them pinned is the reader-side half of the fix that
+            # PR #57 made on the selector side.
+            $btIdentityPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+            $btIdentityPanel.Dock = [System.Windows.Forms.DockStyle]::Top
+            $btIdentityPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $btIdentityPanel.WrapContents = $false
+            $btIdentityPanel.AutoSize = $true
+            $btIdentityPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btIdentityPanel.BackColor = [System.Drawing.Color]::FromArgb(18, 18, 22)
+            $btIdentityPanel.Padding = New-Object System.Windows.Forms.Padding(10, 6, 10, 6)
+            $btIdentityPanel.Visible = $false
+            $btForm.Controls.Add($btIdentityPanel)
+
+            $btTargetLabel = New-Object System.Windows.Forms.Label
+            $btTargetLabel.Text = "Watching: (selecting headset...)"
+            $btTargetLabel.AutoSize = $true
+            $btTargetLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
+            $btTargetLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+            $btTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(235, 235, 235)
+            $btIdentityPanel.Controls.Add($btTargetLabel)
+
+            # Coverage line. Carries a text marker ([ok]/[~]/[!]) as well as colour,
+            # so "not observed" is legible without relying on yellow-versus-red.
+            $btCoverageLabel = New-Object System.Windows.Forms.Label
+            $btCoverageLabel.Text = "Waiting for a session -- nothing measured yet"
+            $btCoverageLabel.AutoSize = $true
+            $btCoverageLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
+            $btCoverageLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+            $btCoverageLabel.ForeColor = [System.Drawing.Color]::FromArgb(190, 190, 190)
+            $btIdentityPanel.Controls.Add($btCoverageLabel)
+
             # Console output fills remaining space (add last)
             $btOutputBox = New-Object System.Windows.Forms.RichTextBox
             $btOutputBox.Multiline = $true
@@ -4717,7 +4801,157 @@ $buttonHandlers = @{
             function Write-BtLog {
                 param([string]$Message, [string]$Level = "INFO")
                 Write-WinConfigGuiDiagnostic -Level $Level -Message $Message -Box $btOutputBox -NoPrefix
-                $btForm.Refresh()
+                # Repaint the log box only, NOT the whole form. $btForm.Refresh()
+                # invalidates and synchronously redraws every control in the tree
+                # (banner, status strip, five state labels, button row) on every
+                # single log line. A paint is still forced here on purpose: large
+                # stretches of this routine block the UI thread with no message
+                # pump running, and without an explicit paint the operator would
+                # watch a blank window during the baseline.
+                $btOutputBox.Update()
+            }
+
+            # Refreshes the pinned identity/coverage strip from live session state.
+            #
+            # Reads the SAME Get-ProbeObservationCoverage the closing report is
+            # built from -- deliberately not a second, simpler live estimate. Two
+            # pieces of code independently answering "is this recording seeing the
+            # session?" is exactly the split that produced the false-green closing
+            # verdict and the wrong-headset capture; the live strip and the final
+            # report must be the same answerer or they will eventually disagree.
+            #
+            # Assigns only on change: these labels are AutoSize inside an AutoSize
+            # docked panel, so every assignment costs a layout pass.
+            # How long NeurOptimal may be running with nothing observed on the
+            # target before the coverage line escalates. Long enough that normal
+            # session start-up does not trip it, short enough to be actionable
+            # inside a session rather than in the closing report.
+            $btCoverageEscalateSec = 120
+            $script:BtRec_NoRunningSince = $null
+
+            function Update-BtLiveCoverage {
+                if (-not $btIdentityPanel) { return }
+                if (-not $btIdentityPanel.Visible) { $btIdentityPanel.Visible = $true }
+
+                $tText = if ($btProbeTargetMac) {
+                    "Watching: $btTargetName   $btProbeTargetMac"
+                } else {
+                    "Watching: NO HEADSET SELECTED -- this recording is not scoped to a device"
+                }
+                if ($btTargetLabel.Text -ne $tText) { $btTargetLabel.Text = $tText }
+                $tCol = if ($btProbeTargetMac) {
+                    [System.Drawing.Color]::FromArgb(235, 235, 235)
+                } else {
+                    [System.Drawing.Color]::FromArgb(255, 140, 140)
+                }
+                if ($btTargetLabel.ForeColor -ne $tCol) { $btTargetLabel.ForeColor = $tCol }
+
+                $cov = $null
+                if (Get-Command Get-ProbeObservationCoverage -ErrorAction SilentlyContinue) {
+                    $cov = try {
+                        Get-ProbeObservationCoverage -Session $btProbeSession -WatchState $btProbeWatch `
+                            -Target $btProbeSession.SessionTarget
+                    } catch { $null }
+                }
+
+                # How long NeurOptimal has been up. Not-yet-observed is the NORMAL
+                # state before a session starts, so it is only worth escalating
+                # once a session could reasonably have been expected. This is
+                # presentation context applied to the one coverage answer, not a
+                # second opinion about it -- the level below still comes entirely
+                # from Get-ProbeObservationCoverage.
+                $noUp = ($btProbeWatch -and $btProbeWatch.AppProcessState -eq 'Running')
+                if ($noUp) {
+                    if (-not $script:BtRec_NoRunningSince) { $script:BtRec_NoRunningSince = Get-Date }
+                } else {
+                    $script:BtRec_NoRunningSince = $null
+                }
+                $noUpSec = if ($script:BtRec_NoRunningSince) {
+                    ((Get-Date) - $script:BtRec_NoRunningSince).TotalSeconds
+                } else { 0 }
+
+                $cText = 'Measurement status unavailable'
+                $cCol  = [System.Drawing.Color]::FromArgb(190, 190, 190)
+                $neutral = [System.Drawing.Color]::FromArgb(190, 190, 190)
+                if ($cov) {
+                    switch ($cov.Level) {
+                        'Observed' {
+                            $cText = '[ok] Observing this session -- headset linked, its COM port is held, data flow is being measured'
+                            $cCol  = [System.Drawing.Color]::FromArgb(120, 230, 130)
+                        }
+                        'Partial' {
+                            $missing = @()
+                            if (-not $cov.TargetEverLinked)   { $missing += 'never linked to the radio' }
+                            if (-not $cov.TargetPortEverHeld) { $missing += 'COM port never held' }
+                            if ($cov.IoSampleCount -eq 0)     { $missing += 'data flow not measured yet' }
+                            $cText = "[~] Partly observing -- $($missing -join '; ')"
+                            $cCol  = [System.Drawing.Color]::FromArgb(240, 210, 110)
+                        }
+                        default {
+                            # NotObserved. Waiting is not a fault: a red alarm from
+                            # the moment the window opens is noise the operator
+                            # learns to ignore, which is precisely the state they
+                            # would need to notice later.
+                            if (-not $noUp) {
+                                $cText = 'Waiting for the headset session -- start NeurOptimal and begin a session'
+                                $cCol  = $neutral
+                            } elseif ($noUpSec -lt $btCoverageEscalateSec) {
+                                $cText = 'Waiting for session activity on this headset -- NeurOptimal is running'
+                                $cCol  = $neutral
+                            } else {
+                                # A session was expected by now and still is not
+                                # visible. THIS is the moment worth escalating.
+                                $cText = "[!] NeurOptimal has been running for $([int]($noUpSec / 60)) min but this headset has not linked and its COM port has not been held -- the recorder may be watching the wrong headset"
+                                $cCol  = [System.Drawing.Color]::FromArgb(255, 140, 140)
+                            }
+                        }
+                    }
+                    # The single strongest wrong-headset signal, and the one the
+                    # void capture would have shown within seconds of the session
+                    # starting. It outranks the level and the waiting-is-normal
+                    # softening above: another headset being active is never the
+                    # expected state.
+                    if ($cov.RivalWasActive) {
+                        $cText = '[!] ANOTHER paired NeurOptimal headset is in use while this one is idle -- you are probably recording the WRONG headset. Stop, power on only the headset you are using, and record again.'
+                        $cCol  = [System.Drawing.Color]::FromArgb(255, 120, 120)
+                    }
+                }
+                if ($btCoverageLabel.Text -ne $cText) { $btCoverageLabel.Text = $cText }
+                if ($btCoverageLabel.ForeColor -ne $cCol) { $btCoverageLabel.ForeColor = $cCol }
+            }
+
+            # Blocking wait that keeps the message pump alive.
+            #
+            # The recorder is a manual DoEvents loop, so between pumps the window
+            # is frozen: a flat Start-Sleep -Milliseconds 200 meant input was
+            # serviced 5 times a second and dragging the window was visibly
+            # jerky even when no probe work was running. Slicing the same wait
+            # and pumping each slice costs nothing measurable (DoEvents on an
+            # empty queue is cheap) and drops the acknowledgement latency for
+            # Stop, Abort and Mark from up to 200 ms to roughly one slice.
+            # -BreakOnOperatorAction returns the moment Stop/Abort/Mark is pressed,
+            # so the recording loop acts on the click instead of finishing its wait
+            # first. It is OPT-IN, and deliberately not the default: the job-wait
+            # loops below run with $script:BtRec_StopClicked already $true (that
+            # flag is what ended the recording), so defaulting it on would turn the
+            # final-snapshot wait into a busy spin.
+            function Wait-BtPump {
+                param(
+                    [int]$Milliseconds = 200,
+                    [int]$SliceMs = 15,
+                    [switch]$BreakOnOperatorAction
+                )
+                $deadline = (Get-Date).AddMilliseconds($Milliseconds)
+                do {
+                    [System.Windows.Forms.Application]::DoEvents()
+                    if ($BreakOnOperatorAction -and
+                        ($script:BtRec_StopClicked -or $script:BtRec_AbortClicked -or $script:BtRec_MarkRequested)) {
+                        return
+                    }
+                    $left = ($deadline - (Get-Date)).TotalMilliseconds
+                    if ($left -le 0) { return }
+                    Start-Sleep -Milliseconds ([Math]::Min($SliceMs, [int][Math]::Ceiling($left)))
+                } while ((Get-Date) -lt $deadline)
             }
 
             # Modal chooser shown ONLY when Select-BluetoothSessionTarget refuses
@@ -4795,9 +5029,11 @@ $buttonHandlers = @{
                 Invoke-BluetoothDiagnosticsAndRecord -RecordAction {} -TimeoutSeconds 60
             } -ArgumentList $btModPath
 
+            # Pumped wait: the baseline can run for up to 60 s and the window was
+            # servicing input 5 times a second throughout it, so the "please wait"
+            # phase could not even be dragged out of the way.
             while ($btBaselineJob.State -in @('Running','NotStarted')) {
-                [System.Windows.Forms.Application]::DoEvents()
-                Start-Sleep -Milliseconds 200
+                Wait-BtPump -Milliseconds 200
             }
 
             $baselineResult = $null
@@ -4967,9 +5203,19 @@ $buttonHandlers = @{
                 # every consumer below is scoped to.
                 $btTargetName    = 'NeurOptimal Headset'
                 $btSessionTarget = $null
+                # Start every recording from a cold property cache. The module can
+                # outlive a recording (a second capture in the same app session),
+                # and target selection must never be decided from values cached
+                # during an earlier run against different hardware.
+                if (Get-Command Clear-BluetoothComPortPropertyCache -ErrorAction SilentlyContinue) {
+                    try { Clear-BluetoothComPortPropertyCache } catch { }
+                }
                 try {
                     $initPnp = Get-BluetoothPnpSnapshot
-                    $btComForSelect = try { Get-BluetoothComPortSnapshot } catch { $null }
+                    # -NoCache: this snapshot picks the headset the whole capture is
+                    # about. It is read once, it is not on the hot path, and it is
+                    # the last place that should be answered from a cache.
+                    $btComForSelect = try { Get-BluetoothComPortSnapshot -NoCache } catch { $null }
                     $btCandidates = @()
                     foreach ($cd in @($initPnp.Devices | Where-Object { $_.FriendlyName -match 'NeurOptimal' })) {
                         $cdMac = try { Get-MacFromPnpInstanceId -InstanceId $cd.InstanceId } catch { $null }
@@ -5099,8 +5345,11 @@ $buttonHandlers = @{
                 $btProbeConfig = New-TargetDeviceConfiguration -TargetName $btTargetName -TargetMac $btProbeTargetMac -AppProcessName $btProbeAppName
                 $btProbeWatch  = New-TargetWatchState -Configuration $btProbeConfig
 
-                # Initial state snapshot
-                $initCom  = try { Get-BluetoothComPortSnapshot } catch { [pscustomobject]@{ Ports = @() } }
+                # Initial state snapshot. -NoCache: this is the baseline the whole
+                # recording is diffed against and it is persisted as evidence, so
+                # it is read from the device, not from the cache. Only the repeating
+                # tick reuses cached node properties.
+                $initCom  = try { Get-BluetoothComPortSnapshot -NoCache } catch { [pscustomobject]@{ Ports = @() } }
                 $initProc = try { Get-TargetDeviceProcessSnapshot } catch { @() }
                 $null = Update-TargetWatchState -WatchState $btProbeWatch -PnpSnapshot $initPnp -ProcessNames $initProc -ComPortSnapshot $initCom
 
@@ -5153,6 +5402,10 @@ $buttonHandlers = @{
 
                 # Show status strip and initial state
                 $btStateStrip.Visible = $true
+                # Pin the target/coverage strip before the first tick, so the
+                # operator can check the headset identity BEFORE starting a
+                # session rather than discovering it in the closing report.
+                Update-BtLiveCoverage
 
                 Write-BtLog "CURRENT STATE" -Level "STEP"
                 Write-BtLog "  Device        : $(Get-ProbeStateUserText -Kind device -State $btProbeWatch.DeviceState)" -Level (Get-ProbeStateGuiLevel $btProbeWatch.DeviceState)
@@ -5216,17 +5469,13 @@ $buttonHandlers = @{
                 if ($btProbeSession.PowerPlan -and $btProbeSession.PowerPlan.IsPowerSaver) {
                     Write-BtLog "  Power plan    : $($btProbeSession.PowerPlan.ActivePlan) -- throttles USB/Bluetooth performance" -Level "WARN"
                 }
-                Write-BtLog "" -Level "DIM"
-                Write-BtLog "WHAT THESE MEAN" -Level "DIM"
-                Write-BtLog "  Device     = Is the Bluetooth headset visible to Windows?" -Level "DIM"
-                Write-BtLog "  COM port   = Virtual serial port NeurOptimal uses to receive EEG data" -Level "DIM"
-                Write-BtLog "  Radio link = Wireless connection to headset. Normal to be 'off' when idle." -Level "DIM"
-                Write-BtLog "               Drops DURING an active stream = the mid-session disconnect event" -Level "DIM"
-                Write-BtLog "  Port open  = Is a process holding the headset's COM port right now?" -Level "DIM"
-                Write-BtLog "               NOT the same as data flowing -- NeurOptimal keeps the port open" -Level "DIM"
-                Write-BtLog "               whether or not the headset is actually sending anything" -Level "DIM"
-                Write-BtLog "  NO.exe     = Is the NeurOptimal application running?" -Level "DIM"
-                Write-BtLog "  USB suspend= Power-saving feature that can shut down the Bluetooth radio mid-session" -Level "DIM"
+                # The glossary used to be printed here, ten lines into the live
+                # timeline. It is reference material, not an event: by the time
+                # an operator actually wonders what "Port open" means -- twenty
+                # minutes into a session -- it has long scrolled away, while the
+                # events they needed to read were pushed down by it. It now sits
+                # behind the "What do these mean?" button next to the state
+                # strip, where it is available at the moment the question occurs.
                 Write-BtLog "" -Level "DIM"
                 if ($noRunning) {
                     Write-BtLog "  NeurOptimal is already running. Run tests or reproduce the issue you have been seeing." -Level "INFO"
@@ -5267,6 +5516,37 @@ $buttonHandlers = @{
             $btHeartbeatTick = 0
             $btAnomalyBarTime = $null
             $btOpActionsLogged = 0
+            $btLastElapsedSec = -1
+            # Per-collector tick cost, recorded as evidence. Before this, nothing
+            # in a capture said how long a tick took, so "watching every 3s" was
+            # an assertion no artifact could contradict -- and on the dev box the
+            # real figure was ~5.5s, i.e. the recorder was blocking its own UI
+            # thread continuously and the stated cadence was fiction.
+            $btTickIntervalSec = 3
+            $btLastTickStart = $null
+            $btTickStats = [ordered]@{
+                TickCount = 0; SlowTickCount = 0; SlowTickThresholdMs = 2000
+                TotalMs = [double]0; MaxMs = [double]0
+                # Scheduling health, kept separate from execution cost: a tick can
+                # be fast and still be running at the wrong rate.
+                IntervalCount = 0; IntervalTotalMs = [double]0; IntervalMaxMs = [double]0
+                MissedDeadlines = 0; MinPumpRecoveryMs = 250
+                PumpFloorDeviations = 0
+                TargetIntervalMs = 3000
+                # The cold-cache tick, isolated. This is the measurement that
+                # decides whether seeding the property cache from the pre-recording
+                # -NoCache snapshot is worth doing -- deferred until field timing
+                # says so, which needs this number to exist in field bundles.
+                FirstTickMs = [double]0
+                CollectorMaxMs = [ordered]@{ Inventory = [double]0; Pnp = [double]0; ComPort = [double]0; Process = [double]0; Update = [double]0; Render = [double]0 }
+                CollectorTotalMs = [ordered]@{ Inventory = [double]0; Pnp = [double]0; ComPort = [double]0; Process = [double]0; Update = [double]0; Render = [double]0 }
+            }
+            $btSlowTickWarned = $false
+            $btCadenceWarned = $false
+            $btSlowTicksAfterFirst = 0
+            $btInvFailWarned = $false
+            $btTickSw = [System.Diagnostics.Stopwatch]::new()
+            $btPartSw = [System.Diagnostics.Stopwatch]::new()
 
             while (-not $script:BtRec_StopClicked) {
                 [System.Windows.Forms.Application]::DoEvents()
@@ -5284,13 +5564,33 @@ $buttonHandlers = @{
                     Write-BtLog "[~] Operator ran '$($opa.Tool)'$opaDur -- Bluetooth changes right after this are likely caused by it, not by NeurOptimal" -Level "WARN"
                 }
 
-                # Update elapsed label with current state summary
-                if ($btDeepProbeAvailable -and $btProbeWatch) {
-                    $devShort = Get-ProbeStateUserText -Kind device -State $btProbeWatch.DeviceState -Short
-                    $streamShort = Get-ProbeStateUserText -Kind stream -State $btProbeSession.StreamingState -Short
-                    $btElapsedLabel.Text = "Recording  {0:mm\:ss}  |  {1}  |  {2}" -f $elapsed, $devShort, $streamShort
-                } else {
-                    $btElapsedLabel.Text = "Recording  {0:mm\:ss}  -- click Stop and Upload when done" -f $elapsed
+                # Update elapsed label with current state summary.
+                #
+                # Recomputed at 1 Hz, not on every 200 ms pass, and assigned only
+                # when the string actually differs. The label is AutoSize inside
+                # an AutoSize docked FlowLayoutPanel, so each assignment re-runs
+                # the panel's layout and can reflow the form -- five times a
+                # second for a display whose finest unit is one second.
+                $elSecNow = [int]$elapsed.TotalSeconds
+                if ($elSecNow -ne $btLastElapsedSec) {
+                    $btLastElapsedSec = $elSecNow
+                    # Scrolling up stops the log following new lines (see the
+                    # sticky-bottom writer in Console.psm1). Say so, otherwise a
+                    # log that has quietly stopped moving reads as a hang.
+                    $btScrollHint = ''
+                    try {
+                        if (-not (Test-WinConfigGuiBoxAtBottom -Box $btOutputBox)) {
+                            $btScrollHint = '  |  scrolled up -- new events below'
+                        }
+                    } catch { }
+                    $newElapsedText = if ($btDeepProbeAvailable -and $btProbeWatch) {
+                        $devShort = Get-ProbeStateUserText -Kind device -State $btProbeWatch.DeviceState -Short
+                        $streamShort = Get-ProbeStateUserText -Kind stream -State $btProbeSession.StreamingState -Short
+                        "Recording  {0:mm\:ss}  |  {1}  |  {2}{3}" -f $elapsed, $devShort, $streamShort, $btScrollHint
+                    } else {
+                        "Recording  {0:mm\:ss}  -- click Stop and Upload when done{1}" -f $elapsed, $btScrollHint
+                    }
+                    if ($btElapsedLabel.Text -ne $newElapsedText) { $btElapsedLabel.Text = $newElapsedText }
                 }
 
                 # ── Operator marker ──────────────────────────────────────────
@@ -5338,10 +5638,57 @@ $buttonHandlers = @{
 
                 # ── Deep probe tick (every 3s, main thread) ──────────────────
                 if ($btDeepProbeAvailable -and $btProbeWatch -and $now -ge $btNextProbeTick) {
+                    # Start-to-start interval is what the "checked every 3s" claim
+                    # actually means. Execution duration alone cannot contradict
+                    # that claim -- it was the missing measurement that let a ~5 s
+                    # cadence be reported as 3 s.
+                    $btTickStart = Get-Date
+                    if ($btLastTickStart) {
+                        $btIntervalMs = ($btTickStart - $btLastTickStart).TotalMilliseconds
+                        $btTickStats.IntervalCount++
+                        $btTickStats.IntervalTotalMs += $btIntervalMs
+                        if ($btIntervalMs -gt $btTickStats.IntervalMaxMs) { $btTickStats.IntervalMaxMs = $btIntervalMs }
+                    }
+                    $btLastTickStart = $btTickStart
+                    $btTickSw.Restart()
                     try {
-                        $pnpNow  = Get-BluetoothPnpSnapshot
-                        $comNow  = try { Get-BluetoothComPortSnapshot } catch { [pscustomobject]@{ Ports = @() } }
+                        # One enumeration for both snapshots. Measured on the dev
+                        # box: four scoped queries ~1,230 ms, one inventory plus
+                        # projection ~400 ms, with the projections byte-identical
+                        # to the queries they replace. It also removes a real
+                        # inconsistency -- the two snapshots used to describe
+                        # enumeration instants about half a second apart, so a
+                        # device arriving or leaving between them produced a
+                        # capture whose halves disagreed about the machine.
+                        #
+                        # TICK ONLY. Baseline and final still run their own
+                        # queries; the evidence paths do not move until this has
+                        # field parity. On inventory failure $btInv is unusable,
+                        # both collectors fall back to their own queries, and the
+                        # two channels fail independently as before.
+                        $btPartSw.Restart()
+                        $btInv = try { Get-BluetoothPnpInventory } catch { $null }
+                        if ($btInv -and -not $btInv.Ok -and -not $btInvFailWarned) {
+                            $btInvFailWarned = $true
+                            Write-BtLog "  [~] Shared device enumeration unavailable ($($btInv.Failure)) -- each check is querying separately, which is slower but complete." -Level "DIM"
+                        }
+                        $btTickStats.CollectorTotalMs['Inventory'] += $btPartSw.Elapsed.TotalMilliseconds
+                        if ($btPartSw.Elapsed.TotalMilliseconds -gt $btTickStats.CollectorMaxMs['Inventory']) { $btTickStats.CollectorMaxMs['Inventory'] = $btPartSw.Elapsed.TotalMilliseconds }
+
+                        $btPartSw.Restart()
+                        $pnpNow  = Get-BluetoothPnpSnapshot -Inventory $btInv
+                        $btTickStats.CollectorTotalMs['Pnp'] += $btPartSw.Elapsed.TotalMilliseconds
+                        if ($btPartSw.Elapsed.TotalMilliseconds -gt $btTickStats.CollectorMaxMs['Pnp']) { $btTickStats.CollectorMaxMs['Pnp'] = $btPartSw.Elapsed.TotalMilliseconds }
+
+                        $btPartSw.Restart()
+                        $comNow  = try { Get-BluetoothComPortSnapshot -Inventory $btInv } catch { [pscustomobject]@{ Ports = @() } }
+                        $btTickStats.CollectorTotalMs['ComPort'] += $btPartSw.Elapsed.TotalMilliseconds
+                        if ($btPartSw.Elapsed.TotalMilliseconds -gt $btTickStats.CollectorMaxMs['ComPort']) { $btTickStats.CollectorMaxMs['ComPort'] = $btPartSw.Elapsed.TotalMilliseconds }
+
+                        $btPartSw.Restart()
                         $procNow = try { Get-TargetDeviceProcessSnapshot } catch { @() }
+                        $btTickStats.CollectorTotalMs['Process'] += $btPartSw.Elapsed.TotalMilliseconds
+                        if ($btPartSw.Elapsed.TotalMilliseconds -gt $btTickStats.CollectorMaxMs['Process']) { $btTickStats.CollectorMaxMs['Process'] = $btPartSw.Elapsed.TotalMilliseconds }
 
                         # ── Self-heal target acquisition ─────────────────────
                         # If we never locked onto the headset's MAC (operator
@@ -5380,11 +5727,15 @@ $buttonHandlers = @{
                             }
                         }
 
+                        $btPartSw.Restart()
                         $newObs = Update-TargetWatchState -WatchState $btProbeWatch -PnpSnapshot $pnpNow -ProcessNames $procNow -ComPortSnapshot $comNow
 
                         $probeEvents = Invoke-DeviceProbeTick -Session $btProbeSession -WatchState $btProbeWatch `
                             -NewObservations $newObs -TargetMac $btProbeTargetMac -AppProcessName $btProbeAppName
+                        $btTickStats.CollectorTotalMs['Update'] += $btPartSw.Elapsed.TotalMilliseconds
+                        if ($btPartSw.Elapsed.TotalMilliseconds -gt $btTickStats.CollectorMaxMs['Update']) { $btTickStats.CollectorMaxMs['Update'] = $btPartSw.Elapsed.TotalMilliseconds }
 
+                        $btPartSw.Restart()
                         foreach ($evt in $probeEvents) {
                             $ts = $evt.Timestamp.ToString('HH:mm:ss')
                             $kindTag = switch ($evt.Kind) {
@@ -5426,8 +5777,52 @@ $buttonHandlers = @{
                         $appState = $btProbeWatch.AppProcessState
                         $btStateLabels['App'].Text = "NO.exe: $(if ($appState -eq 'Running') { 'Running' } else { 'Off' })"
                         $btStateLabels['App'].ForeColor = Get-ProbeStateColor $appState
+
+                        # Always-visible answer to "which headset is this watching,
+                        # and is it actually seeing my session?" -- the two questions
+                        # capture 8E39860E4AF2 could not answer while it was running.
+                        # Both were derivable at the time; neither reached the
+                        # operator until the closing report, 37 minutes too late.
+                        Update-BtLiveCoverage
+
+                        $btTickStats.CollectorTotalMs['Render'] += $btPartSw.Elapsed.TotalMilliseconds
+                        if ($btPartSw.Elapsed.TotalMilliseconds -gt $btTickStats.CollectorMaxMs['Render']) { $btTickStats.CollectorMaxMs['Render'] = $btPartSw.Elapsed.TotalMilliseconds }
                     } catch {
                         Write-BtLog "  [probe tick error]: $_" -Level "DIM"
+                    }
+
+                    $btTickSw.Stop()
+                    $btTickMs = $btTickSw.Elapsed.TotalMilliseconds
+                    $btTickStats.TickCount++
+                    $btTickStats.TotalMs += $btTickMs
+                    if ($btTickMs -gt $btTickStats.MaxMs) { $btTickStats.MaxMs = $btTickMs }
+                    # The first tick pays for a cold property cache -- by design,
+                    # and once. Kept in MaxMs and reported on its own, because it
+                    # is the number that decides whether seeding the cache from
+                    # the pre-recording snapshot is worth doing; excluded only
+                    # from the judgement about whether this PC is PERSISTENTLY
+                    # slow, which is a different question about a later state.
+                    if ($btTickStats.TickCount -eq 1) { $btTickStats.FirstTickMs = $btTickMs }
+
+                    # ── Execution cost, NOT cadence ──────────────────────────
+                    # A slow tick means the window is unresponsive WHILE a check
+                    # runs. It does not by itself mean checks are further apart:
+                    # a 2.5 s tick still finishes 500 ms inside a 3 s deadline,
+                    # clear of the pump floor, so the cadence is untouched. Those
+                    # were one warning making a claim only one of them supported;
+                    # the cadence half is now emitted from the scheduler, which is
+                    # the only place that actually measures it.
+                    if ($btTickMs -gt $btTickStats.SlowTickThresholdMs) {
+                        $btTickStats.SlowTickCount++
+                        if ($btTickStats.TickCount -gt 1) {
+                            $btSlowTicksAfterFirst++
+                            # Two, so a single blip is not reported as a property
+                            # of the machine.
+                            if (-not $btSlowTickWarned -and $btSlowTicksAfterFirst -ge 2) {
+                                $btSlowTickWarned = $true
+                                Write-BtLog "  [~] Checks on this PC are taking about $([int]$btTickMs) ms each -- the window may feel sluggish while one runs. Checks are still happening on schedule and the recording is unaffected." -Level "WARN"
+                            }
+                        }
                     }
 
                     # Anomaly confirmation bar handling
@@ -5476,7 +5871,45 @@ $buttonHandlers = @{
                         Write-BtLog "  ... watching  [${elSec}s]  Device: $hbDevice  |  $hbStream" -Level "DIM"
                     }
 
-                    $btNextProbeTick = $now.AddSeconds(3)
+                    # ── Fixed-rate scheduling ────────────────────────────────
+                    # The next deadline is the PREVIOUS DEADLINE plus the
+                    # interval, not "now plus the interval". Scheduling from the
+                    # end of the tick makes the real period interval + execution
+                    # time -- a 1 s tick would start every 4 s, not every 3 --
+                    # and every tick-count-based detection window would silently
+                    # stretch by a third.
+                    #
+                    # Overrun is handled by SKIPPING missed deadlines rather than
+                    # running catch-up ticks back to back, and by guaranteeing a
+                    # floor of message-pump time afterwards. Without that floor a
+                    # box slower than its own interval never pumps at all, which
+                    # is the failure this replaced.
+                    # Arithmetic lives in Get-NextProbeTickDeadline so it is a pure
+                    # function with its own tests rather than a branch buried in a
+                    # GUI loop that no test can reach.
+                    $btSched = Get-NextProbeTickDeadline -PreviousDeadline $btNextProbeTick `
+                        -TickEnd (Get-Date) -IntervalSeconds $btTickIntervalSec `
+                        -MinPumpRecoveryMs $btTickStats.MinPumpRecoveryMs
+                    $btNextProbeTick = $btSched.NextDeadline
+                    $btTickStats.MissedDeadlines += $btSched.MissedDeadlines
+                    # The floor overriding the fixed rate means the box could not
+                    # sustain the advertised cadence AND stay responsive. Counted,
+                    # not absorbed: it is the difference between "checked every 3s"
+                    # and "checked as often as this PC allowed".
+                    if ($btSched.PumpFloorApplied) { $btTickStats.PumpFloorDeviations++ }
+
+                    # ── Cadence, NOT execution cost ──────────────────────────
+                    # Emitted only on evidence that the schedule actually slipped:
+                    # a deadline was missed, or the pump floor had to override the
+                    # fixed rate. This is the ONLY claim that "checks are further
+                    # apart than 3s" is entitled to make, and it is made from the
+                    # scheduler's own outputs rather than inferred from how long a
+                    # tick happened to take.
+                    if (-not $btCadenceWarned -and
+                        ($btSched.MissedDeadlines -gt 0 -or $btSched.PumpFloorApplied)) {
+                        $btCadenceWarned = $true
+                        Write-BtLog "  [~] This PC cannot sustain a check every 3s, so checks are being spaced further apart to keep the window usable. Recording is unaffected -- the capture records the cadence it actually achieved, not the one it aimed for." -Level "WARN"
+                    }
                 }
 
                 # ── Event log poll (background job, every 8s -- unchanged) ───
@@ -5537,7 +5970,7 @@ $buttonHandlers = @{
                     } -ArgumentList $pollMod, $pollSince
                 }
 
-                Start-Sleep -Milliseconds 200
+                Wait-BtPump -Milliseconds 200 -BreakOnOperatorAction
             }
 
             if ($btPollJob) { Remove-Job $btPollJob -Force -ErrorAction SilentlyContinue }
@@ -5641,8 +6074,7 @@ $buttonHandlers = @{
                         } -ArgumentList $btModPath
                         $btScanDeadline = (Get-Date).AddSeconds(75)
                         while ($btScanJob.State -in @('Running','NotStarted') -and (Get-Date) -lt $btScanDeadline) {
-                            [System.Windows.Forms.Application]::DoEvents()
-                            Start-Sleep -Milliseconds 200
+                            Wait-BtPump -Milliseconds 200
                         }
                         if ($btScanJob.State -in @('Running','NotStarted')) {
                             Stop-Job $btScanJob -ErrorAction SilentlyContinue
@@ -5797,6 +6229,51 @@ $buttonHandlers = @{
                             TargetMacFrozen = $btProbeSession.TargetMacFrozen
                             Coverage        = $btCoverage
                             Observations    = @($btProbeWatch.Observations)
+                            # How long each tick actually took, per collector.
+                            # A capture used to assert "watching every 3s" with
+                            # nothing able to contradict it; measured on the dev
+                            # box a tick ran ~5.5s, so ticks were both further
+                            # apart than advertised and blocking the UI thread
+                            # almost continuously. Recorded so cadence changes
+                            # are argued from field data rather than guessed --
+                            # and so a box where this is still bad is visible
+                            # without anyone having to reproduce it.
+                            TickTiming      = if ($btTickStats -and $btTickStats.TickCount -gt 0) { @{
+                                TickCount           = [int]$btTickStats.TickCount
+                                MeanMs              = [int]($btTickStats.TotalMs / $btTickStats.TickCount)
+                                MaxMs               = [int]$btTickStats.MaxMs
+                                # Reported separately from MeanMs/MaxMs: the first
+                                # tick runs against a cold property cache, so
+                                # folding it into an average makes a one-off
+                                # start-up cost look like the steady state.
+                                FirstTickMs         = [int]$btTickStats.FirstTickMs
+                                SlowTickCount       = [int]$btTickStats.SlowTickCount
+                                SlowTickThresholdMs = [int]$btTickStats.SlowTickThresholdMs
+                                # What the capture's cadence ACTUALLY was, so the
+                                # "checked every 3s" claim is falsifiable from the
+                                # bundle instead of taken on trust.
+                                TargetIntervalMs    = [int]$btTickStats.TargetIntervalMs
+                                MeanIntervalMs      = if ($btTickStats.IntervalCount -gt 0) { [int]($btTickStats.IntervalTotalMs / $btTickStats.IntervalCount) } else { $null }
+                                MaxIntervalMs       = [int]$btTickStats.IntervalMaxMs
+                                MissedDeadlines     = [int]$btTickStats.MissedDeadlines
+                                PumpFloorDeviations = [int]$btTickStats.PumpFloorDeviations
+                                CollectorMeanMs     = @{
+                                    Inventory = [int]($btTickStats.CollectorTotalMs['Inventory'] / $btTickStats.TickCount)
+                                    Pnp     = [int]($btTickStats.CollectorTotalMs['Pnp']     / $btTickStats.TickCount)
+                                    ComPort = [int]($btTickStats.CollectorTotalMs['ComPort'] / $btTickStats.TickCount)
+                                    Process = [int]($btTickStats.CollectorTotalMs['Process'] / $btTickStats.TickCount)
+                                    Update  = [int]($btTickStats.CollectorTotalMs['Update']  / $btTickStats.TickCount)
+                                    Render  = [int]($btTickStats.CollectorTotalMs['Render']  / $btTickStats.TickCount)
+                                }
+                                CollectorMaxMs      = @{
+                                    Inventory = [int]$btTickStats.CollectorMaxMs['Inventory']
+                                    Pnp     = [int]$btTickStats.CollectorMaxMs['Pnp']
+                                    ComPort = [int]$btTickStats.CollectorMaxMs['ComPort']
+                                    Process = [int]$btTickStats.CollectorMaxMs['Process']
+                                    Update  = [int]$btTickStats.CollectorMaxMs['Update']
+                                    Render  = [int]$btTickStats.CollectorMaxMs['Render']
+                                }
+                            } } else { $null }
                             OperatorActions = @($script:BtRecOperatorActions | ForEach-Object { @{
                                 Tool        = $_.Tool
                                 ToolId      = $_.ToolId
@@ -5940,9 +6417,10 @@ $buttonHandlers = @{
                 } -TimeoutSeconds 60
             } -ArgumentList $btModPath
 
+            # NOT -BreakOnOperatorAction: Stop has already been clicked by the time
+            # this runs, so an early return here would spin instead of waiting.
             while ($btFinalJob.State -in @('Running','NotStarted')) {
-                [System.Windows.Forms.Application]::DoEvents()
-                Start-Sleep -Milliseconds 200
+                Wait-BtPump -Milliseconds 200
             }
 
             $finalResult = $null

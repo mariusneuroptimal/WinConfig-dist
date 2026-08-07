@@ -2509,8 +2509,78 @@ function Get-ProbeStateColor {
     }
 }
 
+function Get-NextProbeTickDeadline {
+    <#
+    .SYNOPSIS
+        Computes the next probe-tick deadline using fixed-rate scheduling.
+    .DESCRIPTION
+        The recorder claims to check "every 3s", and every tick-count-based
+        detection window is denominated in that interval. Two scheduling mistakes
+        break that claim in opposite directions, and this function exists so both
+        are decided in one pure, testable place instead of inline in the GUI loop:
+
+          - Scheduling from the END of a tick makes the real period
+            interval + execution time. A 1 s tick would then start every 4 s and
+            every detection window would silently stretch by a third.
+
+          - Scheduling from the previous deadline with no overrun handling puts
+            the next deadline in the PAST whenever a tick outruns its interval,
+            so it fires again immediately and the UI message pump never runs.
+            That is what made a ~5 s tick block the recorder window continuously.
+
+        So: the next deadline is the previous DEADLINE plus the interval; if that
+        has already passed, whole missed periods are SKIPPED rather than run as
+        back-to-back catch-up ticks, and the result is pushed out far enough to
+        guarantee a minimum slice of message-pump time.
+
+        Pure: no clock reads, no I/O. The caller supplies both timestamps.
+    .PARAMETER PreviousDeadline
+        The deadline the tick that just ran was scheduled for (NOT when it began).
+    .PARAMETER TickEnd
+        When that tick finished.
+    .PARAMETER IntervalSeconds
+        The nominal tick interval.
+    .PARAMETER MinPumpRecoveryMs
+        Guaranteed gap between TickEnd and the next deadline.
+    .OUTPUTS
+        [pscustomobject] NextDeadline, MissedDeadlines, PumpFloorApplied.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][datetime]$PreviousDeadline,
+        [Parameter(Mandatory)][datetime]$TickEnd,
+        [ValidateRange(1, 3600)][int]$IntervalSeconds = 3,
+        [ValidateRange(0, 60000)][int]$MinPumpRecoveryMs = 250
+    )
+
+    $next = $PreviousDeadline.AddSeconds($IntervalSeconds)
+    $missed = 0
+
+    if ($next -le $TickEnd) {
+        # Skip whole periods rather than replaying them.
+        $overdueSec = ($TickEnd - $next).TotalSeconds
+        $missed = [int][Math]::Floor($overdueSec / $IntervalSeconds) + 1
+        $next = $next.AddSeconds($IntervalSeconds * $missed)
+    }
+
+    $floor = $TickEnd.AddMilliseconds($MinPumpRecoveryMs)
+    $floorApplied = $false
+    if ($next -lt $floor) {
+        $next = $floor
+        $floorApplied = $true
+    }
+
+    return [pscustomobject]@{
+        PSTypeName       = 'WinConfig.FlightRecorder.TickSchedule'
+        NextDeadline     = $next
+        MissedDeadlines  = $missed
+        PumpFloorApplied = $floorApplied
+    }
+}
+
 Export-ModuleMember -Function @(
     'Initialize-BtWin32Api',
+    'Get-NextProbeTickDeadline',
     'Get-NoExeVersion',
     'Test-NoUsesMacResolve',
     'Get-BtConnectionState',

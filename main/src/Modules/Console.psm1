@@ -272,6 +272,51 @@ function Initialize-GuiDiagnosticBox {
     $Box.ReadOnly = $true
 }
 
+function Test-GuiBoxAtBottom {
+    <#
+    .SYNOPSIS
+        Reports whether a RichTextBox is scrolled to (or very near) its end.
+    .DESCRIPTION
+        Used to decide whether new output should follow the caret. Writers used
+        to call ScrollToCaret() unconditionally, which yanked the view back to
+        the bottom on every line and made it impossible to read earlier output
+        while a diagnostic was still producing it -- in the Flight Recorder that
+        is a live 40-minute session actively fighting the reader.
+
+        "Near" rather than "exactly at": a partially visible last line, or a
+        pending layout, can leave the last visible character index a little short
+        of TextLength even when the box is visually pinned to the bottom.
+        Treating only an exact match as sticky would unpin the box the first
+        time that happened and never re-pin it.
+
+        Returns $true on any failure, so a control that cannot be measured keeps
+        the old always-follow behaviour instead of silently freezing.
+    .PARAMETER Box
+        The RichTextBox to test.
+    .OUTPUTS
+        [bool]
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Windows.Forms.RichTextBox]$Box
+    )
+
+    try {
+        if ($Box.TextLength -le 0) { return $true }
+        if (-not $Box.IsHandleCreated) { return $true }
+        $lastVisible = $Box.GetCharIndexFromPosition(
+            (New-Object System.Drawing.Point(1, ($Box.ClientSize.Height - 2))))
+        # One trailing line's worth of slack, measured in characters rather than
+        # pixels because the box is fixed-pitch and this only needs to be robust,
+        # not exact.
+        return ($lastVisible -ge ($Box.TextLength - 2))
+    } catch {
+        return $true
+    }
+}
+
 function Write-GuiDiagnostic {
     <#
     .SYNOPSIS
@@ -334,13 +379,35 @@ function Write-GuiDiagnostic {
         "[{0}] {1}`r`n" -f $Level.PadRight(6), $Message
     }
 
+    # Sticky-bottom autoscroll: follow new output only when the reader was
+    # already at the end. Measured BEFORE appending -- afterwards the box is
+    # always at the bottom, because AppendText moves the caret there itself.
+    $wasAtBottom = Test-GuiBoxAtBottom -Box $Box
+    $firstVisible = if ($wasAtBottom) { -1 } else {
+        try { $Box.GetCharIndexFromPosition((New-Object System.Drawing.Point(1, 1))) } catch { -1 }
+    }
+
     # Append with color
     $Box.SelectionStart = $Box.TextLength
     $Box.SelectionLength = 0
     $Box.SelectionColor = $color
     $Box.AppendText($output)
     $Box.SelectionColor = $Box.ForeColor
-    $Box.ScrollToCaret()
+
+    if ($wasAtBottom -or $firstVisible -lt 0) {
+        $Box.ScrollToCaret()
+    } else {
+        # Put the reader's top line back. ScrollToCaret scrolls the minimum
+        # distance needed to reveal the caret, and the caret is now above the
+        # viewport, so the target character lands back on the top row.
+        try {
+            $Box.SelectionStart = $firstVisible
+            $Box.SelectionLength = 0
+            $Box.ScrollToCaret()
+        } catch {
+            $Box.ScrollToCaret()
+        }
+    }
 }
 
 function Write-GuiSeparator {
@@ -381,4 +448,4 @@ function Get-GuiColors {
 }
 
 # Export public functions
-Export-ModuleMember -Function Initialize-Console, Write-Diagnostic, Write-ConsoleSeparator, Write-ConsoleHeader, Get-ConsoleColors, Test-ConsoleInitialized, Initialize-GuiDiagnosticBox, Write-GuiDiagnostic, Write-GuiSeparator, Get-GuiColors
+Export-ModuleMember -Function Initialize-Console, Write-Diagnostic, Write-ConsoleSeparator, Write-ConsoleHeader, Get-ConsoleColors, Test-ConsoleInitialized, Initialize-GuiDiagnosticBox, Write-GuiDiagnostic, Write-GuiSeparator, Get-GuiColors, Test-GuiBoxAtBottom

@@ -6214,6 +6214,236 @@ function Get-BluetoothComPortPortName {
     return $null
 }
 
+# Cache of the STATIC per-device-node properties read by
+# Get-BluetoothComPortSnapshot, keyed by InstanceId.
+#
+# Why this exists (measured, dev box, 2026-08-07): each Get-PnpDeviceProperty
+# call costs ~300 ms. The snapshot read two keys per device across two separate
+# calls, so with 8 port nodes one snapshot spent ~4.8 s inside CIM. The Flight
+# Recorder calls it on a "every 3s" tick from the WinForms UI thread, so the
+# recorder window was blocked ~5.5 s out of every ~5.5 s -- the stated 3 s
+# cadence and the real cadence were two different answers, and only one of them
+# reached the operator.
+#
+# Both cached keys are fixed for the lifetime of a device NODE: DEVPKEY_Device_Parent
+# is assigned when the node is enumerated, and BusReportedDeviceDesc is what the
+# device reported at that same enumeration. Neither can change while the node
+# exists under one InstanceId. Entries for InstanceIds absent from the current
+# enumeration are pruned every call, so a remove/re-add re-reads from the device.
+#
+# Archival snapshots (baseline/final, and anything persisted as evidence) pass
+# -NoCache and always read fresh -- the cache is a tick-path optimization and
+# must never be the thing a stored artifact was built from.
+$script:BtComPortStaticPropCache = @{}
+
+# Monotonic generation counter, bumped once per Get-BluetoothComPortSnapshot.
+# Used instead of a clock so retry pacing is deterministic and testable.
+$script:BtComPortSnapshotSeq = 0
+
+# How many snapshot generations a FAILED property read is remembered before the
+# device is asked again. At the recorder's 3 s tick this is roughly half a
+# minute: long enough that a permanently denied property does not reintroduce a
+# per-tick cost, short enough that a transient failure does not silently cost
+# the capture a field for its whole duration.
+$script:BtComPortPropRetryGenerations = 10
+
+function Clear-BluetoothComPortPropertyCache {
+    <#
+    .SYNOPSIS
+        Empties the static COM-port property cache used by Get-BluetoothComPortSnapshot.
+    .DESCRIPTION
+        Exists so a recording session can start from a cold cache, and so tests
+        can assert cache behaviour without reloading the module.
+    #>
+    [CmdletBinding()]
+    param()
+    $script:BtComPortStaticPropCache = @{}
+}
+
+function Get-BluetoothComPortStaticProperty {
+    <#
+    .SYNOPSIS
+        Reads the static (node-lifetime-constant) PnP properties for one port node.
+    .DESCRIPTION
+        Returns DEVPKEY_Device_Parent and DEVPKEY_Device_BusReportedDeviceDesc for
+        an InstanceId, batching both keys into ONE Get-PnpDeviceProperty call.
+
+        Measured: one call with two keys costs the same as one call with one key
+        (~270 ms vs ~300 ms), so batching alone halves the cost even with the
+        cache cold. A batch containing ANY key the platform rejects returns
+        nothing at all, so a batch that comes back short falls back to reading
+        each key on its own -- preserving the previous behaviour exactly on hosts
+        where one of the keys is unavailable.
+
+        Best-effort throughout: a denied or missing property yields $null for that
+        field and must never cost the caller its whole snapshot.
+    .PARAMETER InstanceId
+        The device node to read.
+    .PARAMETER NoCache
+        Bypass the cache for both read and write. Use for archival snapshots.
+    .OUTPUTS
+        [pscustomobject] ParentInstanceId, BusReportedDeviceDesc.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()]
+        [string]$InstanceId,
+
+        [switch]$NoCache
+    )
+
+    if ([string]::IsNullOrWhiteSpace($InstanceId)) {
+        return [pscustomobject]@{ ParentInstanceId = $null; BusReportedDeviceDesc = $null }
+    }
+
+    if (-not $NoCache -and $script:BtComPortStaticPropCache.ContainsKey($InstanceId)) {
+        $hit = $script:BtComPortStaticPropCache[$InstanceId]
+        # A cached SUCCESS is final -- the values are node-lifetime constants. A
+        # cached FAILURE only suppresses retries for a bounded number of
+        # generations, then the device gets asked again.
+        if (-not $hit.ReadFailed -or $script:BtComPortSnapshotSeq -lt $hit.RetryAtSeq) {
+            return $hit
+        }
+    }
+
+    $parentKey = 'DEVPKEY_Device_Parent'
+    # The BusReportedDeviceDesc key in raw GUID form. Windows echoes it back under
+    # its canonical name, so results are matched on both spellings.
+    $busKeyRaw  = '{540b947e-8b40-45bc-a8a2-6a0b894cbda2} 4'
+    $busKeyName = 'DEVPKEY_Device_BusReportedDeviceDesc'
+
+    $parent  = $null
+    $busDesc = $null
+    # Tracked PER KEY, and separately from the value. "The read succeeded and this
+    # device reports no bus description" and "the read did not happen" are
+    # different facts: the first is static and safe to cache forever, the second
+    # is not static at all and must not be frozen in for the whole recording.
+    $parentOk = $false
+    $busOk    = $false
+
+    $props = @()
+    try {
+        $props = @(Get-PnpDeviceProperty -InstanceId $InstanceId `
+            -KeyName $parentKey, $busKeyRaw -ErrorAction SilentlyContinue)
+    } catch { $props = @() }
+
+    foreach ($p in $props) {
+        $kn = [string]$p.KeyName
+        if ($kn -eq $parentKey) {
+            $parentOk = $true
+            if ($p.Data) { $parent = [string]$p.Data }
+        } elseif ($kn -eq $busKeyName -or $kn -eq $busKeyRaw) {
+            $busOk = $true
+            if ($p.Data) { $busDesc = [string]$p.Data }
+        }
+    }
+
+    # Per-key fallback, driven by which keys are actually MISSING rather than by
+    # whether the batch returned anything at all. A batch that comes back with
+    # one of the two keys used to skip the fallback entirely and silently leave
+    # the other field null.
+    if (-not $parentOk) {
+        try {
+            $pp = Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName $parentKey -ErrorAction Stop
+            if ($pp) { $parentOk = $true; if ($pp.Data) { $parent = [string]$pp.Data } }
+        } catch { }
+    }
+    if (-not $busOk) {
+        try {
+            $bp = Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName $busKeyRaw -ErrorAction Stop
+            if ($bp) { $busOk = $true; if ($bp.Data) { $busDesc = [string]$bp.Data } }
+        } catch { }
+    }
+
+    $readFailed = -not ($parentOk -and $busOk)
+
+    $result = [pscustomobject]@{
+        ParentInstanceId      = $parent
+        BusReportedDeviceDesc = $busDesc
+        ReadFailed            = $readFailed
+        # When a failed read becomes eligible for another attempt, in snapshot
+        # generations. Retrying every tick would hand back the per-tick cost this
+        # cache exists to remove on a box where the property is simply denied;
+        # never retrying would let one transient glitch blank
+        # BusReportedDeviceDesc -- the only field that tells the COMMAND port from
+        # the DATA port -- for an entire capture.
+        RetryAtSeq            = if ($readFailed) { $script:BtComPortSnapshotSeq + $script:BtComPortPropRetryGenerations } else { 0 }
+    }
+    if (-not $NoCache) { $script:BtComPortStaticPropCache[$InstanceId] = $result }
+    return $result
+}
+
+function Get-BluetoothPnpInventory {
+    <#
+    .SYNOPSIS
+        Takes ONE full PnP device enumeration for several collectors to project.
+    .DESCRIPTION
+        The recorder's tick ran four separate Get-PnpDevice queries -- Bluetooth
+        class, Ports class, and the BTHENUM prefix TWICE, once per snapshot
+        function. Measured on the dev box that is ~1,230 ms; a single unfiltered
+        enumeration plus client-side projection is ~400 ms, and the three
+        projections are byte-identical to the scoped queries they replace
+        (verified on hardware with both Arcs paired).
+
+        The second benefit matters as much as the speed: the PnP and COM-port
+        snapshots currently describe enumeration instants roughly half a second
+        apart, so a device appearing or vanishing between them produces a capture
+        whose two halves disagree about the machine. Projecting both from one
+        inventory makes them describe the same instant by construction.
+
+        NEVER THROWS. A failed enumeration comes back as Ok = $false with the
+        reason attached, so the caller can fall back to letting each collector
+        run its own scoped queries. That fallback is the point: sharing one
+        enumeration must not mean losing both evidence channels together.
+    .OUTPUTS
+        PSCustomObject (PSTypeName WinConfig.FlightRecorder.PnpInventory) with
+        CapturedAt, Ok, Devices, Failure.
+    #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        $all = @(Get-PnpDevice -ErrorAction Stop)
+        return [pscustomobject]@{
+            PSTypeName = 'WinConfig.FlightRecorder.PnpInventory'
+            CapturedAt = Get-Date
+            Ok         = $true
+            Devices    = $all
+            Failure    = $null
+        }
+    } catch {
+        return [pscustomobject]@{
+            PSTypeName = 'WinConfig.FlightRecorder.PnpInventory'
+            CapturedAt = Get-Date
+            Ok         = $false
+            Devices    = @()
+            Failure    = $_.Exception.Message
+        }
+    }
+}
+
+function Test-BluetoothPnpInventoryUsable {
+    <#
+    .SYNOPSIS
+        Whether an inventory object may be projected from.
+    .DESCRIPTION
+        Central so every collector applies the same admission rule: anything
+        malformed, failed, or absent falls back to the collector's own scoped
+        queries rather than silently projecting from nothing and reporting an
+        empty machine.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([AllowNull()]$Inventory)
+
+    if ($null -eq $Inventory) { return $false }
+    try {
+        if (-not $Inventory.Ok) { return $false }
+        if ($null -eq $Inventory.Devices) { return $false }
+    } catch { return $false }
+    return $true
+}
+
 function Get-BluetoothComPortSnapshot {
     <#
     .SYNOPSIS
@@ -6239,38 +6469,61 @@ function Get-BluetoothComPortSnapshot {
                 Present, PortName ('COM3' or $null), ParentBluetoothInstanceId,
                 AssociatedBluetoothMac (12 hex uppercase or $null), Source
             Failures     : [PSCustomObject[]] (query, reason)
+    .PARAMETER NoCache
+        Read every device node's static properties fresh instead of reusing the
+        per-InstanceId cache. Use for baseline/final and any snapshot persisted
+        as evidence; the cache exists to keep the recorder's 3 s tick from
+        blocking its own UI thread for seconds at a time.
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [switch]$NoCache,
+        [AllowNull()]$Inventory
+    )
 
     $now = Get-Date
     $failures = @()
     $ports = @()
+    $script:BtComPortSnapshotSeq++
 
-    # Helper: try to read the parent InstanceId via Get-PnpDeviceProperty.
-    # Falls back to $null on any failure (older OS, permission denied, missing
-    # property). This is best-effort enrichment, not a hard requirement.
-    $getParent = {
-        param([string]$InstanceId)
-        if ([string]::IsNullOrWhiteSpace($InstanceId)) { return $null }
-        try {
-            $prop = Get-PnpDeviceProperty -InstanceId $InstanceId `
-                -KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop
-            if ($prop -and $prop.Data) { return [string]$prop.Data }
-        } catch { }
-        return $null
-    }
+    # Project from a shared enumeration when one is supplied and usable; run the
+    # scoped queries otherwise. Anything failed or malformed falls through to the
+    # original behaviour so this collector never loses its independent failure
+    # path just because a caller tried to share work.
+    $useInv = Test-BluetoothPnpInventoryUsable -Inventory $Inventory
 
     $candidates = @()
     try {
-        $candidates += Get-PnpDevice -Class Ports -ErrorAction Stop
+        if ($useInv) {
+            $candidates += @($Inventory.Devices | Where-Object { $_.Class -eq 'Ports' })
+        } else {
+            $candidates += Get-PnpDevice -Class Ports -ErrorAction Stop
+        }
     } catch {
         $failures += [pscustomobject]@{ Query = 'Get-PnpDevice -Class Ports'; Reason = $_.Exception.Message }
     }
     # Catch any Bluetooth-tagged entries that aren't class Ports (e.g. RFCOMM
     # service nodes that expose a PortName via friendly text).
+    #
+    # The BTHENUM prefix is pushed into the -InstanceId query rather than being
+    # applied client-side to a full device-tree enumeration: on this dev box that
+    # is 24 objects marshalled instead of 313, for a verified-identical result
+    # set. The client-side regex is KEPT below so the filter's meaning does not
+    # depend on the provider's wildcard semantics, and an unsupported -InstanceId
+    # falls back to the original full enumeration rather than silently returning
+    # fewer devices.
     try {
-        $extra = Get-PnpDevice -ErrorAction Stop | Where-Object {
+        $btScoped = $null
+        if ($useInv) {
+            $btScoped = @($Inventory.Devices)
+        } else {
+            try {
+                $btScoped = @(Get-PnpDevice -InstanceId 'BTHENUM\*' -ErrorAction Stop)
+            } catch {
+                $btScoped = @(Get-PnpDevice -ErrorAction Stop)
+            }
+        }
+        $extra = $btScoped | Where-Object {
             $_.InstanceId -match '^BTHENUM\\' -and (
                 ($_.FriendlyName -match 'Standard Serial over Bluetooth|Bluetooth Serial|SPP|\(COM\d+\)') -or
                 ($_.Service -match 'RFCOMM|Serenum')
@@ -6312,7 +6565,22 @@ function Get-BluetoothComPortSnapshot {
             elseif ($instanceId -match '&([0-9A-Fa-f]{12})&') { $mac = $Matches[1].ToUpperInvariant() }
         }
 
-        $parentId = & $getParent $instanceId
+        # DEVPKEY_Device_BusReportedDeviceDesc -- the per-channel name the DEVICE
+        # reports ("NEUROPTIMAL COMMAND" / "NEUROPTIMAL DATA"). FriendlyName is
+        # the generic "Standard Serial over Bluetooth link (COMx)" for every SPP
+        # channel, so this is the ONLY field that tells the command port from the
+        # data port. Read here (passively, no port is opened) because the Flight
+        # Recorder's watch path consumes this snapshot: the property was already
+        # being read elsewhere in this module, just never on the path that
+        # produces a bundle, so every recorder capture reported two
+        # indistinguishable ports for one MAC.
+        #
+        # Batched with the parent lookup into a single cached read -- see
+        # Get-BluetoothComPortStaticProperty for why that matters.
+        $staticProps = Get-BluetoothComPortStaticProperty -InstanceId $instanceId -NoCache:$NoCache
+        $parentId = $staticProps.ParentInstanceId
+        $busDesc  = $staticProps.BusReportedDeviceDesc
+
         # Only retain the parent when it's a Bluetooth-tree node, so callers
         # can rely on this field for correlation without re-checking.
         $parentBt = $null
@@ -6327,23 +6595,6 @@ function Get-BluetoothComPortSnapshot {
         $present = $true
         try { $present = [bool]$c.Present } catch { $present = ($c.Status -eq 'OK') }
 
-        # DEVPKEY_Device_BusReportedDeviceDesc -- the per-channel name the DEVICE
-        # reports ("NEUROPTIMAL COMMAND" / "NEUROPTIMAL DATA"). FriendlyName is
-        # the generic "Standard Serial over Bluetooth link (COMx)" for every SPP
-        # channel, so this is the ONLY field that tells the command port from the
-        # data port. Read here (passively, no port is opened) because the Flight
-        # Recorder's watch path consumes this snapshot: the property was already
-        # being read elsewhere in this module, just never on the path that
-        # produces a bundle, so every recorder capture reported two
-        # indistinguishable ports for one MAC. Best-effort, same as the parent
-        # lookup above -- a denied property must not cost us the whole snapshot.
-        $busDesc = $null
-        try {
-            $busDesc = (Get-PnpDeviceProperty -InstanceId $instanceId `
-                -KeyName '{540b947e-8b40-45bc-a8a2-6a0b894cbda2} 4' `
-                -ErrorAction SilentlyContinue).Data
-        } catch { }
-
         $ports += [pscustomobject]@{
             Source                    = if ($c.Class -eq 'Ports') { 'Class:Ports' } else { 'InstanceId:BTHENUM' }
             InstanceId                = $instanceId
@@ -6357,6 +6608,26 @@ function Get-BluetoothComPortSnapshot {
             ParentBluetoothInstanceId = $parentBt
             AssociatedBluetoothMac    = $mac
             BusReportedDeviceDesc     = if ($busDesc) { [string]$busDesc } else { $null }
+        }
+    }
+
+    # Prune cache entries for device nodes that are no longer enumerated. A node
+    # that disappears and comes back is re-read from the device rather than
+    # answered from a value captured before it went away.
+    #
+    # Gated on the enumeration having SUCCEEDED, not on it having returned
+    # something. Those are different: a query that failed is no evidence that the
+    # devices it would have returned are gone, while a query that succeeded and
+    # returned nothing is exactly the case where every entry should be dropped --
+    # every port vanishing at once is the FI-012/FI-014 shape, the one time a
+    # stale cache would be most misleading. Keying on Count previously made the
+    # total-loss case the one case that never pruned.
+    $enumerationOk = ($failures.Count -eq 0)
+    if (-not $NoCache -and $enumerationOk) {
+        $live = @{}
+        foreach ($c in $candidates) { $live[[string]$c.InstanceId] = $true }
+        foreach ($stale in @($script:BtComPortStaticPropCache.Keys | Where-Object { -not $live.ContainsKey($_) })) {
+            $script:BtComPortStaticPropCache.Remove($stale)
         }
     }
 
@@ -6471,16 +6742,28 @@ function Get-BluetoothPnpSnapshot {
             CapturedAt : [DateTime]
             Devices    : [PSCustomObject[]] (one entry per device)
             Failures   : [PSCustomObject[]] (errors recorded as evidence)
+    .PARAMETER Inventory
+        Optional Get-BluetoothPnpInventory result to project from instead of
+        running this function's own device queries. Anything absent, failed or
+        malformed is ignored and the scoped queries run as before.
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [AllowNull()]$Inventory
+    )
 
     $now = Get-Date
     $failures = @()
     $devices = @()
 
+    $useInv = Test-BluetoothPnpInventoryUsable -Inventory $Inventory
+
     try {
-        $btClass = Get-PnpDevice -Class Bluetooth -ErrorAction Stop
+        $btClass = if ($useInv) {
+            @($Inventory.Devices | Where-Object { $_.Class -eq 'Bluetooth' })
+        } else {
+            Get-PnpDevice -Class Bluetooth -ErrorAction Stop
+        }
         foreach ($d in $btClass) {
             $devices += [pscustomobject]@{
                 Source       = 'Class:Bluetooth'
@@ -6499,7 +6782,21 @@ function Get-BluetoothPnpSnapshot {
     }
 
     try {
-        $bthEnum = Get-PnpDevice -ErrorAction Stop | Where-Object { $_.InstanceId -match '^BTHENUM\\' }
+        # Scope the query provider-side (see Get-BluetoothComPortSnapshot for the
+        # measurement); the client-side regex stays as the authority on what
+        # counts as a match, and an unsupported -InstanceId falls back to the
+        # full enumeration rather than quietly returning fewer devices.
+        $bthScoped = $null
+        if ($useInv) {
+            $bthScoped = @($Inventory.Devices)
+        } else {
+            try {
+                $bthScoped = @(Get-PnpDevice -InstanceId 'BTHENUM\*' -ErrorAction Stop)
+            } catch {
+                $bthScoped = @(Get-PnpDevice -ErrorAction Stop)
+            }
+        }
+        $bthEnum = $bthScoped | Where-Object { $_.InstanceId -match '^BTHENUM\\' }
         foreach ($d in $bthEnum) {
             # Avoid duplicates when a device is already in Class:Bluetooth set.
             if ($devices | Where-Object { $_.InstanceId -eq $d.InstanceId }) { continue }
@@ -7298,11 +7595,20 @@ Export-ModuleMember -Function @(
     'Get-ServiceResetOutcome',
     'Get-BluetoothOperationalLogNames',
     # Flight Recorder snapshots (read-only collectors)
+    # One shared enumeration the tick's collectors project from, so both describe
+    # the same instant and pay for it once. Optional everywhere by design.
+    'Get-BluetoothPnpInventory',
+    'Test-BluetoothPnpInventoryUsable',
     'Get-BluetoothPnpSnapshot',
     'Get-BluetoothAdapterSnapshot',
     'Get-BluetoothServiceSnapshot',
     'Get-BluetoothComPortSnapshot',
     'Get-BluetoothComPortPortName',
+    # Static per-node property read + its cache control. Exported so the recorder
+    # can start each session cold and so tests can assert the cache is bypassed
+    # on the evidence path.
+    'Get-BluetoothComPortStaticProperty',
+    'Clear-BluetoothComPortPropertyCache',
     'Get-BluetoothServiceSurfaceSnapshot',
     'Get-BluetoothEventLogInventory',
     'Get-BluetoothRecentEvents',
