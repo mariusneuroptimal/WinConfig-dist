@@ -5373,6 +5373,13 @@ $buttonHandlers = @{
                 $btProbeSession = New-DeviceProbeSession
                 $btProbeSession.BtWin32Available = $btWin32Ok
                 $btProbeSession.NoExeVersion = try { Get-NoExeVersion } catch { $null }
+                # The recording window opens HERE, on the same $btRecordStart the
+                # operator markers and the on-screen "Recording mm:ss" label
+                # already count from -- not at the first probe tick, which is at
+                # least one interval later and on a starved run far more than
+                # that (issue #78). This is the only place it is stamped; the
+                # duration is derived from it by Get-ProbeRecordingWindow.
+                $btProbeSession.RecordingStartedAt = $btRecordStart
 
                 # FI-012 baseline. Read-only registry + QueryDosDevice; cheap
                 # enough to run inline. Guarded because the probe module may be
@@ -6217,6 +6224,12 @@ $buttonHandlers = @{
                 Wait-BtPump -Milliseconds 200 -BreakOnOperatorAction
             }
 
+            # The recording window closes the instant the loop exits, before any
+            # packaging work is charged to it (issue #78). Paired with
+            # RecordingStartedAt above; together they are the ONLY source of the
+            # recorded duration.
+            if ($btProbeSession) { $btProbeSession.RecordingStoppedAt = Get-Date }
+
             if ($btPollJob) { Remove-Job $btPollJob -Force -ErrorAction SilentlyContinue }
 
             $btStopBtn.Enabled = $false
@@ -6428,6 +6441,21 @@ $buttonHandlers = @{
                             Write-BtLog "  Re-pair $($h.RepairNum.ToString().PadLeft(2))  $timeStr  $portStr  [ok] same ports" -Level "DIM"
                         }
                     }
+                }
+
+                # The recording window, and the join guard over it (issue #78).
+                # Computed BEFORE the findings are printed so a divergence
+                # between the marker clock, the episode ledger and the duration
+                # lands in the FINDINGS section an operator actually reads --
+                # a guard whose result only the manifest carries is a guard
+                # nobody is warned by. Same object feeds the manifest duration
+                # below, so the number and the check cannot come apart.
+                $btWindow = $null
+                if ($btProbeSession -and (Get-Command Get-ProbeRecordingWindow -ErrorAction SilentlyContinue)) {
+                    $btWindow = try { Get-ProbeRecordingWindow -Session $btProbeSession } catch { $null }
+                }
+                if ($btWindow -and @($btWindow.Findings).Count -gt 0) {
+                    $btProbeSummary.Findings = @($btProbeSummary.Findings) + @($btWindow.Findings)
                 }
 
                 Write-BtLog "" -Level "DIM"
@@ -6772,9 +6800,33 @@ $buttonHandlers = @{
                         # decides whether a tail of link flaps is a fault or an
                         # unattended overnight run.
                         ProbeTickCount           = if ($btProbeSession) { [int]$btProbeSession.TickCount } else { $null }
-                        RecordingDurationSeconds = if ($btProbeSession -and $btProbeSession.FirstTickAt -and $btProbeSession.LastTickAt) {
-                            [int][math]::Round((([datetime]$btProbeSession.LastTickAt) - ([datetime]$btProbeSession.FirstTickAt)).TotalSeconds)
-                        } else { $null }
+                        # From Get-ProbeRecordingWindow, which is now the ONLY
+                        # answerer for this question. It used to be computed
+                        # here as the TICK span (FirstTickAt..LastTickAt) --
+                        # a different clock from the one operator markers and
+                        # the on-screen elapsed label count from, and shorter
+                        # by however long the loop took to reach its first tick
+                        # plus however long it ran past its last. On capture
+                        # 236061907514 that gap was ~65 s of a ~134 s run, so
+                        # the manifest reported 69 s for a recording carrying
+                        # markers at 86 s and 107 s (issue #78).
+                        #
+                        # Null when the window was never stamped, deliberately.
+                        # Falling back to the tick span would restore the second
+                        # answerer, and a wrong duration is worse than an absent
+                        # one here: durationSeconds / tickCount is how cadence is
+                        # read, and 69/22 = 3.14 s passes for a healthy 3 s loop
+                        # when the truth was 6.1 s and 18 of 22 deadlines missed.
+                        RecordingDurationSeconds = if ($btWindow) { $btWindow.DurationSeconds } else { $null }
+                        # The tick span survives under a name that says what it
+                        # is, so the gap between "how long the recorder ran" and
+                        # "how long the sampling loop was alive" is visible in
+                        # the bundle instead of being inferred from timestamps.
+                        RecordingTickSpanSeconds = if ($btWindow) { $btWindow.TickSpanSeconds } else { $null }
+                        # False means a marker or an episode is stamped outside
+                        # the recording window -- the timeline of this capture
+                        # cannot be trusted. Null on builds before #78.
+                        RecordingWindowConsistent = if ($btWindow) { [bool]$btWindow.Consistent } else { $null }
                         # ── Identity of what was recorded ────────────────────
                         # All three were already captured in the session and went
                         # only to the console log, so reading a bundle meant
@@ -6969,6 +7021,15 @@ $buttonHandlers = @{
                         # this one.
                         ObservationCoverageLevel = if ($btCoverage) { [string]$btCoverage.Level } else { $null }
                         ObservationQuality = if ($btCoverage) { [string]$btCoverage.Quality } else { $null }
+                        # Whether there was a measured window at all, as a fact
+                        # rather than a clause inside ObservationSummary. The
+                        # summary sentence used to claim "data flow was
+                        # measured" off IoSampleCount > 0, which says samples
+                        # were COLLECTED, not that they were usable -- capture
+                        # 236061907514 shipped that sentence beside
+                        # ObservationQuality 'None' and findings saying data
+                        # flow was NOT assessed (issue #77). Null before #77.
+                        ObservationDataFlowMeasured = if ($btCoverage) { [bool]$btCoverage.DataFlowMeasured } else { $null }
                         ObservationSeconds = if ($btCoverage) { $btCoverage.ObservationSeconds } else { $null }
                         ObservationTickCount = if ($btCoverage) { [int]$btCoverage.TickCount } else { $null }
                         ObservationIoSampleCount = if ($btCoverage) { [int]$btCoverage.IoSampleCount } else { $null }

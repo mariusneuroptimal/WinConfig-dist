@@ -1221,6 +1221,29 @@ function New-DeviceProbeSession {
         TickCount                = 0
         FirstTickAt              = $null
         LastTickAt               = $null
+        # ── The recording window, which is NOT the tick window (issue #78) ────
+        # The tick loop starts at least one tick interval after the operator
+        # pressed Record, and on a starved run far later -- capture
+        # 236061907514 took 11.85 s to reach its first tick and stopped
+        # ~25 s after its last one. Deriving "how long did this run?" from
+        # FirstTickAt..LastTickAt therefore UNDERSTATES it, and did: the
+        # manifest said 69 s for a run carrying operator markers stamped at 86 s
+        # and 107 s, with a read-rate episode ending ~134 s in.
+        #
+        # That is the channel-mismatch shape. Two clocks answered one question:
+        # the operator marker and the on-screen "Recording mm:ss" label both
+        # count from the moment Record was pressed, while the manifest counted
+        # tick span. Only one may be authoritative, and it has to be the one the
+        # operator and the markers already use -- so these two are set by the
+        # recording loop and the duration is derived from them. FirstTickAt/
+        # LastTickAt survive for what they genuinely measure: tick cadence.
+        #
+        # The understatement is not cosmetic. durationSeconds / tickCount is the
+        # documented way to get real cadence, and 69/22 = 3.14 s reads as a
+        # healthy 3 s loop; the true ~134/22 = 6.1 s is the 82 %-missed-deadline
+        # starvation that should have flagged the capture.
+        RecordingStartedAt       = $null
+        RecordingStoppedAt       = $null
         # How invasive the recorder actually was. Get-ComPortHoldState is the
         # only non-admin way to learn whether a port is held, but it works by
         # OPENING the port -- the very thing Test-BluetoothSerialPortOpen is
@@ -2364,6 +2387,127 @@ function Invoke-AnomalyDiagnosticSnapshot {
 # GUI HELPERS
 # =============================================================================
 
+function Get-ProbeRecordingWindow {
+    <#
+    .SYNOPSIS
+        Pure. THE single answer to "how long did this recording run?", and the
+        join guard that catches anything stamped outside that window.
+    .DESCRIPTION
+        Field bug, capture 236061907514 (2026-08-10, issue #78). The manifest
+        reported RecordingDurationSeconds 69 for a run carrying operator markers
+        at ElapsedSeconds 86 and 107, with a read-rate episode ending ~134 s in.
+        The run was roughly TWICE its reported length.
+
+        Two clocks were answering one question:
+
+          the operator marker and the on-screen "Recording mm:ss" label counted
+          from the moment Record was pressed;
+          the manifest counted FirstTickAt..LastTickAt -- the TICK span.
+
+        Those differ by however long the loop took to reach its first tick plus
+        however long it ran past its last one. On a healthy run that is a couple
+        of seconds and nobody notices. On the capture above the first tick landed
+        11.85 s in and the loop was starved (MeanIntervalMs 3750 against a 3000
+        target, 18 of 22 deadlines missed), so the gap was ~65 s.
+
+        This is the channel-mismatch class, so it is fixed the way that class has
+        to be fixed: the second answerer is REMOVED, not reconciled. The
+        authoritative clock is the one the operator and the markers already use,
+        because a marker is the whole point of the artifact -- it binds an
+        on-screen NeurOptimal error to a machine state, and a timeline the
+        markers fall outside of is not a timeline.
+
+        NO FALLBACK TO THE TICK SPAN. If the recording window was never set, this
+        reports DurationSeconds $null and says so in a finding. Substituting the
+        tick span would re-create the very second answerer this removes, and a
+        wrong duration is worse than an absent one: 69/22 reads as a healthy
+        3.14 s cadence, which is exactly how an 82 %-missed-deadline run passed
+        for normal. TickSpanSeconds is still reported, under a name that says
+        what it is.
+
+        WHY THE GUARD LIVES HERE. Per the channel-mismatch pattern, the assertion
+        belongs where the channels are JOINED, not inside each detector -- a
+        detector handed its own fixture input will always agree with itself. The
+        markers, the episode ledger and the duration only ever meet here.
+    .PARAMETER Session
+        The probe session (RecordingStartedAt, RecordingStoppedAt, FirstTickAt,
+        LastTickAt, OperatorMarkers, IoClosedEpisodes).
+    .OUTPUTS
+        [pscustomobject] StartedAt, StoppedAt, DurationSeconds, TickSpanSeconds,
+        Consistent, Findings
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Session
+    )
+
+    $startedAt = $Session.RecordingStartedAt
+    $stoppedAt = $Session.RecordingStoppedAt
+
+    $durationSeconds = if ($startedAt -and $stoppedAt) {
+        [int][math]::Round([math]::Max(0, (([datetime]$stoppedAt) - ([datetime]$startedAt)).TotalSeconds))
+    } else { $null }
+
+    # Kept, and deliberately NOT used as a duration. The tick span is a real
+    # measurement of a different thing: how long the sampling loop was alive.
+    $tickSpanSeconds = if ($Session.FirstTickAt -and $Session.LastTickAt) {
+        [int][math]::Round([math]::Max(0, (([datetime]$Session.LastTickAt) - ([datetime]$Session.FirstTickAt)).TotalSeconds))
+    } else { $null }
+
+    $findings = @()
+
+    if ($null -eq $durationSeconds) {
+        # Absent renders as absent. The alternative -- quietly reporting the tick
+        # span -- is the defect.
+        $findings += '[~] The recording window was never stamped, so this capture cannot say how long it ran. Tick span is reported separately and is NOT the same measurement.'
+    }
+
+    # ── The join: nothing may be stamped outside the window it belongs to ─────
+    if ($null -ne $durationSeconds) {
+        # A marker's ElapsedSeconds counts from the same origin the duration now
+        # does, so this comparison is apples to apples by construction. One
+        # second of slack absorbs the truncation in [int]$elapsed.TotalSeconds.
+        $lateMarkers = @($Session.OperatorMarkers | Where-Object {
+            $_ -and $null -ne $_.ElapsedSeconds -and ([int]$_.ElapsedSeconds) -gt ($durationSeconds + 1)
+        })
+        foreach ($mk in $lateMarkers) {
+            $findings += "[!] An operator marker is stamped $([int]$mk.ElapsedSeconds)s into a recording reported as $($durationSeconds)s long. The marker clock and the duration clock have diverged, so this capture's timeline cannot be trusted (issue #78)."
+        }
+
+        if ($startedAt -and $stoppedAt) {
+            $windowStart = ([datetime]$startedAt).AddSeconds(-1)
+            $windowEnd   = ([datetime]$stoppedAt).AddSeconds(1)
+            # CLOSED episodes only. The in-flight episode is stamped by
+            # New-IoEpisodeRecord with (Get-Date) at summary time, which is
+            # legitimately a moment after the window closed -- checking it would
+            # manufacture a divergence finding on every clean run.
+            foreach ($ep in @($Session.IoClosedEpisodes)) {
+                if (-not $ep -or -not $ep.EndedAtIso) { continue }
+                $endedAt = $null
+                # A malformed stamp is not evidence of a divergence, so it is
+                # skipped rather than reported as one.
+                try { $endedAt = [datetime]::Parse($ep.EndedAtIso, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind) } catch { continue }
+                if ($endedAt -lt $windowStart -or $endedAt -gt $windowEnd) {
+                    $findings += "[!] A read-rate episode ended at $($ep.EndedAtIso), outside the recording window. The episode ledger and the duration clock have diverged, so this capture's timeline cannot be trusted (issue #78)."
+                }
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        PSTypeName      = 'WinConfig.FlightRecorder.RecordingWindow'
+        StartedAt       = $startedAt
+        StoppedAt       = $stoppedAt
+        DurationSeconds = $durationSeconds
+        # How long the SAMPLING LOOP was alive, which is shorter than the
+        # recording by the time to first tick plus the time after the last one.
+        # Published so the gap is visible rather than inferred.
+        TickSpanSeconds = $tickSpanSeconds
+        Consistent      = ($findings.Count -eq 0)
+        Findings        = @($findings)
+    }
+}
+
 function Get-ProbeObservationCoverage {
     <#
     .SYNOPSIS
@@ -2400,7 +2544,15 @@ function Get-ProbeObservationCoverage {
         Optional Select-BluetoothSessionTarget result, for rival-candidate
         evidence.
     .OUTPUTS
-        [pscustomobject] Level, Reasons, Summary and the raw evidence booleans.
+        [pscustomobject] Level, Reasons, Summary, DataFlowMeasured and the raw
+        evidence booleans.
+
+        Level and DataFlowMeasured are DIFFERENT claims and both are needed.
+        Level is categorical -- were all the channels seen -- and is not
+        weakened by duration or usability. DataFlowMeasured says whether there
+        was a measured window to speak about. A capture can legitimately be
+        Observed with DataFlowMeasured false: every channel was seen, and none
+        of them was measured.
     #>
     [CmdletBinding()]
     param(
@@ -2438,19 +2590,6 @@ function Get-ProbeObservationCoverage {
         if (-not $linked -and -not $heldPort -and $ioSamples -eq 0) { 'NotObserved' }
         elseif ($linked -and $heldPort -and $ioSamples -gt 0)       { 'Observed' }
         else                                                        { 'Partial' }
-
-    $summary = switch ($level) {
-        'NotObserved' {
-            $who = if ($Target -and $Target.Name) { "'$($Target.Name)'" } else { 'the target headset' }
-            "This recording did not observe a session. $who never linked, its COM port was never held, and no data flow was measured, so nothing here describes what NeurOptimal was doing."
-        }
-        'Partial' {
-            'This recording observed the session only partly, so its findings rest on less evidence than a full capture.'
-        }
-        default {
-            'This recording observed the session: the headset linked, its port was held, and data flow was measured.'
-        }
-    }
 
     # ── Observation QUALITY: a separate axis from Level ──────────────────────
     # Level answers "did we see all the channels?". It is categorical and it is
@@ -2503,6 +2642,55 @@ function Get-ProbeObservationCoverage {
         }
     }
 
+    # ── Was data flow actually MEASURED? (issue #77) ─────────────────────────
+    # Samples COLLECTED is not the same claim as data flow MEASURED, and the
+    # operator sentence below used to conflate them. On capture 236061907514 the
+    # Summary read "...and data flow was measured" while QualitySummary in the
+    # same object read "No read baseline was ever established" and the findings
+    # said data flow was NOT assessed. Three renderings of one run, two of them
+    # true. #68 item 1: never assert something the same record contradicts.
+    #
+    # This is derived from $postBaselineSeconds -- the SAME value QualitySummary
+    # is built from -- and not re-derived from the session. That is deliberate:
+    # it makes "Summary claims measurement while Quality is None" unrepresentable
+    # rather than merely untested, which is what guarding at the join means when
+    # the join is inside one function.
+    #
+    # ⚠️ NOT the same claim as ReadRateRecord.BaselineEstablished, and it must
+    # not be "corrected" into it. That field asks "did any channel ever hold a
+    # baseline", including an episode-ledger baseline that was never announced.
+    # This asks the narrower question the operator sentence actually makes: was
+    # there a measured WINDOW to speak about. A baseline with no window after it
+    # gives an operator nothing, and claiming otherwise is the defect.
+    $dataFlowMeasured = ($null -ne $postBaselineSeconds)
+
+    if ($ioSamples -gt 0 -and -not $dataFlowMeasured) {
+        $reasons += 'Read-rate samples were taken but no baseline was ever established, so data flow was NOT assessed -- the absence of a read-collapse finding here means nothing was measured, not that nothing was wrong.'
+    }
+
+    # Level is NOT weakened by this. It answers "were all the channels seen?",
+    # stays categorical, and a capture that linked, held the port and sampled
+    # reads has seen them all. The honesty belongs in the sentence a human
+    # reads and in DataFlowMeasured, which a consumer can branch on -- moving it
+    # into Level would silently merge "saw nothing" with "saw everything,
+    # measured nothing", two very different captures.
+    $summary = switch ($level) {
+        'NotObserved' {
+            $who = if ($Target -and $Target.Name) { "'$($Target.Name)'" } else { 'the target headset' }
+            "This recording did not observe a session. $who never linked, its COM port was never held, and no data flow was measured, so nothing here describes what NeurOptimal was doing."
+        }
+        'Partial' {
+            'This recording observed the session only partly, so its findings rest on less evidence than a full capture.'
+        }
+        default {
+            if ($dataFlowMeasured) {
+                'This recording observed the session: the headset linked, its port was held, and data flow was measured.'
+            } else {
+                'This recording observed the session: the headset linked and its port was held -- but data flow was NOT assessed. Read-rate samples were taken and no baseline was ever established, so nothing here says whether the EEG read path was healthy.'
+            }
+        }
+    }
+
     return [pscustomobject]@{
         PSTypeName        = 'WinConfig.FlightRecorder.ObservationCoverage'
         Level             = $level
@@ -2518,6 +2706,10 @@ function Get-ProbeObservationCoverage {
         # channels?" and "for how long?" stay separate claims.
         Quality              = $quality
         QualitySummary       = $qualitySummary
+        # Whether there was a measured window at all, as a fact a consumer can
+        # branch on instead of parsing the English above (issue #77). True iff
+        # Quality is not 'None', by construction.
+        DataFlowMeasured     = $dataFlowMeasured
         ObservationSeconds   = $observationSeconds
         TickCount            = [int]$Session.TickCount
         SecondsToReadBaseline = $secondsToBaseline
@@ -3168,6 +3360,11 @@ Export-ModuleMember -Function @(
     'Get-DeviceProbeSessionSummary',
     'Invoke-AnomalyDiagnosticSnapshot',
     'Get-ProbeObservationCoverage',
+    # The single answerer for "how long did this recording run?", plus the join
+    # guard over markers and the episode ledger (issue #78). Exported because
+    # the manifest must read the same answer the guard checked, not a second
+    # derivation of it.
+    'Get-ProbeRecordingWindow',
     'Get-ProbeSessionVerdict',
     'Get-ProbeStateGuiLevel',
     'Get-ProbeStateColor',
