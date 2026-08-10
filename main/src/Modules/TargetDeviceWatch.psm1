@@ -114,6 +114,66 @@ function Resolve-ComPortRole {
     return @{ Role = $null; Source = 'none'; Conflict = $false }
 }
 
+function Format-ComPortRoleSummary {
+    <#
+    .SYNOPSIS
+        Pure. Renders one operator-facing line saying which of the headset's COM
+        ports is the DATA channel and which is the COMMAND channel.
+    .DESCRIPTION
+        Issue #68 item 2: the recorder window is the ONLY view of a live probe --
+        no tick data reaches disk until the run ends -- so the port roles have to
+        be pinned in the window, not left in the closing report. The roles were
+        already resolved every tick by Resolve-ComPortRole and written to
+        WatchState.ComPortMatches[].ChannelRole; nothing rendered them live.
+
+        Issue #68 item 4 governs every branch here: an absent measurement must
+        render as absent. "Not probed yet" and "no ports matched" are DIFFERENT
+        states and are worded differently, and neither may be shortened to a
+        bare 'unknown' -- which reads as a reading that was taken.
+
+        A role conflict outranks everything: Resolve-ComPortRole returns a null
+        role when the device's own channel name and the RFCOMM channel number
+        disagree, and a tech sent to the wrong port with confidence is worse off
+        than one told the roles could not be established.
+    .OUTPUTS
+        [string] Single line, ASCII, safe to put in a WinForms Label.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [hashtable]$WatchState
+    )
+
+    if (-not $WatchState) {
+        return 'COM ports: not probed yet -- no reading has been taken'
+    }
+    if ($WatchState.ComPortRoleConflict) {
+        return '[!] COM port roles CONFLICT -- the channel name and the RFCOMM channel number disagree; roles NOT stated'
+    }
+
+    $matchesList = @($WatchState.ComPortMatches)
+    if ($matchesList.Count -eq 0) {
+        # Deliberately distinct from the not-probed wording above. Both are
+        # "no roles on screen"; only one of them is a measurement.
+        return 'COM ports: none matched to this headset yet'
+    }
+
+    $parts = @()
+    foreach ($m in $matchesList) {
+        $portName = if ($m.PortName) { [string]$m.PortName } else { '(port name not reported)' }
+        $parts += switch ([string]$m.ChannelRole) {
+            'Data'    { "DATA $portName" }
+            'Command' { "COMMAND $portName" }
+            # Never guess. FI-012 records that the COM NUMBER moves between
+            # re-pairs while the channel does not, so a positional guess here
+            # would be wrong on exactly the machines this recorder exists for.
+            default   { "$portName (role not established)" }
+        }
+    }
+    return "COM ports: $($parts -join ' | ')"
+}
+
 function Get-TargetWatchStateValues {
     [CmdletBinding()]
     param()
@@ -1150,6 +1210,7 @@ Export-ModuleMember -Function @(
     'Find-TargetDeviceInPnpSnapshot',
     'Find-TargetBluetoothComPort',
     'Resolve-ComPortRole',
+    'Format-ComPortRoleSummary',
     'Get-TargetDeviceProcessSnapshot',
     'Test-ProcessRunningInSnapshot',
     'New-TargetWatchState',

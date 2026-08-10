@@ -4769,6 +4769,19 @@ $buttonHandlers = @{
             $btIdentityPanel.Visible = $false
             $btForm.Controls.Add($btIdentityPanel)
 
+            # Findings raised BEFORE the recording loop starts, kept for the life
+            # of the window (#68 item 3). The SERIALCOMM collision that carried a
+            # REBOOT remedy was only recovered because the operator pasted the log
+            # text out by hand before it scrolled; a startup finding that can only
+            # be read in the first ten seconds of a 30-minute run is a finding the
+            # recorder did not deliver.
+            $script:BtRec_StartupPhase    = $true
+            $script:BtRec_StartupFindings = New-Object System.Collections.ArrayList
+            # Placeholder wording says which state this is (#68 item 4). The run
+            # folder is created further down; until then there is no Run ID to
+            # show, and that is different from failing to read one.
+            $script:BtRec_RunIdText = '(not assigned yet)'
+
             $btTargetLabel = New-Object System.Windows.Forms.Label
             $btTargetLabel.Text = "Watching: (selecting headset...)"
             $btTargetLabel.AutoSize = $true
@@ -4776,6 +4789,28 @@ $buttonHandlers = @{
             $btTargetLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
             $btTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(235, 235, 235)
             $btIdentityPanel.Controls.Add($btTargetLabel)
+
+            # Run ID, and which COM port is the DATA channel and which is the
+            # COMMAND channel. Issue #68 item 2.
+            #
+            # Both facts already existed and neither was on screen. The Run ID was
+            # written once, as log line 1 -- into the exact band #64 had covered,
+            # so it was unreachable for the rest of the run. The DATA/COMMAND
+            # roles were resolved on EVERY tick by Resolve-ComPortRole and stored
+            # in ComPortMatches[].ChannelRole, and rendered only in the closing
+            # report. With no tick data on disk until the run ends, a fact that is
+            # not in this panel is a fact neither the operator nor a remote
+            # assistant reading a screenshot can obtain.
+            #
+            # Consolas because these are identifiers that get read back over the
+            # phone and transcribed into a case.
+            $btIdentityDetailLabel = New-Object System.Windows.Forms.Label
+            $btIdentityDetailLabel.Text = "Run ID: (starting...)"
+            $btIdentityDetailLabel.AutoSize = $true
+            $btIdentityDetailLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
+            $btIdentityDetailLabel.Font = New-Object System.Drawing.Font("Consolas", 8)
+            $btIdentityDetailLabel.ForeColor = [System.Drawing.Color]::FromArgb(190, 190, 190)
+            $btIdentityPanel.Controls.Add($btIdentityDetailLabel)
 
             # Coverage line. Carries a text marker ([ok]/[~]/[!]) as well as colour,
             # so "not observed" is legible without relying on yellow-versus-red.
@@ -4786,6 +4821,27 @@ $buttonHandlers = @{
             $btCoverageLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
             $btCoverageLabel.ForeColor = [System.Drawing.Color]::FromArgb(190, 190, 190)
             $btIdentityPanel.Controls.Add($btCoverageLabel)
+
+            # Re-opens the startup findings for the life of the window (#68 item
+            # 3). Hidden while there are none, so a clean start costs no space and
+            # the button appearing is itself the signal.
+            $btStartupFindingsBtn = New-Object System.Windows.Forms.Button
+            $btStartupFindingsBtn.Text = "Startup findings"
+            $btStartupFindingsBtn.AutoSize = $true
+            $btStartupFindingsBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btStartupFindingsBtn.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 0)
+            $btStartupFindingsBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btStartupFindingsBtn.BackColor = [System.Drawing.Color]::FromArgb(90, 60, 20)
+            $btStartupFindingsBtn.ForeColor = [System.Drawing.Color]::FromArgb(255, 225, 170)
+            $btStartupFindingsBtn.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+            $btStartupFindingsBtn.Visible = $false
+            # script: scope and FindForm() rather than a closure. An Add_Click
+            # scriptblock does NOT run inside the local scope it was written in,
+            # so a locally-defined function or a captured $btForm would resolve to
+            # nothing at click time -- and the failure would be a dead button on a
+            # field machine, invisible to every test here.
+            $btStartupFindingsBtn.Add_Click({ script:Show-BtStartupFindings -Owner $this.FindForm() })
+            $btIdentityPanel.Controls.Add($btStartupFindingsBtn)
 
             # Console output fills the space the docked panels leave.
             #
@@ -4822,6 +4878,34 @@ $buttonHandlers = @{
 
             function Write-BtLog {
                 param([string]$Message, [string]$Level = "INFO")
+
+                # #68 item 3. Captured HERE, at the one place every startup line
+                # passes through, rather than at each of the seven sites that
+                # raise one. A per-site hook is a detector that a new call site
+                # silently opts out of -- the failure mode is no field data and
+                # no test that can see it. The choke point cannot be un-called.
+                #
+                # Marker OR level, because both channels exist in this code and
+                # neither is a superset: the arrival cross-check carries [!]/[~]
+                # markers, while the USB-suspend risk factor is a bare WARN line.
+                if ($script:BtRec_StartupPhase -and $null -ne $script:BtRec_StartupFindings) {
+                    if ($Level -in @('FAIL', 'WARN') -or $Message -match '^\s*\[[!~]\]') {
+                        # Level travels WITH the message. Re-deriving severity in
+                        # the viewer would be a second answerer to a question this
+                        # call already answered, and it would silently downgrade
+                        # every finding that carries no [!]/[~] marker.
+                        if ($Message.Trim()) {
+                            [void]$script:BtRec_StartupFindings.Add([pscustomobject]@{
+                                Level = $Level; Message = $Message.TrimEnd()
+                            })
+                        }
+                        if ($btStartupFindingsBtn -and $script:BtRec_StartupFindings.Count -gt 0) {
+                            $btStartupFindingsBtn.Text = "Startup findings ($($script:BtRec_StartupFindings.Count))"
+                            if (-not $btStartupFindingsBtn.Visible) { $btStartupFindingsBtn.Visible = $true }
+                        }
+                    }
+                }
+
                 Write-WinConfigGuiDiagnostic -Level $Level -Message $Message -Box $btOutputBox -NoPrefix
                 # Repaint the log box only, NOT the whole form. $btForm.Refresh()
                 # invalidates and synchronously redraws every control in the tree
@@ -4831,6 +4915,62 @@ $buttonHandlers = @{
                 # pump running, and without an explicit paint the operator would
                 # watch a blank window during the baseline.
                 $btOutputBox.Update()
+            }
+
+            # Re-surfaces the startup findings on demand (#68 item 3).
+            #
+            # A RichTextBox rather than a MessageBox on purpose: the reason this
+            # issue exists is that the operator had to select and copy the
+            # findings out of the log to preserve them, and a MessageBox can be
+            # neither scrolled nor partially selected. It is also the diagnostic
+            # output contract -- semantic colouring has to survive, so a [!] here
+            # reads the same as it did in the log. Modal is safe: the recorder
+            # host is STA and this runs on its UI thread.
+            function script:Show-BtStartupFindings {
+                param($Owner)
+                $items = @($script:BtRec_StartupFindings)
+                $dlg = New-Object System.Windows.Forms.Form
+                $dlg.Text = "Findings from the start of this recording"
+                $dlg.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+                $dlg.ClientSize = New-Object System.Drawing.Size(820, 420)
+
+                $hdr = New-Object System.Windows.Forms.Label
+                $hdr.Dock = [System.Windows.Forms.DockStyle]::Top
+                $hdr.Height = 34
+                $hdr.Padding = New-Object System.Windows.Forms.Padding(8, 8, 8, 0)
+                $hdr.Text = "These were raised before recording began and stay available for the whole run."
+                $dlg.Controls.Add($hdr)
+
+                $tb = New-Object System.Windows.Forms.RichTextBox
+                $tb.ReadOnly = $true
+                $tb.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Both
+                $tb.WordWrap = $false
+                $tb.Dock = [System.Windows.Forms.DockStyle]::Fill
+                Initialize-WinConfigGuiDiagnosticBox -Box $tb
+                if ($items.Count -gt 0) {
+                    foreach ($it in $items) {
+                        Write-WinConfigGuiDiagnostic -Level $it.Level -Message $it.Message -Box $tb -NoPrefix
+                    }
+                } else {
+                    # Absence rendered as absence (#68 item 4): the button is
+                    # hidden while there are none, so an empty list HERE means the
+                    # collection was lost, not that the start was clean.
+                    Write-WinConfigGuiDiagnostic -Level 'WARN' -Box $tb -NoPrefix `
+                        -Message "No startup findings were retained. This is NOT a statement that the start was clean -- scroll to the top of the log to read it directly."
+                }
+                $dlg.Controls.Add($tb)
+                $dlg.Controls.SetChildIndex($tb, 0)
+
+                $close = New-Object System.Windows.Forms.Button
+                $close.Text = "Close"
+                $close.Dock = [System.Windows.Forms.DockStyle]::Bottom
+                $close.Height = 32
+                $close.DialogResult = [System.Windows.Forms.DialogResult]::OK
+                $dlg.Controls.Add($close)
+                $dlg.AcceptButton = $close
+
+                if ($Owner) { [void]$dlg.ShowDialog($Owner) } else { [void]$dlg.ShowDialog() }
+                $dlg.Dispose()
             }
 
             # Refreshes the pinned identity/coverage strip from live session state.
@@ -4867,6 +5007,28 @@ $buttonHandlers = @{
                     [System.Drawing.Color]::FromArgb(255, 140, 140)
                 }
                 if ($btTargetLabel.ForeColor -ne $tCol) { $btTargetLabel.ForeColor = $tCol }
+
+                # Run ID + DATA/COMMAND port roles (#68 item 2). The roles come
+                # from Format-ComPortRoleSummary over the SAME ComPortMatches the
+                # closing report reads -- not a second, simpler live estimate, for
+                # the same reason the coverage line below reuses
+                # Get-ProbeObservationCoverage.
+                $roleText = if (Get-Command Format-ComPortRoleSummary -ErrorAction SilentlyContinue) {
+                    try { Format-ComPortRoleSummary -WatchState $btProbeWatch }
+                    catch { 'COM ports: role check failed to run -- roles NOT established' }
+                } else {
+                    # Explicitly not a reading (#68 item 4). "unknown" here would
+                    # be indistinguishable from a probe that ran and found nothing.
+                    'COM ports: role check unavailable in this build -- not measured'
+                }
+                $dText = "Run ID: $script:BtRec_RunIdText    $roleText"
+                if ($btIdentityDetailLabel.Text -ne $dText) { $btIdentityDetailLabel.Text = $dText }
+                $dCol = if ($roleText -match '^\[!\]') {
+                    [System.Drawing.Color]::FromArgb(255, 140, 140)
+                } else {
+                    [System.Drawing.Color]::FromArgb(190, 190, 190)
+                }
+                if ($btIdentityDetailLabel.ForeColor -ne $dCol) { $btIdentityDetailLabel.ForeColor = $dCol }
 
                 $cov = $null
                 if (Get-Command Get-ProbeObservationCoverage -ErrorAction SilentlyContinue) {
@@ -5040,6 +5202,12 @@ $buttonHandlers = @{
                 try { $btDiagRun = New-WinConfigDiagnosticRun -ToolId 'bluetooth-diagnostics' } catch { }
             }
             $btRunId = if ($btDiagRun) { $btDiagRun.RunId } else { [guid]::NewGuid().ToString("N").Substring(0,12).ToUpper() }
+
+            # Pinned as well as logged (#68 item 2): the log line is written into
+            # the top band and is the first thing pushed out of reach.
+            $script:BtRec_RunIdText = $btRunId
+            $btIdentityDetailLabel.Text = "Run ID: $btRunId    COM ports: not probed yet -- no reading has been taken"
+            if (-not $btIdentityPanel.Visible) { $btIdentityPanel.Visible = $true }
 
             Write-BtLog "Run ID: $btRunId" -Level "DIM"
             Write-BtLog "Step 1 of 3: Taking Bluetooth baseline snapshot (5-10 seconds)..." -Level "STEP"
@@ -5493,7 +5661,11 @@ $buttonHandlers = @{
                             }
                         }
                     } catch {
-                        Write-BtLog "  [arrival cross-check unavailable: $_]" -Level "DIM"
+                        # DIM made a check that did not run look like a check that
+                        # found nothing -- the exact silence #68 item 4 is about.
+                        # WARN also enrols it in the startup findings, so the
+                        # operator can still see it 30 minutes later.
+                        Write-BtLog "  [~] Arrival cross-check DID NOT RUN ($_) -- the state on arrival was not assessed. Absence of arrival findings below means nothing." -Level "WARN"
                     }
                 }
                 if ($btProbeSession.NoExeVersion) {
@@ -5504,8 +5676,16 @@ $buttonHandlers = @{
                     }
                 }
                 if ($btProbeSession.AdapterInfo -and $btProbeSession.AdapterInfo.Present) {
-                    $driverVer = if ($btProbeSession.AdapterInfo.DriverInfo -and $btProbeSession.AdapterInfo.DriverInfo.Version) { $btProbeSession.AdapterInfo.DriverInfo.Version } else { 'unknown' }
-                    Write-BtLog "  BT adapter    : $($btProbeSession.AdapterInfo.FriendlyName)  driver v$driverVer" -Level "DIM"
+                    # "driver vunknown" reads as a version string that was read
+                    # and came back odd. The driver version is the field this
+                    # investigation rolls back and compares across hosts, so an
+                    # unread one has to say it was not read (#68 item 4).
+                    $driverVer = if ($btProbeSession.AdapterInfo.DriverInfo -and $btProbeSession.AdapterInfo.DriverInfo.Version) {
+                        "driver v$($btProbeSession.AdapterInfo.DriverInfo.Version)"
+                    } else {
+                        'driver version NOT READ from Windows'
+                    }
+                    Write-BtLog "  BT adapter    : $($btProbeSession.AdapterInfo.FriendlyName)  $driverVer" -Level "DIM"
                     $pm = $btProbeSession.AdapterInfo.PowerManagementEnabled
                     if ($pm -eq $true) {
                         Write-BtLog "  USB suspend   : ENABLED (risk factor -- can cause random disconnects)" -Level "WARN"
@@ -5539,6 +5719,16 @@ $buttonHandlers = @{
                 Write-BtLog "" -Level "DIM"
                 Write-BtLog "  Watching for Bluetooth changes (every 3s) -- events appear below as they happen" -Level "DIM"
             } else {
+                # The pinned strip is now visible from the Run ID onwards, and in
+                # this mode Update-BtLiveCoverage never runs -- so without this the
+                # panel would sit on "(selecting headset...)" for the whole run,
+                # implying a selection that is not going to happen. #68 item 1:
+                # never assert a state the run contradicts.
+                $btTargetLabel.Text = "Watching: NO HEADSET SELECTED -- device tracking is unavailable, so this recording is not scoped to a device"
+                $btTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 140, 140)
+                $btCoverageLabel.Text = "Limited monitoring -- coverage is NOT being measured. Only Bluetooth connect/disconnect events are captured."
+                $btCoverageLabel.ForeColor = [System.Drawing.Color]::FromArgb(240, 210, 110)
+
                 Write-BtLog "  Limited monitoring mode -- device tracking not available" -Level "WARN"
                 if ($btProbeLoadError) {
                     Write-BtLog "  Reason: $btProbeLoadError" -Level "DIM"
@@ -5594,6 +5784,13 @@ $buttonHandlers = @{
             $btInvFailWarned = $false
             $btTickSw = [System.Diagnostics.Stopwatch]::new()
             $btPartSw = [System.Diagnostics.Stopwatch]::new()
+
+            # Everything above this line was raised before any recording happened,
+            # so it is what the "Startup findings" button reopens. From here on,
+            # findings belong to the session timeline and are events, not arrival
+            # state -- mixing them would turn the button into a second copy of the
+            # log and destroy the reason it exists.
+            $script:BtRec_StartupPhase = $false
 
             while (-not $script:BtRec_StopClicked) {
                 [System.Windows.Forms.Application]::DoEvents()
