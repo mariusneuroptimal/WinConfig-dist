@@ -1087,7 +1087,18 @@ function New-DeviceProbeSession {
         StreamingState           = 'Stopped'
         # Ever-held, as opposed to held-on-the-last-tick. Drives observation
         # coverage; see Get-ProbeObservationCoverage.
-        StreamEverActive         = $false
+        #
+        # Latched straight off HeldPorts on EVERY tick. It replaces
+        # StreamEverActive (issue #67), which latched only inside the
+        # StreamingState TRANSITION branch and so could not see a port that was
+        # ALREADY held when Record was pressed: the recorder seeds
+        # StreamingState from the arrival snapshot, so a session already
+        # streaming produces no transition and the flag stayed false for the
+        # whole run. Capture 2DC7C9DFD5FA held both ports on 1300 of 1302
+        # probes and still reported "No process ever held the target headset's
+        # COM port", downgrading the first clean 30-minute run to Partial.
+        # The name now matches the source: this field IS HeldPorts, remembered.
+        PortEverHeld             = $false
         ActiveStreamPort         = $null
         # Last tick's port classification. HeldPorts drives the honest operator
         # text; UnavailablePorts is the FI-012 signal the old bool test erased by
@@ -1294,6 +1305,18 @@ function Invoke-DeviceProbeTick {
     # the record even if it opens later.
     $Session.UnavailablePorts = @(@($Session.UnavailablePorts) + $newDeadPorts | Where-Object { $_ } | Select-Object -Unique)
 
+    # Session-long memory of the port hold. HeldPorts is the LAST tick only, so
+    # without this nothing can answer "was the target's port ever held at any
+    # point?" -- the question that separates "the session had a problem" from
+    # "this recording never saw the session".
+    #
+    # Deliberately OUTSIDE the transition branch below, and read off exactly the
+    # list PortOpenDenied is incremented from a few lines down. Issue #67: the
+    # old latch lived in the transition branch, so it never fired on a run whose
+    # port was held from the first tick onwards -- the shape of every healthy
+    # capture where the operator starts the recorder during a session.
+    if (@($Session.HeldPorts | Where-Object { $_ }).Count -gt 0) { $Session.PortEverHeld = $true }
+
     # Invasiveness accounting. Tolerates a result without the lists for the same
     # reason as HeldPorts above: Get-StreamingState is mocked in tests and an
     # older caller must not take the tick down.
@@ -1312,11 +1335,10 @@ function Invoke-DeviceProbeTick {
         $Session.StreamingState = $newStreamState
 
         if ($newStreamState -eq 'Active') {
-            # Session-long memory. StreamingState is the LAST tick only, so
-            # without this nothing can answer "was the target's port ever held
-            # at any point?" -- the question that separates "the session had a
-            # problem" from "this recording never saw the session".
-            $Session.StreamEverActive       = $true
+            # NOTE: the session-long port-hold latch is NOT set here. It is set
+            # every tick from HeldPorts above, because this branch only runs on
+            # a CHANGE and a port held from the start of the recording never
+            # produces one. See PortEverHeld / issue #67.
             $Session.StreamPeakCpuS         = 0.0
             $Session.StreamPeakWorkingSetMB = 0
             $Session.StreamCpuFirstSample   = $null
@@ -1983,7 +2005,7 @@ function Get-DeviceProbeSessionSummary {
     if ($deadPorts.Count -gt 0) {
         $integForDead = if ($Session.SerialPortIntegrityEnd) { $Session.SerialPortIntegrityEnd } else { $Session.SerialPortIntegrity }
         $integBad     = [bool]($integForDead -and -not $integForDead.Healthy)
-        if ($integBad -or $Session.StreamEverActive) {
+        if ($integBad -or $Session.PortEverHeld) {
             $why = if ($integBad) {
                 'The serial port integrity check independently reports an OS-level fault, so this is not simply a device that was switched off.'
             } else {
@@ -2275,7 +2297,7 @@ function Get-ProbeObservationCoverage {
         wrong device. But a single powered-off Arc is equally NotObserved --
         coverage is about what was measured, never about blame.
     .PARAMETER Session
-        The probe session (BtLinkEverConnected, StreamEverActive, IoReadOpDeltas).
+        The probe session (BtLinkEverConnected, PortEverHeld, IoReadOpDeltas).
     .PARAMETER WatchState
         The target watch state (FirstComPortSeenTime).
     .PARAMETER Target
@@ -2292,7 +2314,10 @@ function Get-ProbeObservationCoverage {
     )
 
     $linked     = [bool]$Session.BtLinkEverConnected
-    $heldPort   = [bool]$Session.StreamEverActive
+    # Sourced from the port-hold latch, NOT from a stream classification. The
+    # field is named TargetPortEverHeld and the operator sentence below asserts a
+    # port hold, so anything else here is name/source drift (issue #67).
+    $heldPort   = [bool]$Session.PortEverHeld
     $ioSamples  = @($Session.IoReadOpDeltas).Count
     $sawPort    = if ($WatchState) { [bool]$WatchState.FirstComPortSeenTime } else { $false }
 

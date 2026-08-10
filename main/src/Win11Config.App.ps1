@@ -5406,6 +5406,15 @@ $buttonHandlers = @{
                 $btProbeSession.ActiveStreamPort = $initStream.ActivePort
                 $btProbeSession.HeldPorts        = @($initStream.HeldPorts)
                 $btProbeSession.UnavailablePorts = @($initStream.UnavailablePorts)
+                # A port ALREADY held when recording starts is a real observation,
+                # for the same reason as the link seeding above -- and here it is
+                # also the state that seeds StreamingState to 'Active', which means
+                # the tick loop will never see a transition. Issue #67: the old
+                # ever-held flag latched only on that transition, so the commonest
+                # healthy shape (recorder started during a live session) reported
+                # "COM port never held" for the whole run, live in the window and
+                # again in the bundle, and downgraded a clean capture to Partial.
+                if (@($initStream.HeldPorts | Where-Object { $_ }).Count -gt 0) { $btProbeSession.PortEverHeld = $true }
                 if ($initStream.State -eq 'Active') { $btProbeSession.StateEnteredAt['streaming_Active_at'] = Get-Date }
 
                 # Show status strip and initial state
@@ -5624,7 +5633,7 @@ $buttonHandlers = @{
                                 -IoBaselineOpsPerTick ([int]$btProbeSession.IoBaselineOpsPerTick) `
                                 -IoRecentOpsPerTick   ([int]$btProbeSession.IoRecentOpsPerTick) `
                                 -SerialIntegrityFault ([bool]($btProbeSession.SerialPortIntegrity -and -not $btProbeSession.SerialPortIntegrity.Healthy)) `
-                                -TargetEverActive     ([bool]$btProbeSession.StreamEverActive)
+                                -TargetEverActive     ([bool]$btProbeSession.PortEverHeld)
                             [void]$btProbeSession.OperatorMarkers.Add($mk)
                             Write-BtLog "  $($now.ToString('HH:mm:ss'))  [MARK    ]  $(Format-ProbeStateMarker -Marker $mk)" -Level "ACTION"
                             foreach ($cx in @($mk.Contradictions)) {
