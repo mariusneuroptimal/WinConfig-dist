@@ -4787,13 +4787,35 @@ $buttonHandlers = @{
             $btCoverageLabel.ForeColor = [System.Drawing.Color]::FromArgb(190, 190, 190)
             $btIdentityPanel.Controls.Add($btCoverageLabel)
 
-            # Console output fills remaining space (add last)
+            # Console output fills the space the docked panels leave.
+            #
+            # 🔴 The Fill control must sit at CHILD INDEX 0, and "add last" does
+            # NOT achieve that. WinForms lays a container's children out from the
+            # HIGHEST index down, shrinking the remaining rectangle as it goes,
+            # so the control at index 0 is positioned LAST and is the one that
+            # receives what is left. Added last, this box got index 5, was laid
+            # out FIRST against the full client rectangle, and the four docked
+            # panels were then painted ON TOP of it.
+            #
+            # That is issue #64, measured: with a 900x600 client the log sat at
+            # Top=0 Height=600 behind 136px of pinned panels and a 40px status
+            # bar. The hidden band at the top is exactly where the Run ID, the
+            # baseline verdict and the startup [!] findings are written -- a
+            # SERIALCOMM collision with a REBOOT remedy was nearly missed because
+            # of it, and no amount of scrolling could bring it back: the text was
+            # not scrolled away, it was underneath another control.
+            #
+            # SetChildIndex(0) is used rather than reordering the Add calls
+            # because it states the invariant at the point it matters. Note
+            # SendToBack() does the OPPOSITE of what is wanted here -- it moves
+            # the control to the HIGHEST index, which is the broken state.
             $btOutputBox = New-Object System.Windows.Forms.RichTextBox
             $btOutputBox.Multiline = $true
             $btOutputBox.ScrollBars = "Vertical"
             $btOutputBox.Dock = [System.Windows.Forms.DockStyle]::Fill
             Initialize-WinConfigGuiDiagnosticBox -Box $btOutputBox
             $btForm.Controls.Add($btOutputBox)
+            $btForm.Controls.SetChildIndex($btOutputBox, 0)
 
             $btForm.Show()
             $btForm.Refresh()
@@ -5051,7 +5073,15 @@ $buttonHandlers = @{
                     "PartialSuccess" { "WARN" }
                     default          { "WARN" }
                 }
-                Write-BtLog "Baseline: $($baselineResult.Status)  Verdict=$vStr  Findings=$($baselineResult.FindingCount)" -Level $blvl
+                # SCOPED, because this verdict is the AUDIO-domain check and says
+                # nothing at all about EEG data flow. Rendered bare it reads as
+                # the verdict on the session: on SP9 the operator reported
+                # "Verdict=DEGRADED" for a run whose data flow was perfectly
+                # Stable, the single finding behind it being "[~] USB selective
+                # suspend: ENABLED". A domain-scoped name must say its scope
+                # wherever it is rendered or a reader will generalise it
+                # (issue #68).
+                Write-BtLog "Baseline: $($baselineResult.Status)  Audio verdict=$vStr (audio checks only -- says nothing about EEG data flow)  Findings=$($baselineResult.FindingCount)" -Level $blvl
                 if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
                     try { Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name "baseline.json" -Data $baselineResult } catch { }
                 }
@@ -6476,7 +6506,9 @@ $buttonHandlers = @{
                     "PartialSuccess" { "WARN" }
                     default          { "WARN" }
                 }
-                Write-BtLog "Final: $($finalResult.Status)  Verdict=$vStr  Findings=$($finalResult.FindingCount)" -Level $flvl
+                # Scoped for the same reason as the baseline line above. The data
+                # flow answer is the read-rate outcome, printed separately.
+                Write-BtLog "Final: $($finalResult.Status)  Audio verdict=$vStr (audio checks only -- says nothing about EEG data flow)  Findings=$($finalResult.FindingCount)" -Level $flvl
                 if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
                     try { Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name "final.json" -Data $finalResult } catch { }
                 }
