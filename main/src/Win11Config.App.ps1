@@ -6673,7 +6673,12 @@ $buttonHandlers = @{
                         # invisible in ReadRateCollapsed but is exactly what an
                         # intermittent Arc produces, so it gets its own counter.
                         ReadRateDegradedTicks = if ($btProbeSession) { [int]$btProbeSession.IoDegradedTicks } else { $null }
-                        ReadRateWorstFractionOfBaseline = if ($btProbeSession) { $btProbeSession.IoWorstFractionOfBaseline } else { $null }
+                        # Read from the RECORD, not the session. This field and
+                        # ReadRateWorstRecentOpsPerTick below are two halves of one
+                        # observation; sourcing them from two objects is how capture
+                        # E0C8B0588CC7 shipped a worst fraction of 0% beside a worst
+                        # rate of null (issue #65). The record chooses both together.
+                        ReadRateWorstFractionOfBaseline = if ($btIoRecord) { $btIoRecord.WorstFractionOfBaseline } else { $null }
                         # ── Session-long read-rate record ────────────────────
                         # Every field above describes the LAST port-open episode
                         # only, because NO.exe re-opening the port resets the live
@@ -6687,6 +6692,13 @@ $buttonHandlers = @{
                         # question a bundle is read to answer.
                         ReadRateEverCollapsed = if ($btIoRecord) { [bool]$btIoRecord.EverCollapsed } else { $null }
                         ReadRateCollapseEpisodes = if ($btIoRecord) { [int]$btIoRecord.CollapseEpisodes } else { $null }
+                        # The marker channel, counted separately from the episode
+                        # ledger. An operator marker samples the INSTANT the fault
+                        # was on screen; the ledger evaluates a trailing window and
+                        # can legitimately miss what the marker caught. Both counts
+                        # are published so a reader can see which one saw it.
+                        ReadRateMarkerCollapseCount = if ($btIoRecord) { [int]$btIoRecord.MarkerCollapseCount } else { $null }
+                        ReadRateCollapseObservedBy = if ($btIoRecord) { $btIoRecord.CollapseObservedBy } else { $null }
                         # >0 means 'NoBaseline' at the end can mean "thrown away",
                         # not "never found". Without it the two are identical in
                         # the record and only one of them is benign.

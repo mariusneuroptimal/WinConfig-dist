@@ -1132,7 +1132,15 @@ function New-DeviceProbeSession {
         # used to summarise as "held steady" -- the reading a dropout-every-
         # 30-seconds headset would produce. These two remember the dips.
         IoDegradedTicks          = 0
+        # The worst read rate seen on the TICK path, kept as a PAIR. The fraction
+        # was tracked alone, and the ops/tick that produced it was recovered from
+        # a different channel entirely (the collapsed-episode ledger), so capture
+        # E0C8B0588CC7 reported a worst fraction of 0% beside a worst rate of
+        # null: two halves of one observation, sourced from two places, one of
+        # which had nothing to say. Both are $null until something is measured --
+        # 0 in a percentage field would read as "total collapse" (issue #65).
         IoWorstFractionOfBaseline = $null
+        IoWorstRecentOpsPerTick   = $null
         IoStalled                = $false
         IoStallReported          = $false
         # Closed read-rate EPISODES.
@@ -1524,6 +1532,9 @@ function Invoke-DeviceProbeTick {
                         ($null -eq $Session.IoWorstFractionOfBaseline -or
                          $ioVerdict.FractionOfBaseline -lt $Session.IoWorstFractionOfBaseline)) {
                         $Session.IoWorstFractionOfBaseline = $ioVerdict.FractionOfBaseline
+                        # Captured in the SAME assignment as the fraction, so the
+                        # two can only ever describe the same tick.
+                        $Session.IoWorstRecentOpsPerTick   = [int]$ioVerdict.RecentOpsPerTick
                     }
 
                     # Baseline established -- the ONLY positive confirmation the
@@ -1928,7 +1939,7 @@ function Get-DeviceProbeSessionSummary {
         } else {
             'recovering each time'
         }
-        [void]$findings.Add("[~] NO.exe's read rate dipped below a quarter of its own baseline on $($Session.IoDegradedTicks) tick(s) during this recording, $recoveryClaim (worst point ~$($Session.IoWorstFractionOfBaseline)% of normal). No single dip lasted long enough to call a collapse, but a healthy stream does not do this -- suspect an intermittent link or an Arc dropping out briefly.")
+        [void]$findings.Add("[~] NO.exe's read rate dipped below a quarter of its own baseline on $($Session.IoDegradedTicks) tick(s) during this recording, $recoveryClaim (worst point ~$($ioRecord.WorstFractionOfBaseline)% of normal). No single dip lasted long enough to call a collapse, but a healthy stream does not do this -- suspect an intermittent link or an Arc dropping out briefly.")
     } elseif ($ioRecord.Outcome -eq 'Stable') {
         # Was `$Session.IoVerdict -eq 'Streaming'` -- the LAST tick's verdict.
         # Capture 91C5F8EB3E3F: 33 minutes, a 446 ops/tick baseline held across
@@ -2724,6 +2735,10 @@ function Get-IoSessionReadRateRecord {
         The session-long read-rate record: closed episodes plus the live one.
     .DESCRIPTION
         The single answer to "did data flow ever collapse during this recording?"
+        -- across BOTH channels that can observe one: the trailing-window episode
+        ledger and the instantaneous operator markers. Neither alone is the
+        answer, and only joining them here keeps the record from contradicting
+        its own findings text (issue #65).
 
         The live IoVerdict answers only "was it collapsing at the last tick",
         which is a different question and the wrong one to build a bundle on. A
@@ -2735,8 +2750,9 @@ function Get-IoSessionReadRateRecord {
         can both call it and cannot disagree.
     .OUTPUTS
         [pscustomobject] EverCollapsed, EverDegrading, CollapseEpisodes,
-        EpisodeCount, BaselineResetCount, PeakBaselineOpsPerTick,
-        WorstRecentOpsPerTick, FirstCollapseAtIso, Episodes.
+        MarkerCollapseCount, CollapseObservedBy, EpisodeCount,
+        BaselineResetCount, PeakBaselineOpsPerTick, WorstRecentOpsPerTick,
+        WorstFractionOfBaseline, FirstCollapseAtIso, Episodes.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Session)
@@ -2750,16 +2766,71 @@ function Get-IoSessionReadRateRecord {
     $episodes = @($episodes | Where-Object { $_ })
 
     $collapsed = @($episodes | Where-Object { $_.Collapsed })
+
+    # ── The SECOND answerer: operator markers ────────────────────────────────
+    # The episode ledger evaluates on a TRAILING WINDOW; a marker samples the
+    # INSTANT the operator saw the dialog. Both are correct and they measure
+    # different things, so they can legitimately disagree -- and on capture
+    # E0C8B0588CC7 they did: the window bottomed at 14% of baseline and never
+    # crossed the collapse threshold, while a marker caught 8 ops/tick against a
+    # 444 baseline, 2%, and stamped IoVerdict 'Collapsed'. The record then held
+    # EverCollapsed: false in the same file as the marker text "reads COLLAPSED
+    # to 8/tick ... (2% of normal)".
+    #
+    # That run was the Wi-Fi coexistence control. "Never collapsed" invited
+    # exactly the wrong conclusion -- that cutting Wi-Fi had prevented the
+    # collapse -- when the operator had hit 12006 twice, mid-session, and the
+    # hypothesis was in fact refuted. A summary field nearly inverted an
+    # experimental result (issue #65).
+    #
+    # Joining here, in the one function both the findings and the bundle call,
+    # is what makes the contradiction UNEMITTABLE rather than merely detected:
+    # there is no longer an input for which EverCollapsed is false while a
+    # marker says Collapsed. The two counts stay separate below, because "how
+    # many episodes collapsed" and "how many times an operator caught one" are
+    # different questions and blurring them would lose the marker's evidence.
+    $markers = @($Session.OperatorMarkers | Where-Object { $_ })
+    $markerCollapsed = @($markers | Where-Object { $_.IoVerdict -eq 'Collapsed' })
+
     $peak = 0
-    $worstRecent = $null
     foreach ($e in $episodes) {
         if ([int]$e.BaselineOpsPerTick -gt $peak) { $peak = [int]$e.BaselineOpsPerTick }
     }
+    foreach ($m in $markerCollapsed) {
+        if ([int]$m.IoBaselineOpsPerTick -gt $peak) { $peak = [int]$m.IoBaselineOpsPerTick }
+    }
+
+    # ── The worst observation, as ONE pair from ONE channel ──────────────────
+    # WorstFractionOfBaseline used to be read off the session by the bundle while
+    # WorstRecentOpsPerTick was read off this record, so the manifest carried two
+    # halves of one observation assembled from two objects -- and they contradicted
+    # (0% beside null). They are chosen together here: whichever channel saw the
+    # lowest fraction supplies BOTH numbers, so they always describe one moment.
+    $worstCandidates = @()
     foreach ($e in $collapsed) {
-        if ($null -eq $worstRecent -or [int]$e.RecentOpsPerTick -lt $worstRecent) {
-            $worstRecent = [int]$e.RecentOpsPerTick
+        $worstCandidates += [pscustomobject]@{ Fraction = $e.FractionOfBaseline; Recent = [int]$e.RecentOpsPerTick }
+    }
+    foreach ($m in $markerCollapsed) {
+        $worstCandidates += [pscustomobject]@{ Fraction = $m.IoFractionOfBaseline; Recent = [int]$m.IoRecentOpsPerTick }
+    }
+    if ($null -ne $Session.IoWorstFractionOfBaseline) {
+        $worstCandidates += [pscustomobject]@{
+            Fraction = $Session.IoWorstFractionOfBaseline
+            Recent   = [int]$Session.IoWorstRecentOpsPerTick
         }
     }
+    $worst = $null
+    foreach ($c in @($worstCandidates | Where-Object { $null -ne $_.Fraction })) {
+        if ($null -eq $worst -or $c.Fraction -lt $worst.Fraction) { $worst = $c }
+    }
+    # A collapsed observation with no fraction attached still carries a rate, and
+    # dropping it would put null in the field a finding quotes.
+    $worstRecent = if ($worst) { $worst.Recent } else {
+        $bare = @(@($collapsed | ForEach-Object { [int]$_.RecentOpsPerTick }) +
+                  @($markerCollapsed | ForEach-Object { [int]$_.IoRecentOpsPerTick }))
+        if ($bare.Count -gt 0) { ($bare | Measure-Object -Minimum).Minimum } else { $null }
+    }
+    $worstFraction = if ($worst) { $worst.Fraction } else { $null }
 
     # ── Session-level outcome ────────────────────────────────────────────────
     # Derived ONCE, here, so the findings and the bundle manifest cannot answer
@@ -2781,31 +2852,65 @@ function Get-IoSessionReadRateRecord {
     # what an episode verdict other than NoBaseline means. A sub-floor read rate
     # leaves BaselineOpsPerTick nonzero while the verdict stays NoBaseline, so
     # peak alone would call an unmeasurable session stable.
-    $baselineEstablished = @($episodes | Where-Object {
+    # A marker stamped 'Collapsed' against a real baseline is itself proof a
+    # baseline was established, so it counts here too -- otherwise the record
+    # could report Outcome 'Collapsed' beside BaselineEstablished false, which is
+    # the same contradiction one field over.
+    $baselineEstablished = (@($episodes | Where-Object {
         $_.Verdict -in @('Streaming', 'Degrading', 'Collapsed')
-    }).Count -gt 0
+    }).Count -gt 0) -or
+        (@($markerCollapsed | Where-Object { [int]$_.IoBaselineOpsPerTick -gt 0 }).Count -gt 0)
 
     # Held-and-falling is the fault shape; released-and-falling is a clinic
     # finishing a session. Same gate the findings use.
     $terminalDegrading = ($Session.IoVerdict -eq 'Degrading' -and $Session.StreamingState -eq 'Active')
     $dipsBeyondTeardown = ([int]$Session.IoDegradedTicks -gt $script:IoCollapseTicks)
 
+    # A marker counts here exactly as an episode does. It is a measurement the
+    # operator stood next to, and it is the only channel that samples the moment
+    # the fault was visible in NeurOptimal.
+    $everCollapsed = ($collapsed.Count -gt 0 -or $markerCollapsed.Count -gt 0)
+
+    # Earliest sighting from EITHER channel. ISO-8601 with a fixed offset sorts
+    # lexicographically in chronological order.
+    $collapseStamps = @()
+    if ($collapsed.Count -gt 0)       { $collapseStamps += $collapsed[0].EndedAtIso }
+    if ($markerCollapsed.Count -gt 0) { $collapseStamps += $markerCollapsed[0].AtIso }
+    # Indexing [0] into an empty array THROWS under Set-StrictMode -Version
+    # Latest, and the empty case is the common one -- every clean session.
+    $sortedStamps = @($collapseStamps | Where-Object { $_ } | Sort-Object)
+    $firstCollapseIso = if ($sortedStamps.Count -gt 0) { $sortedStamps[0] } else { $null }
+
     $outcome =
-        if ($collapsed.Count -gt 0)                        { 'Collapsed' }
+        if ($everCollapsed)                                { 'Collapsed' }
         elseif ($terminalDegrading -or $dipsBeyondTeardown) { 'Degraded' }
         elseif ($baselineEstablished)                       { 'Stable' }
         else                                                { 'Unassessed' }
 
     return [pscustomobject]@{
         PSTypeName             = 'WinConfig.FlightRecorder.IoSessionReadRate'
-        EverCollapsed          = ($collapsed.Count -gt 0)
-        EverDegrading          = (@($episodes | Where-Object { $_.Degrading }).Count -gt 0)
+        EverCollapsed          = $everCollapsed
+        EverDegrading          = ((@($episodes | Where-Object { $_.Degrading }).Count -gt 0) -or
+                                  (@($markers | Where-Object { $_.IoVerdict -eq 'Degrading' }).Count -gt 0))
+        # Episodes and markers are counted SEPARATELY on purpose. Folding a
+        # marker into CollapseEpisodes would claim an episode the ledger never
+        # closed; dropping it would lose the only channel that saw the collapse.
         CollapseEpisodes       = $collapsed.Count
+        MarkerCollapseCount    = $markerCollapsed.Count
+        # Which channel actually saw it. A reader comparing this record against
+        # the marker list needs to know why the counts differ.
+        CollapseObservedBy     =
+            if ($collapsed.Count -gt 0 -and $markerCollapsed.Count -gt 0) { 'EpisodeAndMarker' }
+            elseif ($collapsed.Count -gt 0)                               { 'Episode' }
+            elseif ($markerCollapsed.Count -gt 0)                         { 'Marker' }
+            else                                                          { $null }
         EpisodeCount           = $episodes.Count
         BaselineResetCount     = [int]$Session.IoBaselineResetCount
         PeakBaselineOpsPerTick = $peak
         WorstRecentOpsPerTick  = $worstRecent
-        FirstCollapseAtIso     = if ($collapsed.Count -gt 0) { $collapsed[0].EndedAtIso } else { $null }
+        # Paired with the line above by construction; see the selection block.
+        WorstFractionOfBaseline = $worstFraction
+        FirstCollapseAtIso     = $firstCollapseIso
         Episodes               = $episodes
         # Collapsed | Degraded | Stable | Unassessed
         Outcome                = $outcome
