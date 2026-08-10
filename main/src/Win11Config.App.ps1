@@ -6699,6 +6699,14 @@ $buttonHandlers = @{
                         # are published so a reader can see which one saw it.
                         ReadRateMarkerCollapseCount = if ($btIoRecord) { [int]$btIoRecord.MarkerCollapseCount } else { $null }
                         ReadRateCollapseObservedBy = if ($btIoRecord) { $btIoRecord.CollapseObservedBy } else { $null }
+                        # A baseline WAS announced and the ledger no longer holds
+                        # one -- so the collapse fields describe a question that
+                        # was not assessed, not an answer of "no". An unbounded
+                        # recording window is what destroys it: idle ticks drag
+                        # the trailing median under the floor (capture
+                        # 31D0729CA5B8, 15.4 h of idle after a 33-min session).
+                        ReadRateBaselineLostAfterAnnouncement = if ($btIoRecord) { [bool]$btIoRecord.BaselineLostAfterAnnouncement } else { $null }
+                        ReadRateIdleTailSeconds = if ($btIoRecord) { $btIoRecord.IdleTailSeconds } else { $null }
                         # >0 means 'NoBaseline' at the end can mean "thrown away",
                         # not "never found". Without it the two are identical in
                         # the record and only one of them is benign.

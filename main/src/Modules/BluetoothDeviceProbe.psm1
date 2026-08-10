@@ -233,6 +233,15 @@ $script:IoCollapseFraction = 0.25
 # Consecutive collapsed ticks required (~12s) so a scheduling hiccup cannot fire it.
 $script:IoCollapseTicks = 4
 
+# Idle recording, in seconds, past which the tail is worth naming in the
+# findings. An idle tail is not inert: the baseline is a MEDIAN over the samples
+# before the trailing window, so empty ticks pull it down until the run's own
+# baseline drops under IoBaselineMinOpsPerTick and the episode is discarded as
+# 'NoBaseline' (capture 31D0729CA5B8, 15.4 h of idle after a 33-minute session).
+# Ten minutes is well past a clinic packing up and far short of the erosion that
+# actually destroyed a capture, so it warns long before anything is lost.
+$script:IoIdleTailWarnSeconds = 600
+
 # Post-baseline seconds at or above which an Observed capture is called
 # 'Sustained' rather than 'Brief'. Five minutes: comfortably more than the ~27s
 # a baseline needs to exist at all, and short enough that it does not label
@@ -1143,6 +1152,23 @@ function New-DeviceProbeSession {
         IoWorstRecentOpsPerTick   = $null
         IoStalled                = $false
         IoStallReported          = $false
+        # A collapse WAS detected at some point in this run. Unresettable, and
+        # deliberately separate from IoStalled, which the port-re-open wipe
+        # clears because a baseline may not span two handles.
+        #
+        # #59 kept a collapse that a RE-OPEN would have erased, by closing the
+        # episode into IoClosedEpisodes first. Capture 31D0729CA5B8 found the
+        # other way to lose one: TIME. A 33-minute session was followed by 15.4 h
+        # of idle recording with the port still held, so the trailing median
+        # decayed to zero, the live episode evaluated to 'NoBaseline' and
+        # New-IoEpisodeRecord discarded it -- taking the collapse with it. No
+        # re-open ever happened, so BaselineResetCount stayed 0 and the
+        # documented escape hatch could not catch it (issue #63).
+        IoCollapseEverDetected   = $false
+        # Last tick that actually moved read operations. The idle tail is the
+        # difference between this and the final tick, and it is the single fact
+        # that explains a capture like 31D0729CA5B8 to a reader.
+        IoLastNonZeroReadAt      = $null
         # Closed read-rate EPISODES.
         #
         # The live fields above describe one port-open episode and are wiped
@@ -1511,6 +1537,9 @@ function Invoke-DeviceProbeTick {
                             $Session.IoReadOpDeltas.Clear()
                         } else {
                             [void]$Session.IoReadOpDeltas.Add($opsDelta)
+                            # Stamped from the tick path, so the idle tail is
+                            # measured rather than inferred from wall clock.
+                            if ($opsDelta -gt 0) { $Session.IoLastNonZeroReadAt = $now }
                         }
                     }
                     $Session.IoLastReadOps = $ioSample.ReadOps
@@ -1581,6 +1610,10 @@ function Invoke-DeviceProbeTick {
                     if ($ioVerdict.Verdict -eq 'Collapsed' -and -not $Session.IoStallReported) {
                         $Session.IoStalled       = $true
                         $Session.IoStallReported = $true
+                        # The unresettable twin. IoStalled above is wiped by a
+                        # port re-open and eroded by an idle tail; this is the
+                        # run-level fact that a collapse was measured at all.
+                        $Session.IoCollapseEverDetected = $true
                         $ioPort = if ($Session.ActiveStreamPort) { $Session.ActiveStreamPort } else { 'the COM port' }
                         # Distinguishes this from the CPU-flatline case in the
                         # operator's own terms: the app is visibly still working.
@@ -1878,6 +1911,14 @@ function Get-DeviceProbeSessionSummary {
         # captures where the collapse had already been erased.
         $fromOps = if ($Session.IoStalled) { [int]$Session.IoBaselineOpsPerTick } else { [int]$ioRecord.PeakBaselineOpsPerTick }
         $toOps   = if ($Session.IoStalled) { [int]$Session.IoRecentOpsPerTick } else { [int]$ioRecord.WorstRecentOpsPerTick }
+        # The live baseline erodes with the recording window: on capture
+        # 31D0729CA5B8 a 15.4 h idle tail dragged it to 0, and this sentence read
+        # "went from ~0 to ~0 read operations per tick" -- a 0-to-0 collapse. The
+        # record's peak now honours the announcement latch, so it holds the rate
+        # this run actually established. Never report a from-rate below it.
+        if ([int]$ioRecord.PeakBaselineOpsPerTick -gt $fromOps) {
+            $fromOps = [int]$ioRecord.PeakBaselineOpsPerTick
+        }
         # A collapse that is over by the end of the recording is still a
         # collapse. Saying so explicitly, because the live verdict now reads
         # clean and a reader comparing the two needs to know which is which.
@@ -1974,6 +2015,26 @@ function Get-DeviceProbeSessionSummary {
             "the target's COM port was never held by any process, and read sampling only runs while it is"
         }
         [void]$findings.Add("[info] Data flow was NOT assessed in this recording: $whyNot. This is not a clean result -- nothing was measured. If NeurOptimal was running a session during this recording, it was not using the headset this recording watched.")
+    }
+
+    # ── The idle tail ─────────────────────────────────────────────────────────
+    # A recording left running long after the session ends does not simply add
+    # harmless empty ticks: the read-rate baseline is the MEDIAN of the samples
+    # before the trailing window, so idle zeros drag it down until the run's own
+    # baseline falls under the floor and the live episode is discarded as
+    # 'NoBaseline'. Capture 31D0729CA5B8 ran 15.9 h for a 33-minute session and
+    # ended reporting no baseline at all, having announced 436 ops/tick.
+    #
+    # This must be stated, not left for a reader to work out from timestamps.
+    # It is the difference between "this capture cannot answer the question" and
+    # "the answer is no".
+    if ($ioRecord.BaselineLostAfterAnnouncement) {
+        $tailNote = if ($null -ne $ioRecord.IdleTailSeconds) {
+            " The recording continued for $([int]($ioRecord.IdleTailSeconds / 60)) minute(s) after the last read activity"
+        } else { ' The recording continued after read activity stopped' }
+        [void]$findings.Add("[!] This recording MEASURED data flow -- a baseline of ~$($ioRecord.AnnouncedBaselineOpsPerTick) read operations per tick was established -- and then lost the measurement before the recording ended.$tailNote, and idle ticks drag the baseline down until it falls under the floor needed to detect a collapse. So this capture CANNOT say whether reads collapsed during the session: read its collapse fields as 'not assessed', not as 'nothing went wrong'. Stop the recorder when the session stops.")
+    } elseif ($null -ne $ioRecord.IdleTailSeconds -and $ioRecord.IdleTailSeconds -ge $script:IoIdleTailWarnSeconds) {
+        [void]$findings.Add("[~] The recording ran for $([int]($ioRecord.IdleTailSeconds / 60)) minute(s) after the last read activity. The measurement survived it this time, but an idle tail erodes the read-rate baseline and long enough of one destroys it -- stop the recorder when the session stops.")
     }
 
     # ── Operator-marked moments ───────────────────────────────────────────────
@@ -2792,6 +2853,23 @@ function Get-IoSessionReadRateRecord {
     $markers = @($Session.OperatorMarkers | Where-Object { $_ })
     $markerCollapsed = @($markers | Where-Object { $_.IoVerdict -eq 'Collapsed' })
 
+    # ── The THIRD answerer: the announcement latch ───────────────────────────
+    # IoBaselineAnnouncedAt/OpsPerTick is set once per run and never reset -- it
+    # was built to answer "was data flow EVER measurable during this recording?"
+    # and it is the honest terminal fact. The record never consulted it, so on
+    # capture 31D0729CA5B8 three channels disagreed about whether a baseline
+    # existed: the announcement said 436 ops/tick at 20:39:50, coverage said
+    # Sustained after 238 s -- and THIS record, the one that gates collapse
+    # detection, said BaselineEstablished false with a peak of 0.
+    #
+    # The cause is erosion, not a reset: 15.4 h of idle ticks after a 33-minute
+    # session dragged the trailing median to zero, so the live episode evaluated
+    # to 'NoBaseline' and was discarded by New-IoEpisodeRecord. BaselineResetCount
+    # was 0 throughout, which is why gating on it does not catch this (issue #63).
+    $announcedAt  = $Session.IoBaselineAnnouncedAt
+    $announcedOps = [int]$Session.IoBaselineAnnouncedOpsPerTick
+    $announced    = ($null -ne $announcedAt -and $announcedOps -gt 0)
+
     $peak = 0
     foreach ($e in $episodes) {
         if ([int]$e.BaselineOpsPerTick -gt $peak) { $peak = [int]$e.BaselineOpsPerTick }
@@ -2799,6 +2877,10 @@ function Get-IoSessionReadRateRecord {
     foreach ($m in $markerCollapsed) {
         if ([int]$m.IoBaselineOpsPerTick -gt $peak) { $peak = [int]$m.IoBaselineOpsPerTick }
     }
+    # A peak below the rate that was ANNOUNCED is not a measurement, it is
+    # erosion. Reporting 0 here is what produced the finding that read
+    # "went from ~0 to ~0 read operations per tick".
+    if ($announcedOps -gt $peak) { $peak = $announcedOps }
 
     # ── The worst observation, as ONE pair from ONE channel ──────────────────
     # WorstFractionOfBaseline used to be read off the session by the bundle while
@@ -2856,10 +2938,19 @@ function Get-IoSessionReadRateRecord {
     # baseline was established, so it counts here too -- otherwise the record
     # could report Outcome 'Collapsed' beside BaselineEstablished false, which is
     # the same contradiction one field over.
-    $baselineEstablished = (@($episodes | Where-Object {
+    $ledgerBaseline = (@($episodes | Where-Object {
         $_.Verdict -in @('Streaming', 'Degrading', 'Collapsed')
     }).Count -gt 0) -or
         (@($markerCollapsed | Where-Object { [int]$_.IoBaselineOpsPerTick -gt 0 }).Count -gt 0)
+    # An announcement is proof on its own. "BaselineEstablished false while
+    # ReadBaselineAnnouncedAtUtc is populated" is an impossible state and the
+    # record must not be able to emit it.
+    $baselineEstablished = ($ledgerBaseline -or $announced)
+    # ...but say so when the two disagree, rather than papering over it. This is
+    # the state that makes EverCollapsed vacuous: the ledger that gates collapse
+    # detection no longer holds the baseline the run actually established, so
+    # "no collapse recorded" means "not assessed", not "nothing went wrong".
+    $baselineLostAfterAnnouncement = ($announced -and -not $ledgerBaseline)
 
     # Held-and-falling is the fault shape; released-and-falling is a clinic
     # finishing a session. Same gate the findings use.
@@ -2869,7 +2960,28 @@ function Get-IoSessionReadRateRecord {
     # A marker counts here exactly as an episode does. It is a measurement the
     # operator stood next to, and it is the only channel that samples the moment
     # the fault was visible in NeurOptimal.
-    $everCollapsed = ($collapsed.Count -gt 0 -or $markerCollapsed.Count -gt 0)
+    # The detector's own latch counts as a channel. On 31D0729CA5B8 a collapse
+    # fired during the run -- and then the only record of it, the live episode,
+    # decayed below the baseline floor and was discarded, so the ledger held
+    # nothing at all.
+    $detectorCollapsed = [bool]$Session.IoCollapseEverDetected
+    $everCollapsed = ($collapsed.Count -gt 0 -or $markerCollapsed.Count -gt 0 -or $detectorCollapsed)
+
+    # Which channels saw it, joined rather than ranked -- three can now observe a
+    # collapse and a reader comparing the counts needs to know which ones did.
+    $observers = @()
+    if ($collapsed.Count -gt 0)       { $observers += 'Episode' }
+    if ($markerCollapsed.Count -gt 0) { $observers += 'Marker' }
+    if ($detectorCollapsed)           { $observers += 'Detector' }
+    $collapseObservedBy = if ($observers.Count -gt 0) { $observers -join '+' } else { $null }
+
+    # How long the recording ran on AFTER read activity stopped. An unbounded
+    # window silently destroys the read-rate channel -- 15.4 h of idle ticks
+    # dragged a 436 ops/tick baseline to zero -- so the tail is published as its
+    # own number instead of being left for a reader to infer from timestamps.
+    $idleTailSeconds = if ($Session.IoLastNonZeroReadAt -and $Session.LastTickAt) {
+        [int][math]::Max(0, ($Session.LastTickAt - $Session.IoLastNonZeroReadAt).TotalSeconds)
+    } else { $null }
 
     # Earliest sighting from EITHER channel. ISO-8601 with a fixed offset sorts
     # lexicographically in chronological order.
@@ -2884,14 +2996,25 @@ function Get-IoSessionReadRateRecord {
     $outcome =
         if ($everCollapsed)                                { 'Collapsed' }
         elseif ($terminalDegrading -or $dipsBeyondTeardown) { 'Degraded' }
+        # Measured once, then the ledger that answers the collapse question lost
+        # it. 'Stable' would be a claim this capture cannot support -- the whole
+        # point of #63 is that a vacuous pass is indistinguishable from a real
+        # one. Deliberately reuses the existing four-value vocabulary rather
+        # than adding a fifth the dashboard would not recognise.
+        elseif ($baselineLostAfterAnnouncement)             { 'Unassessed' }
         elseif ($baselineEstablished)                       { 'Stable' }
         else                                                { 'Unassessed' }
 
     return [pscustomobject]@{
         PSTypeName             = 'WinConfig.FlightRecorder.IoSessionReadRate'
         EverCollapsed          = $everCollapsed
+        # IoDegradedTicks is counted here too. Capture 31D0729CA5B8 shipped
+        # EverDegrading false beside Outcome 'Degraded' and
+        # MeaningfullyDegraded true, in one object -- the outcome was derived
+        # from the tick counter while this field looked only at episodes.
         EverDegrading          = ((@($episodes | Where-Object { $_.Degrading }).Count -gt 0) -or
-                                  (@($markers | Where-Object { $_.IoVerdict -eq 'Degrading' }).Count -gt 0))
+                                  (@($markers | Where-Object { $_.IoVerdict -eq 'Degrading' }).Count -gt 0) -or
+                                  ([int]$Session.IoDegradedTicks -gt 0))
         # Episodes and markers are counted SEPARATELY on purpose. Folding a
         # marker into CollapseEpisodes would claim an episode the ledger never
         # closed; dropping it would lose the only channel that saw the collapse.
@@ -2899,11 +3022,7 @@ function Get-IoSessionReadRateRecord {
         MarkerCollapseCount    = $markerCollapsed.Count
         # Which channel actually saw it. A reader comparing this record against
         # the marker list needs to know why the counts differ.
-        CollapseObservedBy     =
-            if ($collapsed.Count -gt 0 -and $markerCollapsed.Count -gt 0) { 'EpisodeAndMarker' }
-            elseif ($collapsed.Count -gt 0)                               { 'Episode' }
-            elseif ($markerCollapsed.Count -gt 0)                         { 'Marker' }
-            else                                                          { $null }
+        CollapseObservedBy     = $collapseObservedBy
         EpisodeCount           = $episodes.Count
         BaselineResetCount     = [int]$Session.IoBaselineResetCount
         PeakBaselineOpsPerTick = $peak
@@ -2915,6 +3034,14 @@ function Get-IoSessionReadRateRecord {
         # Collapsed | Degraded | Stable | Unassessed
         Outcome                = $outcome
         BaselineEstablished    = $baselineEstablished
+        # True when a baseline was announced during the run but the episode
+        # ledger no longer holds one. The collapse question was NOT assessed on
+        # this capture, whatever EverCollapsed says, and a reader must be told
+        # that rather than left to read "false" as "nothing went wrong".
+        BaselineLostAfterAnnouncement = $baselineLostAfterAnnouncement
+        AnnouncedBaselineOpsPerTick   = if ($announced) { $announcedOps } else { $null }
+        # Seconds the recording ran on after read activity stopped.
+        IdleTailSeconds        = $idleTailSeconds
         # The claim a badge should be built from. A terminal 'Degrading' caused
         # by teardown is NOT this.
         MeaningfullyDegraded   = ($outcome -eq 'Degraded')
