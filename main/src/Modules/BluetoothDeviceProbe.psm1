@@ -1922,9 +1922,22 @@ function Get-DeviceProbeSessionSummary {
         # A collapse that is over by the end of the recording is still a
         # collapse. Saying so explicitly, because the live verdict now reads
         # clean and a reader comparing the two needs to know which is which.
-        $endedNote = if (-not $Session.IoStalled -and $ioRecord.EverCollapsed) {
-            " The port was re-opened after this, which restarted the read-rate measurement -- so the recording ENDS looking clean and the collapse is only visible in this record. Re-opening is NOT evidence the underlying problem was fixed."
-        } else { '' }
+        #
+        # But the CAUSE must be evidenced. This sentence used to assert "the port
+        # was re-opened" from nothing but `-not IoStalled`, which is true of any
+        # run whose live measurement was lost -- including the #63 erosion shape,
+        # where BaselineResetCount is 0 and no re-open ever happened. Inventing a
+        # mechanism is worse than naming none: a reader chasing a re-open that did
+        # not occur is being sent somewhere by the tool.
+        $endedNote =
+            if ($Session.IoStalled) { '' }
+            elseif ($ioRecord.BaselineResetCount -gt 0) {
+                " The port was re-opened after this, which restarted the read-rate measurement -- so the recording ENDS looking clean and the collapse is only visible in this record. Re-opening is NOT evidence the underlying problem was fixed."
+            }
+            elseif ($ioRecord.EverCollapsed) {
+                " The live read-rate measurement was lost before the recording ended, so the recording ENDS looking clean and the collapse is only visible in this record. That is NOT evidence the underlying problem went away -- and the record does not say what ended the measurement."
+            }
+            else { '' }
         $epNote = if ($ioRecord.CollapseEpisodes -gt 1) { " This happened in $($ioRecord.CollapseEpisodes) separate episodes." } else { '' }
         [void]$findings.Add("[!] Read rate collapsed while the port stayed open: NO.exe went from ~$fromOps to ~$toOps read operations per tick on $portStr.$linkNote$endedNote$epNote Note this counter is process-wide, so it shows the application stopped doing the I/O it had been doing, not specifically that the port went quiet.")
     } elseif ($Session.IoVerdict -eq 'NoBaseline' -and $Session.StreamingState -eq 'Active') {
@@ -2032,7 +2045,18 @@ function Get-DeviceProbeSessionSummary {
         $tailNote = if ($null -ne $ioRecord.IdleTailSeconds) {
             " The recording continued for $([int]($ioRecord.IdleTailSeconds / 60)) minute(s) after the last read activity"
         } else { ' The recording continued after read activity stopped' }
-        [void]$findings.Add("[!] This recording MEASURED data flow -- a baseline of ~$($ioRecord.AnnouncedBaselineOpsPerTick) read operations per tick was established -- and then lost the measurement before the recording ended.$tailNote, and idle ticks drag the baseline down until it falls under the floor needed to detect a collapse. So this capture CANNOT say whether reads collapsed during the session: read its collapse fields as 'not assessed', not as 'nothing went wrong'. Stop the recorder when the session stops.")
+        # What is unassessed is the interval AFTER the measurement was lost --
+        # never a collapse that was already confirmed. The first version of this
+        # finding said "this capture CANNOT say whether reads collapsed"
+        # unconditionally, so on the 31D0729CA5B8 shape it contradicted its own
+        # record (EverCollapsed true, Outcome 'Collapsed') in the same summary.
+        # That is precisely the channel-mismatch class this work exists to close,
+        # reintroduced one layer out in prose.
+        if ($ioRecord.EverCollapsed) {
+            [void]$findings.Add("[!] This recording MEASURED data flow -- a baseline of ~$($ioRecord.AnnouncedBaselineOpsPerTick) read operations per tick was established -- and CONFIRMED at least one read collapse, and then lost the measurement before the recording ended.$tailNote, and idle ticks drag the baseline down until it falls under the floor needed to detect a collapse. The confirmed collapse STANDS. What this capture cannot say is what the read rate did after the measurement was lost -- read that interval as 'not assessed'. Stop the recorder when the session stops.")
+        } else {
+            [void]$findings.Add("[!] This recording MEASURED data flow -- a baseline of ~$($ioRecord.AnnouncedBaselineOpsPerTick) read operations per tick was established -- and then lost the measurement before the recording ended.$tailNote, and idle ticks drag the baseline down until it falls under the floor needed to detect a collapse. So this capture CANNOT say whether reads collapsed during the session: read its collapse fields as 'not assessed', not as 'nothing went wrong'. Stop the recorder when the session stops.")
+        }
     } elseif ($null -ne $ioRecord.IdleTailSeconds -and $ioRecord.IdleTailSeconds -ge $script:IoIdleTailWarnSeconds) {
         [void]$findings.Add("[~] The recording ran for $([int]($ioRecord.IdleTailSeconds / 60)) minute(s) after the last read activity. The measurement survived it this time, but an idle tail erodes the read-rate baseline and long enough of one destroys it -- stop the recorder when the session stops.")
     }
