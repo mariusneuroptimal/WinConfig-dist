@@ -251,6 +251,14 @@ $script:IoIdleTailWarnSeconds = 600
 # different bar read PostBaselineSeconds directly.
 $script:CoverageSustainedSeconds = 300
 
+# Hard ceiling on the stamped I/O sample ledger (#84). The longest run on record
+# (31D0729CA5B8, 15.4 h) would produce ~18 k entries at a ~3 s tick, so this is
+# roughly 3x the worst real capture and exists only so a pathological run cannot
+# grow the ledger without limit. Overflow is COUNTED and reported, never silently
+# dropped: a truncated ledger that reads as complete is the same class of lie as
+# an unmeasured zero rendered as 0.
+$script:IoSampleLedgerMax = 60000
+
 $script:ProcessIoApiAvailable = $false
 
 function Initialize-ProcessIoApi {
@@ -328,6 +336,177 @@ function Get-ProcessIoSample {
     } catch {
         # Access denied on the handle, or the process exited between calls.
         return $null
+    }
+}
+
+function Add-IoReadRateSample {
+    <#
+    .SYNOPSIS
+        Folds one stamped read-counter sample into the session ledger (#84).
+        Runs on EVERY tick NO.exe exists -- not only while a port is held.
+    .DESCRIPTION
+        The one place the ungated channel is written. It does NOT touch
+        IoLastReadOps, IoReadOpDeltas or any verdict field: the scoped series
+        that feeds Test-IoReadCollapse stays exactly what it was, because the
+        process-wide counter includes file I/O and widening the detector's input
+        would raise its baseline and hide the serial-only collapse it exists to
+        catch.
+
+        Stamps the held-port SET, not a boolean, so a later reader can scope a
+        rate to a particular port rather than only to "some port was held". The
+        counter itself still cannot attribute a read to a port -- see
+        Get-ProcessIoSample -- so this records the scope, it does not invent
+        attribution.
+    .PARAMETER Session
+        The probe session.
+    .PARAMETER ReadOps
+        Cumulative read-operation count for NO.exe at this instant.
+    .PARAMETER At
+        Timestamp of the sample.
+    .PARAMETER HeldPorts
+        The ports held at this instant, from the same tick's stream result.
+    .OUTPUTS
+        [hashtable] the appended record, or $null if it was not recorded.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][double]$ReadOps,
+        [Parameter(Mandatory)][datetime]$At,
+        $HeldPorts = @()
+    )
+
+    if ($Session.IoSamples -isnot [System.Collections.ArrayList]) { return $null }
+
+    $held = @($HeldPorts | Where-Object { $_ })
+
+    $deltaOps = $null
+    $deltaSec = $null
+    if ($null -ne $Session.IoUnscopedLastReadOps -and $null -ne $Session.IoUnscopedLastAt) {
+        $d = $ReadOps - [double]$Session.IoUnscopedLastReadOps
+        # Counters are monotonic within a process. A negative delta means a
+        # DIFFERENT NO.exe, so the interval spans two processes and is not a
+        # rate at all -- record the sample, drop the delta.
+        if ($d -ge 0) {
+            $deltaOps = $d
+            $deltaSec = ($At - [datetime]$Session.IoUnscopedLastAt).TotalSeconds
+            $Session.IoUnscopedTotalOps += $d
+        }
+    }
+
+    $rec = @{
+        At           = $At
+        ReadOps      = $ReadOps
+        DeltaOps     = $deltaOps
+        # Seconds, not ticks. Every consumer of this ledger needs a per-second
+        # rate (#86: the detector compares ops-per-tick against a 3.0-13.5 s
+        # cadence), and a tick is not a unit of time on a starved run.
+        DeltaSeconds = $deltaSec
+        HeldPorts    = $held
+        PortHeld     = ($held.Count -gt 0)
+    }
+
+    if ($Session.IoSamples.Count -ge $script:IoSampleLedgerMax) {
+        $Session.IoSamplesDropped++
+        return $null
+    }
+    [void]$Session.IoSamples.Add($rec)
+
+    if ($null -eq $Session.IoUnscopedFirstAt) { $Session.IoUnscopedFirstAt = $At }
+    $Session.IoUnscopedLastReadOps = $ReadOps
+    $Session.IoUnscopedLastAt      = $At
+    return $rec
+}
+
+function Get-IoReadRateScopes {
+    <#
+    .SYNOPSIS
+        Pure. Derives a port-held-scoped read rate and an unscoped one from the
+        stamped sample ledger (#84).
+    .DESCRIPTION
+        Two rates because there are two questions, and one gate used to answer
+        only the first:
+
+          PortHeld*  reads during intervals when a port was held. This is the
+                     window the collapse detector judges, and the only one that
+                     can speak to 12006.
+          Unscoped*  reads across the whole recording. The ONLY channel that can
+                     say anything about a 12005, where NO holds no port and the
+                     old gate therefore took no sample at all.
+
+        Neither is evidence that a read went to the Arc. The counter is
+        process-wide and cannot attribute a read to a port
+        (Get-ProcessIoSample). A HIGH unscoped rate beside a zero port-held rate
+        says NO.exe was busy with something else, not that the serial path was
+        alive -- which is precisely the 12005 shape worth being able to see.
+
+        Intervals, not samples, are the unit: an interval is scoped port-held
+        only when BOTH ends were held, since a read that landed inside it could
+        have arrived on either side of the release.
+
+        Returns $null when nothing was sampled, so an unmeasured run renders as
+        absent rather than as a confident zero.
+    .PARAMETER Samples
+        The session's IoSamples ledger.
+    .PARAMETER DroppedCount
+        Samples the ledger cap refused, so a truncated ledger says so.
+    .OUTPUTS
+        [pscustomobject] SampleCount, IntervalCount, PortHeldSeconds,
+        UnscopedSeconds, PortHeldOps, UnscopedOps, PortHeldOpsPerSecond,
+        UnscopedOpsPerSecond, SamplesDropped, Basis.
+    #>
+    [CmdletBinding()]
+    param(
+        $Samples,
+        [int]$DroppedCount = 0
+    )
+
+    $list = @($Samples | Where-Object { $_ })
+    if ($list.Count -eq 0) { return $null }
+
+    $heldOps = [double]0; $heldSec = [double]0; $heldIntervals = 0
+    $allOps  = [double]0; $allSec  = [double]0; $intervals     = 0
+    $prev = $null
+
+    foreach ($s in $list) {
+        $d  = $s.DeltaOps
+        $ds = $s.DeltaSeconds
+        # A sample with no delta is a real observation of the counter, it just
+        # opens no interval -- the first of the run, or the first after a
+        # process change. Counted in SampleCount, absent from the rates.
+        if ($null -ne $d -and $null -ne $ds -and [double]$ds -gt 0) {
+            $intervals++
+            $allOps += [double]$d
+            $allSec += [double]$ds
+            if ($prev -and $prev.PortHeld -and $s.PortHeld) {
+                $heldIntervals++
+                $heldOps += [double]$d
+                $heldSec += [double]$ds
+            }
+        }
+        $prev = $s
+    }
+
+    # $null, never 0. A rate of 0 means "measured, nothing read"; an absent
+    # rate means "no interval to measure over". Collapsing them is how a
+    # capture starts claiming a healthy zero.
+    $heldRate = if ($heldSec -gt 0) { [math]::Round($heldOps / $heldSec, 1) } else { $null }
+    $allRate  = if ($allSec  -gt 0) { [math]::Round($allOps  / $allSec,  1) } else { $null }
+
+    return [pscustomobject]@{
+        PSTypeName           = 'WinConfig.FlightRecorder.IoReadRateScopes'
+        SampleCount          = $list.Count
+        IntervalCount        = $intervals
+        PortHeldIntervalCount = $heldIntervals
+        PortHeldOps          = [math]::Round($heldOps, 0)
+        PortHeldSeconds      = [math]::Round($heldSec, 1)
+        PortHeldOpsPerSecond = $heldRate
+        UnscopedOps          = [math]::Round($allOps, 0)
+        UnscopedSeconds      = [math]::Round($allSec, 1)
+        UnscopedOpsPerSecond = $allRate
+        # Reported, not silent: a capped ledger must not read as a complete one.
+        SamplesDropped       = $DroppedCount
+        Basis                = 'Process-wide ReadOperationCount for NO.exe, sampled every tick the process existed. Includes file I/O and CANNOT attribute a read to a COM port. PortHeld* covers intervals held at both ends.'
     }
 }
 
@@ -1520,6 +1699,46 @@ function New-DeviceProbeSession {
         # the announced figure is the one the operator actually saw.
         IoBaselineAnnouncedAt    = $null
         IoBaselineAnnouncedOpsPerTick = $null
+        # ── Stamped sample ledger (#84) ──────────────────────────────────────
+        # Every tick on which NO.exe existed, whether or not a port was held.
+        #
+        # The measurement above is gated on StreamingState -eq 'Active', which is
+        # derived from the INVASIVE port-open hold test. That coupling has two
+        # consequences and both are structural, not incidental:
+        #
+        #   1. A 12005 can never be scored by read rate. 12005 means NO holds no
+        #      port, so StreamingState is 'Stopped', so no sample was taken. In
+        #      DB98B6EE3324 three of six markers were 12005 and were unscoreable
+        #      BY CONSTRUCTION -- not for want of evidence, but because the
+        #      instrument was switched off exactly when the thing occurred.
+        #   2. Turning the port-open probe off (#83) would silently turn the
+        #      primary measurement off with it, so the control run meant to
+        #      exonerate the probe could not be scored at all.
+        #
+        # Each entry stamps the time, the cumulative counter, the delta and the
+        # HELD-PORT SET at that moment, so a rate can be scoped after the fact
+        # instead of only at capture time. That is what keeps the collapse
+        # detector honest: Get-ProcessIoSample counts reads for the WHOLE process
+        # (file I/O included), and today's 'Active' gate incidentally scoped the
+        # baseline to port-held windows. Sampling everything without recording
+        # the scope would let NO's config and session-file reads raise the
+        # baseline and make a serial-only collapse HARDER to see.
+        IoSamples                = [System.Collections.ArrayList]::new()
+        # Bounded, and the bound is REPORTED. ~3 s ticks over the 15.4 h run in
+        # 31D0729CA5B8 is ~18 k entries; the cap is well above that and exists so
+        # a pathological run cannot grow this without limit. A dropped sample
+        # must never be silent -- a truncated ledger that reads as complete is
+        # the same class of lie as an unmeasured zero.
+        IoSamplesDropped         = 0
+        # The UNSCOPED counter pair, kept separate from IoLastReadOps so the
+        # scoped series feeding Test-IoReadCollapse is bit-for-bit what it was.
+        # Two questions, two series: "did the serial read path collapse while the
+        # port was held" is the detector's; "was this process reading at all"
+        # is the one a 12005 needs, and it has no port to be scoped to.
+        IoUnscopedLastReadOps    = $null
+        IoUnscopedTotalOps       = [double]0
+        IoUnscopedFirstAt        = $null
+        IoUnscopedLastAt         = $null
         AppNotRespondingTicks    = 0
         AppHangReported          = $false
         # How long the recording actually ran, and how many samples are behind
@@ -1821,10 +2040,47 @@ function Invoke-DeviceProbeTick {
         }
     }
 
-    # ── NO.exe health sampling ───────────────────────────────────────────
+    # ── Read-rate sampling: UNGATED (#84) ────────────────────────────────
+    # Everything below this comment used to sit behind StreamingState -eq
+    # 'Active', i.e. behind the invasive port-open hold test. The primary
+    # measurement the Flight Recorder exists to produce was therefore switched
+    # off exactly when NO.exe held no port -- which is the definition of a 12005,
+    # so a 12005 could never be scored by read rate no matter how long anyone
+    # recorded. It also meant the #83 control (run once with the port probe
+    # disabled) would have disabled the measurement it was meant to be scored on.
+    #
+    # The PROCESS LOOKUP AND THE COUNTER READ ARE HOISTED, not duplicated. One
+    # Get-Process and one Get-ProcessIoSample per tick, shared by both channels:
+    # a second pair would add cost to the tick #83 is about, and would let the
+    # two channels disagree about the same instant.
+    $noProcTick   = $null
+    $ioSampleTick = $null
+    if ($AppProcessName) {
+        try { $noProcTick = Get-Process -Name $AppProcessName -ErrorAction SilentlyContinue | Select-Object -First 1 } catch { $noProcTick = $null }
+    }
+    if ($noProcTick) {
+        try {
+            $ioSampleTick = Get-ProcessIoSample -Process $noProcTick
+            if ($ioSampleTick) {
+                # HeldPorts is assigned earlier in this tick, from the same
+                # stream result the scoped channel uses, so the scope stamped
+                # here and the gate below can never describe different instants.
+                $null = Add-IoReadRateSample -Session $Session -ReadOps $ioSampleTick.ReadOps `
+                    -At $now -HeldPorts $Session.HeldPorts
+            }
+        } catch { $ioSampleTick = $null }
+    }
+
+    # ── NO.exe health sampling (port-held scope) ─────────────────────────
+    # Still gated, deliberately. The CPU-flatline stall means "holding the port
+    # and idle", which is meaningless without the hold; and the collapse
+    # detector's baseline must stay scoped to port-held windows, because
+    # Get-ProcessIoSample counts the WHOLE process and letting config and
+    # session-file reads in would raise the baseline and hide the serial-only
+    # collapse it exists to catch.
     if ($Session.StreamingState -eq 'Active' -and $AppProcessName) {
         try {
-            $noProc = Get-Process -Name $AppProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+            $noProc = $noProcTick
             if ($noProc) {
                 $cpuS = [math]::Round($noProc.CPU, 1)
                 $wsMB = [math]::Round($noProc.WorkingSet64 / 1MB, 0)
@@ -1877,7 +2133,10 @@ function Invoke-DeviceProbeTick {
                 # all; a read collapse catches one still busy with its other work
                 # while only the serial path is dead. The 12005 and 12006 field
                 # captures are one of each.
-                $ioSample = Get-ProcessIoSample -Process $noProc
+                # The SAME read the ungated channel stamped above -- not a second
+                # syscall. One counter value per tick means the scoped verdict
+                # and the stamped ledger can never describe different instants.
+                $ioSample = $ioSampleTick
                 if ($ioSample) {
                     if ($null -ne $Session.IoLastReadOps) {
                         $opsDelta = $ioSample.ReadOps - [double]$Session.IoLastReadOps
@@ -3684,6 +3943,8 @@ Export-ModuleMember -Function @(
     'Get-ProbeStateConsistency',
     'Initialize-ProcessIoApi',
     'Get-ProcessIoSample',
+    'Add-IoReadRateSample',
+    'Get-IoReadRateScopes',
     'Test-IoReadCollapse',
     'New-ProbeStateMarker',
     'Format-ProbeStateMarker',

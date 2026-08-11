@@ -6952,6 +6952,19 @@ $buttonHandlers = @{
                                     })
                                 } else { @() })
                         } else { $null }
+                        # Read rate on BOTH scopes (#84). The read-rate channel
+                        # used to be gated on the invasive port-hold test, so a
+                        # 12005 -- which BY DEFINITION means NO holds no port --
+                        # took no sample at all and was unscoreable by
+                        # construction, not for want of evidence. PortHeld* is
+                        # the window the collapse detector judges; Unscoped* is
+                        # the only channel that can say anything at all about a
+                        # 12005. Neither attributes a read to a port: the counter
+                        # is process-wide, and Basis says so inside the capture.
+                        IoReadRateScopes = if ($btProbeSession -and (Get-Command Get-IoReadRateScopes -ErrorAction SilentlyContinue)) {
+                            Get-IoReadRateScopes -Samples $btProbeSession.IoSamples `
+                                -DroppedCount ([int]$btProbeSession.IoSamplesDropped)
+                        } else { $null }
                         # FI-012 at the top level so a ZIP can be triaged from
                         # the manifest alone -- these ZIPs are not auto-analyzed,
                         # so whoever opens one should not have to know which
