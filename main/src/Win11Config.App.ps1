@@ -5436,10 +5436,31 @@ $buttonHandlers = @{
                         # steals nothing: on a port NO.exe owns the open fails with
                         # a sharing violation and no handle is ever acquired. This
                         # is the same call the probe already makes every tick.
+                        #
+                        # TIMED, and folded into the same accumulator the probe
+                        # loop feeds. The recording window opened at
+                        # $btRecordStart above, so these opens are INSIDE it --
+                        # and being the first of the session they are the cold,
+                        # slowest ones. Leaving them out while the denominator
+                        # counted their wall clock biased the observer-effect
+                        # figure downward, in the direction that exonerates the
+                        # recorder. Note this loop probes EVERY candidate Arc,
+                        # not just the one finally selected; the report is
+                        # per-port so those stay separable.
                         $cdHeld = @()
                         if (Get-Command Get-ComPortHoldState -ErrorAction SilentlyContinue) {
                             foreach ($cdP in $cdPorts) {
-                                if ((try { Get-ComPortHoldState -PortName $cdP } catch { $null }) -eq 'Held') { $cdHeld += $cdP }
+                                $cdSw = [System.Diagnostics.Stopwatch]::StartNew()
+                                $cdState = try { Get-ComPortHoldState -PortName $cdP } catch { $null }
+                                $cdSw.Stop()
+                                if (Get-Command Add-PortOpenTimingSamples -ErrorAction SilentlyContinue) {
+                                    try {
+                                        $null = Add-PortOpenTimingSamples -Timing $btProbeSession.PortOpenTiming -Phase 'Selection' -Durations @(
+                                            @{ Port = $cdP; State = ([string]$cdState); DurationMs = $cdSw.Elapsed.TotalMilliseconds }
+                                        )
+                                    } catch { }
+                                }
+                                if ($cdState -eq 'Held') { $cdHeld += $cdP }
                             }
                         }
                         $btCandidates += [pscustomobject]@{
@@ -5607,6 +5628,16 @@ $buttonHandlers = @{
                 # anywhere else, because this snapshot is what the operator reads
                 # before deciding whether anything is wrong.
                 $initStream = Get-StreamingState -WatchState $btProbeWatch
+                # This call opens the same ports the tick loop does, and it too
+                # sits inside the recording window ($btRecordStart, above). It
+                # already emits PortOpenDurations -- the first cut of #83 threw
+                # them away, so the arrival opens were spent but never counted.
+                if (Get-Command Add-PortOpenTimingSamples -ErrorAction SilentlyContinue) {
+                    try {
+                        $null = Add-PortOpenTimingSamples -Timing $btProbeSession.PortOpenTiming `
+                            -Durations $initStream.PortOpenDurations -Phase 'Startup'
+                    } catch { }
+                }
                 $btProbeSession.StreamingState = $initStream.State
                 $btProbeSession.ActiveStreamPort = $initStream.ActivePort
                 $btProbeSession.HeldPorts        = @($initStream.HeldPorts)
@@ -6898,6 +6929,29 @@ $buttonHandlers = @{
                         PortOpenAttempts = if ($btProbeSession) { [int]$btProbeSession.PortOpenAttempts } else { $null }
                         PortOpenAcquired = if ($btProbeSession) { [int]$btProbeSession.PortOpenAcquired } else { $null }
                         PortOpenDenied   = if ($btProbeSession) { [int]$btProbeSession.PortOpenDenied } else { $null }
+                        # ...and for HOW LONG (#83). The counts above cannot say
+                        # what share of the recording the probe spent inside a
+                        # successful open of a port NO.exe was trying to take,
+                        # and they cannot settle whether these opens are the tick
+                        # cost -- `Update` spans several calls, so blaming them
+                        # was an inference. SuccessfulOpenCallMs is an UPPER
+                        # BOUND on the lock-out interval, not a measurement of
+                        # it: the stopwatch spans the whole call, ownership is a
+                        # subset. The report carries that in its Basis field.
+                        # Null, not zero, on a run that measured none: an
+                        # unmeasured observer effect must not read as an absent
+                        # one. Roles are passed so DATA and COMMAND stay
+                        # separable -- 12005 names the COMMAND port, and pooling
+                        # the two would bury it.
+                        PortOpenTiming = if ($btProbeSession -and (Get-Command Get-PortOpenTimingReport -ErrorAction SilentlyContinue)) {
+                            Get-PortOpenTimingReport -Timing $btProbeSession.PortOpenTiming `
+                                -RecordingSeconds $(if ($btWindow) { $btWindow.DurationSeconds } else { $null }) `
+                                -PortRoles @(if ($btProbeWatch) {
+                                    @(@($btProbeWatch.ComPortMatches) | Where-Object { $_.PortName } | ForEach-Object {
+                                        @{ PortName = $_.PortName; Role = $_.ChannelRole }
+                                    })
+                                } else { @() })
+                        } else { $null }
                         # FI-012 at the top level so a ZIP can be triaged from
                         # the manifest alone -- these ZIPs are not auto-analyzed,
                         # so whoever opens one should not have to know which

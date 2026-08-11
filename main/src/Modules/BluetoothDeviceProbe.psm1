@@ -540,8 +540,24 @@ function Get-StreamingState {
     # question could only be argued, not answered. Counting it is a prerequisite
     # for deciding whether to back the interval off; measure first.
     $openedPorts = @()
+    # DURATION, not just count. The count says how often we touched the port; it
+    # cannot say for how long we owned it, and on a Bluetooth SPP port an open is
+    # not local -- it brings up an RFCOMM channel over the air. Two questions ride
+    # on this and neither could be answered from a capture (issue #83):
+    #   1. Is this the tick cost? `Update` measures ~82% of the tick but spans
+    #      several calls, so blaming the opens was an INFERENCE.
+    #   2. What fraction of the recording did the probe own a port NO.exe was
+    #      trying to open? That is the observer-effect number.
+    # Timed at the CALL SITE deliberately: Get-ComPortHoldState keeps its string
+    # return and its signature, so every existing caller and every test mock of it
+    # is untouched.
+    $durations = @()
     foreach ($p in $ports) {
-        switch (Get-ComPortHoldState -PortName $p) {
+        $holdSw = [System.Diagnostics.Stopwatch]::StartNew()
+        $holdState = Get-ComPortHoldState -PortName $p
+        $holdSw.Stop()
+        $durations += @{ Port = $p; State = $holdState; DurationMs = $holdSw.Elapsed.TotalMilliseconds }
+        switch ($holdState) {
             'Held'        { $activePorts += $p }
             'Unavailable' { $deadPorts   += $p }
             'Free'        { $openedPorts += $p }
@@ -550,17 +566,314 @@ function Get-StreamingState {
 
     if ($activePorts.Count -gt 0) {
         return @{
-            State            = 'Active'
-            ActivePort       = ($activePorts -join ', ')
-            HeldPorts        = @($activePorts)
-            UnavailablePorts = @($deadPorts)
-            OpenedPorts      = @($openedPorts)
-            ProbedPorts      = @($ports)
+            State             = 'Active'
+            ActivePort        = ($activePorts -join ', ')
+            HeldPorts         = @($activePorts)
+            UnavailablePorts  = @($deadPorts)
+            OpenedPorts       = @($openedPorts)
+            ProbedPorts       = @($ports)
+            PortOpenDurations = @($durations)
         }
     }
     return @{
         State = 'Stopped'; ActivePort = $null; HeldPorts = @()
         UnavailablePorts = @($deadPorts); OpenedPorts = @($openedPorts); ProbedPorts = @($ports)
+        PortOpenDurations = @($durations)
+    }
+}
+
+function Add-PortOpenTimingSample {
+    <#
+    .SYNOPSIS
+        Pure-ish. Folds one timed Get-ComPortHoldState result into the session's
+        per-port timing accumulator, in place.
+    .DESCRIPTION
+        Split by RETURNED STATE, because the states cost wildly different things
+        and averaging them together hides the only one that matters. A 'Held'
+        result is a sharing violation and returns almost immediately; a 'Free'
+        result means a handle really was taken, which is both the slow case and
+        the invasive one. A single mean over both understates 'Free' by however
+        often NO.exe happened to be holding the port.
+    .PARAMETER Timing
+        The accumulator hashtable, keyed by port name.
+    .PARAMETER Phase
+        Which part of the recording this sample came from: 'Selection' (target
+        selection), 'Startup' (the arrival snapshot) or 'Tick' (the probe loop).
+        Recorded because the recording window opens BEFORE the first two, so a
+        report built from ticks alone divides a tick-only numerator by a
+        whole-session denominator and understates the observer effect -- and the
+        opens it drops are the COLD ones, the slowest on a Bluetooth SPP port.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Timing,
+        # AllowEmptyString, deliberately. The tick path feeds this from
+        # ([string]$d.Port) on a hashtable it did not build, so a malformed entry
+        # arrives as ''. Rejecting it at the binder throws INSIDE the tick and
+        # takes the whole tick down -- the failure mode every other tolerance in
+        # this function exists to prevent. Bind it, then drop it below.
+        [Parameter(Mandatory)][AllowEmptyString()][string]$PortName,
+        [string]$State = 'Unknown',
+        [double]$DurationMs = 0,
+        [AllowEmptyString()][string]$Phase = 'Tick'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PortName)) { return }
+    $st = if ([string]::IsNullOrWhiteSpace($State)) { 'Unknown' } else { $State }
+    $ph = if ([string]::IsNullOrWhiteSpace($Phase)) { 'Unknown' } else { $Phase }
+
+    if (-not $Timing.ContainsKey($PortName)) {
+        $Timing[$PortName] = @{ Count = 0; TotalMs = [double]0; MaxMs = [double]0; MinMs = $null; ByState = @{}; ByPhase = @{} }
+    }
+    $port = $Timing[$PortName]
+    # Back-fill for an accumulator seeded by an older build of this function, so
+    # a mid-session module reload cannot throw on a missing key.
+    if (-not $port.ContainsKey('ByPhase')) { $port['ByPhase'] = @{} }
+    $port.Count++
+    $port.TotalMs += $DurationMs
+    if ($DurationMs -gt $port.MaxMs) { $port.MaxMs = $DurationMs }
+    # $null, not 0 -- a MinMs seeded at 0 can never be beaten and would report a
+    # zero-cost open on every box.
+    if ($null -eq $port.MinMs -or $DurationMs -lt [double]$port.MinMs) { $port.MinMs = $DurationMs }
+
+    if (-not $port.ByState.ContainsKey($st)) {
+        $port.ByState[$st] = @{ Count = 0; TotalMs = [double]0; MaxMs = [double]0 }
+    }
+    $bucket = $port.ByState[$st]
+    $bucket.Count++
+    $bucket.TotalMs += $DurationMs
+    if ($DurationMs -gt $bucket.MaxMs) { $bucket.MaxMs = $DurationMs }
+
+    if (-not $port.ByPhase.ContainsKey($ph)) {
+        $port.ByPhase[$ph] = @{ Count = 0; TotalMs = [double]0; OpenCount = 0; OpenMs = [double]0 }
+    }
+    $pb = $port.ByPhase[$ph]
+    $pb.Count++
+    $pb.TotalMs += $DurationMs
+    # Only 'Free' -- same rule as the headline. Split out per phase so a reader
+    # can see how much of the number came from the one-off startup opens and how
+    # much from the loop, rather than having to trust that both were counted.
+    if ($st -eq 'Free') { $pb.OpenCount++; $pb.OpenMs += $DurationMs }
+}
+
+function Add-PortOpenTimingSamples {
+    <#
+    .SYNOPSIS
+        Folds a whole PortOpenDurations list into the session's timing
+        accumulator. The ONE place any caller feeds this channel.
+    .DESCRIPTION
+        A choke point, not a convenience. The first cut of this measurement was
+        fed from the probe tick only (Invoke-DeviceProbeTick), while the
+        recording window it is divided by opens earlier -- at $btRecordStart,
+        before target selection and before the arrival snapshot. Both of those
+        also open ports, and being the FIRST opens of the session they are the
+        cold ones. Numerator missing them, denominator including their wall
+        clock: the observer effect came out biased LOW, in the direction that
+        makes the recorder look innocent.
+
+        Every producer of a duration list now goes through here with a Phase
+        label, so adding a third call site is one call and shows up in the
+        report instead of silently skewing it.
+    .PARAMETER Durations
+        The PortOpenDurations list from Get-StreamingState, or any list of
+        entries carrying Port / State / DurationMs.
+    .PARAMETER Phase
+        'Selection' | 'Startup' | 'Tick'.
+    .OUTPUTS
+        [int] samples accepted. Returned so a caller can assert it wired up.
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        $Timing,
+        $Durations,
+        [AllowEmptyString()][string]$Phase = 'Tick'
+    )
+
+    # Tolerant for the same reason the tick path is: this runs inside the
+    # recording loop and inside startup, and neither may be taken down by a
+    # malformed entry. A run that measured nothing must report nothing.
+    if ($Timing -isnot [hashtable]) { return 0 }
+    $n = 0
+    foreach ($d in @($Durations)) {
+        if (-not $d) { continue }
+        $port = try { [string]$d.Port } catch { '' }
+        if ([string]::IsNullOrWhiteSpace($port)) { continue }
+        $state = try { [string]$d.State } catch { 'Unknown' }
+        $ms    = try { [double]$d.DurationMs } catch { [double]0 }
+        Add-PortOpenTimingSample -Timing $Timing -PortName $port -State $state -DurationMs $ms -Phase $Phase
+        $n++
+    }
+    return $n
+}
+
+function Get-PortOpenTimingReport {
+    <#
+    .SYNOPSIS
+        Pure. Summarises the per-port hold-test timing accumulator for a capture.
+    .DESCRIPTION
+        The headline is SuccessfulOpenCallMs: the summed wall-clock duration of
+        the Get-ComPortHoldState calls that RETURNED 'Free', i.e. the ones where
+        a handle was genuinely acquired. A 'Held' result cost time but took no
+        handle, and an 'Unavailable' one never had a handle to hold.
+
+        WHAT THIS IS NOT. It is not the time the probe owned the handle. The
+        stopwatch spans the entire call -- SerialPort construction, the RFCOMM
+        bring-up, Open(), Close() and Dispose() -- and ownership is a strict
+        subset of that. So the figure is an UPPER BOUND on the interval in which
+        NO.exe would have been locked out, not a measurement of it. Naming it
+        "handle held" would have made the recorder look more invasive than
+        anything here proves, and an upper bound is what the release-blocker
+        decision actually needs: if the bound is small the question is closed,
+        and if it is large the exact interval has to be established at the
+        Windows level before anyone acts on it. Basis travels with the number,
+        because a metric and the thing it licenses you to say must not get
+        separated (see Get-ComPortHoldState on handle-vs-dataflow).
+
+        Percentages are reported PER PORT as well as pooled. The Arc's two SPP
+        channels are not interchangeable -- 12005 names the COMMAND port -- and
+        a pooled figure can hide a heavily-probed channel behind a quiet one.
+
+        Returns $null when nothing was sampled, so an unmeasured run renders as
+        absent rather than as a confident zero.
+    .PARAMETER Timing
+        The session's PortOpenTiming accumulator.
+    .PARAMETER RecordingSeconds
+        Recording length, used only for the percentages. Omit and they are $null
+        rather than a divide-by-zero or a misleading 0.
+    .PARAMETER PortRoles
+        Optional PortName/Role pairs (from WatchState.ComPortMatches) so each
+        port carries DATA/COMMAND. Never key off the COM number: the roles swap
+        on every re-pair.
+    .OUTPUTS
+        [pscustomobject] Ports, SampleCount, HandleAcquiredCount,
+        SuccessfulOpenCallMs, SuccessfulOpenCallPercentOfRecording,
+        SlowestHoldProbeMs, SlowestPort, SlowestPortState, Phases, Basis.
+    #>
+    [CmdletBinding()]
+    param(
+        $Timing,
+        [Nullable[double]]$RecordingSeconds = $null,
+        $PortRoles = $null
+    )
+
+    if ($Timing -isnot [hashtable] -or $Timing.Keys.Count -eq 0) { return $null }
+
+    $roleOf = @{}
+    foreach ($r in @($PortRoles)) {
+        if (-not $r) { continue }
+        $rn = try { [string]$r.PortName } catch { '' }
+        if ([string]::IsNullOrWhiteSpace($rn)) { continue }
+        $rv = try { [string]$r.Role } catch { '' }
+        if (-not [string]::IsNullOrWhiteSpace($rv)) { $roleOf[$rn] = $rv }
+    }
+
+    $msToPct = {
+        param([double]$Ms)
+        if ($null -ne $RecordingSeconds -and [double]$RecordingSeconds -gt 0) {
+            [math]::Round(($Ms / ([double]$RecordingSeconds * 1000)) * 100, 2)
+        } else { $null }
+    }
+
+    $ports        = @()
+    $sampleCount  = 0
+    $openMs       = [double]0
+    $openCount    = 0
+    $slowestMs    = [double]0
+    $slowestPort  = $null
+    $slowestState = $null
+    $phaseTotals  = @{}
+
+    foreach ($name in @($Timing.Keys | Sort-Object)) {
+        $p = $Timing[$name]
+        if (-not $p -or [int]$p.Count -le 0) { continue }
+        $sampleCount += [int]$p.Count
+
+        $states     = @()
+        $portOpenMs = [double]0
+        $portOpens  = 0
+        foreach ($stName in @($p.ByState.Keys | Sort-Object)) {
+            $b = $p.ByState[$stName]
+            if (-not $b -or [int]$b.Count -le 0) { continue }
+            $states += [pscustomobject]@{
+                State  = $stName
+                Count  = [int]$b.Count
+                MeanMs = [math]::Round([double]$b.TotalMs / [int]$b.Count, 1)
+                MaxMs  = [math]::Round([double]$b.MaxMs, 1)
+            }
+            if ($stName -eq 'Free') {
+                $portOpenMs += [double]$b.TotalMs
+                $portOpens  += [int]$b.Count
+            }
+            # The slowest call is attributed to the state it returned. Its
+            # maximum can come from an Unavailable or a Held result -- neither of
+            # which is an open -- so calling it the slowest OPEN would have been
+            # wrong on exactly the captures where the serial stack is broken.
+            if ([double]$b.MaxMs -gt $slowestMs) {
+                $slowestMs    = [double]$b.MaxMs
+                $slowestPort  = $name
+                $slowestState = $stName
+            }
+        }
+        $openMs    += $portOpenMs
+        $openCount += $portOpens
+
+        foreach ($phName in @($p.ByPhase.Keys)) {
+            $pb = $p.ByPhase[$phName]
+            if (-not $pb -or [int]$pb.Count -le 0) { continue }
+            if (-not $phaseTotals.ContainsKey($phName)) {
+                $phaseTotals[$phName] = @{ Count = 0; OpenCount = 0; OpenMs = [double]0 }
+            }
+            $phaseTotals[$phName].Count     += [int]$pb.Count
+            $phaseTotals[$phName].OpenCount += [int]$pb.OpenCount
+            $phaseTotals[$phName].OpenMs    += [double]$pb.OpenMs
+        }
+
+        $ports += [pscustomobject]@{
+            PortName = $name
+            Role     = $(if ($roleOf.ContainsKey($name)) { $roleOf[$name] } else { $null })
+            Count    = [int]$p.Count
+            MeanMs   = [math]::Round([double]$p.TotalMs / [int]$p.Count, 1)
+            MinMs    = if ($null -eq $p.MinMs) { $null } else { [math]::Round([double]$p.MinMs, 1) }
+            MaxMs    = [math]::Round([double]$p.MaxMs, 1)
+            TotalMs  = [math]::Round([double]$p.TotalMs, 1)
+            # Per port, because pooling DATA and COMMAND can bury the channel the
+            # operator-facing error is actually about.
+            HandleAcquiredCount                 = $portOpens
+            SuccessfulOpenCallMs                = [math]::Round($portOpenMs, 1)
+            SuccessfulOpenCallPercentOfRecording = & $msToPct $portOpenMs
+            ByState  = @($states)
+        }
+    }
+
+    if ($ports.Count -eq 0) { return $null }
+
+    $phases = @()
+    foreach ($phName in @($phaseTotals.Keys | Sort-Object)) {
+        $pt = $phaseTotals[$phName]
+        $phases += [pscustomobject]@{
+            Phase                = $phName
+            SampleCount          = [int]$pt.Count
+            HandleAcquiredCount  = [int]$pt.OpenCount
+            SuccessfulOpenCallMs = [math]::Round([double]$pt.OpenMs, 1)
+        }
+    }
+
+    return [pscustomobject]@{
+        PSTypeName                           = 'WinConfig.FlightRecorder.PortOpenTiming'
+        Ports                                = @($ports)
+        SampleCount                          = $sampleCount
+        HandleAcquiredCount                  = $openCount
+        SuccessfulOpenCallMs                 = [math]::Round($openMs, 1)
+        SuccessfulOpenCallPercentOfRecording = & $msToPct $openMs
+        SlowestHoldProbeMs                   = [math]::Round($slowestMs, 1)
+        SlowestPort                          = $slowestPort
+        SlowestPortState                     = $slowestState
+        # Where the samples came from. 'Tick' alone on a capture that also ran
+        # selection and startup means those paths were not wired -- which is the
+        # defect this field exists to make visible rather than plausible.
+        Phases                               = @($phases)
+        Basis                                = 'Full Get-ComPortHoldState call: SerialPort construct + RFCOMM bring-up + Open + Close + Dispose. UPPER BOUND on the exclusive-ownership interval, not a measurement of it.'
     }
 }
 
@@ -1255,6 +1568,14 @@ function New-DeviceProbeSession {
         PortOpenAttempts         = 0
         PortOpenAcquired         = 0
         PortOpenDenied           = 0
+        # ...and for HOW LONG. The counters above answer "how often"; they cannot
+        # bound the time NO.exe could not have had the port, which is the
+        # observer-effect question. Keyed by port name, split by returned hold
+        # state AND by phase -- the recording window opens before target
+        # selection, so a tick-only numerator understates it. Fed only through
+        # Add-PortOpenTimingSamples. See Get-PortOpenTimingReport on why the
+        # headline is an upper bound rather than a measurement.
+        PortOpenTiming           = @{}
         # Cross-field contradictions present in the arrival snapshot, before any
         # transition could fire. Populated by the caller at startup.
         StartupConsistency       = @()
@@ -1385,6 +1706,13 @@ function Invoke-DeviceProbeTick {
             $Session.PortOpenAcquired += @($streamResult.OpenedPorts | Where-Object { $_ }).Count
         }
         $Session.PortOpenDenied += @($Session.HeldPorts | Where-Object { $_ }).Count
+        # Tolerates absence for the same reason as the lists above: an older
+        # caller or a test mock of Get-StreamingState must not take the tick down.
+        # A capture from such a run reports no timing rather than a wrong zero.
+        if ($streamResult.ContainsKey('PortOpenDurations')) {
+            $null = Add-PortOpenTimingSamples -Timing $Session.PortOpenTiming `
+                -Durations $streamResult.PortOpenDurations -Phase 'Tick'
+        }
     }
 
     if ($newStreamState -ne $Session.StreamingState) {
@@ -3340,6 +3668,12 @@ Export-ModuleMember -Function @(
     # built from the same answer the findings are, not from the live last-tick
     # fields that a port re-open silently resets.
     'New-IoEpisodeRecord',
+    # Invasiveness accounting (#83). Exported so the manifest is built from the
+    # same summariser the tests assert on, rather than a second one at the call
+    # site -- the channel-mismatch pattern this repo keeps re-filing.
+    'Add-PortOpenTimingSample',
+    'Add-PortOpenTimingSamples',
+    'Get-PortOpenTimingReport',
     'Get-IoSessionReadRateRecord',
     'Get-NoExeVersion',
     'Test-NoUsesMacResolve',
