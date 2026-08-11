@@ -1635,6 +1635,504 @@ function Get-ProbeStateConsistency {
 }
 
 # =============================================================================
+# DIAGNOSTIC CHAIN
+# =============================================================================
+
+function Get-BtDiagnosticChain {
+    <#
+    .SYNOPSIS
+        Pure. Orders the probe's independent state fields into a DEPENDENCY
+        CHAIN and localizes the first step that cannot be verified.
+    .DESCRIPTION
+        WHAT THIS FIXES. The recorder measures five things and renders them side
+        by side as five equals. They are not equals: a dead radio link makes the
+        port-hold reading, the read rate and every downstream conclusion
+        consequences rather than findings. An operator reading five indicators
+        counts FOUR problems where there is one cause and three effects, and the
+        remedy they pick is chosen from the wrong layer.
+
+        The chain answers a different question: what is the LAST step that is
+        verified good, and what is the FIRST one that is not. That is the
+        sentence a clinic tech can act on and a remote assistant can triage from
+        a screenshot.
+
+        THREE THINGS ARE KEPT APART, because collapsing any pair of them is how
+        this recorder has misled readers before:
+
+          Health       what the reading SAYS      Healthy/Idle/Degraded/Failed/Unknown
+          Observation  where the reading CAME FROM Observed/Inferred/Historical/
+                                                   NotObserved/NotMeasurable
+          BlockedBy    whether it is a CONSEQUENCE  upstream node id, or $null
+
+        'Idle' is not a soft 'Failed'. It is a reading that is legitimately
+        negative: a headset with no radio link before a session has started, a
+        COM port nobody is holding because NeurOptimal is not open. FI-012 is the
+        standing warning here -- SPP devices hold no profile open, so a perfectly
+        healthy idle Arc reads Disconnected. Painting that red would reproduce
+        the wall of false problems this function exists to remove, in the
+        opposite direction.
+
+        'NotObserved' is not 'Healthy' and not 'Idle'. When the active port-open
+        probe is disabled by setting (the non-intrusive arm), NOTHING looked at
+        the port hold. The chain must stop there and say so, because a chain that
+        walks past an unread sensor and reports a boundary further down is
+        asserting the health of a link nothing measured.
+
+        BlockedBy IS AN ATTRIBUTE, NOT A HEALTH VALUE, and the difference is
+        deliberate. Overwriting a downstream node's health with 'BLOCKED' throws
+        away a reading that was actually taken. If the radio is down AND we
+        observed that no process holds the port, both facts are worth keeping:
+        the node reports Idle, and BlockedBy names the radio as the explanation.
+
+        THE EDGE ORDER IS NOT THE OBVIOUS ONE. COM port registration is NOT
+        downstream of the radio link. Ports stay registered while the radio is
+        disconnected -- they are a HISTORICAL fact about a past pairing, which is
+        why the ComPorts node is marked Observation='Historical' even when it is
+        green. Placing it under the link, as a layer-stack reading of the problem
+        suggests, would make every idle box show a broken COM layer.
+
+        WHAT IS NOT A NODE HERE. There is no protocol/handshake node: this tool
+        never writes to the Arc, so bytes-sent is unobservable by design, and a
+        permanently-Unknown node is noise that trains readers to skip the chain.
+        Host and OS are not nodes either -- they do not fail in a way that
+        produces a Bluetooth boundary, so they would be permanent green.
+
+        WHY UnavailablePorts DOES NOT SET A HEALTH HERE. A registered port that
+        will not open is already judged, with the FI-012 hedge, by
+        Get-ProbeStateConsistency. Judging it a second time in this function
+        would be two pieces of code independently answering one question -- the
+        channel-mismatch class. It travels as EVIDENCE on the PortHold node so a
+        reader sees it, and the verdict stays with the single answerer.
+    .PARAMETER StreamState
+        'Active' (a port is held) / 'Stopped' / 'DisabledBySetting' / 'Unknown'.
+    .PARAMETER PortHoldObserved
+        $false only when the active port-open probe is disabled by setting.
+    .PARAMETER IoObserved
+        $false when the read-rate API could not be initialised. Note this is
+        INDEPENDENT of PortHoldObserved: read-rate sampling reads NO.exe's own
+        counters and opens no port, so it survives the non-intrusive arm and is
+        the only data-flow channel left there.
+    .OUTPUTS
+        PSCustomObject (PSTypeName WinConfig.FlightRecorder.DiagnosticChain).
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$DeviceState,
+        [string]$ComPortState,
+        [AllowEmptyCollection()][array]$ComPortNames = @(),
+        [string]$BtLinkState,
+        [string]$StreamState,
+        [AllowEmptyCollection()][array]$HeldPorts = @(),
+        [AllowEmptyCollection()][array]$UnavailablePorts = @(),
+        [System.Nullable[bool]]$AppRunning,
+        [bool]$BtLinkEverConnected = $false,
+        [bool]$PortHoldObserved = $true,
+        [string]$IoVerdict = 'NoBaseline',
+        [bool]$IoObserved = $true,
+        [int]$IoSamplesTotal = 0,
+        [System.Nullable[double]]$IoFractionOfBaseline,
+        [System.Nullable[double]]$IoRecentOpsPerSecond,
+        [System.Nullable[double]]$IoBaselineOpsPerSecond,
+        [hashtable]$AdapterInfo
+    )
+
+    $held = @($HeldPorts | Where-Object { $_ })
+    $dead = @($UnavailablePorts | Where-Object { $_ })
+    $ports = @($ComPortNames | Where-Object { $_ })
+
+    # Local builder. Evidence entries carry their OWN kind rather than
+    # inheriting the node's Observation, because a single node routinely mixes
+    # them: the port-hold node states an observation AND the inference drawn
+    # from it AND the caveat that the inference does not reach EEG.
+    # Local, NOT script:-scoped. A script:-scoped inner function would be
+    # redefined into module scope on every call and would outlive this one.
+    function New-ChainEvidence { param([string]$Kind, [string]$Text)
+        return [pscustomobject]@{ Kind = $Kind; Text = $Text }
+    }
+
+    $nodes = New-Object System.Collections.ArrayList
+
+    # ── 1. Adapter ────────────────────────────────────────────────────────────
+    # Historical by construction: AdapterInfo is collected ONCE, at recording
+    # start. Saying 'Observed' would claim a live reading the recorder does not
+    # take on every tick.
+    $adapterHealth = 'Unknown'
+    $adapterObs    = 'NotObserved'
+    $adapterDetail = 'Not read'
+    $adapterEv     = @()
+    if ($AdapterInfo) {
+        $adapterObs = 'Historical'
+        $adapterName = if ($AdapterInfo.FriendlyName) { $AdapterInfo.FriendlyName } else { 'Bluetooth adapter' }
+        if (-not $AdapterInfo.Present) {
+            $adapterHealth = 'Failed'
+            $adapterDetail = 'Not found'
+            $adapterEv += (New-ChainEvidence 'Historical' 'No Bluetooth adapter was found on this PC when the recording started.')
+        } elseif ($AdapterInfo.Enabled) {
+            $adapterHealth = 'Healthy'
+            $adapterDetail = 'OK'
+            $adapterEv += (New-ChainEvidence 'Historical' "$adapterName reported status OK when the recording started.")
+        } else {
+            $adapterHealth = 'Failed'
+            $adapterDetail = "Status $($AdapterInfo.Status)"
+            $adapterEv += (New-ChainEvidence 'Historical' "$adapterName reported status '$($AdapterInfo.Status)' when the recording started.")
+        }
+        if ($AdapterInfo.DriverInfo -and $AdapterInfo.DriverInfo.Version) {
+            $adapterEv += (New-ChainEvidence 'Historical' "Driver $($AdapterInfo.DriverInfo.Version).")
+        }
+        $adapterEv += (New-ChainEvidence 'NotObserved' 'Read once at the start of the recording, not on every check. An adapter that failed mid-session is not reflected here.')
+    } else {
+        $adapterEv += (New-ChainEvidence 'NotObserved' 'Adapter information was not collected for this recording.')
+    }
+    [void]$nodes.Add(@{
+        Id = 'Adapter'; Title = 'Bluetooth adapter'; EdgeLabel = $null; DependsOn = @()
+        Health = $adapterHealth; Observation = $adapterObs; Detail = $adapterDetail; Evidence = $adapterEv
+    })
+
+    # ── 2. Pairing ────────────────────────────────────────────────────────────
+    # 'Unconfigured' means paired but with no COM ports assigned. The PAIRING
+    # step succeeded, so it stays green here and the ComPorts node below carries
+    # the failure. Reporting one fact at two nodes would double-count a single
+    # cause -- which is what this whole function is built to stop.
+    $pairHealth = 'Unknown'; $pairEv = @()
+    switch ($DeviceState) {
+        'PairedCandidate' { $pairHealth = 'Healthy' }
+        'Configured'      { $pairHealth = 'Healthy' }
+        'Unconfigured'    { $pairHealth = 'Healthy' }
+        'Ambiguous'       { $pairHealth = 'Degraded' }
+        'SeenByPnp'       { $pairHealth = 'Failed' }
+        'Missing'         { $pairHealth = 'Failed' }
+        default           { $pairHealth = 'Unknown' }
+    }
+    $pairText = Get-ProbeStateUserText -Kind device -State $DeviceState -Short
+    $pairEv += (New-ChainEvidence 'Observed' (Get-ProbeStateUserText -Kind device -State $DeviceState))
+    if ($pairHealth -eq 'Healthy') {
+        $pairEv += (New-ChainEvidence 'Inferred' 'Windows holds a pairing record for this headset. That is a stored key, not a live connection.')
+    }
+    [void]$nodes.Add(@{
+        Id = 'Pairing'; Title = 'Headset paired'; EdgeLabel = 'adapter present -> Windows pairing record'; DependsOn = @('Adapter')
+        Health = $pairHealth; Observation = 'Observed'; Detail = $pairText; Evidence = $pairEv
+    })
+
+    # ── 3. COM ports registered ───────────────────────────────────────────────
+    # HISTORICAL even when green. This is the single most over-read fact in the
+    # whole recorder: registered ports are what a PREVIOUS successful pairing
+    # left behind, and they persist through a flat battery, a headset in a
+    # drawer, and a driver that has stopped working.
+    $comHealth = 'Unknown'; $comEv = @()
+    switch ($ComPortState) {
+        'ComPortFound'        { $comHealth = 'Healthy' }
+        'ComPortAmbiguous'    { $comHealth = 'Healthy' }
+        'ComPortMissing'      { $comHealth = 'Failed' }
+        'ComPortUnconfigured' { $comHealth = 'Unknown' }
+        default               { $comHealth = 'Unknown' }
+    }
+    $comDetail = if ($ports.Count -gt 0) { $ports -join ', ' } else { Get-ProbeStateUserText -Kind comport -State $ComPortState -Short }
+    $comEv += (New-ChainEvidence 'Observed' (Get-ProbeStateUserText -Kind comport -State $ComPortState))
+    if ($ports.Count -gt 0) { $comEv += (New-ChainEvidence 'Observed' "Registered: $($ports -join ', ').") }
+    if ($comHealth -eq 'Healthy') {
+        $comEv += (New-ChainEvidence 'Historical' 'A registered COM port is what a previous successful pairing left behind. It survives a flat battery, a headset in a drawer and a broken driver, so it does NOT show that anything is connected now.')
+    }
+    [void]$nodes.Add(@{
+        Id = 'ComPorts'; Title = 'COM ports registered'; EdgeLabel = 'pairing record -> virtual serial ports'; DependsOn = @('Pairing')
+        Health = $comHealth; Observation = 'Historical'; Detail = $comDetail; Evidence = $comEv
+    })
+
+    # ── 4. Radio link ─────────────────────────────────────────────────────────
+    # THE FI-012 TRAP LIVES HERE. 'NotConnected' on its own is NOT a fault: SPP
+    # holds no profile open, so an idle Arc that is working perfectly reads
+    # disconnected, and during the FI-012 field case IsConnected read False while
+    # both ports opened fine. It is only a failure when something else contradicts
+    # it -- a port is held (something believes it has a session), or this
+    # recording already saw the link UP and it has since gone (a drop, which no
+    # power switch explains).
+    $linkHealth = 'Unknown'; $linkObs = 'Observed'; $linkEv = @()
+    $linkDetail = Get-ProbeStateUserText -Kind btlink -State $BtLinkState -Short
+    if ($BtLinkState -eq 'Connected') {
+        $linkHealth = 'Healthy'
+        $linkEv += (New-ChainEvidence 'Observed' 'The Bluetooth radio reports an active link to this headset.')
+    } elseif ($BtLinkState -eq 'NotConnected') {
+        if ($StreamState -eq 'Active') {
+            $linkHealth = 'Failed'
+            $linkEv += (New-ChainEvidence 'Observed' 'The radio reports no link to this headset, while a process is holding its COM port.')
+            $linkEv += (New-ChainEvidence 'Inferred' 'Something believes it has a session over a link that is not there. This is the shape "Arc not detected" takes from the OS side.')
+        } elseif ($BtLinkEverConnected) {
+            $linkHealth = 'Failed'
+            $linkEv += (New-ChainEvidence 'Observed' 'The radio reports no link now, but it DID report one earlier in this same recording.')
+            $linkEv += (New-ChainEvidence 'Inferred' 'A link that was up and is now down is a drop. Being switched off does not explain a link that existed minutes ago.')
+        } else {
+            $linkHealth = 'Idle'
+            $linkEv += (New-ChainEvidence 'Observed' 'The radio reports no active link to this headset.')
+            $linkEv += (New-ChainEvidence 'Inferred' 'This is NORMAL between sessions. This headset holds no Bluetooth profile open while idle, so a healthy Arc sitting on the desk reads exactly like this. It is only a fault if it happens DURING a session.')
+        }
+    } else {
+        $linkHealth = 'Unknown'; $linkObs = 'NotObserved'
+        $linkEv += (New-ChainEvidence 'NotObserved' 'The radio link state could not be read. This check needs administrator rights and a discovered device.')
+    }
+    [void]$nodes.Add(@{
+        Id = 'RadioLink'; Title = 'Live radio link'; EdgeLabel = 'pairing record -> live wireless link'; DependsOn = @('Adapter', 'Pairing')
+        Health = $linkHealth; Observation = $linkObs; Detail = $linkDetail; Evidence = $linkEv
+    })
+
+    # ── 5. Application ────────────────────────────────────────────────────────
+    # Idle, never Failed. NeurOptimal not being open is an operator state, not a
+    # defect, and it is the correct EXPLANATION for an idle port below.
+    $appHealth = 'Unknown'; $appDetail = 'Unknown'; $appEv = @()
+    if ($AppRunning -eq $true) {
+        $appHealth = 'Healthy'; $appDetail = 'Running'
+        $appEv += (New-ChainEvidence 'Observed' 'NeurOptimal is running.')
+    } elseif ($AppRunning -eq $false) {
+        $appHealth = 'Idle'; $appDetail = 'Not running'
+        $appEv += (New-ChainEvidence 'Observed' 'NeurOptimal is not running.')
+        $appEv += (New-ChainEvidence 'Inferred' 'Nothing below this point can happen while the application is closed. This is expected before a session starts -- it is not a fault.')
+    } else {
+        $appEv += (New-ChainEvidence 'NotObserved' 'The process list could not be read.')
+    }
+    [void]$nodes.Add(@{
+        # DependsOn is EMPTY, and that is the whole reason this function models
+        # dependencies instead of a single spine. NeurOptimal runs perfectly well
+        # with no radio link and no headset. Chaining it under the link would
+        # report "NeurOptimal not running" as a CONSEQUENCE of a Bluetooth
+        # failure, which is a false causal claim on the one screen an operator
+        # uses to choose a remedy.
+        Id = 'App'; Title = 'NeurOptimal running'; EdgeLabel = 'operator starts NeurOptimal'; DependsOn = @()
+        Health = $appHealth; Observation = $(if ($null -eq $AppRunning) { 'NotObserved' } else { 'Observed' }); Detail = $appDetail; Evidence = $appEv
+    })
+
+    # ── 6. Port ownership ─────────────────────────────────────────────────────
+    $holdHealth = 'Unknown'; $holdObs = 'Observed'; $holdEv = @()
+    $holdDetail = Get-ProbeStateUserText -Kind stream -State $StreamState -Short
+    if (-not $PortHoldObserved) {
+        # The chain STOPS here in the non-intrusive arm, and that is correct.
+        # Nothing looked. Reporting a boundary further down would be asserting
+        # the health of a link no sensor read.
+        $holdHealth = 'Unknown'; $holdObs = 'NotObserved'
+        $holdDetail = 'Not observed'
+        $holdEv += (New-ChainEvidence 'NotObserved' 'The active port-open probe is DISABLED by setting for this recording, so nothing checked whether a process is holding the headset''s COM port. This is not a report that the port is idle.')
+        $holdEv += (New-ChainEvidence 'NotObserved' 'The chain cannot be evaluated past this point from port ownership. Read-rate below is a separate sensor and is still running.')
+    } elseif ($StreamState -eq 'Active') {
+        $holdHealth = 'Healthy'
+        $holdDetail = if ($held.Count -gt 0) { "Held ($($held -join ', '))" } else { 'Held' }
+        $holdEv += (New-ChainEvidence 'Observed' "A process is holding $(if ($held.Count -gt 0) { $held -join ', ' } else { 'the headset''s COM port' }).")
+        $holdEv += (New-ChainEvidence 'Inferred' 'A held port means some process believes it has a session. It does NOT mean data is flowing: NeurOptimal keeps the port open whether or not the headset sends a single sample.')
+    } elseif ($StreamState -eq 'Stopped') {
+        $holdHealth = 'Idle'
+        $holdEv += (New-ChainEvidence 'Observed' 'No process is holding the headset''s COM port.')
+    } else {
+        $holdHealth = 'Unknown'; $holdObs = 'NotObserved'
+        $holdEv += (New-ChainEvidence 'NotObserved' "Port ownership state '$StreamState' could not be interpreted.")
+    }
+    # Evidence, deliberately NOT a verdict -- see the header note. The single
+    # answerer for whether a dead port is a fault is Get-ProbeStateConsistency,
+    # which applies the FI-012 hedge that a switched-off headset and a broken
+    # serial stack are indistinguishable from the error alone.
+    if ($dead.Count -gt 0) {
+        $holdEv += (New-ChainEvidence 'Observed' "$($dead -join ', ') is registered but did not open when tested. Whether that is a fault depends on the headset's power state -- see the cross-check findings in the log; this chain does not judge it.")
+    }
+    [void]$nodes.Add(@{
+        # Three dependencies merging. This is where the transport branch and the
+        # application branch join, and it is the first node that can honestly be
+        # called a consequence of either.
+        Id = 'PortHold'; Title = 'COM port held'; EdgeLabel = 'live link + application -> owns the serial port'; DependsOn = @('ComPorts', 'RadioLink', 'App')
+        Health = $holdHealth; Observation = $holdObs; Detail = $holdDetail; Evidence = $holdEv
+    })
+
+    # ── 7. Data flow ──────────────────────────────────────────────────────────
+    # Read-rate is NOT gated on the port-hold probe. It samples NO.exe's own I/O
+    # counters and opens nothing, so it is the sensor that survives the
+    # non-intrusive arm -- the only corroboration left there.
+    $dataHealth = 'Unknown'; $dataObs = 'Observed'; $dataDetail = 'Unknown'; $dataEv = @()
+    if (-not $IoObserved) {
+        $dataObs = 'NotObserved'; $dataDetail = 'Not observed'
+        $dataEv += (New-ChainEvidence 'NotObserved' 'Read-rate monitoring was unavailable for this recording, so data flow was never assessed.')
+    } else {
+        switch ($IoVerdict) {
+            'Streaming'  { $dataHealth = 'Healthy';  $dataDetail = 'Reads steady' }
+            'Degrading'  { $dataHealth = 'Degraded'; $dataDetail = 'Reads falling' }
+            'Collapsed'  { $dataHealth = 'Failed';   $dataDetail = 'Reads collapsed' }
+            'NoBaseline' { $dataHealth = 'Unknown';  $dataDetail = 'No baseline yet' }
+            default      { $dataHealth = 'Unknown';  $dataDetail = $IoVerdict }
+        }
+        if ($IoVerdict -eq 'NoBaseline') {
+            $dataEv += (New-ChainEvidence 'NotObserved' "No read-rate baseline has been established yet ($IoSamplesTotal sample(s) so far). A baseline needs a stretch of steady reading to compare against.")
+        } else {
+            $rateText = ''
+            if ($null -ne $IoRecentOpsPerSecond -and $null -ne $IoBaselineOpsPerSecond) {
+                $rateText = " ($([Math]::Round([double]$IoRecentOpsPerSecond,1))/s against a $([Math]::Round([double]$IoBaselineOpsPerSecond,1))/s baseline)"
+            }
+            $dataEv += (New-ChainEvidence 'Observed' "NeurOptimal's read-operation rate$rateText.")
+            if ($null -ne $IoFractionOfBaseline) {
+                $dataEv += (New-ChainEvidence 'Observed' "That is $([Math]::Round([double]$IoFractionOfBaseline * 100))% of the level this session established for itself.")
+            }
+            $dataEv += (New-ChainEvidence 'Inferred' 'This counts READ OPERATIONS by NeurOptimal, not EEG samples. It is a proxy for the serial path being alive, measured from outside the application.')
+        }
+    }
+    [void]$nodes.Add(@{
+        Id = 'DataFlow'; Title = 'Data arriving'; EdgeLabel = 'owns the port -> bytes actually being read'; DependsOn = @('PortHold')
+        Health = $dataHealth; Observation = $dataObs; Detail = $dataDetail; Evidence = $dataEv
+    })
+
+    # ── 8. EEG ────────────────────────────────────────────────────────────────
+    # Always NotMeasurable, and that is the point of including it. Everything
+    # above going green is routinely read as "the session is fine". It is not:
+    # nothing in this tool validates EEG content, and a node that says so in the
+    # chain is the only place a reader will meet that limit at the moment they
+    # are drawing the conclusion.
+    [void]$nodes.Add(@{
+        Id = 'Eeg'; Title = 'Valid EEG signal'; EdgeLabel = 'bytes read -> usable EEG'; DependsOn = @('DataFlow')
+        Health = 'Unknown'; Observation = 'NotMeasurable'; Detail = 'Not measurable'
+        Evidence = @(
+            (New-ChainEvidence 'NotMeasurable' 'This tool cannot read or validate EEG content. The port is owned by NeurOptimal, and opening it to look would take it away from the application.')
+            (New-ChainEvidence 'NotMeasurable' 'Every step above being green does NOT prove the EEG signal is good. It proves the transport underneath it is.')
+        )
+    })
+
+    # ── Root-cause walk ───────────────────────────────────────────────────────
+    # A DEPENDENCY walk, not a positional one. The first version of this scanned
+    # the display list for the first non-Healthy node and blamed everything after
+    # it -- which marked "NeurOptimal not running" a consequence of a dead radio
+    # link. It is not: the application has no Bluetooth dependency at all. A
+    # false causal claim on the one screen an operator uses to pick a remedy is
+    # worse than the five-independent-indicators problem this replaces.
+    #
+    # ROOT: a node that is not Healthy while every node it depends on IS.
+    # BLOCKED: a node that is not Healthy and has at least one non-Healthy
+    # dependency, so its own reading is explained from above.
+    $byId = @{}
+    foreach ($n in $nodes) { $byId[$n.Id] = $n }
+
+    $roots = New-Object System.Collections.ArrayList
+    foreach ($n in $nodes) {
+        $n.BlockedBy = $null
+        if ($n.Health -eq 'Healthy') { continue }
+        # First unhealthy dependency IN DECLARED ORDER, so the named cause is
+        # stable across ticks rather than depending on hashtable enumeration.
+        $badDep = $null
+        foreach ($depId in @($n.DependsOn)) {
+            if ($byId.ContainsKey($depId) -and $byId[$depId].Health -ne 'Healthy') { $badDep = $depId; break }
+        }
+        if ($badDep) { $n.BlockedBy = $badDep } else { [void]$roots.Add($n) }
+    }
+
+    $blocked  = @($nodes | Where-Object { $_.BlockedBy } | ForEach-Object { $_.Id })
+    $verified = @($nodes | Where-Object { $_.Health -eq 'Healthy' } | ForEach-Object { $_.Id })
+
+    # Which root to headline. Severity first so a real failure is never hidden
+    # behind an idle sibling branch, display order as the tie-break so the answer
+    # does not flicker between two equally-severe roots from tick to tick.
+    #
+    # The EEG node ranks BELOW idle deliberately: it is only ever a root when
+    # everything measurable is green, and in that state the honest headline is
+    # "this tool cannot see further", not "EEG is a problem".
+    $severity = @{ 'Failed' = 4; 'Degraded' = 3; 'Unknown' = 2; 'Idle' = 1 }
+    $boundaryNode = $null
+    $bestRank = -1
+    foreach ($r in $roots) {
+        $rank = if ($r.Observation -eq 'NotMeasurable') { 0 }
+                elseif ($severity.ContainsKey($r.Health)) { $severity[$r.Health] }
+                else { 2 }
+        if ($rank -gt $bestRank) { $bestRank = $rank; $boundaryNode = $r }
+    }
+    # Defensive: Eeg is always non-Healthy, so there is always at least one root.
+    # If a future edit makes every node Healthy, headline the last node rather
+    # than dereferencing $null.
+    if (-not $boundaryNode) { $boundaryNode = $nodes[$nodes.Count - 1] }
+
+    # Localization: WHY the chain stops, which is a different question from what
+    # the boundary node's health is. An operator needs to know whether they are
+    # looking at a fault, at an expected idle state, or at a sensor nobody read.
+    $localization = switch ($boundaryNode.Health) {
+        'Failed'   { 'Failure' }
+        'Degraded' { 'Degrading' }
+        'Idle'     { 'Idle' }
+        default    { if ($boundaryNode.Observation -eq 'NotMeasurable') { 'LimitOfTool' } else { 'NotObserved' } }
+    }
+
+    # Discrete, and about the LOCALIZATION claim rather than about the world. A
+    # boundary the probe watched directly is a strong claim; a boundary that is
+    # just where the readings ran out is a weak one. No numeric score: nothing
+    # here computes a calibrated probability, and printing 0.95 would invent one.
+    $confidence = if ($boundaryNode.Health -eq 'Failed' -and $boundaryNode.Observation -eq 'Observed') { 'High' }
+                  elseif ($boundaryNode.Health -in @('Degraded', 'Idle') -and $boundaryNode.Observation -eq 'Observed') { 'Medium' }
+                  else { 'Low' }
+
+    # THE EDGE LABEL IS THE BOUNDARY STATEMENT. "pairing record -> live wireless
+    # link" already names the verified side and the unverified side, so a
+    # "verified through X" preamble in front of it is the same fact twice.
+    #
+    # The verified SET is not enumerated in the sentence either. It is the set of
+    # green chips directly above, and re-listing seven of them pushed this line
+    # to three dense rows -- at which point the conclusion an operator needs is
+    # buried in a restatement of the picture they can already see. The counts
+    # stay, because "6 of 8" is the part the chips do not say at a glance.
+    $verifiedCount = $verified.Count
+    $totalCount    = $nodes.Count
+
+    $summary = switch ($localization) {
+        'Failure'     { "FIRST FAILING STEP: $($boundaryNode.EdgeLabel).  ($verifiedCount of $totalCount steps verified.)" }
+        'Degrading'   { "FIRST DEGRADING STEP: $($boundaryNode.EdgeLabel).  ($verifiedCount of $totalCount steps verified.)" }
+        'Idle'        { "Chain stops at '$($boundaryNode.Title)': $($boundaryNode.Detail) -- an expected idle state, not a fault.  ($verifiedCount of $totalCount verified.)" }
+        'LimitOfTool' { "All $verifiedCount measurable steps verified. '$($boundaryNode.Title)' is beyond what this tool can measure, so this is NOT proof the session is good." }
+        default       { "Chain stops at '$($boundaryNode.Title)': NOT OBSERVED -- nothing that depends on it is ruled in or out.  ($verifiedCount of $totalCount verified.)" }
+    }
+    # A second root is reported rather than dropped. Two independent branches
+    # being down at once is a materially different situation from one, and the
+    # headline can only carry one of them.
+    #
+    # NotMeasurable roots are excluded here. The EEG node is a root on every
+    # healthy tick, so listing it in this clause would put the same sentence on
+    # screen permanently and train readers to skip the clause -- at which point
+    # it stops delivering the second root it exists for. Its caveat is not lost:
+    # when everything measurable IS healthy, EEG becomes the headline boundary
+    # and the caveat is the whole summary, which is the moment it matters.
+    $otherRoots = @($roots | Where-Object { $_.Id -ne $boundaryNode.Id -and $_.Observation -ne 'NotMeasurable' })
+    if ($otherRoots.Count -gt 0) {
+        $otherTitles = @($otherRoots | ForEach-Object { "$($_.Title) ($($_.Detail))" })
+        $summary += " Also unverified, independently: $($otherTitles -join ', ')."
+    }
+    # Counted, not listed. Which steps are consequences is already carried by the
+    # dimmed chips; what the sentence has to add is that they are consequences at
+    # all -- the "four problems" reading this whole function exists to prevent.
+    if ($blocked.Count -gt 0) {
+        $stepWord = if ($blocked.Count -eq 1) { 'step below is a consequence' } else { 'steps below are consequences' }
+        $summary += " $($blocked.Count) $stepWord of this, not separate problems."
+    }
+
+    $nodeObjects = @($nodes | ForEach-Object {
+        [pscustomobject]@{
+            PSTypeName   = 'WinConfig.FlightRecorder.DiagnosticChainNode'
+            Id           = $_.Id
+            Title        = $_.Title
+            EdgeLabel    = $_.EdgeLabel
+            DependsOn    = @($_.DependsOn)
+            Health       = $_.Health
+            Observation  = $_.Observation
+            Detail       = $_.Detail
+            BlockedBy    = $_.BlockedBy
+            IsRoot       = ($null -eq $_.BlockedBy -and $_.Health -ne 'Healthy')
+            Evidence     = @($_.Evidence)
+        }
+    })
+
+    return [pscustomobject]@{
+        PSTypeName      = 'WinConfig.FlightRecorder.DiagnosticChain'
+        Nodes           = $nodeObjects
+        # No leading comma on these. The `,@()` idiom guards against PowerShell
+        # unrolling a single-element array on RETURN from a function; a property
+        # assignment does not unroll, so the comma here would nest each list
+        # inside a one-element wrapper and every consumer joining it would print
+        # System.Object[].
+        VerifiedNodeIds = $verified
+        RootNodeIds     = @($roots | ForEach-Object { $_.Id })
+        BoundaryNodeId  = $boundaryNode.Id
+        BoundaryEdge    = $boundaryNode.EdgeLabel
+        BlockedNodeIds  = $blocked
+        Localization    = $localization
+        Confidence      = $confidence
+        Summary         = $summary
+    }
+}
+
+# =============================================================================
 # OPERATOR MARKERS
 # =============================================================================
 
@@ -4992,6 +5490,11 @@ Export-ModuleMember -Function @(
     'Get-ActivePortOpenProbeSetting',
     'Test-ActivePortOpenProbeEnabled',
     'Get-ProbeStateConsistency',
+    # The failure-boundary chain. Exported because the window, the persisted
+    # chain.jsonl and the tests must all read ONE computation of "where does the
+    # verified part of the chain end" -- deriving it a second time at the render
+    # site is the channel-mismatch class this repo keeps re-filing.
+    'Get-BtDiagnosticChain',
     'Initialize-ProcessIoApi',
     'Get-ProcessIoSample',
     'Add-IoReadRateSample',

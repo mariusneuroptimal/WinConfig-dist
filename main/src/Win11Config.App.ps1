@@ -4669,39 +4669,64 @@ $buttonHandlers = @{
             $btAnomalyInvestBtn.Add_Click({ $script:BtAnomaly_Resolved = $true; $script:BtAnomaly_IsExpected = $false })
             $btAnomalyBar.Controls.Add($btAnomalyInvestBtn)
 
-            # Device status strip (5 compact state indicators, flow layout)
-            $btStateStrip = New-Object System.Windows.Forms.FlowLayoutPanel
-            $btStateStrip.Dock = [System.Windows.Forms.DockStyle]::Top
-            $btStateStrip.Height = 32
-            $btStateStrip.BackColor = [System.Drawing.Color]::FromArgb(25, 25, 30)
-            $btStateStrip.Visible = $false
-            $btStateStrip.WrapContents = $false
-            $btStateStrip.Padding = New-Object System.Windows.Forms.Padding(4, 0, 0, 0)
-            $btForm.Controls.Add($btStateStrip)
+            # ── Diagnostic chain strip ────────────────────────────────────────
+            #
+            # REPLACES the five independent state indicators that used to live
+            # here (Device / COM / Radio / Port / NO.exe). They were rendered as
+            # five equals, and they are not equals: when the radio link is down,
+            # the port reading and everything under it are CONSEQUENCES. An
+            # operator reading five indicators counted four problems where there
+            # was one cause and three effects, and picked a remedy from the wrong
+            # layer.
+            #
+            # The strip is not kept alongside the chain. Two on-screen renderers
+            # of one question is the channel-mismatch class this repo has filed
+            # nine instances of -- the moment they disagree, the one a human
+            # happens to read wins. Get-BtDiagnosticChain is the single answerer
+            # and this panel is a renderer of it.
+            #
+            # WrapContents is TRUE on the node row, deliberately. Eight chips do
+            # not fit one line on a scaled display, and this form's history is of
+            # controls clipping rather than reflowing (#64).
+            $btChainPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+            $btChainPanel.Dock = [System.Windows.Forms.DockStyle]::Top
+            $btChainPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $btChainPanel.WrapContents = $false
+            $btChainPanel.AutoSize = $true
+            $btChainPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btChainPanel.BackColor = [System.Drawing.Color]::FromArgb(25, 25, 30)
+            $btChainPanel.Padding = New-Object System.Windows.Forms.Padding(8, 5, 8, 6)
+            $btChainPanel.Visible = $false
+            $btForm.Controls.Add($btChainPanel)
 
-            $btStateLabels = @{}
-            $stateIndicators = @(
-                @{ Key = 'Device';  Text = 'Device: --' }
-                @{ Key = 'COM';     Text = 'COM: --' }
-                @{ Key = 'Link';    Text = 'Radio: --' }
-                # Reads "Port open" / "Port idle" -- the short state text is already
-                # self-describing, so no "Stream:" prefix (which asserted data flow
-                # the probe never measured).
-                @{ Key = 'Stream';  Text = 'Port: --' }
-                @{ Key = 'App';     Text = 'NO.exe: --' }
-            )
-            foreach ($ind in $stateIndicators) {
-                $lbl = New-Object System.Windows.Forms.Label
-                $lbl.Text = $ind.Text
-                $lbl.AutoSize = $true
-                $lbl.Height = 22
-                $lbl.Margin = New-Object System.Windows.Forms.Padding(4, 5, 8, 0)
-                $lbl.Font = New-Object System.Drawing.Font("Consolas", 8)
-                $lbl.ForeColor = [System.Drawing.Color]::FromArgb(180, 180, 180)
-                $lbl.TextAlign = "MiddleLeft"
-                $btStateStrip.Controls.Add($lbl)
-                $btStateLabels[$ind.Key] = $lbl
-            }
+            $btChainRow = New-Object System.Windows.Forms.FlowLayoutPanel
+            $btChainRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+            $btChainRow.WrapContents = $true
+            $btChainRow.AutoSize = $true
+            $btChainRow.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btChainRow.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 4)
+            $btChainPanel.Controls.Add($btChainRow)
+
+            # The failure boundary, in a sentence. This is the highest-value line
+            # in the window: "verified through X, first failing step Y" is what a
+            # clinic tech can act on and what a remote assistant can triage from a
+            # screenshot. Bold and full width, because it is the conclusion and
+            # everything above it is the working.
+            $btBoundaryLabel = New-Object System.Windows.Forms.Label
+            $btBoundaryLabel.Text = "Diagnostic chain: (starting...)"
+            $btBoundaryLabel.AutoSize = $true
+            $btBoundaryLabel.Margin = New-Object System.Windows.Forms.Padding(2, 0, 0, 2)
+            $btBoundaryLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+            $btBoundaryLabel.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+            $btChainPanel.Controls.Add($btBoundaryLabel)
+
+            # Node chips are created ONCE, on the first render, keyed by the node
+            # ids the module hands back -- so the module owns the node set and
+            # this file never carries a second copy of it. Rebuilding controls
+            # every tick would also churn the UI thread, which is already this
+            # window's bottleneck.
+            $script:BtChain_NodeLabels = @{}
+            $script:BtChain_LastBoundaryKey = $null
 
             # Glossary for the five indicators above, on demand. These are the
             # terms operators misread -- particularly "Port open", which does NOT
@@ -4719,31 +4744,52 @@ $buttonHandlers = @{
             $btGlossaryBtn.Font = New-Object System.Drawing.Font("Segoe UI", 8)
             $btGlossaryBtn.Add_Click({
                 $g = @(
-                    "Device      Is the Bluetooth headset visible to Windows?"
+                    "THE CHAIN"
+                    "Each step depends on the ones before it. The bold line underneath"
+                    "says how far the chain is VERIFIED and which step is the first that"
+                    "is not. Click any step to see the raw evidence behind it."
                     ""
-                    "COM port    The virtual serial port NeurOptimal uses to receive EEG data."
+                    "WHAT THE MARKERS MEAN"
+                    "  [ok]            Checked and good."
+                    "  [!]             Checked and FAILING. This is a problem."
+                    "  [~]             Checked and getting worse."
+                    "  [idle]          Checked, and legitimately not active right now."
+                    "                  NOT a fault. A headset with no session running"
+                    "                  reads like this, and so does a closed NeurOptimal."
+                    "  [not observed]  NOTHING CHECKED THIS. It is not good and not bad;"
+                    "                  there is no reading. Do not read it as 'fine'."
+                    "  [n/a]           This tool cannot measure it at all."
                     ""
-                    "Radio link  The wireless connection to the headset."
-                    "            It is NORMAL for this to be off while idle."
-                    "            Dropping DURING an active session is the mid-session"
-                    "            disconnect event we are looking for."
+                    "A step shown dimmed with a leading dot is EXPLAINED BY a step above"
+                    "it -- a consequence, not a separate problem to chase."
                     ""
-                    "Port open   Is some process holding the headset's COM port right now?"
-                    "            This is NOT the same as data flowing. NeurOptimal keeps"
-                    "            the port open whether or not the headset is sending"
-                    "            anything, so a held port on its own proves nothing about"
-                    "            EEG data."
+                    "THE THREE THINGS THAT GET CONFUSED"
+                    "  Registered   COM ports exist. Left behind by an earlier successful"
+                    "               pairing. They survive a flat battery and a headset in"
+                    "               a drawer, so they prove nothing about right now."
+                    "  Radio link   The live wireless connection. It is NORMAL for this"
+                    "               to be off between sessions -- this headset holds no"
+                    "               Bluetooth profile open while idle. Dropping DURING a"
+                    "               session is the event we are hunting."
+                    "  Port held    Some process is holding the headset's COM port."
+                    "               This is NOT the same as data flowing. NeurOptimal"
+                    "               keeps the port open whether or not the headset sends"
+                    "               a single sample."
                     ""
-                    "NO.exe      Is the NeurOptimal application running?"
+                    "WHAT GREEN DOES NOT PROVE"
+                    "Every step going green does not prove the EEG signal is good. It"
+                    "proves the transport underneath it is. This tool cannot read EEG"
+                    "content -- the port belongs to NeurOptimal, and opening it to look"
+                    "would take it away from the application."
                     ""
-                    "USB suspend A Windows power-saving feature that can shut down the"
-                    "            Bluetooth radio mid-session."
+                    "USB suspend  A Windows power-saving feature that can shut down the"
+                    "             Bluetooth radio mid-session."
                 ) -join "`r`n"
-                [void][System.Windows.Forms.MessageBox]::Show($g, "What these indicators mean",
+                [void][System.Windows.Forms.MessageBox]::Show($g, "How to read the diagnostic chain",
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Information)
             })
-            $btStateStrip.Controls.Add($btGlossaryBtn)
+            $btChainPanel.Controls.Add($btGlossaryBtn)
 
             # ── Always-visible "what am I watching, and am I seeing it?" strip ──
             #
@@ -4973,6 +5019,71 @@ $buttonHandlers = @{
                 $dlg.Dispose()
             }
 
+            # Per-node evidence, on click. FACT AND INTERPRETATION ARE SEPARATED
+            # HERE, under their own headings, because the recorder's findings
+            # already mix them -- "the most likely reason by far is that the
+            # headset is switched off" is a useful sentence and it is not an
+            # observation. A reader who cannot tell which is which cannot judge
+            # how far to trust the conclusion, and this window is read by people
+            # deciding whether to re-pair a headset or send a machine away.
+            #
+            # script: scope and $this.Tag rather than a closure: an Add_Click
+            # scriptblock does not run in the scope it was written in, so a
+            # captured variable resolves to nothing at click time and the failure
+            # is a dead button on a field machine.
+            function script:Show-BtChainNodeDetail {
+                param($Owner, $Node)
+                if (-not $Node) { return }
+
+                $statusWord = switch ($Node.Health) {
+                    'Healthy'  { 'OK' }
+                    'Failed'   { 'FAILING' }
+                    'Degraded' { 'GETTING WORSE' }
+                    'Idle'     { 'IDLE (not a fault)' }
+                    default    {
+                        if ($Node.Observation -eq 'NotMeasurable') { 'NOT MEASURABLE BY THIS TOOL' }
+                        elseif ($Node.Observation -eq 'NotObserved') { 'NOT OBSERVED -- no reading was taken' }
+                        else { 'UNKNOWN' }
+                    }
+                }
+
+                $lines = New-Object System.Collections.ArrayList
+                [void]$lines.Add($Node.Title)
+                [void]$lines.Add(('-' * $Node.Title.Length))
+                [void]$lines.Add("State      : $($Node.Detail)")
+                [void]$lines.Add("Status     : $statusWord")
+                [void]$lines.Add("Reading    : $($Node.Observation)")
+                if ($Node.EdgeLabel) { [void]$lines.Add("This step  : $($Node.EdgeLabel)") }
+                if ($Node.BlockedBy) {
+                    [void]$lines.Add("")
+                    [void]$lines.Add("EXPLAINED BY: $($Node.BlockedBy)")
+                    [void]$lines.Add("This step depends on that one, so its state here is a consequence.")
+                    [void]$lines.Add("Fix the step above first; this is not a separate problem to chase.")
+                }
+
+                # Grouped by evidence kind rather than listed flat. The grouping
+                # IS the message.
+                $groups = @(
+                    @{ Kind = 'Observed';      Head = 'OBSERVED  (directly measured)' }
+                    @{ Kind = 'Inferred';      Head = 'INFERRED  (concluded from the above, not measured)' }
+                    @{ Kind = 'Historical';    Head = 'HISTORICAL  (true earlier; not re-checked just now)' }
+                    @{ Kind = 'NotObserved';   Head = 'NOT OBSERVED  (no reading exists)' }
+                    @{ Kind = 'NotMeasurable'; Head = 'BEYOND THIS TOOL' }
+                )
+                foreach ($grp in $groups) {
+                    $items = @($Node.Evidence | Where-Object { $_.Kind -eq $grp.Kind })
+                    if ($items.Count -eq 0) { continue }
+                    [void]$lines.Add("")
+                    [void]$lines.Add($grp.Head)
+                    foreach ($it in $items) { [void]$lines.Add("  - $($it.Text)") }
+                }
+
+                [void][System.Windows.Forms.MessageBox]::Show(
+                    ($lines -join "`r`n"), "Evidence: $($Node.Title)",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Information)
+            }
+
             # Refreshes the pinned identity/coverage strip from live session state.
             #
             # Reads the SAME Get-ProbeObservationCoverage the closing report is
@@ -4990,6 +5101,195 @@ $buttonHandlers = @{
             # inside a session rather than in the closing report.
             $btCoverageEscalateSec = 120
             $script:BtRec_NoRunningSince = $null
+
+            # Renders the diagnostic chain. A RENDERER ONLY -- every judgement
+            # here (which node is the root cause, which are consequences, how far
+            # the chain is verified) is made by Get-BtDiagnosticChain and read off
+            # the object. Nothing in this function decides anything, deliberately:
+            # a second place that works out what is wrong is a second place that
+            # can disagree with the first, and the one a human happens to be
+            # looking at wins.
+            function Update-BtChainPanel {
+                param($Chain)
+                if (-not $Chain -or -not $btChainPanel) { return }
+                if (-not $btChainPanel.Visible) { $btChainPanel.Visible = $true }
+
+                foreach ($node in $Chain.Nodes) {
+                    # Marker text AND colour, never colour alone. Roughly one man
+                    # in twelve cannot separate this palette's green from its red,
+                    # and these windows get read over a phone from a screenshot.
+                    $marker = switch ($node.Health) {
+                        'Healthy'  { '[ok]' }
+                        'Failed'   { '[!]' }
+                        'Degraded' { '[~]' }
+                        'Idle'     { '[idle]' }
+                        default    {
+                            if ($node.Observation -eq 'NotMeasurable') { '[n/a]' }
+                            elseif ($node.Observation -eq 'NotObserved') { '[not observed]' }
+                            else { '[?]' }
+                        }
+                    }
+                    $colour = switch ($node.Health) {
+                        'Healthy'  { [System.Drawing.Color]::FromArgb(70, 190, 90) }
+                        'Failed'   { [System.Drawing.Color]::FromArgb(235, 95, 95) }
+                        'Degraded' { [System.Drawing.Color]::FromArgb(225, 175, 55) }
+                        'Idle'     { [System.Drawing.Color]::FromArgb(150, 150, 150) }
+                        default    {
+                            # Blue-grey for "nobody looked", NOT the neutral grey
+                            # the measured-but-idle states use. Grey is what an
+                            # operator reads as "fine, nothing happening"; an
+                            # unread sensor must not look the same as a reading.
+                            if ($node.Observation -eq 'NotObserved') { [System.Drawing.Color]::FromArgb(120, 155, 205) }
+                            else { [System.Drawing.Color]::FromArgb(125, 125, 125) }
+                        }
+                    }
+
+                    $text = "$marker $($node.Title): $($node.Detail)"
+                    if ($node.BlockedBy) {
+                        # A consequence recedes. The leading dot carries it for
+                        # readers who cannot use the dimming.
+                        $text = ". $text"
+                        $colour = [System.Drawing.Color]::FromArgb(
+                            [int]($colour.R * 0.55), [int]($colour.G * 0.55), [int]($colour.B * 0.55))
+                    }
+
+                    $lbl = $script:BtChain_NodeLabels[$node.Id]
+                    if (-not $lbl) {
+                        $lbl = New-Object System.Windows.Forms.Label
+                        $lbl.AutoSize = $true
+                        $lbl.Margin = New-Object System.Windows.Forms.Padding(0, 2, 14, 2)
+                        $lbl.Font = New-Object System.Drawing.Font("Consolas", 8)
+                        $lbl.Cursor = [System.Windows.Forms.Cursors]::Hand
+                        $lbl.Add_Click({ script:Show-BtChainNodeDetail -Owner $this.FindForm() -Node $this.Tag })
+                        $btChainRow.Controls.Add($lbl)
+                        $script:BtChain_NodeLabels[$node.Id] = $lbl
+                    }
+                    # Tag carries the node for the click handler, which cannot see
+                    # this scope. Refreshed every render so a dialog opened at
+                    # 14:32 shows 14:32's evidence and not the first tick's.
+                    $lbl.Tag = $node
+                    if ($lbl.Text -ne $text) { $lbl.Text = $text }
+                    if ($lbl.ForeColor -ne $colour) { $lbl.ForeColor = $colour }
+                }
+
+                $bColour = switch ($Chain.Localization) {
+                    'Failure'     { [System.Drawing.Color]::FromArgb(255, 130, 130) }
+                    'Degrading'   { [System.Drawing.Color]::FromArgb(240, 195, 90) }
+                    'Idle'        { [System.Drawing.Color]::FromArgb(180, 180, 180) }
+                    'LimitOfTool' { [System.Drawing.Color]::FromArgb(150, 210, 165) }
+                    default       { [System.Drawing.Color]::FromArgb(150, 185, 235) }
+                }
+                if ($btBoundaryLabel.Text -ne $Chain.Summary) { $btBoundaryLabel.Text = $Chain.Summary }
+                if ($btBoundaryLabel.ForeColor -ne $bColour) { $btBoundaryLabel.ForeColor = $bColour }
+                # An AutoSize label in a FlowLayoutPanel does not wrap unless it is
+                # given a maximum width, and an unwrapped sentence this long forces
+                # the panel wider than the form -- the clipping failure mode #64
+                # was about. Recomputed each render so it survives a resize.
+                $maxW = $btChainPanel.ClientSize.Width - 24
+                if ($maxW -gt 100 -and $btBoundaryLabel.MaximumSize.Width -ne $maxW) {
+                    $btBoundaryLabel.MaximumSize = New-Object System.Drawing.Size($maxW, 0)
+                }
+            }
+
+            # Computes the chain from live session state, renders it, and
+            # persists it when it CHANGES. One function, called from the arrival
+            # snapshot and from the tick, so the inputs are assembled in exactly
+            # one place: two call sites each mapping session fields onto the
+            # module's parameters is two mappings that can drift, and a drift here
+            # would show the operator one chain and write another to the capture.
+            #
+            # PERSIST FIRST, RENDER SECOND, for the reason #87 established: a
+            # window closed without uploading used to leave nothing behind. The
+            # boundary is the single most useful thing to score a capture by --
+            # "what did this recorder believe was broken, and when did that
+            # change" -- and until now it did not exist in any file.
+            function Update-BtChain {
+                if (-not (Get-Command Get-BtDiagnosticChain -ErrorAction SilentlyContinue)) { return }
+                if (-not $btProbeWatch -or -not $btProbeSession) { return }
+
+                $portNames = @()
+                if ($btProbeWatch.ComPortMatches)          { $portNames += @($btProbeWatch.ComPortMatches          | ForEach-Object { $_.PortName }) }
+                if ($btProbeWatch.AmbiguousComPortMatches) { $portNames += @($btProbeWatch.AmbiguousComPortMatches | ForEach-Object { $_.PortName }) }
+                $portNames = @($portNames | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+
+                # $null, not $false, when the process channel produced no state.
+                # $false here is the claim "NeurOptimal is not running", and an
+                # unobserved claim is exactly what the chain's NotObserved rung
+                # exists to keep out.
+                $appRunning = switch ($btProbeWatch.AppProcessState) {
+                    'Running'    { $true }
+                    'NotRunning' { $false }
+                    default      { $null }
+                }
+
+                $chainArgs = @{
+                    DeviceState         = $btProbeWatch.DeviceState
+                    ComPortState        = $btProbeWatch.ComPortState
+                    ComPortNames        = $portNames
+                    BtLinkState         = $btProbeSession.BtLinkState
+                    StreamState         = $btProbeSession.StreamingState
+                    HeldPorts           = @($btProbeSession.HeldPorts | Where-Object { $_ })
+                    UnavailablePorts    = @($btProbeSession.UnavailablePorts | Where-Object { $_ })
+                    AppRunning          = $appRunning
+                    BtLinkEverConnected = [bool]$btProbeSession.BtLinkEverConnected
+                    # The locked setting, NOT a re-read of the environment. The
+                    # toggle is resolved once per run on purpose (#94); asking the
+                    # environment again here could disagree with the run's own
+                    # recorded arm.
+                    PortHoldObserved    = [bool]$btProbeSession.ActivePortOpenProbeEnabled
+                    IoObserved          = [bool]$btProbeSession.IoApiAvailable
+                    IoVerdict           = $btProbeSession.IoVerdict
+                    IoSamplesTotal      = [int]$btProbeSession.IoSamplesTotal
+                    AdapterInfo         = $btProbeSession.AdapterInfo
+                }
+                if ($null -ne $btProbeSession.IoFractionOfBaseline)   { $chainArgs.IoFractionOfBaseline   = [double]$btProbeSession.IoFractionOfBaseline }
+                if ($null -ne $btProbeSession.IoRecentOpsPerSecond)   { $chainArgs.IoRecentOpsPerSecond   = [double]$btProbeSession.IoRecentOpsPerSecond }
+                if ($null -ne $btProbeSession.IoBaselineOpsPerSecond) { $chainArgs.IoBaselineOpsPerSecond = [double]$btProbeSession.IoBaselineOpsPerSecond }
+
+                $chain = $null
+                try { $chain = Get-BtDiagnosticChain @chainArgs } catch { return }
+                if (-not $chain) { return }
+
+                # Keyed on the FULL node vector, not just the boundary. A node
+                # degrading below the boundary is a real change in what this
+                # recorder believes, and a file that only recorded boundary moves
+                # would render those ticks as "nothing happened".
+                $key = ($chain.Nodes | ForEach-Object {
+                    "$($_.Id)=$($_.Health)/$($_.Observation)/$(if ($_.BlockedBy) { $_.BlockedBy } else { '-' })"
+                }) -join ';'
+
+                if ($btDiagRun -and $key -ne $script:BtChain_LastBoundaryKey) {
+                    $wrote = Add-WinConfigDiagnosticJsonLine -RunFolder $btDiagRun.RunFolder -Name 'chain.jsonl' -Depth 6 -Data ([ordered]@{
+                        AtUtc          = (Get-Date).ToUniversalTime().ToString('o')
+                        BoundaryNodeId = $chain.BoundaryNodeId
+                        BoundaryEdge   = $chain.BoundaryEdge
+                        Localization   = $chain.Localization
+                        Confidence     = $chain.Confidence
+                        Verified       = @($chain.VerifiedNodeIds)
+                        Roots          = @($chain.RootNodeIds)
+                        Blocked        = @($chain.BlockedNodeIds)
+                        Summary        = $chain.Summary
+                        Nodes          = @($chain.Nodes | ForEach-Object {
+                            [ordered]@{ Id = $_.Id; Health = $_.Health; Observation = $_.Observation; BlockedBy = $_.BlockedBy; Detail = $_.Detail }
+                        })
+                        EpisodeId      = $btProbeSession.IoEpisodeId
+                        TickIndex      = [int]$btProbeSession.TickCount
+                    })
+                    if ($wrote) {
+                        $script:BtChain_LastBoundaryKey = $key
+                        $script:BtChain_LinesWritten = [int]$script:BtChain_LinesWritten + 1
+                    } else {
+                        # Counted, never silent -- a timeline with holes that reads
+                        # as complete is the same class of lie as an unmeasured
+                        # zero rendered as 0. The key is NOT advanced on a failed
+                        # write, so the next tick retries this state rather than
+                        # treating it as recorded.
+                        $script:BtChain_LinesDropped = [int]$script:BtChain_LinesDropped + 1
+                    }
+                }
+
+                Update-BtChainPanel -Chain $chain
+            }
 
             function Update-BtLiveCoverage {
                 if (-not $btIdentityPanel) { return }
@@ -5219,6 +5519,13 @@ $buttonHandlers = @{
             # in one app session does not inherit the first one's totals.
             $script:BtRec_EventLinesWritten = 0
             $script:BtRec_EventLinesDropped = 0
+            # chain.jsonl accounting, reset for the same reason. The change key
+            # is reset with them: carried over from a previous recording it would
+            # suppress the new run's opening chain line as "unchanged", and the
+            # capture would open with no boundary at all.
+            $script:BtChain_LinesWritten    = 0
+            $script:BtChain_LinesDropped    = 0
+            $script:BtChain_LastBoundaryKey = $null
             $btIdentityDetailLabel.Text = "Run ID: $btRunId    COM ports: not probed yet -- no reading has been taken"
             if (-not $btIdentityPanel.Visible) { $btIdentityPanel.Visible = $true }
 
@@ -5763,8 +6070,13 @@ $buttonHandlers = @{
                     @($initStream.HeldPorts | Where-Object { $_ }).Count -gt 0) { $btProbeSession.PortEverHeld = $true }
                 if ($initStream.State -eq 'Active') { $btProbeSession.StateEnteredAt['streaming_Active_at'] = Get-Date }
 
-                # Show status strip and initial state
-                $btStateStrip.Visible = $true
+                # Show the diagnostic chain and the initial state. Rendered from
+                # the ARRIVAL snapshot, before the first tick: a box that is
+                # already in a bad combination when Record is pressed produces no
+                # transitions at all, so a chain that only appeared on tick one
+                # would miss precisely the state the arrival cross-check exists
+                # for.
+                Update-BtChain
                 # Pin the target/coverage strip before the first tick, so the
                 # operator can check the headset identity BEFORE starting a
                 # session rather than discovering it in the closing report.
@@ -6211,26 +6523,10 @@ $buttonHandlers = @{
                             }
                         }
 
-                        # Update status strip
-                        $btStateLabels['Device'].Text = "Device: $(Get-ProbeStateUserText -Kind device -State $btProbeWatch.DeviceState -Short)"
-                        $btStateLabels['Device'].ForeColor = Get-ProbeStateColor $btProbeWatch.DeviceState
-                        $comText = Get-ProbeStateUserText -Kind comport -State $btProbeWatch.ComPortState -Short
-                        if ($btProbeWatch.ComPortState -in @('ComPortFound','ComPortAmbiguous')) {
-                            $portNames = @()
-                            if ($btProbeWatch.ComPortMatches.Count -gt 0) { $portNames += $btProbeWatch.ComPortMatches | ForEach-Object { $_.PortName } }
-                            if ($btProbeWatch.AmbiguousComPortMatches.Count -gt 0) { $portNames += $btProbeWatch.AmbiguousComPortMatches | ForEach-Object { $_.PortName } }
-                            $portNames = @($portNames | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
-                            if ($portNames.Count -gt 0) { $comText = $portNames -join ',' }
-                        }
-                        $btStateLabels['COM'].Text = "COM: $comText"
-                        $btStateLabels['COM'].ForeColor = Get-ProbeStateColor $btProbeWatch.ComPortState
-                        $btStateLabels['Link'].Text = "Radio: $(Get-ProbeStateUserText -Kind btlink -State $btProbeSession.BtLinkState -Short)"
-                        $btStateLabels['Link'].ForeColor = Get-ProbeStateColor $btProbeSession.BtLinkState
-                        $btStateLabels['Stream'].Text = "$(Get-ProbeStateUserText -Kind stream -State $btProbeSession.StreamingState -Short)"
-                        $btStateLabels['Stream'].ForeColor = Get-ProbeStateColor $btProbeSession.StreamingState
-                        $appState = $btProbeWatch.AppProcessState
-                        $btStateLabels['App'].Text = "NO.exe: $(if ($appState -eq 'Running') { 'Running' } else { 'Off' })"
-                        $btStateLabels['App'].ForeColor = Get-ProbeStateColor $appState
+                        # Diagnostic chain: compute, persist on change, render.
+                        # This replaced five independent indicators that showed a
+                        # single root cause as four separate problems.
+                        Update-BtChain
 
                         # Always-visible answer to "which headset is this watching,
                         # and is it actually seeing my session?" -- the two questions
@@ -7341,6 +7637,12 @@ $buttonHandlers = @{
                         # count nobody can check against anything.
                         EventTimelineLinesWritten = [int]$script:BtRec_EventLinesWritten
                         EventTimelineLinesDropped = [int]$script:BtRec_EventLinesDropped
+                        # chain.jsonl accounting, for the same reason. Zero
+                        # DiagnosticChainLinesWritten on a completed run means the
+                        # boundary was never recorded -- a capture that cannot be
+                        # scored for what the recorder believed was broken.
+                        DiagnosticChainLinesWritten = [int]$script:BtChain_LinesWritten
+                        DiagnosticChainLinesDropped = [int]$script:BtChain_LinesDropped
                         # ── The session-level answer ─────────────────────────
                         # Collapsed | Degraded | Stable | Unassessed, derived once
                         # in Get-IoSessionReadRateRecord and shared with the
