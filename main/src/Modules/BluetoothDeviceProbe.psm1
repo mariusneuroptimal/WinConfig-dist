@@ -795,6 +795,153 @@ function Test-IoReadCollapse {
 }
 
 # =============================================================================
+# ACTIVE PORT-OPEN PROBE SETTING (pre-registration section 5.3)
+# =============================================================================
+
+# The environment variable that selects the treatment for the hold-probe A-B-A
+# control. ONE published build, runtime-selected -- not a compile-time constant
+# and not a second artifact, because all three arms must run on a build whose
+# identity is byte-identical or the comparison is between two programs.
+#
+# Named for what it governs. It disables the ACTIVE OPENS specifically
+# (Get-ComPortHoldState, i.e. SerialPort.Open on a target port); passive
+# observation of the same fact must stay possible under any later mechanism, so
+# the name must not claim the whole subject of "hold probing".
+$script:ActivePortOpenProbeEnvVar = 'WINCONFIG_ACTIVE_PORT_OPEN_PROBE'
+
+function Get-ActivePortOpenProbeSetting {
+    <#
+    .SYNOPSIS
+        Reads the effective ActivePortOpenProbeEnabled setting ONCE, with the
+        provenance of the read attached.
+    .DESCRIPTION
+        Two requirements that pull in opposite directions, and both are honoured
+        here rather than being traded off:
+
+          1. A CLINIC capture must never be silently degraded by a config this
+             experiment introduced. So absent or unreadable => active opens
+             ENABLED, i.e. exactly today's behaviour.
+          2. An EXPERIMENTAL arm must never be scored when the toggle was not
+             demonstrably what the protocol said. So the read STATUS is recorded
+             beside the value, and anything but a clean explicit read invalidates
+             an arm (pre-registration section 3.4(2)).
+
+        A single boolean cannot serve both: `enabled` reached by default and
+        `enabled` reached by an operator typing it are the same behaviour and
+        completely different evidence. Hence SettingReadStatus.
+
+        This function does NOT cache. Caching would hide a mid-run change, and
+        the drift check at session end exists precisely to SEE one. The lock
+        against hot-switching lives in the session (New-DeviceProbeSession reads
+        this once and every gate reads the session), not in this function.
+    .PARAMETER RawValue
+        Override for the raw setting text, for tests. When bound -- including as
+        an empty string -- the environment is not consulted at all, so a test can
+        exercise the missing case without mutating the process environment.
+    .OUTPUTS
+        [pscustomobject] Enabled, SettingReadStatus, Source, RawValue, Reason.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][AllowNull()]
+        [string]$RawValue
+    )
+
+    $envName = $script:ActivePortOpenProbeEnvVar
+    $raw     = $null
+    $source  = "Environment:$envName"
+    $status  = 'DefaultedMissing'
+    $enabled = $true
+    $reason  = $null
+
+    if ($PSBoundParameters.ContainsKey('RawValue')) {
+        $raw    = $RawValue
+        $source = 'Explicit:RawValue'
+    } else {
+        try {
+            $raw = [System.Environment]::GetEnvironmentVariable($envName)
+        } catch {
+            # A genuine failure to READ, as opposed to a value that would not
+            # parse. Both default to enabled; they are different diagnoses and
+            # the operator needs to be able to tell them apart.
+            return [pscustomobject]@{
+                PSTypeName        = 'WinConfig.FlightRecorder.ActivePortOpenProbeSetting'
+                Enabled           = $true
+                SettingReadStatus = 'DefaultedError'
+                Source            = $source
+                RawValue          = $null
+                Reason            = "Could not read `$env:$envName ($($_.Exception.Message)); active port-open probe left ENABLED, which is the shipped default."
+            }
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        $status  = 'DefaultedMissing'
+        $enabled = $true
+        $reason  = "`$env:$envName is not set; active port-open probe ENABLED (shipped default)."
+    } else {
+        # Deliberately a CLOSED set with the common spellings in it. A closed set
+        # means a typo lands in DefaultedError where it is visible, instead of
+        # being coerced -- PowerShell would read the string 'false' as $true,
+        # which is the one wrong answer that looks like a right one.
+        switch -Regex ($raw.Trim()) {
+            '^(?i)(1|true|on|yes|enabled|enable)$'   { $status = 'Explicit'; $enabled = $true }
+            '^(?i)(0|false|off|no|disabled|disable)$' { $status = 'Explicit'; $enabled = $false }
+            default {
+                $status  = 'DefaultedError'
+                $enabled = $true
+            }
+        }
+        $reason = switch ($status) {
+            'Explicit'       { "`$env:$envName = '$raw'; active port-open probe $(if ($enabled) { 'ENABLED' } else { 'DISABLED' }) by explicit setting." }
+            'DefaultedError' { "`$env:$envName = '$raw', which is not a recognised value; active port-open probe left ENABLED (shipped default). An experimental arm read this way is INVALID." }
+        }
+    }
+
+    return [pscustomobject]@{
+        PSTypeName        = 'WinConfig.FlightRecorder.ActivePortOpenProbeSetting'
+        Enabled           = [bool]$enabled
+        SettingReadStatus = $status
+        Source            = $source
+        # The exact text that was read, so a capture can be audited without
+        # re-deriving it from a machine nobody still has.
+        RawValue          = $raw
+        Reason            = $reason
+    }
+}
+
+function Test-ActivePortOpenProbeEnabled {
+    <#
+    .SYNOPSIS
+        The ONE answerer for "may this code path open a target COM port?".
+    .DESCRIPTION
+        Reads the value LOCKED onto the session, never the environment. That is
+        the whole point: the setting is resolved once, before the first possible
+        open, and every gate downstream reads the same frozen answer -- so the
+        treatment cannot change halfway through an arm, and a capture cannot
+        contain opens taken under two different settings.
+
+        A session from a build or a test that predates the field is treated as
+        ENABLED, matching the shipped default and the pre-toggle behaviour.
+    .OUTPUTS
+        [bool]
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param($Session)
+
+    if ($null -eq $Session) { return $true }
+    if ($Session -is [hashtable]) {
+        if (-not $Session.ContainsKey('ActivePortOpenProbeEnabled')) { return $true }
+        if ($null -eq $Session['ActivePortOpenProbeEnabled'])        { return $true }
+        return [bool]$Session['ActivePortOpenProbeEnabled']
+    }
+    $prop = $Session.PSObject.Properties['ActivePortOpenProbeEnabled']
+    if (-not $prop -or $null -eq $prop.Value) { return $true }
+    return [bool]$prop.Value
+}
+
+# =============================================================================
 # STREAMING DETECTION
 # =============================================================================
 
@@ -878,12 +1025,44 @@ function Get-StreamingState {
         fields carry what the operator-facing text needs to stay honest:
           HeldPorts         ports someone has open
           UnavailablePorts  ports that exist but would not open (serial stack)
+    .PARAMETER Session
+        The probe session, read ONLY for the locked ActivePortOpenProbeEnabled
+        setting. Omitted => enabled, which is the shipped default and what every
+        pre-toggle caller and test mock means.
     .OUTPUTS
-        [hashtable] State ('Active'/'Stopped'/'Unknown'), ActivePort, HeldPorts,
-        UnavailablePorts.
+        [hashtable] State ('Active'/'Stopped'/'Unknown'/'DisabledBySetting'),
+        ActivePort, HeldPorts, UnavailablePorts.
     #>
     [CmdletBinding()]
-    param([hashtable]$WatchState)
+    param(
+        [hashtable]$WatchState,
+        $Session
+    )
+
+    # ── The gate, FIRST ──────────────────────────────────────────────────
+    # Before the ComPortState check and before anything that could enumerate
+    # ports, so no path through this function can reach an open. The whole
+    # treatment in the A-B-A control is this branch.
+    #
+    # It returns a state of its own -- NOT 'Stopped'. 'Stopped' is a
+    # MEASUREMENT: it means the probe opened every target port and found none of
+    # them held. Returning it here would manufacture that measurement out of a
+    # config flag, and every downstream consumer would then honestly report a
+    # stream that stopped. The keys a held-port reader wants are OMITTED rather
+    # than emptied, for the same reason: an empty set is an observation that
+    # nothing was held, and nothing observed anything.
+    if (-not (Test-ActivePortOpenProbeEnabled -Session $Session)) {
+        return @{
+            State                = 'DisabledBySetting'
+            ActivePort           = $null
+            ActiveProbeDisabled  = $true
+            # PortOpenDurations is present and EMPTY, unlike the port lists,
+            # because it measures an ACTION this function took. Zero opens over
+            # zero milliseconds is a true statement about what was done; an
+            # empty held-port list would be a false statement about what is.
+            PortOpenDurations    = @()
+        }
+    }
 
     if ($WatchState.ComPortState -notin @('ComPortFound', 'ComPortAmbiguous')) {
         return @{ State = 'Stopped'; ActivePort = $null; HeldPorts = @(); UnavailablePorts = @() }
@@ -1308,7 +1487,17 @@ function Get-ProbeStateConsistency {
         [bool]$IoStalled = $false,
         [bool]$IoDegrading = $false,
         [bool]$SerialIntegrityFault = $false,
-        [bool]$TargetEverActive = $false
+        [bool]$TargetEverActive = $false,
+        # Whether the port-hold channel was observed at all. $false only when the
+        # active port-open probe is disabled by setting.
+        #
+        # Every rule below keys on $isHeld or on a non-empty dead-port list, so a
+        # disabled probe fires NOTHING -- and that silence is the danger. This
+        # function's whole job is to stop a bad combination reading as
+        # unremarkable, and a caller that gets back an empty array concludes the
+        # box is consistent. An unobserved channel has to SAY it was unobserved,
+        # in the same array a reader is already looking at.
+        [bool]$PortHoldObserved = $true
     )
 
     $out = @()
@@ -1429,6 +1618,19 @@ function Get-ProbeStateConsistency {
         }
     }
 
+    # Emitted LAST and unconditionally when the channel was off, so it travels
+    # with whatever else this snapshot found. Four of the six rules above need a
+    # held port to fire; without this row their combined silence is
+    # indistinguishable from a clean cross-check, and the operator-facing line
+    # that reads "the Bluetooth layer looks consistent at this moment" would be
+    # asserting the consistency of fields nothing read.
+    if (-not $PortHoldObserved) {
+        $out += @{
+            Level = 'INFO'
+            Text  = "[i] COM port hold was NOT OBSERVED at this instant: the active port-open probe is disabled by setting for this recording. Four of the cross-checks here need a held port to fire, so their silence is not a clean result -- it is the absence of a reading. Do not read this snapshot as ruling out a held-port fault."
+        }
+    }
+
     return $out
 }
 
@@ -1493,7 +1695,12 @@ function New-ProbeStateMarker {
         # while the headset happened to be off would cross-check as a hard port
         # fault; with them the same instant reads as an unreachable device.
         [bool]$SerialIntegrityFault = $false,
-        [bool]$TargetEverActive = $false
+        [bool]$TargetEverActive = $false,
+        # See Get-ProbeStateConsistency. $false only under a disabled active
+        # port-open probe, and it must reach the stored marker, not just the
+        # cross-check: the marker IS the labelling channel, read months later by
+        # someone who has no way to know which arm produced it.
+        [bool]$PortHoldObserved = $true
     )
 
     $clean = if ($Label) { ([string]$Label).Trim() } else { '' }
@@ -1516,7 +1723,8 @@ function New-ProbeStateMarker {
         -HeldPorts $HeldPorts -UnavailablePorts $UnavailablePorts `
         -AppRunning $AppRunning -IoStalled ($IoVerdict -eq 'Collapsed') `
         -IoDegrading ($IoVerdict -eq 'Degrading') `
-        -SerialIntegrityFault $SerialIntegrityFault -TargetEverActive $TargetEverActive)
+        -SerialIntegrityFault $SerialIntegrityFault -TargetEverActive $TargetEverActive `
+        -PortHoldObserved $PortHoldObserved)
 
     # Recomputed here rather than passed in so a marker is self-describing: the
     # archive is read long after the fact, and a raw pair of counters makes the
@@ -1535,8 +1743,20 @@ function New-ProbeStateMarker {
         ComPortState     = $ComPortState
         BtLinkState      = $BtLinkState
         StreamState      = $StreamState
-        HeldPorts        = @($HeldPorts | Where-Object { $_ })
-        UnavailablePorts = @($UnavailablePorts | Where-Object { $_ })
+        # $null, not @(), when nothing looked. An empty list in a stored marker
+        # is the sentence "no port was held when the operator saw this dialog" --
+        # and on a 12005 that is precisely the finding the corpus turns on, so a
+        # fabricated one would not sit harmlessly in the archive, it would be
+        # read as the discriminator.
+        # Leading comma: without it an observed-but-empty held set unrolls to
+        # $null and becomes indistinguishable from the unobserved case, which is
+        # the exact distinction these two lines exist to make.
+        HeldPorts        = $(if ($PortHoldObserved) { ,@($HeldPorts | Where-Object { $_ }) } else { $null })
+        UnavailablePorts = $(if ($PortHoldObserved) { ,@($UnavailablePorts | Where-Object { $_ }) } else { $null })
+        # Stated as its own field so no reader has to know that $null above is
+        # meaningful, and so a marker from a pre-toggle build (field absent) is
+        # not confused with one that recorded a genuine observation.
+        PortHoldObserved = [bool]$PortHoldObserved
         AppRunning       = $AppRunning
         NoExeVersion     = if ($NoExeVersion) { [string]$NoExeVersion } else { $null }
         # Read-rate state at the marked instant. This is the field that turns a
@@ -1568,7 +1788,16 @@ function Format-ProbeStateMarker {
     $secs  = $Marker.ElapsedSeconds % 60
     $when  = '{0}  {1}m{2:00}s into the recording' -f $Marker.At.ToString('HH:mm:ss'), $mins, $secs
 
-    $ports = if (@($Marker.HeldPorts).Count -gt 0) { "held $(@($Marker.HeldPorts) -join ', ')" } else { 'no port held' }
+    # THREE cases, not two. 'no port held' is the 12005 signature and the single
+    # most consequential phrase this line can print; rendering it for a run that
+    # never looked would put a fabricated discriminator into the corpus. A marker
+    # from a pre-toggle build has no PortHoldObserved field at all, and that is
+    # treated as observed -- which it was.
+    $holdObserved = -not ($Marker.ContainsKey('PortHoldObserved') -and -not $Marker.PortHoldObserved)
+    $ports =
+        if (-not $holdObserved)                    { 'port hold NOT OBSERVED (active port-open probe disabled)' }
+        elseif (@($Marker.HeldPorts).Count -gt 0)  { "held $(@($Marker.HeldPorts) -join ', ')" }
+        else                                       { 'no port held' }
 
     # The read rate belongs on this line. Without it the marker for capture
     # C2FB1FD51A35 rendered as a tidy all-green state vector -- device paired,
@@ -1770,11 +1999,50 @@ function New-DeviceProbeSession {
     <#
     .SYNOPSIS
         Creates a fresh session-tracking state hashtable for a probe run.
+    .PARAMETER ActivePortOpenProbeSetting
+        The already-read setting object from Get-ActivePortOpenProbeSetting.
+        Defaults to reading it here, which is deliberate and is the LOCK: this
+        constructor runs before target selection and before the arrival
+        snapshot, i.e. before the first instant at which any code in this
+        recorder could open a target port. Every gate downstream reads the value
+        off the session, so the treatment is fixed for the whole run and cannot
+        be hot-switched by editing the environment mid-recording.
     #>
     [CmdletBinding()]
-    param()
+    param($ActivePortOpenProbeSetting)
+
+    $apop = if ($null -ne $ActivePortOpenProbeSetting) {
+        $ActivePortOpenProbeSetting
+    } else {
+        Get-ActivePortOpenProbeSetting
+    }
 
     return @{
+        # ── The active port-open probe treatment, LOCKED at construction ────
+        # Pre-registration section 5.3. Absent or unreadable => ENABLED, so a
+        # clinic capture can never be silently degraded by a config this
+        # experiment introduced; the READ STATUS beside it is what lets an
+        # experimental arm be invalidated for the same condition (section
+        # 3.4(2)). One boolean could not carry both, so there are two fields.
+        ActivePortOpenProbeEnabled    = [bool]$apop.Enabled
+        ActivePortOpenProbeReadStatus = [string]$apop.SettingReadStatus
+        ActivePortOpenProbeSource     = [string]$apop.Source
+        ActivePortOpenProbeRawValue   = $apop.RawValue
+        ActivePortOpenProbeReason     = [string]$apop.Reason
+        ActivePortOpenProbeLockedAt   = Get-Date
+        # End-of-run re-read. Drift is DETECTED and reported; it never changes
+        # behaviour, because a run whose treatment changed halfway through is not
+        # a run with a late treatment, it is an invalid run.
+        ActivePortOpenProbeEndEnabled    = $null
+        ActivePortOpenProbeEndReadStatus = $null
+        ActivePortOpenProbeDrift         = $null
+        # Which sensors were actually live for the port-hold question. The
+        # explicit list exists so absence is legible: a reader must be able to
+        # tell "no sensor looked" from "a sensor looked and saw nothing", and no
+        # field may be populated by whichever sensor happened to be available
+        # (the channel-mismatch class, nine instances filed).
+        PortObservationSources        = @(if ($apop.Enabled) { 'ActiveOpenProbe' })
+        ActiveSensorState             = $(if ($apop.Enabled) { 'Observing' } else { 'DisabledBySetting' })
         StateEnteredAt           = @{}
         LastComPortNames         = @()
         SustainedComAnomaly      = $false
@@ -1784,7 +2052,15 @@ function New-DeviceProbeSession {
         BtLinkEnteredAt          = $null
         BtLinkFlapCount          = 0
         BtLinkEverConnected      = $false
-        StreamingState           = 'Stopped'
+        # Seeded to the DISABLED state rather than 'Stopped' when the active
+        # probe is off, and that is load-bearing twice over. It keeps a
+        # measurement word out of a capture that took no measurement; and
+        # because the transition machine below fires on
+        # ($newStreamState -ne $Session.StreamingState), seeding it to the value
+        # every tick will return is what stops arm B manufacturing a spurious
+        # STREAM transition on tick one and an episode boundary out of a config
+        # flag.
+        StreamingState           = $(if ($apop.Enabled) { 'Stopped' } else { 'DisabledBySetting' })
         # Ever-held, as opposed to held-on-the-last-tick. Drives observation
         # coverage; see Get-ProbeObservationCoverage.
         #
@@ -1798,7 +2074,16 @@ function New-DeviceProbeSession {
         # probes and still reported "No process ever held the target headset's
         # COM port", downgrading the first clean 30-minute run to Partial.
         # The name now matches the source: this field IS HeldPorts, remembered.
-        PortEverHeld             = $false
+        #
+        # $null when the active probe is disabled, and this is the field where
+        # that matters most. $false here is the sentence "No process ever held
+        # the target headset's COM port during this recording" -- a flat
+        # negative claim about the session, rendered to the operator and used to
+        # downgrade coverage. In arm B nothing ever looked, so the claim has no
+        # basis. This is the shape #67 shipped once already, with a latch that
+        # could not fire; the difference now is that the sensor is off ON
+        # PURPOSE, which makes an unobserved $false even easier to believe.
+        PortEverHeld             = $(if ($apop.Enabled) { $false } else { $null })
         # Recomputed from the live held set on EVERY tick since #85, and left
         # $null while more than one port is held rather than naming one of them:
         # the read counter is process-wide, so picking a single port out of a set
@@ -1843,15 +2128,29 @@ function New-DeviceProbeSession {
         # Last tick's port classification. HeldPorts drives the honest operator
         # text; UnavailablePorts is the FI-012 signal the old bool test erased by
         # folding "would not open" in with "nobody has it open".
-        HeldPorts                = @()
-        UnavailablePorts         = @()
+        #
+        # $null, NOT @(), when the active open probe is disabled -- and that is
+        # the same distinction one more time. An empty list is a MEASUREMENT
+        # ("we looked at every target port and none was held"); $null is the
+        # absence of one ("no sensor looked"). Seeding these to @() on a run
+        # where nothing will ever observe them would put a confident negative
+        # into a capture and every reader downstream would believe it.
+        #
+        # NOTE THE LEADING COMMA, here and in the three below. `$(if (..) { @() })`
+        # evaluates to $null, not to an empty array -- PowerShell unrolls a
+        # single-element pipeline and an empty array unrolls to nothing. Without
+        # the comma the ENABLED branch silently produces exactly the $null the
+        # disabled branch is supposed to be the only source of, which would
+        # make every ordinary clinic capture claim its port hold was unobserved.
+        HeldPorts                = $(if ($apop.Enabled) { ,@() } else { $null })
+        UnavailablePorts         = $(if ($apop.Enabled) { ,@() } else { $null })
         # Explicit current/ever pairs (#88). The two above are kept because the
         # module reads them everywhere, but a CONSUMER must never have to know
         # that one is last-tick and the other a session union -- that asymmetry,
         # joined without noticing, is #81.
-        HeldPortsEver            = @()
-        UnavailablePortsCurrent  = @()
-        UnavailablePortsEver     = @()
+        HeldPortsEver            = $(if ($apop.Enabled) { ,@() } else { $null })
+        UnavailablePortsCurrent  = $(if ($apop.Enabled) { ,@() } else { $null })
+        UnavailablePortsEver     = $(if ($apop.Enabled) { ,@() } else { $null })
         StreamPeakCpuS           = 0.0
         StreamPeakWorkingSetMB   = 0
         # Data-flow corroboration. The probe cannot read the EEG bytes -- the port
@@ -1931,8 +2230,8 @@ function New-DeviceProbeSession {
         IoStalled                = $false
         IoStallReported          = $false
         # A collapse WAS detected at some point in this run. Unresettable, and
-        # deliberately separate from IoStalled, which the port-re-open wipe
-        # clears because a baseline may not span two handles.
+        # deliberately separate from IoStalled, which the release/reacquire reset
+        # clears because continuity is unknown while no port is held.
         #
         # #59 kept a collapse that a RE-OPEN would have erased, by closing the
         # episode into IoClosedEpisodes first. Capture 31D0729CA5B8 found the
@@ -1949,9 +2248,10 @@ function New-DeviceProbeSession {
         IoLastNonZeroReadAt      = $null
         # Closed read-rate EPISODES.
         #
-        # The live fields above describe one port-open episode and are wiped
-        # whenever the port is re-opened, because a baseline may not span two
-        # handles. That reset is correct for the live measurement and was
+        # The live fields above describe one port-hold episode and are wiped when
+        # the held set empties and later refills, because continuity is unknown
+        # across that release window. A non-empty held-set change does NOT reset
+        # them (#85). That reset is correct for the live measurement and was
         # catastrophic for the record: field capture C0AE9604CDAC (Arc 000013,
         # 2026-08-07) established a 776 ops/tick baseline, collapsed to 1% of it
         # across 12 ticks, was marked by the operator against NO code 12006 with
@@ -2186,14 +2486,34 @@ function Invoke-DeviceProbeTick {
     $Session.LastTickAt = $now
 
     # ── Port-hold detection (NOT a data-flow measurement) ────────────────
-    $streamResult = Get-StreamingState -WatchState $WatchState
+    # The Session is passed for exactly one reason: Get-StreamingState reads the
+    # locked ActivePortOpenProbeEnabled off it and refuses to open anything when
+    # the treatment is off. It is the gate for this path AND for the arrival
+    # snapshot. Candidate selection is another path; the anomaly snapshot's
+    # Test-ComPortInUse wrapper is the fourth and is gated independently.
+    $activeProbe  = Test-ActivePortOpenProbeEnabled -Session $Session
+    $streamResult = Get-StreamingState -WatchState $WatchState -Session $Session
     $newStreamState = $streamResult.State
     # Tolerate a result without the port lists: Get-StreamingState is mocked in
     # tests and may be replaced by an older caller, and a missing list must not
     # take the whole tick down.
-    $Session.HeldPorts = @(
-        if ($streamResult -is [hashtable] -and $streamResult.ContainsKey('HeldPorts')) { $streamResult.HeldPorts } else { @() }
-    )
+    #
+    # The two absences are NOT the same and must not collapse into one branch. A
+    # tolerated older caller genuinely probed and this code merely cannot see
+    # what it found, so @() is the safe floor it always was. A DISABLED probe did
+    # not look at all, and the only honest rendering of that is $null -- see the
+    # seeding in New-DeviceProbeSession. The discriminator is the SESSION's
+    # locked setting, never the shape of the result: one field, one answerer.
+    #
+    # LEADING COMMAS on both array branches. `$x = if (..) { @() }` assigns
+    # $null: PowerShell unrolls the statement's output and an empty array
+    # unrolls to nothing. The previous form wrapped the whole if in @(), which
+    # hid this -- and it cannot be wrapped any more, because $null is now a
+    # meaningful third value that @() would flatten straight back to @().
+    $Session.HeldPorts =
+        if ($streamResult -is [hashtable] -and $streamResult.ContainsKey('HeldPorts')) {
+            ,@($streamResult.HeldPorts)
+        } elseif (-not $activeProbe) { $null } else { ,@() }
     $newDeadPorts = @(
         if ($streamResult -is [hashtable] -and $streamResult.ContainsKey('UnavailablePorts')) { $streamResult.UnavailablePorts } else { @() }
     )
@@ -2201,16 +2521,22 @@ function Invoke-DeviceProbeTick {
     # when you read it (#88, and the shape behind #81). HeldPorts is last-tick
     # only; UnavailablePorts is a session-long UNION. Joining those two without
     # noticing the mismatch is how #81's false "port will not open" was produced.
-    $Session.UnavailablePortsCurrent = @($newDeadPorts | Where-Object { $_ })
-    # Union across the session: a port that failed to open at any point stays in
-    # the record even if it opens later.
-    $Session.UnavailablePorts = @(@($Session.UnavailablePorts) + $newDeadPorts | Where-Object { $_ } | Select-Object -Unique)
-    $Session.UnavailablePortsEver = @($Session.UnavailablePorts)
-    # The counterpart the record never had: which ports were held at ANY point.
-    # PortEverHeld below answers the boolean; nothing answered "which".
-    $Session.HeldPortsEver = @(
-        @($Session.HeldPortsEver) + @($Session.HeldPorts) | Where-Object { $_ } | Select-Object -Unique
-    )
+    if ($activeProbe) {
+        $Session.UnavailablePortsCurrent = @($newDeadPorts | Where-Object { $_ })
+        # Union across the session: a port that failed to open at any point stays
+        # in the record even if it opens later.
+        $Session.UnavailablePorts = @(@($Session.UnavailablePorts) + $newDeadPorts | Where-Object { $_ } | Select-Object -Unique)
+        $Session.UnavailablePortsEver = @($Session.UnavailablePorts)
+        # The counterpart the record never had: which ports were held at ANY
+        # point. PortEverHeld below answers the boolean; nothing answered "which".
+        $Session.HeldPortsEver = @(
+            @($Session.HeldPortsEver) + @($Session.HeldPorts) | Where-Object { $_ } | Select-Object -Unique
+        )
+    }
+    # else: left at the $null New-DeviceProbeSession seeded. Assigning @() here
+    # -- even "harmlessly", even to a union that will never gain a member -- is
+    # the precise mistake this whole section exists to avoid: it converts "not
+    # observed" into "observed to be nothing" on every single tick.
 
     # ── Held-port SET changes (#85) ──────────────────────────────────────────
     # StreamingState is a two-valued aggregate: Active if ANY target port is
@@ -3391,13 +3717,30 @@ function Invoke-AnomalyDiagnosticSnapshot {
     <#
     .SYNOPSIS
         Captures diagnostic context when user confirms an anomaly as unexpected.
+    .PARAMETER Session
+        The probe session, read ONLY for the locked ActivePortOpenProbeEnabled.
     .OUTPUTS
         [hashtable] with EventLogs, AdapterState, ComPortStatus, DeviceState, PowerPlan.
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][hashtable]$Context
+        [Parameter(Mandatory)][hashtable]$Context,
+        $Session
     )
+
+    # ── The FOURTH active-open path ──────────────────────────────────────
+    # ComPortStatus below calls Test-ComPortInUse, which is Get-ComPortHoldState,
+    # which opens the port. This one is not on the tick path and is easy to miss:
+    # it fires once, from an operator confirmation, long after the toggle was
+    # read.
+    #
+    # It is arguably unreachable with the probe disabled -- PendingConfirmation
+    # is only ever set on the Active -> Stopped stream edge, which cannot occur
+    # when nothing classifies the stream. The gate is here anyway, because
+    # "unreachable via the path I happened to trace" is not the contract. The
+    # contract is that the disabled state prevents EVERY active open, and a gate
+    # that depends on a second component's behaviour to hold is not a gate.
+    $activeProbe = Test-ActivePortOpenProbeEnabled -Session $Session
 
     $snapshot = @{
         CapturedAt  = (Get-Date).ToString('o')
@@ -3438,10 +3781,20 @@ function Invoke-AnomalyDiagnosticSnapshot {
         if ($Context.WatchState.AmbiguousComPortMatches)  { $ports += @($Context.WatchState.AmbiguousComPortMatches | ForEach-Object { $_.PortName } | Where-Object { $_ }) }
     }
     $ports = @($ports | Select-Object -Unique)
-    if ($ports.Count -gt 0) {
+    if ($ports.Count -gt 0 -and $activeProbe) {
         $snapshot.ComPortStatus = @($ports | ForEach-Object {
             @{ PortName = $_; InUse = (Test-ComPortInUse -PortName $_) }
         })
+    } elseif ($ports.Count -gt 0) {
+        # Named as NOT COLLECTED with a reason, rather than omitted or emitted
+        # with InUse = $false. An omitted key reads as "there were no ports";
+        # an InUse of $false is a measurement nobody took, on the one artifact
+        # produced specifically because something went wrong.
+        $snapshot.ComPortStatus = $null
+        $snapshot.ComPortStatusNotCollected = @{
+            Ports  = @($ports)
+            Reason = 'The active port-open probe is disabled by setting for this recording, so port-hold state was not read. This is not a report that the ports were free.'
+        }
     }
 
     # Device state
@@ -3643,6 +3996,12 @@ function Get-ProbeObservationCoverage {
     # field is named TargetPortEverHeld and the operator sentence below asserts a
     # port hold, so anything else here is name/source drift (issue #67).
     $heldPort   = [bool]$Session.PortEverHeld
+    # ...and separately, whether anything was in a position to answer. With the
+    # active port-open probe disabled the latch is $null, not $false: no sensor
+    # looked. The two must stay distinct all the way to the rendered sentence,
+    # because "we watched and no process ever took the port" and "we did not
+    # watch" are opposite conclusions that a bare $false merges.
+    $heldPortObserved = ($null -ne $Session.PortEverHeld)
     # SESSION TOTAL, not the current episode's buffer (#88). The buffer is
     # Clear()ed on every port re-open, so asking it "how many samples did this
     # recording take" returns the residue since the last reset -- and a run whose
@@ -3679,7 +4038,11 @@ function Get-ProbeObservationCoverage {
 
     $reasons = @()
     if (-not $linked)        { $reasons += 'The target headset never linked to the radio during this recording.' }
-    if (-not $heldPort)      { $reasons += 'No process ever held the target headset''s COM port during this recording.' }
+    if (-not $heldPortObserved) {
+        $reasons += 'Whether any process held the target headset''s COM port was NOT OBSERVED: the active port-open probe was disabled by setting for this recording. This is not a report that the port was free.'
+    } elseif (-not $heldPort) {
+        $reasons += 'No process ever held the target headset''s COM port during this recording.'
+    }
     if ($ioSamples -eq 0)    { $reasons += 'No read-rate samples were taken, so data flow was never measured.' }
     if ($rivalActive)        { $reasons += "Another paired NeurOptimal headset WAS holding a COM port while this one was idle -- this recording is very likely pointed at the wrong headset." }
     elseif ($rivals.Count -gt 0) { $reasons += "$($rivals.Count) other NeurOptimal headset(s) are paired on this box, so the recording may have watched the wrong one." }
@@ -3775,10 +4138,24 @@ function Get-ProbeObservationCoverage {
     $summary = switch ($level) {
         'NotObserved' {
             $who = if ($Target -and $Target.Name) { "'$($Target.Name)'" } else { 'the target headset' }
-            "This recording did not observe a session. $who never linked, its COM port was never held, and no data flow was measured, so nothing here describes what NeurOptimal was doing."
+            # The port clause is SPLIT, because in the disabled-probe arm the
+            # original wording -- "its COM port was never held" -- is a finding
+            # this run is in no position to make. Everything else in the
+            # sentence survives; only the channel that was switched off changes
+            # from a claim into a statement of what was not looked at.
+            $portClause = if ($heldPortObserved) {
+                'its COM port was never held'
+            } else {
+                'whether its COM port was held was not observed (the active port-open probe was disabled)'
+            }
+            "This recording did not observe a session. $who never linked, $portClause, and no data flow was measured, so nothing here describes what NeurOptimal was doing."
         }
         'Partial' {
-            'This recording observed the session only partly, so its findings rest on less evidence than a full capture.'
+            if ($heldPortObserved) {
+                'This recording observed the session only partly, so its findings rest on less evidence than a full capture.'
+            } else {
+                'This recording observed the session only partly: the active port-open probe was disabled by setting, so the COM port-hold channel was not observed at all. Read whatever follows as silence on that channel, not as a clean result on it.'
+            }
         }
         default {
             if ($dataFlowMeasured) {
@@ -3795,7 +4172,12 @@ function Get-ProbeObservationCoverage {
         Reasons           = @($reasons)
         Summary           = $summary
         TargetEverLinked  = $linked
-        TargetPortEverHeld = $heldPort
+        # TRI-STATE: $true / $false / $null-for-not-observed. Consumers that
+        # branch on truthiness keep working; consumers that need to tell a
+        # negative from a silence now can, and TargetPortHoldObserved beside it
+        # says which without anyone having to know that $null is meaningful.
+        TargetPortEverHeld = $Session.PortEverHeld
+        TargetPortHoldObserved = $heldPortObserved
         # Session total. The name kept its meaning; the source was wrong (#88).
         IoSampleCount     = $ioSamples
         # ...and the current-episode buffer, named so nobody has to guess which
@@ -4009,6 +4391,11 @@ function Get-ProbeStateUserText {
         # "Port open", not "Active": the probe measures a handle, not data flow.
         'stream.Active'               = 'Port open'
         'stream.Stopped'              = 'Port idle'
+        # NOT a third value of the same scale. 'Port open' and 'Port idle' are
+        # both readings; this one says no reading was taken, and the wording has
+        # to make an operator glancing at a strip stop rather than file it beside
+        # 'idle'.
+        'stream.DisabledBySetting'    = 'Not observed'
     }
     $longText = @{
         'device.Missing'              = 'Not found -- Windows has not discovered the headset yet. Turn it on and put it in pairing mode.'
@@ -4034,6 +4421,7 @@ function Get-ProbeStateUserText {
         # is what made a stalled Arc read as a healthy session in the field.
         'stream.Active'               = 'COM port open -- NeurOptimal is holding the headset''s serial port. This does NOT confirm EEG data is arriving; the probe cannot read the port while another process owns it.'
         'stream.Stopped'              = 'COM port idle -- no process is holding the headset''s serial port, so NeurOptimal is not connected to it right now'
+        'stream.DisabledBySetting'    = 'COM port hold NOT OBSERVED -- the active port-open probe is disabled by setting for this recording, so nothing checked whether a process is holding the headset''s serial port. This is not a report that the port is idle.'
     }
 
     $key = "$Kind.$State"
@@ -4068,6 +4456,10 @@ function Get-ProbeStateColor {
         'Running'              { return [System.Drawing.Color]::FromArgb(40, 160, 60) }
         'Stopped'              { return [System.Drawing.Color]::FromArgb(100, 100, 100) }
         'NotRunning'           { return [System.Drawing.Color]::FromArgb(100, 100, 100) }
+        # Blue-grey, not the neutral grey the measured-but-idle states use. Grey
+        # is what an operator reads as "fine, nothing happening"; this state is
+        # "nobody is watching this channel", and it should not look the same.
+        'DisabledBySetting'    { return [System.Drawing.Color]::FromArgb(90, 120, 165) }
         'Unknown'              { return [System.Drawing.Color]::FromArgb(100, 100, 100) }
         default                { return [System.Drawing.Color]::FromArgb(100, 100, 100) }
     }
@@ -4597,6 +4989,8 @@ Export-ModuleMember -Function @(
     'Test-ComPortInUse',
     'Get-ComPortHoldState',
     'Get-StreamingState',
+    'Get-ActivePortOpenProbeSetting',
+    'Test-ActivePortOpenProbeEnabled',
     'Get-ProbeStateConsistency',
     'Initialize-ProcessIoApi',
     'Get-ProcessIoSample',

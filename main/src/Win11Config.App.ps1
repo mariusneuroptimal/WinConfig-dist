@@ -5066,7 +5066,16 @@ $buttonHandlers = @{
                         'Partial' {
                             $missing = @()
                             if (-not $cov.TargetEverLinked)   { $missing += 'never linked to the radio' }
-                            if (-not $cov.TargetPortEverHeld) { $missing += 'COM port never held' }
+                            # NOT OBSERVED and NEVER HELD are different strip
+                            # texts, because they are different facts. With the
+                            # active port-open probe disabled nothing looked, and
+                            # "COM port never held" would be the recorder
+                            # reporting a finding it did not make.
+                            if ($null -eq $cov.TargetPortEverHeld) {
+                                $missing += 'COM port hold NOT OBSERVED (active port-open probe disabled)'
+                            } elseif (-not $cov.TargetPortEverHeld) {
+                                $missing += 'COM port never held'
+                            }
                             if ($cov.IoSampleCount -eq 0)     { $missing += 'data flow not measured yet' }
                             $cText = "[~] Partly observing -- $($missing -join '; ')"
                             $cCol  = [System.Drawing.Color]::FromArgb(240, 210, 110)
@@ -5385,6 +5394,63 @@ $buttonHandlers = @{
                 # duration is derived from it by Get-ProbeRecordingWindow.
                 $btProbeSession.RecordingStartedAt = $btRecordStart
 
+                # ── The active port-open probe treatment, announced ───────────
+                # New-DeviceProbeSession resolved and LOCKED it a few lines
+                # above, which is before target selection and before the arrival
+                # snapshot -- i.e. before the first instant any code here could
+                # open a target port. Announced immediately for two reasons: the
+                # operator has to verify it at BOTH ends of an experimental arm
+                # (pre-registration section 3.4(2)), and a disabled probe removes
+                # a whole evidence channel from everything printed below it.
+                #
+                # A malformed/unreadable value is announced as loudly as a
+                # disabled probe. An absent value is the ordinary clinic default
+                # and remains visible as DefaultedMissing without turning every
+                # non-experimental recording into a warning. Either defaulted
+                # status invalidates an experimental arm; the capture records the
+                # distinction so the protocol can enforce it.
+                if ($btProbeSession.ContainsKey('ActivePortOpenProbeEnabled')) {
+                    $apopLevel = if (-not $btProbeSession.ActivePortOpenProbeEnabled) { 'WARN' }
+                                 elseif ($btProbeSession.ActivePortOpenProbeReadStatus -ne 'Explicit' -and
+                                         $btProbeSession.ActivePortOpenProbeReadStatus -ne 'DefaultedMissing') { 'WARN' }
+                                 else { 'DIM' }
+                    Write-BtLog "  Active port-open probe: $(if ($btProbeSession.ActivePortOpenProbeEnabled) { 'ENABLED' } else { 'DISABLED' })  (read: $($btProbeSession.ActivePortOpenProbeReadStatus))" -Level $apopLevel
+                    if (-not $btProbeSession.ActivePortOpenProbeEnabled) {
+                        Write-BtLog "      This recording will NOT open the headset's COM ports. Port-hold, streaming state and the port-release cycle are NOT OBSERVED -- not 'idle', not 'stopped'. Read-rate sampling continues unchanged." -Level "WARN"
+                    }
+                    if ($btProbeSession.ActivePortOpenProbeReadStatus -eq 'DefaultedError') {
+                        Write-BtLog "      $($btProbeSession.ActivePortOpenProbeReason)" -Level "WARN"
+                    }
+
+                    # ── PROVENANCE, line 1 of events.jsonl ────────────────────
+                    # Written to the timeline as well as the manifest, and
+                    # FIRST. The manifest is produced at teardown, so a run whose
+                    # window is closed without uploading has no manifest at all
+                    # -- and that has already happened once, on 2026-08-10. The
+                    # treatment an arm ran under is the one fact that cannot be
+                    # reconstructed afterwards from anything else in the package,
+                    # because the whole point of the toggle is that it removes
+                    # the evidence that would betray it.
+                    if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticJsonLine -ErrorAction SilentlyContinue)) {
+                        $provWrote = Add-WinConfigDiagnosticJsonLine -RunFolder $btDiagRun.RunFolder -Name 'events.jsonl' -Data ([ordered]@{
+                            AtUtc      = $btRecordStart.ToUniversalTime().ToString('o')
+                            Kind       = 'PROVENANCE'
+                            State      = 'ActivePortOpenProbe'
+                            Level      = $(if ($btProbeSession.ActivePortOpenProbeEnabled) { 'INFO' } else { 'WARN' })
+                            Reason     = [string]$btProbeSession.ActivePortOpenProbeReason
+                            ActivePortOpenProbeEnabled    = [bool]$btProbeSession.ActivePortOpenProbeEnabled
+                            ActivePortOpenProbeReadStatus = [string]$btProbeSession.ActivePortOpenProbeReadStatus
+                            ActivePortOpenProbeSource     = [string]$btProbeSession.ActivePortOpenProbeSource
+                            ActivePortOpenProbeRawValue   = $btProbeSession.ActivePortOpenProbeRawValue
+                            PortObservationSources        = @($btProbeSession.PortObservationSources)
+                            ActiveSensorState             = [string]$btProbeSession.ActiveSensorState
+                            RunId      = $btRunId
+                        })
+                        if (-not $provWrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
+                        else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
+                    }
+                }
+
                 # FI-012 baseline. Read-only registry + QueryDosDevice; cheap
                 # enough to run inline. Guarded because the probe module may be
                 # an older copy without it (env-var override / sibling repo).
@@ -5412,6 +5478,14 @@ $buttonHandlers = @{
                 # every consumer below is scoped to.
                 $btTargetName    = 'NeurOptimal Headset'
                 $btSessionTarget = $null
+                # Read off the SESSION, which locked it at construction a few
+                # lines above -- never re-read from the environment here. This is
+                # the first point in a recording at which any code could open a
+                # target port, and it must be governed by the same frozen answer
+                # the arrival snapshot and every tick will use.
+                $btSelectActiveProbe = if (Get-Command Test-ActivePortOpenProbeEnabled -ErrorAction SilentlyContinue) {
+                    Test-ActivePortOpenProbeEnabled -Session $btProbeSession
+                } else { $true }
                 # Start every recording from a cold property cache. The module can
                 # outlive a recording (a second capture in the same app session),
                 # and target selection must never be decided from values cached
@@ -5451,8 +5525,17 @@ $buttonHandlers = @{
                         # recorder. Note this loop probes EVERY candidate Arc,
                         # not just the one finally selected; the report is
                         # per-port so those stay separable.
-                        $cdHeld = @()
-                        if (Get-Command Get-ComPortHoldState -ErrorAction SilentlyContinue) {
+                        #
+                        # GATED. This is one of three direct call sites and one of
+                        # four invocation paths -- arrival and tick share
+                        # Get-StreamingState, while the anomaly snapshot uses the
+                        # Test-ComPortInUse wrapper. $null, not @(): an empty held set
+                        # here is read by Select-BluetoothSessionTarget as
+                        # positive evidence that this candidate is idle, so
+                        # emptying it would not merely lose the tie-breaker, it
+                        # would feed the selector a fabricated observation.
+                        $cdHeld = $(if ($btSelectActiveProbe) { ,@() } else { $null })
+                        if ($btSelectActiveProbe -and (Get-Command Get-ComPortHoldState -ErrorAction SilentlyContinue)) {
                             foreach ($cdP in $cdPorts) {
                                 $cdSw = [System.Diagnostics.Stopwatch]::StartNew()
                                 $cdState = try { Get-ComPortHoldState -PortName $cdP } catch { $null }
@@ -5474,7 +5557,8 @@ $buttonHandlers = @{
                     }
 
                     if (Get-Command Select-BluetoothSessionTarget -ErrorAction SilentlyContinue) {
-                        $btSessionTarget = Select-BluetoothSessionTarget -Candidates $btCandidates
+                        $btSessionTarget = Select-BluetoothSessionTarget -Candidates $btCandidates `
+                            -HeldPortEvidenceAvailable $btSelectActiveProbe
                     }
 
                     if ($btSessionTarget -and $btSessionTarget.RequiresOperatorChoice) {
@@ -5488,7 +5572,8 @@ $buttonHandlers = @{
                             $btPick = Show-BtTargetChooser -Candidates @($btSessionTarget.Candidates) -Owner $btForm
                         } catch { $btPick = $null }
                         if ($btPick) {
-                            $btSessionTarget = Select-BluetoothSessionTarget -Candidates $btCandidates -ExplicitMac $btPick
+                            $btSessionTarget = Select-BluetoothSessionTarget -Candidates $btCandidates -ExplicitMac $btPick `
+                                -HeldPortEvidenceAvailable $btSelectActiveProbe
                             Write-BtLog "  Target chosen: $($btSessionTarget.Summary)" -Level "OK"
                         } else {
                             Write-BtLog "  Recording cancelled: no headset was chosen, so this capture would have described the wrong device." -Level "FAIL"
@@ -5631,7 +5716,11 @@ $buttonHandlers = @{
                 # Get-ComPortHoldState. The distinction matters here more than
                 # anywhere else, because this snapshot is what the operator reads
                 # before deciding whether anything is wrong.
-                $initStream = Get-StreamingState -WatchState $btProbeWatch
+                # -Session is what gates it: Get-StreamingState reads the locked
+                # ActivePortOpenProbeEnabled and returns 'DisabledBySetting'
+                # without touching a port. This is the SECOND of the three active
+                # -open paths; passing the session here is not optional plumbing.
+                $initStream = Get-StreamingState -WatchState $btProbeWatch -Session $btProbeSession
                 # This call opens the same ports the tick loop does, and it too
                 # sits inside the recording window ($btRecordStart, above). It
                 # already emits PortOpenDurations -- the first cut of #83 threw
@@ -5644,8 +5733,17 @@ $buttonHandlers = @{
                 }
                 $btProbeSession.StreamingState = $initStream.State
                 $btProbeSession.ActiveStreamPort = $initStream.ActivePort
-                $btProbeSession.HeldPorts        = @($initStream.HeldPorts)
-                $btProbeSession.UnavailablePorts = @($initStream.UnavailablePorts)
+                # Assigned ONLY when a sensor produced them. On the disabled path
+                # these keys are absent from the result, and @($null) would turn
+                # that absence into a one-element array containing $null -- an
+                # observation of nothing, which then seeds every consumer below.
+                # Leave the session's own $null seeding in place instead.
+                if ($initStream.ContainsKey('HeldPorts')) {
+                    $btProbeSession.HeldPorts = @($initStream.HeldPorts)
+                }
+                if ($initStream.ContainsKey('UnavailablePorts')) {
+                    $btProbeSession.UnavailablePorts = @($initStream.UnavailablePorts)
+                }
                 # A port ALREADY held when recording starts is a real observation,
                 # for the same reason as the link seeding above -- and here it is
                 # also the state that seeds StreamingState to 'Active', which means
@@ -5654,7 +5752,15 @@ $buttonHandlers = @{
                 # healthy shape (recorder started during a live session) reported
                 # "COM port never held" for the whole run, live in the window and
                 # again in the bundle, and downgraded a clean capture to Partial.
-                if (@($initStream.HeldPorts | Where-Object { $_ }).Count -gt 0) { $btProbeSession.PortEverHeld = $true }
+                #
+                # Only ever latches to $true, and only from an observation. On
+                # the disabled path there is no HeldPorts key, the condition is
+                # false, and PortEverHeld stays at the $null the session seeded
+                # -- NOT $false. Writing $false here would be this recorder
+                # asserting "no process ever held the port" on a run where it
+                # never looked.
+                if ($initStream.ContainsKey('HeldPorts') -and
+                    @($initStream.HeldPorts | Where-Object { $_ }).Count -gt 0) { $btProbeSession.PortEverHeld = $true }
                 if ($initStream.State -eq 'Active') { $btProbeSession.StateEnteredAt['streaming_Active_at'] = Get-Date }
 
                 # Show status strip and initial state
@@ -5671,6 +5777,12 @@ $buttonHandlers = @{
                 if ($initStream.State -eq 'Active') {
                     $streamPort = if ($initStream.ActivePort) { " ($($initStream.ActivePort))" } else { '' }
                     Write-BtLog "  COM port open : Yes$streamPort -- a process is holding the port (this does NOT confirm data is flowing)" -Level "OK"
+                } elseif ($initStream.State -eq 'DisabledBySetting') {
+                    # WARN, not DIM. The dim line is where a reading that came
+                    # back negative belongs; a channel that was switched off has
+                    # to be visible enough that an operator notices it is missing
+                    # from every conclusion the rest of the run reaches.
+                    Write-BtLog "  COM port open : $(Get-ProbeStateUserText -Kind stream -State $initStream.State)" -Level "WARN"
                 } else {
                     Write-BtLog "  COM port open : $(Get-ProbeStateUserText -Kind stream -State $initStream.State)" -Level "DIM"
                 }
@@ -5690,8 +5802,9 @@ $buttonHandlers = @{
                             -ComPortState $btProbeWatch.ComPortState `
                             -BtLinkState  $initLink `
                             -StreamState  $initStream.State `
-                            -HeldPorts    @($initStream.HeldPorts) `
-                            -UnavailablePorts @($initStream.UnavailablePorts) `
+                            -HeldPorts    @($initStream.HeldPorts | Where-Object { $_ }) `
+                            -UnavailablePorts @($initStream.UnavailablePorts | Where-Object { $_ }) `
+                            -PortHoldObserved ([bool]$btProbeSession.ActivePortOpenProbeEnabled) `
                             -AppRunning   $noRunning `
                             -SerialIntegrityFault ([bool]($btProbeSession.SerialPortIntegrity -and -not $btProbeSession.SerialPortIntegrity.Healthy)))
                         $btProbeSession.StartupConsistency = $btArrival
@@ -5894,8 +6007,9 @@ $buttonHandlers = @{
                                 -ComPortState $btProbeWatch.ComPortState `
                                 -BtLinkState  $btProbeSession.BtLinkState `
                                 -StreamState  $btProbeSession.StreamingState `
-                                -HeldPorts    @($btProbeSession.HeldPorts) `
-                                -UnavailablePorts @($btProbeSession.UnavailablePorts) `
+                                -HeldPorts    @($btProbeSession.HeldPorts | Where-Object { $_ }) `
+                                -UnavailablePorts @($btProbeSession.UnavailablePorts | Where-Object { $_ }) `
+                                -PortHoldObserved ([bool]$btProbeSession.ActivePortOpenProbeEnabled) `
                                 -AppRunning   ($btProbeWatch.AppProcessState -eq 'Running') `
                                 -NoExeVersion $btProbeSession.NoExeVersion `
                                 -IoVerdict    $btProbeSession.IoVerdict `
@@ -5909,7 +6023,17 @@ $buttonHandlers = @{
                             foreach ($cx in @($mk.Contradictions)) {
                                 Write-BtLog "             $cx" -Level "WARN"
                             }
-                            if (@($mk.Contradictions).Count -eq 0) {
+                            # Only claimable when every channel was actually
+                            # read. With the active port-open probe disabled the
+                            # held-port checks cannot fire, so "looks consistent"
+                            # would be an all-clear derived from an unread
+                            # channel -- and this line is the one an operator
+                            # takes away from the moment a dialog appeared.
+                            # Get-ProbeStateConsistency now emits an explicit
+                            # not-observed row in that case, so Contradictions is
+                            # non-empty and this branch is skipped; the guard is
+                            # belt-and-braces against that row being dropped.
+                            if (@($mk.Contradictions).Count -eq 0 -and $btProbeSession.ActivePortOpenProbeEnabled) {
                                 Write-BtLog "             [~] Bluetooth layer looks consistent at this moment -- whatever NeurOptimal is showing comes from above it. Marked for follow-up." -Level "WARN"
                             }
                         } else {
@@ -6051,7 +6175,12 @@ $buttonHandlers = @{
                                     # The state the event happened IN, not just
                                     # the event: a STREAM transition is only
                                     # scoreable beside the set it moved from.
-                                    HeldPorts  = @($btProbeSession.HeldPorts | Where-Object { $_ })
+                                    # $null when the active probe is disabled:
+                                    # a file of "HeldPorts": [] lines reads as
+                                    # continuous port-free operation.
+                                    HeldPorts  = $(if ($btProbeSession.ActivePortOpenProbeEnabled) {
+                                        ,@($btProbeSession.HeldPorts | Where-Object { $_ })
+                                    } else { $null })
                                     EpisodeId  = $btProbeSession.IoEpisodeId
                                     IoVerdict  = $btProbeSession.IoVerdict
                                     TickIndex  = [int]$btProbeSession.TickCount
@@ -6163,7 +6292,7 @@ $buttonHandlers = @{
                             } else {
                                 Write-BtLog "  Confirmed: stream stop was unexpected -- capturing diagnostic snapshot..." -Level "WARN"
                                 try {
-                                    $diagSnap = Invoke-AnomalyDiagnosticSnapshot -Context $btProbeSession.PendingConfirmation
+                                    $diagSnap = Invoke-AnomalyDiagnosticSnapshot -Context $btProbeSession.PendingConfirmation -Session $btProbeSession
                                     if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
                                         try { Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name "anomaly-diagnostic.json" -Data $diagSnap } catch { }
                                     }
@@ -6338,6 +6467,42 @@ $buttonHandlers = @{
             # ── Probe session summary (before final snapshot) ─────────────────────
             $btProbeSummary = $null
             if ($btDeepProbeAvailable -and $btProbeSession -and $btProbeWatch) {
+                # ── Active port-open probe: END verification ──────────────────
+                # Re-READ, never re-APPLIED. Behaviour for this run was fixed at
+                # New-DeviceProbeSession and nothing here may change it: a run
+                # whose treatment moved halfway through is not a run with a late
+                # treatment, it is an invalid run, and the only useful thing to
+                # do with that fact is record it.
+                #
+                # This is the operator's second verification point
+                # (pre-registration section 3.4(2)) made automatic. Verifying by
+                # hand at both ends is exactly the kind of step that gets skipped
+                # on the third arm at the end of a long afternoon.
+                if (Get-Command Get-ActivePortOpenProbeSetting -ErrorAction SilentlyContinue) {
+                    try {
+                        $apopEnd = Get-ActivePortOpenProbeSetting
+                        $btProbeSession.ActivePortOpenProbeEndEnabled    = [bool]$apopEnd.Enabled
+                        $btProbeSession.ActivePortOpenProbeEndReadStatus = [string]$apopEnd.SettingReadStatus
+                        # Drift is EITHER field moving. A run that started
+                        # Explicit-enabled and ended DefaultedMissing-enabled has
+                        # the same behaviour and a different provenance, and the
+                        # provenance is what an arm is scored on.
+                        $btProbeSession.ActivePortOpenProbeDrift = (
+                            ([bool]$apopEnd.Enabled -ne [bool]$btProbeSession.ActivePortOpenProbeEnabled) -or
+                            ([string]$apopEnd.SettingReadStatus -ne [string]$btProbeSession.ActivePortOpenProbeReadStatus)
+                        )
+                        if ($btProbeSession.ActivePortOpenProbeDrift) {
+                            Write-BtLog "  [!] The active port-open probe setting CHANGED during this recording: started $($btProbeSession.ActivePortOpenProbeReadStatus)/$(if ($btProbeSession.ActivePortOpenProbeEnabled) { 'ENABLED' } else { 'DISABLED' }), ended $($apopEnd.SettingReadStatus)/$(if ($apopEnd.Enabled) { 'ENABLED' } else { 'DISABLED' }). The recorder's BEHAVIOUR did not change -- it was locked at the start -- but this capture must NOT be scored as an experimental arm." -Level "FAIL"
+                        }
+                    } catch {
+                        # An end read that fails is itself a result, and reads as
+                        # drift rather than as agreement: the alternative is a
+                        # silent $null that a reader fills in with "unchanged".
+                        $btProbeSession.ActivePortOpenProbeEndReadStatus = 'DefaultedError'
+                        $btProbeSession.ActivePortOpenProbeDrift         = $true
+                    }
+                }
+
                 # FI-012 second sample. Taken before the summary so a box that
                 # degraded mid-recording is reported as such rather than as
                 # "arrived broken".
@@ -6976,6 +7141,41 @@ $buttonHandlers = @{
                         # every ~3s. Recorded so this is answered from a capture
                         # rather than argued -- and so a decision to back the
                         # interval off rests on a measured number.
+                        # ── The treatment this capture ran under ─────────────
+                        # ABSENT on a pre-toggle build, and that is NOT the same
+                        # as $true -- a reader who finds no key here is looking
+                        # at a package from a build that had no toggle, which is
+                        # a different fact from a build that had one and left it
+                        # on. Nothing in the manifest carries a build id, so the
+                        # key's PRESENCE is the only discriminator available
+                        # (same reasoning as the #86 ops-per-second rename).
+                        ActivePortOpenProbeEnabled = if ($btProbeSession -and $btProbeSession.ContainsKey('ActivePortOpenProbeEnabled')) {
+                            [bool]$btProbeSession.ActivePortOpenProbeEnabled
+                        } else { $null }
+                        # 'Explicit' / 'DefaultedMissing' / 'DefaultedError'. A
+                        # defaulted read is SAFE for a clinic and INVALIDATES an
+                        # experimental arm; both consumers read this one field.
+                        ActivePortOpenProbeReadStatus = if ($btProbeSession) { $btProbeSession.ActivePortOpenProbeReadStatus } else { $null }
+                        ActivePortOpenProbeSource     = if ($btProbeSession) { $btProbeSession.ActivePortOpenProbeSource } else { $null }
+                        ActivePortOpenProbeRawValue   = if ($btProbeSession) { $btProbeSession.ActivePortOpenProbeRawValue } else { $null }
+                        # Verified at BOTH ends, automatically. Drift means the
+                        # capture is not scoreable as an arm even though the
+                        # recorder's own behaviour never changed.
+                        ActivePortOpenProbeEndEnabled    = if ($btProbeSession) { $btProbeSession.ActivePortOpenProbeEndEnabled } else { $null }
+                        ActivePortOpenProbeEndReadStatus = if ($btProbeSession) { $btProbeSession.ActivePortOpenProbeEndReadStatus } else { $null }
+                        ActivePortOpenProbeDrift         = if ($btProbeSession) { $btProbeSession.ActivePortOpenProbeDrift } else { $null }
+                        # Which sensors were live for the port-hold question, so
+                        # an empty or absent HeldPorts anywhere in this package
+                        # can be read correctly without inferring it.
+                        PortObservationSources = if ($btProbeSession) { @($btProbeSession.PortObservationSources) } else { $null }
+                        ActiveSensorState      = if ($btProbeSession) { $btProbeSession.ActiveSensorState } else { $null }
+                        # STILL REPORTED when the probe is disabled, and the
+                        # value is a truthful 0 -- unlike an empty HeldPorts.
+                        # This counts an ACTION the recorder took; zero opens
+                        # attempted is a fact about behaviour, not a claim about
+                        # the hardware. The distinction is the whole rule:
+                        # measure-an-action fields may report 0, observe-a-state
+                        # fields must report absence.
                         PortOpenAttempts = if ($btProbeSession) { [int]$btProbeSession.PortOpenAttempts } else { $null }
                         PortOpenAcquired = if ($btProbeSession) { [int]$btProbeSession.PortOpenAcquired } else { $null }
                         PortOpenDenied   = if ($btProbeSession) { [int]$btProbeSession.PortOpenDenied } else { $null }

@@ -4593,14 +4593,31 @@ function Select-BluetoothSessionTarget {
         An operator-chosen MAC. Wins over everything -- an explicit choice is
         not second-guessed, and it is recorded as Explicit so a reader can tell
         a human decision from an inference.
+    .PARAMETER HeldPortEvidenceAvailable
+        Whether anything actually LOOKED at the candidates' COM ports. Defaults
+        to $true, which is every pre-existing caller and the shipped behaviour.
+
+        It exists because with the active port-open probe disabled
+        (ActivePortOpenProbeEnabled = $false) the caller cannot gather held
+        ports at all, and passes $null for every candidate. Without this
+        parameter the tie-breaker below would read those nulls as "no candidate
+        is holding a port" and fall through to AmbiguousRequiresChoice with the
+        summary "NONE is holding a COM port" -- a confident statement about
+        hardware nobody examined, on the screen the operator uses to decide
+        which headset the recording is about.
+
+        Selection stays DETERMINISTIC either way: a single candidate is still
+        automatic (it needs no tie-breaker), an explicit choice still wins, and
+        anything else asks. What changes is only that the ambiguity says why.
     .OUTPUTS
         [pscustomobject] Mac, Name, Mode, Reason, Candidates, IsResolved,
-        RequiresOperatorChoice, Summary.
+        RequiresOperatorChoice, Summary, HeldPortEvidenceAvailable.
     #>
     [CmdletBinding()]
     param(
         [AllowEmptyCollection()][array]$Candidates = @(),
-        [string]$ExplicitMac
+        [string]$ExplicitMac,
+        [bool]$HeldPortEvidenceAvailable = $true
     )
 
     $norm = { param($m) ([string]$m -replace '[^0-9A-Fa-f]', '').ToUpperInvariant() }
@@ -4610,7 +4627,13 @@ function Select-BluetoothSessionTarget {
             Mac              = & $norm $_.Mac
             Name             = [string]$_.Name
             Present          = [bool]$_.Present
-            HeldPorts        = @($_.HeldPorts | Where-Object { $_ })
+            # $null survives as $null when no sensor looked. Collapsing it to
+            # @() here would erase the distinction one layer below the decision
+            # that depends on it.
+            # Leading comma -- `$(if (..) { @() })` is $null, not an empty array,
+            # and here that would turn an examined-and-idle candidate into an
+            # unexamined one.
+            HeldPorts        = $(if ($HeldPortEvidenceAvailable) { ,@($_.HeldPorts | Where-Object { $_ }) } else { $null })
             ComPorts         = @($_.ComPorts  | Where-Object { $_ })
             HasPairingRecord = [bool]$_.HasPairingRecord
         }
@@ -4627,6 +4650,10 @@ function Select-BluetoothSessionTarget {
         IsResolved             = $false
         RequiresOperatorChoice = $false
         Summary                = $null
+        # Recorded on the result, not only consumed, so a capture says whether
+        # the tie-breaker was even available rather than leaving a reader to
+        # infer it from an absent field.
+        HeldPortEvidenceAvailable = [bool]$HeldPortEvidenceAvailable
     }
 
     # An explicit choice is a decision, not a hypothesis. Honour it even if the
@@ -4664,9 +4691,14 @@ function Select-BluetoothSessionTarget {
         return $result
     }
 
-    # More than one. Only a held COM port earns an automatic choice.
-    $active = @($cands | Where-Object { $_.HeldPorts.Count -gt 0 })
-    if ($active.Count -eq 1 -and $active[0].Mac) {
+    # More than one. Only a held COM port earns an automatic choice -- and only
+    # if a held COM port was actually LOOKED FOR. With the active port-open
+    # probe disabled this evidence does not exist, so the tie-breaker is skipped
+    # outright rather than evaluated over nulls: an unexamined candidate must
+    # never be ranked below an equally unexamined one on the strength of a set
+    # that was never populated.
+    $active = @(if ($HeldPortEvidenceAvailable) { $cands | Where-Object { @($_.HeldPorts).Count -gt 0 } })
+    if ($HeldPortEvidenceAvailable -and $active.Count -eq 1 -and $active[0].Mac) {
         $result.Mac        = $active[0].Mac
         $result.Name       = $active[0].Name
         $result.Mode       = 'Automatic'
@@ -4679,12 +4711,19 @@ function Select-BluetoothSessionTarget {
     $result.Mode                   = 'AmbiguousRequiresChoice'
     $result.RequiresOperatorChoice = $true
     $names = @($cands | ForEach-Object { "'$($_.Name)' ($($_.Mac))" }) -join ', '
-    $result.Reason = if ($active.Count -gt 1) { 'MultipleActive' } else { 'NoActiveCandidate' }
-    $result.Summary = if ($active.Count -gt 1) {
-        "$($cands.Count) NeurOptimal headsets are paired and $($active.Count) of them are holding COM ports ($names). The recording cannot tell which one this session is about -- choose it, or the capture will describe the wrong headset."
-    } else {
-        "$($cands.Count) NeurOptimal headsets are paired and NONE is holding a COM port ($names). Nothing distinguishes them, so the recording cannot tell which one this session is about. Power on and connect the headset you are about to use, or choose it explicitly."
-    }
+    $result.Reason =
+        if (-not $HeldPortEvidenceAvailable) { 'NoHeldPortEvidence' }
+        elseif ($active.Count -gt 1)         { 'MultipleActive' }
+        else                                 { 'NoActiveCandidate' }
+    $result.Summary =
+        if (-not $HeldPortEvidenceAvailable) {
+            # Says what was NOT done, and does not say the ports are free.
+            "$($cands.Count) NeurOptimal headsets are paired ($names) and the active port-open probe is DISABLED for this recording, so nothing checked which of them is holding a COM port. That check is the only evidence this recorder uses to choose automatically, so the choice has to be yours. This is not a report that the ports are free."
+        } elseif ($active.Count -gt 1) {
+            "$($cands.Count) NeurOptimal headsets are paired and $($active.Count) of them are holding COM ports ($names). The recording cannot tell which one this session is about -- choose it, or the capture will describe the wrong headset."
+        } else {
+            "$($cands.Count) NeurOptimal headsets are paired and NONE is holding a COM port ($names). Nothing distinguishes them, so the recording cannot tell which one this session is about. Power on and connect the headset you are about to use, or choose it explicitly."
+        }
     return $result
 }
 
