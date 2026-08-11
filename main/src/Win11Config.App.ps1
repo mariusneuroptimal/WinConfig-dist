@@ -5206,6 +5206,10 @@ $buttonHandlers = @{
             # Pinned as well as logged (#68 item 2): the log line is written into
             # the top band and is the first thing pushed out of reach.
             $script:BtRec_RunIdText = $btRunId
+            # events.jsonl accounting (#87). Reset per run, so a second recording
+            # in one app session does not inherit the first one's totals.
+            $script:BtRec_EventLinesWritten = 0
+            $script:BtRec_EventLinesDropped = 0
             $btIdentityDetailLabel.Text = "Run ID: $btRunId    COM ports: not probed yet -- no reading has been taken"
             if (-not $btIdentityPanel.Visible) { $btIdentityPanel.Visible = $true }
 
@@ -5895,8 +5899,9 @@ $buttonHandlers = @{
                                 -AppRunning   ($btProbeWatch.AppProcessState -eq 'Running') `
                                 -NoExeVersion $btProbeSession.NoExeVersion `
                                 -IoVerdict    $btProbeSession.IoVerdict `
-                                -IoBaselineOpsPerTick ([int]$btProbeSession.IoBaselineOpsPerTick) `
-                                -IoRecentOpsPerTick   ([int]$btProbeSession.IoRecentOpsPerTick) `
+                                -IoBaselineOpsPerSecond ([double]$btProbeSession.IoBaselineOpsPerSecond) `
+                                -IoRecentOpsPerSecond   ([double]$btProbeSession.IoRecentOpsPerSecond) `
+                                -EpisodeId    ([string]$btProbeSession.IoEpisodeId) `
                                 -SerialIntegrityFault ([bool]($btProbeSession.SerialPortIntegrity -and -not $btProbeSession.SerialPortIntegrity.Healthy)) `
                                 -TargetEverActive     ([bool]$btProbeSession.PortEverHeld)
                             [void]$btProbeSession.OperatorMarkers.Add($mk)
@@ -6019,6 +6024,44 @@ $buttonHandlers = @{
 
                         $btPartSw.Restart()
                         foreach ($evt in $probeEvents) {
+                            # PERSIST FIRST, render second (#87). Until now these
+                            # events went to the GUI log and NOWHERE else: the
+                            # package has eight files and none of them held the
+                            # session's timeline, so the port release/reacquire
+                            # cycle -- the crispest signal this failure mode
+                            # emits, and the candidate primary outcome for the
+                            # A/B/A control -- could not be scored from a capture
+                            # at all. WatchReport.Observations is not a
+                            # substitute: on DB98B6EE3324 it held 3 entries, all
+                            # stamped at the arrival snapshot, across a 324 s run
+                            # with two port-release cycles.
+                            #
+                            # Written on the SAME loop that renders, so the file
+                            # and the operator's window cannot describe different
+                            # runs, and appended per event so a window closed
+                            # without upload still leaves evidence on disk.
+                            if ($btDiagRun) {
+                                $wrote = Add-WinConfigDiagnosticJsonLine -RunFolder $btDiagRun.RunFolder -Name 'events.jsonl' -Data ([ordered]@{
+                                    AtUtc      = $evt.Timestamp.ToUniversalTime().ToString('o')
+                                    Kind       = $evt.Kind
+                                    State      = $evt.State
+                                    Level      = $evt.Level
+                                    Reason     = $evt.Reason
+                                    Annotation = $evt.Annotation
+                                    # The state the event happened IN, not just
+                                    # the event: a STREAM transition is only
+                                    # scoreable beside the set it moved from.
+                                    HeldPorts  = @($btProbeSession.HeldPorts | Where-Object { $_ })
+                                    EpisodeId  = $btProbeSession.IoEpisodeId
+                                    IoVerdict  = $btProbeSession.IoVerdict
+                                    TickIndex  = [int]$btProbeSession.TickCount
+                                })
+                                # Counted, never silent. A timeline with holes
+                                # that reads as complete is the same class of lie
+                                # as an unmeasured zero rendered as 0.
+                                if (-not $wrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
+                                else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
+                            }
                             $ts = $evt.Timestamp.ToString('HH:mm:ss')
                             $kindTag = switch ($evt.Kind) {
                                 'device'  { 'DEVICE' }
@@ -6633,8 +6676,15 @@ $buttonHandlers = @{
                                 UnavailablePorts = @($_.UnavailablePorts)
                                 AppRunning       = $_.AppRunning
                                 IoVerdict            = $_.IoVerdict
-                                IoBaselineOpsPerTick = $_.IoBaselineOpsPerTick
-                                IoRecentOpsPerTick   = $_.IoRecentOpsPerTick
+                                IoBaselineOpsPerSecond = $_.IoBaselineOpsPerSecond
+                                IoRecentOpsPerSecond   = $_.IoRecentOpsPerSecond
+                                # The read-rate episode live when the operator
+                                # pressed Mark (#87). This is the join key: the
+                                # episode ledger records the same id, so "did the
+                                # 12006 land inside the episode that collapsed?"
+                                # is answerable from the record instead of being
+                                # reconstructed from timestamps.
+                                EpisodeId            = $_.EpisodeId
                                 Contradictions   = @($_.Contradictions)
                             } })
                         }
@@ -7012,17 +7062,22 @@ $buttonHandlers = @{
                         # means data flow was NOT assessed, not that it was fine.
                         ReadRateCollapsed = [bool]($btProbeSession -and $btProbeSession.IoStalled)
                         ReadRateVerdict = if ($btProbeSession) { $btProbeSession.IoVerdict } else { $null }
-                        ReadRateBaselineOpsPerTick = if ($btProbeSession) { $btProbeSession.IoBaselineOpsPerTick } else { $null }
-                        ReadRateRecentOpsPerTick = if ($btProbeSession) { $btProbeSession.IoRecentOpsPerTick } else { $null }
+                        ReadRateBaselineOpsPerSecond = if ($btProbeSession) { $btProbeSession.IoBaselineOpsPerSecond } else { $null }
+                        ReadRateRecentOpsPerSecond = if ($btProbeSession) { $btProbeSession.IoRecentOpsPerSecond } else { $null }
                         # Percent of the session's own baseline, so triage can
                         # rank severity from the manifest alone.
                         ReadRateFractionOfBaseline = if ($btProbeSession) { $btProbeSession.IoFractionOfBaseline } else { $null }
                         # Dips that recovered. A collapse that never completes is
                         # invisible in ReadRateCollapsed but is exactly what an
                         # intermittent Arc produces, so it gets its own counter.
-                        ReadRateDegradedTicks = if ($btProbeSession) { [int]$btProbeSession.IoDegradedTicks } else { $null }
+                        # SECONDS, and the key says so (#86). Leaving the old
+                        # ...DegradedTicks name on a seconds value would be worse
+                        # than either unit on its own: the field name is the ONLY
+                        # thing telling a reader which unit a capture is in, since
+                        # the manifest carries no build id.
+                        ReadRateDegradedSeconds = if ($btProbeSession) { [math]::Round([double]$btProbeSession.IoDegradedSeconds, 1) } else { $null }
                         # Read from the RECORD, not the session. This field and
-                        # ReadRateWorstRecentOpsPerTick below are two halves of one
+                        # ReadRateWorstRecentOpsPerSecond below are two halves of one
                         # observation; sourcing them from two objects is how capture
                         # E0C8B0588CC7 shipped a worst fraction of 0% beside a worst
                         # rate of null (issue #65). The record chooses both together.
@@ -7059,9 +7114,33 @@ $buttonHandlers = @{
                         # not "never found". Without it the two are identical in
                         # the record and only one of them is benign.
                         ReadRateBaselineResetCount = if ($btIoRecord) { [int]$btIoRecord.BaselineResetCount } else { $null }
-                        ReadRatePeakBaselineOpsPerTick = if ($btIoRecord) { [int]$btIoRecord.PeakBaselineOpsPerTick } else { $null }
-                        ReadRateWorstRecentOpsPerTick = if ($btIoRecord) { $btIoRecord.WorstRecentOpsPerTick } else { $null }
+                        ReadRatePeakBaselineOpsPerSecond = if ($btIoRecord) { [double]$btIoRecord.PeakBaselineOpsPerSecond } else { $null }
+                        ReadRateWorstRecentOpsPerSecond = if ($btIoRecord) { $btIoRecord.WorstRecentOpsPerSecond } else { $null }
                         ReadRateEpisodeCount = if ($btIoRecord) { [int]$btIoRecord.EpisodeCount } else { $null }
+                        # #85: an episode is a Stopped -> Active EPOCH, not one
+                        # port-handle lifetime. >0 means at least one episode's
+                        # baseline spans more than one handle, so any per-handle
+                        # reading of the episode ledger is over-precise. Absent
+                        # on pre-#85 captures, which is NOT the same as 0 -- those
+                        # runs could not tell either way.
+                        ReadRateHandleChangeCount = if ($btIoRecord) { [int]$btIoRecord.HandleChangeCount } else { $null }
+                        # #87: markers that fall INSIDE an episode which
+                        # collapsed, joined on the EpisodeId the marker recorded
+                        # at the time. Deliberately a different claim from
+                        # ReadRateMarkerCollapseCount, which counts markers whose
+                        # OWN verdict was Collapsed -- DB98B6EE3324 had six
+                        # markers stamped 'NoBaseline' sitting inside an episode
+                        # that ended Collapsed at 7%, and reporting only the
+                        # first made the corpus pattern look broken when it was
+                        # the marker channel that was blind.
+                        ReadRateMarkerInCollapsedEpisodeCount = if ($btIoRecord) { [int]$btIoRecord.MarkerInCollapsedEpisodeCount } else { $null }
+                        # events.jsonl accounting (#87). A timeline with holes
+                        # that reads as complete is the same class of lie as an
+                        # unmeasured zero rendered as 0, so the drops are
+                        # reported rather than left to be inferred from a line
+                        # count nobody can check against anything.
+                        EventTimelineLinesWritten = [int]$script:BtRec_EventLinesWritten
+                        EventTimelineLinesDropped = [int]$script:BtRec_EventLinesDropped
                         # ── The session-level answer ─────────────────────────
                         # Collapsed | Degraded | Stable | Unassessed, derived once
                         # in Get-IoSessionReadRateRecord and shared with the
@@ -7099,7 +7178,27 @@ $buttonHandlers = @{
                         ObservationDataFlowMeasured = if ($btCoverage) { [bool]$btCoverage.DataFlowMeasured } else { $null }
                         ObservationSeconds = if ($btCoverage) { $btCoverage.ObservationSeconds } else { $null }
                         ObservationTickCount = if ($btCoverage) { [int]$btCoverage.TickCount } else { $null }
+                        # SESSION TOTAL since #88. It used to be the current
+                        # episode's delta buffer, which is cleared on every port
+                        # re-open: DB98B6EE3324 shipped 7 beside a baseline of
+                        # 176, a peak of 297 and two resets, when a verdict needs
+                        # 9 deltas to exist -- arithmetically impossible as a
+                        # total. Worse, Coverage.Level keys off it, so a run
+                        # whose port re-opened on its last tick could report a
+                        # measured session as 'NotObserved'.
                         ObservationIoSampleCount = if ($btCoverage) { [int]$btCoverage.IoSampleCount } else { $null }
+                        # The current-episode buffer, named for what it is: the
+                        # answer to "could a verdict be reached right now".
+                        ObservationIoSampleCountCurrentEpisode = if ($btCoverage) { [int]$btCoverage.IoSampleCountCurrentEpisode } else { $null }
+                        # CURRENT vs EVER as separate fields (#88). HeldPorts was
+                        # last-tick-only while UnavailablePorts was a session
+                        # union, and joining those two without noticing the
+                        # asymmetry is exactly what produced #81's false
+                        # "port will not open".
+                        HeldPortsCurrent      = if ($btProbeSession) { @($btProbeSession.HeldPorts | Where-Object { $_ }) } else { @() }
+                        HeldPortsEver         = if ($btProbeSession) { @($btProbeSession.HeldPortsEver | Where-Object { $_ }) } else { @() }
+                        UnavailablePortsCurrent = if ($btProbeSession) { @($btProbeSession.UnavailablePortsCurrent | Where-Object { $_ }) } else { @() }
+                        UnavailablePortsEver    = if ($btProbeSession) { @($btProbeSession.UnavailablePortsEver | Where-Object { $_ }) } else { @() }
                         SecondsToReadBaseline = if ($btCoverage) { $btCoverage.SecondsToReadBaseline } else { $null }
                         PostBaselineObservationSeconds = if ($btCoverage) { $btCoverage.PostBaselineSeconds } else { $null }
                         # When the recorder told the operator a read baseline
@@ -7117,13 +7216,13 @@ $buttonHandlers = @{
                         #                    established. Data flow was never
                         #                    assessed; do not read it as healthy.
                         # The announced rate is kept separately from
-                        # ReadRateBaselineOpsPerTick because the baseline is a
+                        # ReadRateBaselineOpsPerSecond because the baseline is a
                         # running median -- what the operator saw is not
                         # necessarily what the run ended on.
                         ReadBaselineAnnouncedAtUtc = if ($btProbeSession -and $btProbeSession.IoBaselineAnnouncedAt) {
                             ([datetime]$btProbeSession.IoBaselineAnnouncedAt).ToUniversalTime().ToString('o')
                         } else { $null }
-                        ReadBaselineAnnouncedOpsPerTick = if ($btProbeSession) { $btProbeSession.IoBaselineAnnouncedOpsPerTick } else { $null }
+                        ReadBaselineAnnouncedOpsPerSecond = if ($btProbeSession) { $btProbeSession.IoBaselineAnnouncedOpsPerSecond } else { $null }
                         # Ports registered in SERIALCOMM that would not open. The
                         # old bool port test folded these in with "free".
                         UnopenablePortCount = if ($btProbeSession) { @($btProbeSession.UnavailablePorts | Where-Object { $_ }).Count } else { $null }

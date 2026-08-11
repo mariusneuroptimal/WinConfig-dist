@@ -217,26 +217,87 @@ function Get-BtConnectionState {
 # raised a FAIL. That ordering is load-bearing, so it is pinned by tests rather
 # than assumed.
 
-# Samples needed before a baseline is trusted. Ticks are ~3s, so ~15s of history.
-# With IoCollapseTicks that means no verdict before ~27s of streaming.
-$script:IoBaselineMinTicks = 5
-# Below this median read-op rate there is nothing to collapse FROM, and claiming a
-# collapse would be noise. Reported as "no baseline", never as healthy. A real
-# session measured 438, so this floor sits ~22x below normal.
-$script:IoBaselineMinOpsPerTick = 20
+# THE UNIT IS OPS PER SECOND, AND A TICK IS NOT A UNIT OF TIME (#86).
+#
+# These thresholds were per-TICK, which silently mixed a rate with a duration.
+# Capture DB98B6EE3324 ran its ticks from the 3000 ms target out to 13506 ms
+# (mean 4619 ms), so the same data flow reads as a different number depending on
+# how starved the box was. The direction is counter-intuitive and is what makes
+# it dangerous: a LONG tick accumulates more operations and reads as a SPIKE, a
+# short one as a DIP. #82 makes long ticks common exactly when the machine is
+# struggling, so the artefact CORRELATES WITH THE FAULT.
+#
+# The corpus shows the normalisation working. Healthy baselines span 422-776
+# ops/TICK across the 45 uploaded packages -- a 1.84x spread that looks like real
+# variation between boxes and is not. Divided by each run's own cadence they
+# collapse onto 141-149 ops/SECOND. The clean instance is C0AE9604CDAC: 776
+# ops/tick, by far the highest ever recorded, on a run whose mean interval was
+# 5.43 s -- 142.9 ops/s, dead centre of the 3-second cohort. It was never a busy
+# session, only a slow-ticking one.
+#
+# (Long runs need care with that arithmetic: 8E5C4470B593 reports 433 ops/tick
+# against a 5.35 s WHOLE-RUN mean, which converts to an off-cluster 80.9 ops/s.
+# Its baseline is a LEADING-window statistic and the mean is dragged up by a
+# 1.9-hour tail; at the 3 s cadence its baseline window actually ran at, 433
+# gives 144.3 ops/s -- back on the cluster. The per-interval stamping below is
+# precisely so nothing has to be reconstructed from a whole-run average again.)
+
+# Elapsed streaming time before a baseline is trusted. Was 5 ticks; 5 x the 3 s
+# target is the same 15 s, so nothing about the intended wait has changed -- only
+# that a starved box no longer has to wait proportionally longer to be judged.
+# With IoCollapseSeconds that means no verdict before ~27s of streaming.
+#
+# This also shortens the blind window the field capture exposed: DB98B6EE3324
+# needed 9 deltas at a 4.6 s mean = ~46 s to rebuild a baseline after each port
+# re-open, against a 27-36 s re-acquire cycle, so the recorder could NEVER hold a
+# baseline during that fault. 27 s of elapsed time is still marginal against a
+# 27 s cycle -- this is an improvement, NOT a fix for that; see #85/#87.
+$script:IoBaselineMinSeconds = 15
+# Below this median read rate there is nothing to collapse FROM, and claiming a
+# collapse would be noise. Reported as "no baseline", never as healthy.
+#
+# RE-DERIVED FROM THE CORPUS, NOT TRANSLITERATED. The old floor was 20 ops/tick;
+# dividing by the nominal tick would give ~6.7 ops/s and dividing nothing at all
+# would give 20 ops/s, and BOTH are wrong -- 20 ops/s would have retracted
+# DB98B6EE3324's own 7% collapse finding, whose episode baselined at 60 ops/tick
+# over 4.6 s ticks = 13 ops/s. Instead the floor is bracketed by the decisions
+# the shipped corpus has already made:
+#
+#   lowest baseline the old floor ACCEPTED  3E75BF45FC02, 28 ops/tick @ 5.32 s
+#                                           = 5.26 ops/s (9.33 if its baseline
+#                                           window ran at the 3 s target)
+#   highest baseline it REJECTED            236061907514, 6 ops/tick @ 3.29 s
+#                                           = 1.82 ops/s (2.0 at the target)
+#
+# Any floor inside (2.0, 5.26) preserves every accept/reject decision in all 45
+# packages under either cadence assumption. 3.0 is the geometric middle of that
+# bracket, and sits ~48x below the 146 ops/s a healthy session measures.
+$script:IoBaselineMinOpsPerSecond = 3.0
 # Fraction of baseline that counts as collapsed. Measured in-session jitter is
 # ~3.3%, so 0.25 sits roughly 7x outside normal variation while still catching a
 # PARTIAL stall -- a headset transmitting intermittently, not only one that has
 # gone completely silent. The original 0.1 only caught near-total silence and
-# would have missed a 60% degradation entirely.
+# would have missed a 60% degradation entirely. Dimensionless, so the unit change
+# leaves it exactly as it was.
 $script:IoCollapseFraction = 0.25
-# Consecutive collapsed ticks required (~12s) so a scheduling hiccup cannot fire it.
-$script:IoCollapseTicks = 4
+# Contiguous elapsed seconds below the collapse limit required to fire, so a
+# scheduling hiccup cannot. Was 4 consecutive ticks, which at the 3 s target is
+# the same 12 s -- but on DB98B6EE3324's 13.5 s ticks those 4 ticks would have
+# demanded up to 54 s of silence, and on a fast run as little as 12 s. Same
+# intent, now actually constant.
+$script:IoCollapseSeconds = 12
+# An interval longer than this is not a slow tick, it is a gap -- the app hung,
+# the process was suspended, or the recorder was descheduled -- and dividing an
+# operation count by it produces a rate that describes no real period. The worst
+# interval ever recorded in the field is 13.5 s, so 30 s is well clear of "slow"
+# and firmly in "something stopped". Such intervals are DISCARDED FROM THE RATES
+# AND COUNTED, never silently averaged in: see DiscardedIntervals.
+$script:IoMaxSampleIntervalSeconds = 30
 
 # Idle recording, in seconds, past which the tail is worth naming in the
 # findings. An idle tail is not inert: the baseline is a MEDIAN over the samples
 # before the trailing window, so empty ticks pull it down until the run's own
-# baseline drops under IoBaselineMinOpsPerTick and the episode is discarded as
+# baseline drops under IoBaselineMinOpsPerSecond and the episode is discarded as
 # 'NoBaseline' (capture 31D0729CA5B8, 15.4 h of idle after a 33-minute session).
 # Ten minutes is well past a clinic packing up and far short of the erosion that
 # actually destroyed a capture, so it warns long before anything is lost.
@@ -346,7 +407,7 @@ function Add-IoReadRateSample {
         Runs on EVERY tick NO.exe exists -- not only while a port is held.
     .DESCRIPTION
         The one place the ungated channel is written. It does NOT touch
-        IoLastReadOps, IoReadOpDeltas or any verdict field: the scoped series
+        IoLastReadOps, IoReadSamples or any verdict field: the scoped series
         that feeds Test-IoReadCollapse stays exactly what it was, because the
         process-wide counter includes file I/O and widening the detector's input
         would raise its baseline and hide the serial-only collapse it exists to
@@ -513,8 +574,8 @@ function Get-IoReadRateScopes {
 function Test-IoReadCollapse {
     <#
     .SYNOPSIS
-        Pure. Decides whether a series of per-tick read-operation deltas shows a
-        collapse against its own established baseline.
+        Pure. Decides whether a series of STAMPED read-operation samples shows a
+        collapse against its own established baseline. Ops per SECOND (#86).
     .DESCRIPTION
         Relative, not absolute. An absolute ops/sec threshold would need
         calibrating per box, per NO build and per session type; a box's own
@@ -542,58 +603,187 @@ function Test-IoReadCollapse {
         exactly -- all four ticks below the limit -- so nothing that used to fire
         fires differently. Degrading only fills the silence in between.
 
-        A single tick under the limit is not noise: measured in-session jitter is
-        ~3.3% and the limit sits at 25% of baseline, ~7x outside that.
-    .PARAMETER Deltas
-        Per-tick read-operation deltas, oldest first.
+        A single interval under the limit is not noise: measured in-session
+        jitter is ~3.3% and the limit sits at 25% of baseline, ~7x outside that.
+
+        WHY SECONDS AND NOT TICKS (#86). Every quantity here used to be counted
+        in ticks against a cadence that ran 3.0 s to 13.5 s in the field, so the
+        verdict moved when only the SCHEDULER had moved. Three separate things
+        needed the unit:
+
+          the rate       ops/interval / interval seconds, per interval, so a long
+                         tick no longer reads as a spike
+          the baseline   IoBaselineMinSeconds of ELAPSED history, so a starved
+                         box does not have to wait proportionally longer to be
+                         judged than a healthy one
+          the debounce   IoCollapseSeconds of CONTIGUOUS TRAILING time below the
+                         limit, which is what "4 consecutive ticks" was trying to
+                         say and only said at exactly the 3 s target
+
+        The recent rate is TIME-WEIGHTED (total ops / total seconds over the
+        window), not a mean of per-interval rates: the mean of rates would let one
+        short interval count as much as a long one and reintroduce the artefact at
+        the last step.
+    .PARAMETER Samples
+        Stamped read-operation samples, oldest first. Each needs DeltaOps and
+        DeltaSeconds; anything else is counted as malformed, never averaged in.
     .OUTPUTS
-        [hashtable] Verdict, BaselineOpsPerTick, RecentOpsPerTick, CollapsedTicks,
-        FractionOfBaseline.
+        [hashtable] Verdict, BaselineOpsPerSecond, RecentOpsPerSecond,
+        CollapsedSeconds, DegradedIntervals, FractionOfBaseline, BaselineSeconds,
+        WindowSeconds, DiscardedIntervals, MalformedSamples.
     #>
     [CmdletBinding()]
-    param([AllowEmptyCollection()][array]$Deltas = @())
+    param([AllowEmptyCollection()][array]$Samples = @())
 
-    $d = @($Deltas | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ })
     $result = @{
-        Verdict            = 'NoBaseline'
-        BaselineOpsPerTick = 0
-        RecentOpsPerTick   = 0
-        CollapsedTicks     = 0
+        Verdict              = 'NoBaseline'
+        BaselineOpsPerSecond = 0
+        RecentOpsPerSecond   = 0
+        # Contiguous seconds at the END of the series below the collapse limit --
+        # the debounce itself, so a reader can see how close a Degrading verdict
+        # came to firing without re-deriving it.
+        CollapsedSeconds     = 0
+        # How many intervals ANYWHERE in the trailing window were below the limit.
+        # Separate from the above because an intermittent stall scatters them and
+        # a real collapse runs them together, and only the second fires.
+        DegradedIntervals    = 0
         # Recent rate as a percentage of the session's own baseline. Carried as a
         # number so triage can rank severity without re-deriving it from two
         # counters, and so a marker stays readable if the verdict wording changes.
         # $null (not 0) whenever there is no baseline to be a fraction OF.
-        FractionOfBaseline = $null
+        FractionOfBaseline   = $null
+        # Elapsed time each half of the judgement actually rests on. A capture
+        # that says NoBaseline can now show WHY -- too little history, versus
+        # history at too low a rate -- which used to need the tick count and a
+        # guess at the cadence.
+        BaselineSeconds      = 0
+        WindowSeconds        = 0
+        # Intervals thrown out for being longer than IoMaxSampleIntervalSeconds
+        # or non-positive. Counted, never silent: a rate computed over a gap
+        # describes no real period, and a discard that leaves no trace is
+        # indistinguishable from an interval that never existed.
+        DiscardedIntervals   = 0
+        # Samples that carried no usable (DeltaOps, DeltaSeconds) pair -- an
+        # un-migrated caller still pushing bare numbers, which would otherwise
+        # degrade to a silent NoBaseline forever.
+        MalformedSamples     = 0
     }
-    if ($d.Count -lt ($script:IoBaselineMinTicks + $script:IoCollapseTicks)) { return $result }
 
-    # Everything before the trailing window is the reference period.
-    $window   = @($d[($d.Count - $script:IoCollapseTicks) .. ($d.Count - 1)])
-    $baseline = @($d[0 .. ($d.Count - $script:IoCollapseTicks - 1)])
-    if ($baseline.Count -lt $script:IoBaselineMinTicks) { return $result }
+    # ── Normalise to intervals ───────────────────────────────────────────────
+    # An interval, not a sample, is the unit that can carry a rate: it is the
+    # only thing with both a numerator and a denominator.
+    $iv = [System.Collections.ArrayList]::new()
+    foreach ($s in $Samples) {
+        if ($null -eq $s) { continue }
+        $ops = $null; $sec = $null
+        try { $ops = $s.DeltaOps; $sec = $s.DeltaSeconds } catch { }
+        if ($null -eq $ops -and $null -eq $sec) {
+            # Includes a bare number: (5).DeltaOps is $null, so a legacy caller
+            # lands here and SAYS SO rather than quietly producing no verdict.
+            $result.MalformedSamples++
+            continue
+        }
+        # A sample with no delta is a real observation that opens no interval --
+        # the first of a series, or the first after a process change. Neither
+        # malformed nor discarded; it contributes nothing to a rate, but it DOES
+        # break continuity, for the same reason a discarded interval does.
+        if ($null -eq $ops -or $null -eq $sec) {
+            [void]$iv.Add(@{ Break = $true; Sec = [double]0 })
+            continue
+        }
+        $secD = [double]$sec
+        if ($secD -le 0 -or $secD -gt $script:IoMaxSampleIntervalSeconds) {
+            $result.DiscardedIntervals++
+            # A DISCONTINUITY MARKER, not a deletion. Dropping the interval
+            # outright would splice the two sides of the gap together and let
+            # them look adjacent: six quiet seconds, a 31-second hole nobody
+            # measured, six more quiet seconds, and the debounce would count a
+            # contiguous 12 seconds of collapse across a period it has no
+            # observation of at all. The gap is exactly where the reads might
+            # have resumed. It carries Sec = 0 so it contributes nothing to any
+            # rate, duration or median -- it only stops the contiguity walk.
+            [void]$iv.Add(@{ Break = $true; Sec = [double]0 })
+            continue
+        }
+        [void]$iv.Add(@{ Ops = [double]$ops; Sec = $secD; Rate = ([double]$ops / $secD); Break = $false })
+    }
+    if (@($iv | Where-Object { -not $_.Break }).Count -eq 0) { return $result }
 
-    $sorted = @($baseline | Sort-Object)
+    # ── Split by ELAPSED TIME, not by count ──────────────────────────────────
+    # Walk back from the newest interval until the trailing window covers at
+    # least IoCollapseSeconds. The interval straddling the boundary belongs to
+    # the window, so the window is never SHORTER than the debounce it feeds.
+    $windowSec = [double]0
+    $splitIdx  = $iv.Count
+    for ($i = $iv.Count - 1; $i -ge 0; $i--) {
+        $windowSec += $iv[$i].Sec
+        $splitIdx = $i
+        if ($windowSec -ge $script:IoCollapseSeconds) { break }
+    }
+    # Stamped BEFORE the early returns. A run that is merely too short still
+    # measured a real amount of time, and reporting 0 there would say "nothing
+    # was observed" about a period that was observed and found wanting.
+    $baselineSec = [double]0
+    for ($i = 0; $i -lt $splitIdx; $i++) { $baselineSec += $iv[$i].Sec }
+    $result.BaselineSeconds = [math]::Round($baselineSec, 1)
+    $result.WindowSeconds   = [math]::Round($windowSec, 1)
+
+    if ($windowSec -lt $script:IoCollapseSeconds) { return $result }
+    if ($baselineSec -lt $script:IoBaselineMinSeconds) { return $result }
+
+    # Discontinuity markers are excluded from every RATE calculation below --
+    # they carry no ops and no seconds, and exist only for the contiguity walk.
+    $window   = @($iv[$splitIdx .. ($iv.Count - 1)] | Where-Object { -not $_.Break })
+    $baseline = @($iv[0 .. ($splitIdx - 1)]          | Where-Object { -not $_.Break })
+    if ($baseline.Count -eq 0 -or $window.Count -eq 0) { return $result }
+
+    # Median of the per-interval RATES, deliberately unweighted: each interval is
+    # an independent estimate of the same rate, and the median's whole job is to
+    # be unmoved by the outlier. Weighting by duration would hand the outlier
+    # back the influence the median just took away.
+    $sorted = @($baseline | ForEach-Object { $_.Rate } | Sort-Object)
     $median = if ($sorted.Count % 2 -eq 1) {
         $sorted[[int](($sorted.Count - 1) / 2)]
     } else {
         ($sorted[($sorted.Count / 2) - 1] + $sorted[$sorted.Count / 2]) / 2
     }
-    $result.BaselineOpsPerTick = [math]::Round($median, 0)
+    $result.BaselineOpsPerSecond = [math]::Round($median, 1)
 
-    $recentAvg = ($window | Measure-Object -Average).Average
-    $result.RecentOpsPerTick = [math]::Round($recentAvg, 0)
+    # Time-weighted, per the note above.
+    $winOps = [double]0
+    foreach ($w in $window) { $winOps += $w.Ops }
+    $recentRate = $winOps / $windowSec
+    $result.RecentOpsPerSecond = [math]::Round($recentRate, 1)
 
-    if ($median -lt $script:IoBaselineMinOpsPerTick) { return $result }
+    # Reported above BEFORE this return, deliberately: a sub-floor rate is a real
+    # measurement and the record should carry it. Only the VERDICT is withheld.
+    if ($median -lt $script:IoBaselineMinOpsPerSecond) { return $result }
 
-    $result.FractionOfBaseline = [math]::Round(($recentAvg / $median) * 100, 0)
+    $result.FractionOfBaseline = [math]::Round(($recentRate / $median) * 100, 0)
 
     $limit = $median * $script:IoCollapseFraction
-    $collapsed = @($window | Where-Object { $_ -lt $limit }).Count
-    $result.CollapsedTicks = $collapsed
+    $result.DegradedIntervals = @($window | Where-Object { $_.Rate -lt $limit }).Count
 
-    if ($collapsed -ge $script:IoCollapseTicks) {
+    # The debounce: contiguous seconds below the limit, counted back from the
+    # newest interval. "All four window ticks below" said the same thing at the
+    # 3 s target and something different at every other cadence.
+    #
+    # A DISCONTINUITY ENDS THE RUN, exactly as a healthy interval does. The
+    # seconds have to be contiguous in the RECORDING, not merely adjacent in the
+    # buffer: an unmeasured gap is the most likely place for the reads to have
+    # come back, so counting across it would assert a collapse over a period
+    # nothing observed. Erring toward Degrading here is the safe direction --
+    # Collapsed is the verdict that fires a fault.
+    $contig = [double]0
+    for ($i = $iv.Count - 1; $i -ge 0; $i--) {
+        if ($iv[$i].Break) { break }
+        if ($iv[$i].Rate -lt $limit) { $contig += $iv[$i].Sec } else { break }
+    }
+    $result.CollapsedSeconds = [math]::Round($contig, 1)
+
+    if ($contig -ge $script:IoCollapseSeconds) {
         $result.Verdict = 'Collapsed'
-    } elseif ($collapsed -gt 0) {
+    } elseif ($result.DegradedIntervals -gt 0) {
         # Some of the window is already under the limit. Not enough to fire a
         # fault -- deliberately, so a scheduling hiccup cannot -- but saying
         # "Streaming" here is what let a marked 12006 record itself as healthy.
@@ -1291,8 +1481,14 @@ function New-ProbeStateMarker {
         [System.Nullable[bool]]$AppRunning,
         [string]$NoExeVersion,
         [string]$IoVerdict,
-        [int]$IoBaselineOpsPerTick = 0,
-        [int]$IoRecentOpsPerTick = 0,
+        [double]$IoBaselineOpsPerSecond = 0,
+        [double]$IoRecentOpsPerSecond = 0,
+        # The read-rate episode live at this instant (#87). Stamped, never
+        # reconstructed at summary time from timestamps: re-deriving it would be
+        # a second answerer for a question the marker can answer itself, and it
+        # is unreliable anyway because an episode is a Stopped -> Active epoch
+        # and not necessarily one port handle (#85).
+        [string]$EpisodeId,
         # Corroboration for the dead-port rule. Without these a marker placed
         # while the headset happened to be off would cross-check as a hard port
         # fault; with them the same instant reads as an unreachable device.
@@ -1325,8 +1521,8 @@ function New-ProbeStateMarker {
     # Recomputed here rather than passed in so a marker is self-describing: the
     # archive is read long after the fact, and a raw pair of counters makes the
     # reader do arithmetic to see that 56-against-444 is a fault.
-    $fraction = if ($IoBaselineOpsPerTick -gt 0) {
-        [math]::Round(($IoRecentOpsPerTick / $IoBaselineOpsPerTick) * 100, 0)
+    $fraction = if ($IoBaselineOpsPerSecond -gt 0) {
+        [math]::Round(($IoRecentOpsPerSecond / $IoBaselineOpsPerSecond) * 100, 0)
     } else { $null }
 
     return @{
@@ -1347,9 +1543,12 @@ function New-ProbeStateMarker {
         # marker into evidence about NO's own read path rather than only about
         # the Bluetooth layer.
         IoVerdict            = if ($IoVerdict) { $IoVerdict } else { 'NoBaseline' }
-        IoBaselineOpsPerTick = $IoBaselineOpsPerTick
-        IoRecentOpsPerTick   = $IoRecentOpsPerTick
+        IoBaselineOpsPerSecond = $IoBaselineOpsPerSecond
+        IoRecentOpsPerSecond   = $IoRecentOpsPerSecond
         IoFractionOfBaseline = $fraction
+        # $null when no episode was open -- no port was held, so the marker sits
+        # in no episode. That is a real answer and must not be filled in.
+        EpisodeId            = if ($EpisodeId) { $EpisodeId } else { $null }
         Contradictions   = @($contradictions | ForEach-Object { $_.Text })
     }
 }
@@ -1376,9 +1575,9 @@ function Format-ProbeStateMarker {
     # radio connected, ports held, NO.exe running -- while the one number that
     # showed the fault (56 against a 444 baseline) sat unread in the record.
     $io = switch ($Marker.IoVerdict) {
-        'Collapsed'  { "reads COLLAPSED to $($Marker.IoRecentOpsPerTick)/tick from a $($Marker.IoBaselineOpsPerTick) baseline" }
-        'Degrading'  { "reads FALLING at $($Marker.IoRecentOpsPerTick)/tick against a $($Marker.IoBaselineOpsPerTick) baseline" }
-        'Streaming'  { "reads steady at ~$($Marker.IoRecentOpsPerTick)/tick" }
+        'Collapsed'  { "reads COLLAPSED to $($Marker.IoRecentOpsPerSecond)/s from a $($Marker.IoBaselineOpsPerSecond)/s baseline" }
+        'Degrading'  { "reads FALLING at $($Marker.IoRecentOpsPerSecond)/s against a $($Marker.IoBaselineOpsPerSecond)/s baseline" }
+        'Streaming'  { "reads steady at ~$($Marker.IoRecentOpsPerSecond)/s" }
         default      { 'read rate not assessed' }
     }
     if ($null -ne $Marker.IoFractionOfBaseline -and $Marker.IoVerdict -ne 'Streaming' -and $Marker.IoVerdict -ne 'NoBaseline') {
@@ -1600,12 +1799,59 @@ function New-DeviceProbeSession {
         # COM port", downgrading the first clean 30-minute run to Partial.
         # The name now matches the source: this field IS HeldPorts, remembered.
         PortEverHeld             = $false
+        # Recomputed from the live held set on EVERY tick since #85, and left
+        # $null while more than one port is held rather than naming one of them:
+        # the read counter is process-wide, so picking a single port out of a set
+        # asserts an attribution nothing here can support. It was previously
+        # assigned only on the Stopped -> Active edge, so it kept naming the set
+        # from the last edge and could blame a port released mid-epoch.
         ActiveStreamPort         = $null
+        # Last tick's held SET, for change detection. Compared as a sorted set,
+        # not a count -- COM5 released while COM3 is acquired keeps the count at
+        # one, and that is precisely the change that used to be invisible (#85).
+        HeldPortsPrev            = @()
+        # How often the held set changed WITHOUT ever emptying. Session-long and
+        # episode-scoped, as two fields rather than one whose meaning depends on
+        # when it is read.
+        #
+        # >0 means this recording's read baseline spans more than one port
+        # handle. That is a deliberate choice and not a defect -- see the tick
+        # path for why the alternative is worse -- but it IS a limit on
+        # precision, and a limit a reader cannot see is indistinguishable from
+        # one that does not exist.
+        HeldPortSetChangeCount        = 0
+        HeldPortSetChangeCountEpisode = 0
+        # Every port the CURRENT episode has held at any point, so the episode
+        # record can say whether its baseline covered one handle or several.
+        HeldPortsThisEpisode     = @()
+        # EPISODE IDENTITY (#87). Episodes carried EndedAtIso and nothing else,
+        # so no operator marker could ever be placed INSIDE one -- which is
+        # exactly the join needed to answer "did the 12006 land on the measured
+        # collapse?". On DB98B6EE3324 both facts were measured and the question
+        # was still unanswerable from the record.
+        #
+        # The marker stamps the id live, and the episode record carries the same
+        # id, so the join is RECORDED rather than reconstructed. Reconstructing
+        # it from timestamps would be a second answerer for a question the
+        # marker can answer itself -- the channel-mismatch class this repo has
+        # filed nine instances of -- and it is unreliable anyway, because an
+        # episode is a Stopped -> Active epoch and not necessarily one handle
+        # (#85).
+        IoEpisodeSeq             = 0
+        IoEpisodeId              = $null
+        IoEpisodeStartedAt       = $null
         # Last tick's port classification. HeldPorts drives the honest operator
         # text; UnavailablePorts is the FI-012 signal the old bool test erased by
         # folding "would not open" in with "nobody has it open".
         HeldPorts                = @()
         UnavailablePorts         = @()
+        # Explicit current/ever pairs (#88). The two above are kept because the
+        # module reads them everywhere, but a CONSUMER must never have to know
+        # that one is last-tick and the other a session union -- that asymmetry,
+        # joined without noticing, is #81.
+        HeldPortsEver            = @()
+        UnavailablePortsCurrent  = @()
+        UnavailablePortsEver     = @()
         StreamPeakCpuS           = 0.0
         StreamPeakWorkingSetMB   = 0
         # Data-flow corroboration. The probe cannot read the EEG bytes -- the port
@@ -1624,24 +1870,64 @@ function New-DeviceProbeSession {
         # build or a different session type.
         IoApiAvailable           = $false
         IoLastReadOps            = $null
-        IoReadOpDeltas           = [System.Collections.ArrayList]::new()
+        # Paired with IoLastReadOps and reset with it, so every scoped sample
+        # carries the elapsed time of its OWN interval (#86). The unscoped ledger
+        # keeps its own pair -- see IoUnscopedLastAt -- because the two series are
+        # cleared at different moments and sharing one clock would make the
+        # scoped deltas span a reset.
+        IoLastReadAt             = $null
+        # Stamped scoped samples: @{ DeltaOps; DeltaSeconds; At }.
+        #
+        # RENAMED from IoReadSamples, which held bare doubles. The rename is the
+        # point (#86): a rate needs a denominator, and any writer still pushing a
+        # bare number now fails on a property that does not exist instead of
+        # feeding the detector a duration-contaminated count it cannot tell from a
+        # rate. Test-IoReadCollapse counts such samples as MalformedSamples for
+        # the same reason.
+        IoReadSamples            = [System.Collections.ArrayList]::new()
+        # Session TOTAL samples, monotonic, never cleared (#88).
+        #
+        # IoReadSamples above is the CURRENT episode's buffer and is Clear()ed on
+        # every port re-open, so its length answers "could a verdict be reached
+        # right now", not "how many samples did this recording take". Coverage
+        # asked it the second question and got the first: DB98B6EE3324 reported
+        # IoSampleCount 7 while also reporting a baseline announced at 176
+        # ops/tick, a peak of 297 and TWO baseline resets -- and a verdict needs
+        # IoBaselineMinSeconds + IoCollapseSeconds = 27 s of history to exist at
+        # all, which at that run's 4.6 s cadence is 6 samples minimum. 7 is
+        # arithmetically implausible as a session total; it was the tail after the
+        # last reset.
+        #
+        # This matters beyond the number: Coverage.Level keys off it, so a run
+        # whose port is re-opened on its final tick reported 0 and could be
+        # downgraded to 'NotObserved' -- a capture that measured data flow for its
+        # whole length rendering as one that never measured any. That is the
+        # absent-must-render-as-absent rule failing in the opposite direction: a
+        # PRESENT measurement rendered as absent.
+        IoSamplesTotal           = 0
         IoVerdict                = 'NoBaseline'
-        IoBaselineOpsPerTick     = 0
-        IoRecentOpsPerTick       = 0
+        IoBaselineOpsPerSecond   = 0
+        IoRecentOpsPerSecond     = 0
         IoFractionOfBaseline     = $null
-        # An intermittent stall never satisfies the four-tick debounce, so it
-        # used to summarise as "held steady" -- the reading a dropout-every-
-        # 30-seconds headset would produce. These two remember the dips.
-        IoDegradedTicks          = 0
+        # An intermittent stall never satisfies the debounce, so it used to
+        # summarise as "held steady" -- the reading a dropout-every-30-seconds
+        # headset would produce. These two remember the dips.
+        #
+        # SECONDS, not ticks (#86). This is compared against IoCollapseSeconds in
+        # two places, and a tick count against a seconds threshold is not a
+        # comparison at all -- on 13.5 s ticks four of them are 54 s of trouble
+        # and on 3 s ticks they are 12 s. It accumulates each degraded interval's
+        # OWN elapsed time.
+        IoDegradedSeconds        = 0.0
         # The worst read rate seen on the TICK path, kept as a PAIR. The fraction
-        # was tracked alone, and the ops/tick that produced it was recovered from
-        # a different channel entirely (the collapsed-episode ledger), so capture
+        # was tracked alone, and the rate that produced it was recovered from a
+        # different channel entirely (the collapsed-episode ledger), so capture
         # E0C8B0588CC7 reported a worst fraction of 0% beside a worst rate of
         # null: two halves of one observation, sourced from two places, one of
         # which had nothing to say. Both are $null until something is measured --
         # 0 in a percentage field would read as "total collapse" (issue #65).
         IoWorstFractionOfBaseline = $null
-        IoWorstRecentOpsPerTick   = $null
+        IoWorstRecentOpsPerSecond = $null
         IoStalled                = $false
         IoStallReported          = $false
         # A collapse WAS detected at some point in this run. Unresettable, and
@@ -1698,7 +1984,7 @@ function New-DeviceProbeSession {
         # median: what was announced is not necessarily what the run ends on, and
         # the announced figure is the one the operator actually saw.
         IoBaselineAnnouncedAt    = $null
-        IoBaselineAnnouncedOpsPerTick = $null
+        IoBaselineAnnouncedOpsPerSecond = $null
         # ── Stamped sample ledger (#84) ──────────────────────────────────────
         # Every tick on which NO.exe existed, whether or not a port was held.
         #
@@ -1866,6 +2152,18 @@ function Invoke-DeviceProbeTick {
         Normalized MAC for BT link monitoring.
     .PARAMETER AppProcessName
         Process name (e.g. 'NO') for health sampling.
+    .PARAMETER Now
+        The instant this tick represents. Defaults to Get-Date, which is what
+        production always uses.
+
+        It is injectable because since #86 the clock is not merely a label on
+        the tick -- it is the DENOMINATOR of every read rate the tick computes.
+        A detector that needs IoBaselineMinSeconds + IoCollapseSeconds of elapsed
+        time to reach a verdict cannot be exercised end-to-end by a test loop
+        that runs in milliseconds, and the alternative -- making the test sleep
+        27 seconds, or mocking Get-Date module-wide and catching every other
+        caller of it with it -- is worse than one parameter with a real default.
+        ONE choke point: every timestamp in this tick derives from $now.
     .OUTPUTS
         [hashtable[]] Array of renderable events, each with:
             Kind, State, Reason, Annotation, Level, Timestamp
@@ -1876,11 +2174,12 @@ function Invoke-DeviceProbeTick {
         [Parameter(Mandatory)][hashtable]$WatchState,
         [Parameter(Mandatory)][AllowEmptyCollection()][array]$NewObservations,
         [string]$TargetMac,
-        [string]$AppProcessName = 'NO'
+        [string]$AppProcessName = 'NO',
+        [datetime]$Now = (Get-Date)
     )
 
     $events = @()
-    $now = Get-Date
+    $now = $Now
 
     $Session.TickCount++
     if (-not $Session.FirstTickAt) { $Session.FirstTickAt = $now }
@@ -1898,9 +2197,107 @@ function Invoke-DeviceProbeTick {
     $newDeadPorts = @(
         if ($streamResult -is [hashtable] -and $streamResult.ContainsKey('UnavailablePorts')) { $streamResult.UnavailablePorts } else { @() }
     )
+    # CURRENT vs EVER, as two fields rather than one whose meaning depends on
+    # when you read it (#88, and the shape behind #81). HeldPorts is last-tick
+    # only; UnavailablePorts is a session-long UNION. Joining those two without
+    # noticing the mismatch is how #81's false "port will not open" was produced.
+    $Session.UnavailablePortsCurrent = @($newDeadPorts | Where-Object { $_ })
     # Union across the session: a port that failed to open at any point stays in
     # the record even if it opens later.
     $Session.UnavailablePorts = @(@($Session.UnavailablePorts) + $newDeadPorts | Where-Object { $_ } | Select-Object -Unique)
+    $Session.UnavailablePortsEver = @($Session.UnavailablePorts)
+    # The counterpart the record never had: which ports were held at ANY point.
+    # PortEverHeld below answers the boolean; nothing answered "which".
+    $Session.HeldPortsEver = @(
+        @($Session.HeldPortsEver) + @($Session.HeldPorts) | Where-Object { $_ } | Select-Object -Unique
+    )
+
+    # ── Held-port SET changes (#85) ──────────────────────────────────────────
+    # StreamingState is a two-valued aggregate: Active if ANY target port is
+    # held, Stopped if none is. Every consequence of a port changing hands used
+    # to hang off the Stopped -> Active edge, so a change in WHICH ports are held
+    # -- COM5 released and reacquired while COM3 stays open -- produced no edge
+    # and therefore no consequence at all. It was invisible in the record.
+    #
+    # DECISION, and it is deliberate: a set change is RECORDED, NOT reset.
+    #
+    # The comment on the reset below used to assert "a baseline must not span two
+    # port handles". That rule is retired here, because the measurement never
+    # supported it. The read counter is process-wide and cannot attribute a read
+    # to a port (Get-ProcessIoSample), so a baseline was never per-handle -- it
+    # was per-process-while-holding-something, and resetting on a set change
+    # would enforce a precision the instrument does not have.
+    #
+    # The other half is evidence preservation. Every reset is a chance to lose a
+    # measured collapse: #59 lost one to a re-open, #63 lost one to erosion. At
+    # DB98B6EE3324's 27-36 s re-acquire cycle against the ~27 s a baseline needs
+    # to rebuild, resetting on set changes as well would leave the detector
+    # permanently blind in exactly the fault it exists to catch.
+    #
+    # So the imprecision is rendered instead of acted on: the episode carries how
+    # many times the set changed and which ports it ever contained, and a reader
+    # who wants per-handle precision can see that they do not have it.
+    $heldNowSet = @($Session.HeldPorts | Where-Object { $_ } | Sort-Object)
+    $heldWasSet = @($Session.HeldPortsPrev | Where-Object { $_ } | Sort-Object)
+    if (($heldNowSet -join '|') -ne ($heldWasSet -join '|')) {
+        # Only counted WITHIN an epoch. The set going empty and refilling is the
+        # Stopped -> Active edge, which is already an episode boundary and must
+        # not also be counted as a change spanning one.
+        if ($heldWasSet.Count -gt 0 -and $heldNowSet.Count -gt 0) {
+            $Session.HeldPortSetChangeCount++
+            $Session.HeldPortSetChangeCountEpisode++
+            $gained = @($heldNowSet | Where-Object { $_ -notin $heldWasSet })
+            $lost   = @($heldWasSet | Where-Object { $_ -notin $heldNowSet })
+            $parts  = @()
+            if ($lost.Count)   { $parts += "released $($lost -join ', ')" }
+            if ($gained.Count) { $parts += "acquired $($gained -join ', ')" }
+            # WORDING: the hold test opens a port and observes that it is
+            # refused. That proves SOME process holds it -- it does not prove
+            # which, and nothing here binds the handle to NO.exe. Naming NO.exe
+            # would be the same over-claim as attributing a process-wide read
+            # counter to a particular port.
+            $events += @{
+                Kind = 'STREAM'; State = 'HeldPortsChanged'
+                Reason = "the set of held COM ports changed: $($parts -join ' and '), still held: $($heldNowSet -join ', ')"
+                Annotation = "[i] The set of COM ports held by another process changed without ever emptying, so this is not a stream stop. The read-rate baseline is deliberately NOT restarted here -- the read counter is process-wide and cannot attribute a read to a port, so it now spans more than one handle. Read this episode's rate as covering the whole set."
+                Level = 'INFO'; Timestamp = $now
+            }
+        }
+        $Session.HeldPortsPrev = @($heldNowSet)
+    }
+    # Open the FIRST episode of the run here rather than on the transition edge
+    # below (#87). A session already streaming when Record was pressed produces
+    # no Stopped -> Active edge at all -- the recorder seeds StreamingState from
+    # the arrival snapshot -- so an episode opened only on the edge would leave
+    # every such run with a null EpisodeId and no marker join. Same mistake as
+    # #67's port-hold latch, caught before it shipped this time.
+    $startedEpisodeThisTick = $false
+    if ($heldNowSet.Count -gt 0 -and -not $Session.IoEpisodeId) {
+        $null = Start-IoEpisode -Session $Session -At $now
+        $startedEpisodeThisTick = $true
+    }
+    # Ports this EPISODE has held at any point, so the episode record can say
+    # whether its baseline covered one handle or several.
+    $Session.HeldPortsThisEpisode = @(
+        @($Session.HeldPortsThisEpisode) + $heldNowSet | Where-Object { $_ } | Select-Object -Unique | Sort-Object
+    )
+    # Recomputed EVERY tick from the live set, not once per Stopped -> Active
+    # edge. It was assigned in exactly one place -- inside the transition branch
+    # -- so it kept naming the port set from the last edge and could attribute a
+    # stall to a port that had been released partway through the epoch.
+    $Session.ActiveStreamPort = if ($heldNowSet.Count -eq 1) {
+        $heldNowSet[0]
+    } elseif ($heldNowSet.Count -gt 1) {
+        # Deliberately $null rather than a pick. With both RFCOMM channels open
+        # -- the Arc's normal shape -- naming one asserts an attribution the
+        # process-wide counter cannot support. Callers already fall back to the
+        # live set, which is the honest answer.
+        $null
+    } else {
+        # Nothing held right now. Keep the last known name so a teardown message
+        # can still say which port it was about.
+        $Session.ActiveStreamPort
+    }
 
     # Session-long memory of the port hold. HeldPorts is the LAST tick only, so
     # without this nothing can answer "was the target's port ever held at any
@@ -1951,26 +2348,68 @@ function Invoke-DeviceProbeTick {
             $Session.StreamCpuStalled       = $false
             $Session.StreamCpuStallReported = $false
             # Close out the read-rate episode BEFORE wiping it. The reset below
-            # is correct -- a baseline must not span two port handles -- but it
-            # used to be the only thing that happened, so a collapse already
-            # measured was erased by NO.exe simply re-opening the port, and the
-            # session ended claiming no baseline was ever established. See
-            # IoClosedEpisodes in New-DeviceProbeSession for the field capture.
-            $closing = New-IoEpisodeRecord -Session $Session -At $now
-            if ($closing) { [void]$Session.IoClosedEpisodes.Add($closing) }
-            if ([int]$Session.IoBaselineOpsPerTick -gt 0) { $Session.IoBaselineResetCount++ }
+            # is correct -- the set of held ports went EMPTY and refilled, so
+            # nothing was streaming in between -- but it used to be the only
+            # thing that happened, so a collapse already measured was erased by
+            # NO.exe simply re-opening the port, and the session ended claiming
+            # no baseline was ever established. See IoClosedEpisodes in
+            # New-DeviceProbeSession for the field capture.
+            #
+            # RETIRED CLAIM (#85): this comment used to read "a baseline must not
+            # span two port handles". It can and now does. The reset boundary is
+            # the set EMPTYING, not any change to it -- see the held-port-set
+            # block above for why, and HeldPortSetChangeCount for what a reader
+            # gets instead.
+            # Normally already closed, at RELEASE, by the Stopped branch below --
+            # this call is the idempotent backstop for the paths that reach
+            # 'Active' without having passed through it.
+            #
+            # SKIPPED when this tick already opened an episode, which is the
+            # normal reacquisition shape: the block above sees an empty id and
+            # opens the new episode BEFORE this branch runs, so closing here
+            # would immediately close the episode that is only microseconds old,
+            # leaving the id null until the next tick and burning an id on an
+            # episode that never existed.
+            if (-not $startedEpisodeThisTick) {
+                $null = Close-IoEpisode -Session $Session -At $now
+            }
+            # Counted HERE, where a restart genuinely happens: the baseline
+            # about to be wiped is one the measurement is starting over from.
+            if ([double]$Session.IoBaselineOpsPerSecond -gt 0) { $Session.IoBaselineResetCount++ }
 
             $Session.IoLastReadOps          = $null
-            $Session.IoReadOpDeltas.Clear()
+            # Reset WITH IoLastReadOps, never separately: a surviving timestamp
+            # beside a cleared counter would make the first sample of the new
+            # episode span the whole re-open gap, which is exactly the kind of
+            # interval the detector must not divide by.
+            $Session.IoLastReadAt           = $null
+            $Session.IoReadSamples.Clear()
             $Session.IoVerdict              = 'NoBaseline'
-            $Session.IoBaselineOpsPerTick   = 0
-            $Session.IoRecentOpsPerTick     = 0
+            $Session.IoBaselineOpsPerSecond   = 0
+            $Session.IoRecentOpsPerSecond     = 0
             $Session.IoFractionOfBaseline   = $null
             $Session.IoStalled              = $false
             $Session.IoStallReported        = $false
             $Session.IoBaselineReported     = $false
             $portInfo = if ($streamResult.ActivePort) { " on $($streamResult.ActivePort)" } else { '' }
-            $Session.ActiveStreamPort = $streamResult.ActivePort
+            # A NEW episode begins here, with its own id and start time (#87).
+            # This also clears the episode-scoped held-port counters, so the next
+            # episode's record does not inherit this one's handle churn -- the
+            # session-long counter beside it is never reset, for the same reason
+            # IoClosedEpisodes is not.
+            #
+            # Guarded, because the FIRST tick of a run that was already streaming
+            # satisfies both openers: the block above opens the run's first
+            # episode, and this edge fires on the same tick. Opening twice would
+            # burn E1 unused and start every such capture at E2 -- an id that
+            # refers to nothing, in the field the marker join depends on.
+            if (-not $startedEpisodeThisTick) {
+                $null = Start-IoEpisode -Session $Session -At $now
+            }
+            # ActiveStreamPort is NOT assigned here any more (#85). It is
+            # recomputed from the live held set every tick, above -- assigning it
+            # only on this edge is what let it go stale and misattribute a stall
+            # to a port released partway through the epoch.
             # Deliberately does not say "EEG data streaming" -- this event fires on
             # a handle being taken, which NO.exe does at connect whether or not the
             # headset ever delivers a sample.
@@ -1982,6 +2421,13 @@ function Invoke-DeviceProbeTick {
             $events += $evt
             $Session.StateEnteredAt['streaming_Active_at'] = $now
         } elseif ($prevStreaming -eq 'Active') {
+            # The port set EMPTIED, so the episode ends HERE -- at the release,
+            # not at the next reacquisition (#87). Leaving it open across the
+            # stopped interval stamped the old id onto markers taken while no
+            # port was held, which is precisely the 12005 shape, and dated every
+            # episode's end to the moment the port came back.
+            $null = Close-IoEpisode -Session $Session -At $now
+
             $elapsed = if ($Session.StateEnteredAt['streaming_Active_at']) {
                 [int]($now - $Session.StateEnteredAt['streaming_Active_at']).TotalSeconds
             } else { 0 }
@@ -2144,36 +2590,77 @@ function Invoke-DeviceProbeTick {
                         # delta means this is a different NO.exe, so drop the
                         # history rather than baseline across two processes.
                         if ($opsDelta -lt 0) {
-                            $Session.IoReadOpDeltas.Clear()
+                            $Session.IoReadSamples.Clear()
                         } else {
-                            [void]$Session.IoReadOpDeltas.Add($opsDelta)
+                            # The DENOMINATOR, measured on the same path that
+                            # produced the numerator (#86). Taken from this
+                            # session's own last scoped sample rather than from
+                            # the tick target, because the target is what the
+                            # cadence FAILED to be: DB98B6EE3324 aimed at 3000 ms
+                            # and delivered up to 13506 ms, and using the aim
+                            # would have preserved the exact artefact the unit
+                            # change exists to remove.
+                            $deltaSec = if ($null -ne $Session.IoLastReadAt) {
+                                ($now - [datetime]$Session.IoLastReadAt).TotalSeconds
+                            } else { $null }
+                            [void]$Session.IoReadSamples.Add(@{
+                                DeltaOps     = $opsDelta
+                                DeltaSeconds = $deltaSec
+                                At           = $now
+                            })
+                            # Incremented in the SAME place the sample is added,
+                            # so the total and the buffer can never disagree about
+                            # what was sampled -- only about what survives a
+                            # reset, which is the whole point (#88).
+                            $Session.IoSamplesTotal++
                             # Stamped from the tick path, so the idle tail is
                             # measured rather than inferred from wall clock.
                             if ($opsDelta -gt 0) { $Session.IoLastNonZeroReadAt = $now }
                         }
                     }
                     $Session.IoLastReadOps = $ioSample.ReadOps
+                    # Advanced on EVERY scoped sample including the first and the
+                    # post-reset one, so the next interval is measured from the
+                    # last observation rather than from the last USABLE one.
+                    $ioPrevReadAt = $Session.IoLastReadAt
+                    $Session.IoLastReadAt = $now
 
-                    $ioVerdict = Test-IoReadCollapse -Deltas @($Session.IoReadOpDeltas)
+                    $ioVerdict = Test-IoReadCollapse -Samples @($Session.IoReadSamples)
                     $Session.IoVerdict            = $ioVerdict.Verdict
-                    $Session.IoBaselineOpsPerTick = $ioVerdict.BaselineOpsPerTick
-                    $Session.IoRecentOpsPerTick   = $ioVerdict.RecentOpsPerTick
+                    $Session.IoBaselineOpsPerSecond = $ioVerdict.BaselineOpsPerSecond
+                    $Session.IoRecentOpsPerSecond   = $ioVerdict.RecentOpsPerSecond
                     $Session.IoFractionOfBaseline = $ioVerdict.FractionOfBaseline
 
                     # Session-long memory of dips. A headset that drops out
                     # briefly and recovers never satisfies the debounce, so
                     # without this the summary would call the whole recording
                     # steady -- the exact reading an intermittent Arc produces.
+                    #
+                    # Accumulates THIS interval's own elapsed time, not 1 (#86).
+                    # A tick count compared against IoCollapseSeconds is not a
+                    # comparison, and the two places that make it are the
+                    # intermittent-dip finding and the teardown-dip test.
                     if ($Session.IoVerdict -in @('Degrading', 'Collapsed')) {
-                        $Session.IoDegradedTicks++
+                        $degSec = if ($null -ne $ioPrevReadAt) {
+                            ($now - [datetime]$ioPrevReadAt).TotalSeconds
+                        } else { 0 }
+                        # A gap is not a dip that lasted that long -- the same
+                        # ceiling the detector applies to an interval it would
+                        # otherwise divide by.
+                        if ($degSec -gt 0 -and $degSec -le $script:IoMaxSampleIntervalSeconds) {
+                            $Session.IoDegradedSeconds += $degSec
+                        }
                     }
                     if ($null -ne $ioVerdict.FractionOfBaseline -and
                         ($null -eq $Session.IoWorstFractionOfBaseline -or
                          $ioVerdict.FractionOfBaseline -lt $Session.IoWorstFractionOfBaseline)) {
                         $Session.IoWorstFractionOfBaseline = $ioVerdict.FractionOfBaseline
                         # Captured in the SAME assignment as the fraction, so the
-                        # two can only ever describe the same tick.
-                        $Session.IoWorstRecentOpsPerTick   = [int]$ioVerdict.RecentOpsPerTick
+                        # two can only ever describe the same tick. NOT [int]:
+                        # the rates that matter most here are the small ones, and
+                        # truncating 0.87 ops/s to 0 would report a measured
+                        # trickle as total silence.
+                        $Session.IoWorstRecentOpsPerSecond   = [double]$ioVerdict.RecentOpsPerSecond
                     }
 
                     # Baseline established -- the ONLY positive confirmation the
@@ -2187,7 +2674,7 @@ function Invoke-DeviceProbeTick {
                     # instead of after an upload and a decode.
                     #
                     # Fires on 'Streaming' only, which already requires
-                    # IoBaselineMinTicks samples above IoBaselineMinOpsPerTick --
+                    # IoBaselineMinSeconds samples above IoBaselineMinOpsPerSecond --
                     # so it cannot announce a baseline that is too thin to judge
                     # a collapse against. One-shot per streaming period; the
                     # reset above re-arms it when a new port hold begins.
@@ -2207,11 +2694,11 @@ function Invoke-DeviceProbeTick {
                         # session log.
                         if ($null -eq $Session.IoBaselineAnnouncedAt) {
                             $Session.IoBaselineAnnouncedAt = $now
-                            $Session.IoBaselineAnnouncedOpsPerTick = $ioVerdict.BaselineOpsPerTick
+                            $Session.IoBaselineAnnouncedOpsPerSecond = $ioVerdict.BaselineOpsPerSecond
                         }
                         $events += @{
                             Kind = 'STREAM'; State = 'ReadBaseline'
-                            Reason = "NO.exe read baseline established at ~$($ioVerdict.BaselineOpsPerTick) read operations per tick"
+                            Reason = "NO.exe read baseline established at ~$($ioVerdict.BaselineOpsPerSecond) read operations per second"
                             Annotation = "[ok] Data flow is measurable on this machine, so a stall later in this recording will be caught. The number is this session's own normal -- it varies by box and by build, and only the ratio against it means anything."
                             Level = 'OK'; Timestamp = $now
                         }
@@ -2232,7 +2719,7 @@ function Invoke-DeviceProbeTick {
                         } else { '' }
                         $events += @{
                             Kind = 'ANOMALY'; State = 'ReadRateCollapsed'
-                            Reason = "NO.exe read rate collapsed from ~$($ioVerdict.BaselineOpsPerTick) to ~$($ioVerdict.RecentOpsPerTick) read operations per tick while still holding $ioPort"
+                            Reason = "NO.exe read rate collapsed from ~$($ioVerdict.BaselineOpsPerSecond) to ~$($ioVerdict.RecentOpsPerSecond) read operations per second while still holding $ioPort"
                             Annotation = "[!] The application stopped reading while keeping the port open.$busyNote Windows can still show the Bluetooth link as connected here: the baseband link stays up while the headset stops delivering data, which is what 'Arc Connection Lost' looks like from outside."
                             Level = 'FAIL'; Timestamp = $now
                         }
@@ -2519,15 +3006,15 @@ function Get-DeviceProbeSessionSummary {
         # Numbers come from the session record, so they survive a port re-open.
         # Reading them off the live fields printed "~0 to ~0" on exactly the
         # captures where the collapse had already been erased.
-        $fromOps = if ($Session.IoStalled) { [int]$Session.IoBaselineOpsPerTick } else { [int]$ioRecord.PeakBaselineOpsPerTick }
-        $toOps   = if ($Session.IoStalled) { [int]$Session.IoRecentOpsPerTick } else { [int]$ioRecord.WorstRecentOpsPerTick }
+        $fromOps = if ($Session.IoStalled) { [double]$Session.IoBaselineOpsPerSecond } else { [double]$ioRecord.PeakBaselineOpsPerSecond }
+        $toOps   = if ($Session.IoStalled) { [double]$Session.IoRecentOpsPerSecond } else { [double]$ioRecord.WorstRecentOpsPerSecond }
         # The live baseline erodes with the recording window: on capture
         # 31D0729CA5B8 a 15.4 h idle tail dragged it to 0, and this sentence read
         # "went from ~0 to ~0 read operations per tick" -- a 0-to-0 collapse. The
         # record's peak now honours the announcement latch, so it holds the rate
         # this run actually established. Never report a from-rate below it.
-        if ([int]$ioRecord.PeakBaselineOpsPerTick -gt $fromOps) {
-            $fromOps = [int]$ioRecord.PeakBaselineOpsPerTick
+        if ([double]$ioRecord.PeakBaselineOpsPerSecond -gt $fromOps) {
+            $fromOps = [double]$ioRecord.PeakBaselineOpsPerSecond
         }
         # A collapse that is over by the end of the recording is still a
         # collapse. Saying so explicitly, because the live verdict now reads
@@ -2549,7 +3036,7 @@ function Get-DeviceProbeSessionSummary {
             }
             else { '' }
         $epNote = if ($ioRecord.CollapseEpisodes -gt 1) { " This happened in $($ioRecord.CollapseEpisodes) separate episodes." } else { '' }
-        [void]$findings.Add("[!] Read rate collapsed while the port stayed open: NO.exe went from ~$fromOps to ~$toOps read operations per tick on $portStr.$linkNote$endedNote$epNote Note this counter is process-wide, so it shows the application stopped doing the I/O it had been doing, not specifically that the port went quiet.")
+        [void]$findings.Add("[!] Read rate collapsed while the port stayed open: NO.exe went from ~$fromOps to ~$toOps read operations per second on $portStr.$linkNote$endedNote$epNote Note this counter is process-wide, so it shows the application stopped doing the I/O it had been doing, not specifically that the port went quiet.")
     } elseif ($Session.IoVerdict -eq 'NoBaseline' -and $Session.StreamingState -eq 'Active') {
         # Explicitly NOT a clean bill of health. Saying nothing here would let an
         # unmeasurable session read as a measured-healthy one.
@@ -2565,7 +3052,7 @@ function Get-DeviceProbeSessionSummary {
         # know and an invisible one if the summary just stays quiet.
         # BaselineResetCount ONLY -- deliberately not "a peak baseline exists".
         # Test-IoReadCollapse reports a rate even when it is below the floor
-        # needed to baseline, so a sub-floor reading makes PeakBaselineOpsPerTick
+        # needed to baseline, so a sub-floor reading makes PeakBaselineOpsPerSecond
         # nonzero without any baseline ever having been established, let alone
         # discarded. The counter increments only when a real baseline was thrown
         # away, which is exactly the claim being made here.
@@ -2573,11 +3060,11 @@ function Get-DeviceProbeSessionSummary {
             # 'NoBaseline' here means the baseline was THROWN AWAY by a port
             # re-open, not that none was ever found. Claiming no read activity
             # was visible would be flatly contradicted by the record.
-            [void]$findings.Add("[i] Read-rate monitoring restarted $($ioRecord.BaselineResetCount) time(s) during this recording because the COM port was re-opened, and the last episode had not re-established a baseline when the recording ended. Data flow WAS measured earlier (peak ~$($ioRecord.PeakBaselineOpsPerTick) read operations per tick). The end-of-session read-rate figures describe only the final episode -- do not read them as the whole session.")
-        } elseif ([int]$Session.IoBaselineOpsPerTick -eq 0) {
+            [void]$findings.Add("[i] Read-rate monitoring restarted $($ioRecord.BaselineResetCount) time(s) during this recording because the COM port was re-opened, and the last episode had not re-established a baseline when the recording ended. Data flow WAS measured earlier (peak ~$($ioRecord.PeakBaselineOpsPerSecond) read operations per second). The end-of-session read-rate figures describe only the final episode -- do not read them as the whole session.")
+        } elseif ([double]$Session.IoBaselineOpsPerSecond -eq 0) {
             [void]$findings.Add("[info] No read activity was visible on NO.exe at all this session, so data flow was NOT assessed. If the headset WAS streaming during this recording, the reads are not being issued by the NO.exe process -- on 4.x the serial I/O goes through NI-VISA, which may issue them from its own service process. Worth checking before trusting any read-rate result from this box.")
         } else {
-            [void]$findings.Add("[info] Read-rate monitoring could not establish a baseline for NO.exe this session (observed ~$($Session.IoBaselineOpsPerTick) read operations per tick, below the floor needed to call a collapse). Data flow was NOT assessed -- the absence of a read-collapse finding means nothing was measured, not that nothing was wrong.")
+            [void]$findings.Add("[info] Read-rate monitoring could not establish a baseline for NO.exe this session (observed ~$($Session.IoBaselineOpsPerSecond) read operations per second, below the floor needed to call a collapse). Data flow was NOT assessed -- the absence of a read-collapse finding means nothing was measured, not that nothing was wrong.")
         }
     } elseif ($Session.IoVerdict -eq 'Degrading' -and $Session.StreamingState -eq 'Active') {
         # The recording ended mid-decay WITH THE PORT STILL HELD. That last
@@ -2586,15 +3073,18 @@ function Get-DeviceProbeSessionSummary {
         # so it lands on 'Stopped' and never reaches this branch. Held-and-
         # falling is the fault shape; released-and-falling is a clinic finishing
         # a session. Without the gate every stop in the field would warn.
-        [void]$findings.Add("[!] NO.exe's read rate was FALLING when the recording ended, with the port still open: ~$($Session.IoRecentOpsPerTick) read operations per tick against the ~$($Session.IoBaselineOpsPerTick) this session established for itself$(if ($null -ne $Session.IoFractionOfBaseline) { " ($($Session.IoFractionOfBaseline)% of normal)" }). It had not stayed down long enough to call a collapse, so this is a stall caught in progress. Record for longer if this repeats -- a few more seconds would have settled it.")
-    } elseif ([int]$Session.IoDegradedTicks -gt $script:IoCollapseTicks) {
+        [void]$findings.Add("[!] NO.exe's read rate was FALLING when the recording ended, with the port still open: ~$($Session.IoRecentOpsPerSecond) read operations per second against the ~$($Session.IoBaselineOpsPerSecond) this session established for itself$(if ($null -ne $Session.IoFractionOfBaseline) { " ($($Session.IoFractionOfBaseline)% of normal)" }). It had not stayed down long enough to call a collapse, so this is a stall caught in progress. Record for longer if this repeats -- a few more seconds would have settled it.")
+    } elseif ([double]$Session.IoDegradedSeconds -gt $script:IoCollapseSeconds) {
         # Dips that recovered. An intermittent dropout looks exactly like this
         # and used to summarise as a clean "[ok] held steady".
         #
-        # The threshold is deliberately ABOVE IoCollapseTicks: the tail of a
-        # normal session stop can contribute up to three degraded ticks in the
-        # gap before the port is released, so anything at or below that budget
-        # would fire on routine stops.
+        # The threshold is deliberately ABOVE IoCollapseSeconds: the tail of a
+        # normal session stop can contribute up to about three ticks' worth of
+        # degraded time in the gap before the port is released, so anything at or
+        # below that budget would fire on routine stops. In seconds that budget
+        # no longer changes size with the box's cadence -- the old tick form gave
+        # a struggling machine a budget up to 4.5x larger than a healthy one,
+        # which is backwards: it was most forgiving exactly where dips matter.
         # "Recovering each time" is only true if the measurement ran continuously.
         # A port re-open resets it, which looks identical to a recovery and is not
         # one, so the claim is dropped when a reset could explain it.
@@ -2603,7 +3093,7 @@ function Get-DeviceProbeSessionSummary {
         } else {
             'recovering each time'
         }
-        [void]$findings.Add("[~] NO.exe's read rate dipped below a quarter of its own baseline on $($Session.IoDegradedTicks) tick(s) during this recording, $recoveryClaim (worst point ~$($ioRecord.WorstFractionOfBaseline)% of normal). No single dip lasted long enough to call a collapse, but a healthy stream does not do this -- suspect an intermittent link or an Arc dropping out briefly.")
+        [void]$findings.Add("[~] NO.exe's read rate dipped below a quarter of its own baseline for about $([math]::Round([double]$Session.IoDegradedSeconds, 0))s in total during this recording, $recoveryClaim (worst point ~$($ioRecord.WorstFractionOfBaseline)% of normal). No single dip lasted long enough to call a collapse, but a healthy stream does not do this -- suspect an intermittent link or an Arc dropping out briefly.")
     } elseif ($ioRecord.Outcome -eq 'Stable') {
         # Was `$Session.IoVerdict -eq 'Streaming'` -- the LAST tick's verdict.
         # Capture 91C5F8EB3E3F: 33 minutes, a 446 ops/tick baseline held across
@@ -2616,12 +3106,12 @@ function Get-DeviceProbeSessionSummary {
         #
         # Baseline reported from the session record, not the terminal field, so
         # a port re-open cannot zero the number in the sentence.
-        $steadyOps = if ($ioRecord.PeakBaselineOpsPerTick -gt 0) { $ioRecord.PeakBaselineOpsPerTick } else { $Session.IoBaselineOpsPerTick }
-        $steadyNote = if ($Session.IoDegradedTicks -gt 0) {
+        $steadyOps = if ($ioRecord.PeakBaselineOpsPerSecond -gt 0) { $ioRecord.PeakBaselineOpsPerSecond } else { $Session.IoBaselineOpsPerSecond }
+        $steadyNote = if ($Session.IoDegradedSeconds -gt 0) {
             " (one brief dip, within the allowance a normal session stop accounts for)"
         } else { '' }
-        [void]$findings.Add("[ok] NO.exe read rate held steady at ~$steadyOps read operations per tick while the port was open$steadyNote -- consistent with data actually flowing")
-    } elseif (@($Session.IoReadOpDeltas).Count -eq 0) {
+        [void]$findings.Add("[ok] NO.exe read rate held steady at ~$steadyOps read operations per second while the port was open$steadyNote -- consistent with data actually flowing")
+    } elseif (@($Session.IoReadSamples).Count -eq 0) {
         # THE SILENT CASE. Every branch above is gated, directly or indirectly,
         # on the target's port having been held: read sampling only runs while
         # StreamingState is 'Active'. So a recording where that never happened
@@ -2663,9 +3153,9 @@ function Get-DeviceProbeSessionSummary {
         # That is precisely the channel-mismatch class this work exists to close,
         # reintroduced one layer out in prose.
         if ($ioRecord.EverCollapsed) {
-            [void]$findings.Add("[!] This recording MEASURED data flow -- a baseline of ~$($ioRecord.AnnouncedBaselineOpsPerTick) read operations per tick was established -- and CONFIRMED at least one read collapse, and then lost the measurement before the recording ended.$tailNote, and idle ticks drag the baseline down until it falls under the floor needed to detect a collapse. The confirmed collapse STANDS. What this capture cannot say is what the read rate did after the measurement was lost -- read that interval as 'not assessed'. Stop the recorder when the session stops.")
+            [void]$findings.Add("[!] This recording MEASURED data flow -- a baseline of ~$($ioRecord.AnnouncedBaselineOpsPerSecond) read operations per second was established -- and CONFIRMED at least one read collapse, and then lost the measurement before the recording ended.$tailNote, and idle ticks drag the baseline down until it falls under the floor needed to detect a collapse. The confirmed collapse STANDS. What this capture cannot say is what the read rate did after the measurement was lost -- read that interval as 'not assessed'. Stop the recorder when the session stops.")
         } else {
-            [void]$findings.Add("[!] This recording MEASURED data flow -- a baseline of ~$($ioRecord.AnnouncedBaselineOpsPerTick) read operations per tick was established -- and then lost the measurement before the recording ended.$tailNote, and idle ticks drag the baseline down until it falls under the floor needed to detect a collapse. So this capture CANNOT say whether reads collapsed during the session: read its collapse fields as 'not assessed', not as 'nothing went wrong'. Stop the recorder when the session stops.")
+            [void]$findings.Add("[!] This recording MEASURED data flow -- a baseline of ~$($ioRecord.AnnouncedBaselineOpsPerSecond) read operations per second was established -- and then lost the measurement before the recording ended.$tailNote, and idle ticks drag the baseline down until it falls under the floor needed to detect a collapse. So this capture CANNOT say whether reads collapsed during the session: read its collapse fields as 'not assessed', not as 'nothing went wrong'. Stop the recorder when the session stops.")
         }
     } elseif ($null -ne $ioRecord.IdleTailSeconds -and $ioRecord.IdleTailSeconds -ge $script:IoIdleTailWarnSeconds) {
         [void]$findings.Add("[~] The recording ran for $([int]($ioRecord.IdleTailSeconds / 60)) minute(s) after the last read activity. The measurement survived it this time, but an idle tail erodes the read-rate baseline and long enough of one destroys it -- stop the recorder when the session stops.")
@@ -3124,7 +3614,7 @@ function Get-ProbeObservationCoverage {
         wrong device. But a single powered-off Arc is equally NotObserved --
         coverage is about what was measured, never about blame.
     .PARAMETER Session
-        The probe session (BtLinkEverConnected, PortEverHeld, IoReadOpDeltas).
+        The probe session (BtLinkEverConnected, PortEverHeld, IoReadSamples).
     .PARAMETER WatchState
         The target watch state (FirstComPortSeenTime).
     .PARAMETER Target
@@ -3153,7 +3643,28 @@ function Get-ProbeObservationCoverage {
     # field is named TargetPortEverHeld and the operator sentence below asserts a
     # port hold, so anything else here is name/source drift (issue #67).
     $heldPort   = [bool]$Session.PortEverHeld
-    $ioSamples  = @($Session.IoReadOpDeltas).Count
+    # SESSION TOTAL, not the current episode's buffer (#88). The buffer is
+    # Clear()ed on every port re-open, so asking it "how many samples did this
+    # recording take" returns the residue since the last reset -- and a run whose
+    # port re-opened on its final tick answered 0, which drove Level to
+    # 'NotObserved' on a capture that measured data flow throughout.
+    #
+    # Falls back to the buffer only for a session built by an older module copy,
+    # where the total does not exist. That fallback can still understate; it
+    # cannot overstate, so it degrades toward the old behaviour rather than
+    # inventing coverage.
+    # MAX of the two, never the total alone. The total can never legitimately be
+    # smaller than the buffer that feeds it -- they increment in the same place --
+    # so a smaller total means the session did not come through the tick path: an
+    # older module copy, or a fixture that populated the buffer directly. Taking
+    # the max degrades toward the old behaviour and CANNOT understate, which is
+    # the only direction that matters here: understating is what downgraded a
+    # measured capture to 'NotObserved'. The real wiring is asserted separately,
+    # so this tolerance cannot quietly hide a broken counter.
+    $ioSamples  = [math]::Max([int]$Session.IoSamplesTotal, @($Session.IoReadSamples).Count)
+    # Kept, under a name that says what it is: the honest answer to "could a
+    # verdict be reached right now", which is a real question and a different one.
+    $ioSamplesCurrent = @($Session.IoReadSamples).Count
     $sawPort    = if ($WatchState) { [bool]$WatchState.FirstComPortSeenTime } else { $false }
 
     # A rival is any OTHER candidate the selector saw. Activity on the rival is
@@ -3285,7 +3796,12 @@ function Get-ProbeObservationCoverage {
         Summary           = $summary
         TargetEverLinked  = $linked
         TargetPortEverHeld = $heldPort
+        # Session total. The name kept its meaning; the source was wrong (#88).
         IoSampleCount     = $ioSamples
+        # ...and the current-episode buffer, named so nobody has to guess which
+        # question a number answers. Two clearly-named fields beat one field
+        # whose meaning depends on when you read it.
+        IoSampleCountCurrentEpisode = $ioSamplesCurrent
         TargetComPortSeen = $sawPort
         RivalCandidates   = $rivals.Count
         RivalWasActive    = $rivalActive
@@ -3557,6 +4073,92 @@ function Get-ProbeStateColor {
     }
 }
 
+function Start-IoEpisode {
+    <#
+    .SYNOPSIS
+        Opens a new read-rate episode: assigns its id and start time and clears
+        the episode-scoped counters (#87).
+    .DESCRIPTION
+        ONE choke point, called from two places that both genuinely open an
+        episode:
+
+          the Stopped -> Active edge, after the previous episode is closed; and
+          the first tick that finds a port held with no episode open.
+
+        The second is not redundant. The recorder seeds StreamingState from the
+        arrival snapshot, so a session that was ALREADY streaming when Record
+        was pressed produces no transition at all -- the shape of every healthy
+        capture where the operator starts mid-session. Issue #67 is the same
+        mistake made with the port-hold latch: a fact derived only on an edge is
+        absent from every run that never had one.
+    .PARAMETER Session
+        The probe session.
+    .PARAMETER At
+        The instant the episode begins.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][datetime]$At
+    )
+    $Session.IoEpisodeSeq++
+    # Sequence, not a GUID: it has to be readable in a log line an operator
+    # screenshots, and it only has to be unique within one recording.
+    $Session.IoEpisodeId        = "E$($Session.IoEpisodeSeq)"
+    $Session.IoEpisodeStartedAt = $At
+    $Session.HeldPortSetChangeCountEpisode = 0
+    $Session.HeldPortsThisEpisode          = @()
+    return $Session.IoEpisodeId
+}
+
+function Close-IoEpisode {
+    <#
+    .SYNOPSIS
+        Closes the open read-rate episode at the instant the port set EMPTIED,
+        and clears its identity (#87).
+    .DESCRIPTION
+        The episode used to be closed only on REACQUISITION, which left it "live"
+        for the whole stopped interval. Two things went wrong with that:
+
+          - the App stamps the live EpisodeId onto every operator marker, so a
+            12005 marked while NO holds NO port -- the defining shape of a 12005
+            (see the 12005/12006 discriminator) -- was stamped with the PRECEDING
+            episode's id and could be counted inside it. The one marker class
+            that is definitionally outside an episode was being joined into one.
+          - EndedAtIso recorded the moment the port came BACK, not the moment it
+            was released, so every episode's interval was inflated by the whole
+            release gap.
+
+        Idempotent: closing twice is a no-op, so the reacquisition path can call
+        it without knowing whether the release path already did.
+    .PARAMETER Session
+        The probe session.
+    .PARAMETER At
+        The instant the episode ends -- the release, not the reacquisition.
+    .OUTPUTS
+        [pscustomobject] the closed episode record, or $null if none was open or
+        it had nothing worth keeping.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][datetime]$At
+    )
+    if (-not $Session.IoEpisodeId) { return $null }
+
+    $closing = New-IoEpisodeRecord -Session $Session -At $At
+    if ($closing) { [void]$Session.IoClosedEpisodes.Add($closing) }
+    # IoBaselineResetCount is deliberately NOT touched here. It counts times the
+    # measurement RESTARTED, and it is incremented on the reacquisition path
+    # where a restart actually happens. Counting it at the close would make the
+    # final release of every normal session claim a restart that never occurred,
+    # and that number feeds an operator-facing finding.
+
+    $Session.IoEpisodeId        = $null
+    $Session.IoEpisodeStartedAt = $null
+    return $closing
+}
+
 function New-IoEpisodeRecord {
     <#
     .SYNOPSIS
@@ -3574,7 +4176,7 @@ function New-IoEpisodeRecord {
         [datetime]$At = (Get-Date)
     )
 
-    $baseline = [int]$Session.IoBaselineOpsPerTick
+    $baseline = [double]$Session.IoBaselineOpsPerSecond
     $verdict  = [string]$Session.IoVerdict
 
     # No baseline and no verdict worth keeping: an episode that never measured
@@ -3582,14 +4184,36 @@ function New-IoEpisodeRecord {
     if ($baseline -le 0 -and $verdict -in @('NoBaseline', '', $null)) { return $null }
 
     return [pscustomobject]@{
-        PSTypeName          = 'WinConfig.FlightRecorder.IoEpisode'
-        Verdict             = if ($verdict) { $verdict } else { 'NoBaseline' }
-        BaselineOpsPerTick  = $baseline
-        RecentOpsPerTick    = [int]$Session.IoRecentOpsPerTick
-        FractionOfBaseline  = $Session.IoFractionOfBaseline
-        Collapsed           = ($verdict -eq 'Collapsed')
-        Degrading           = ($verdict -eq 'Degrading')
-        EndedAtIso          = $At.ToString('o')
+        PSTypeName           = 'WinConfig.FlightRecorder.IoEpisode'
+        Verdict              = if ($verdict) { $verdict } else { 'NoBaseline' }
+        BaselineOpsPerSecond = $baseline
+        RecentOpsPerSecond   = [double]$Session.IoRecentOpsPerSecond
+        FractionOfBaseline   = $Session.IoFractionOfBaseline
+        Collapsed            = ($verdict -eq 'Collapsed')
+        Degrading            = ($verdict -eq 'Degrading')
+        EndedAtIso           = $At.ToString('o')
+        # #87: an episode used to carry EndedAtIso and nothing else, so nothing
+        # could be placed INSIDE it. The id is what operator markers join on;
+        # the start time is what makes the interval readable to a human.
+        # $null on a session fixture that never opened one, rather than a made-up
+        # id -- an absent join key must read as absent.
+        EpisodeId            = $Session.IoEpisodeId
+        StartedAtIso         = if ($Session.IoEpisodeStartedAt) {
+            ([datetime]$Session.IoEpisodeStartedAt).ToString('o')
+        } else { $null }
+        # How many samples the verdict above actually rests on. With the window
+        # in elapsed seconds (#86) the sample count no longer follows from the
+        # duration, so it has to be stated.
+        SampleCount          = @($Session.IoReadSamples).Count
+        # THE PRECISION THIS RECORD ACTUALLY HAS (#85). An episode is a
+        # Stopped -> Active EPOCH, not one port-handle lifetime: the held set can
+        # change hands inside it without ever emptying, and the baseline
+        # deliberately survives that. These two say so, in the record, so nobody
+        # has to infer it -- any reasoning that treats an episode as one handle
+        # is over-precise, and until now the record gave no way to tell.
+        HandleChangeCount    = [int]$Session.HeldPortSetChangeCountEpisode
+        PortsSeen            = @($Session.HeldPortsThisEpisode | Where-Object { $_ })
+        BaselineSpansHandles = ([int]$Session.HeldPortSetChangeCountEpisode -gt 0)
     }
 }
 
@@ -3615,7 +4239,7 @@ function Get-IoSessionReadRateRecord {
     .OUTPUTS
         [pscustomobject] EverCollapsed, EverDegrading, CollapseEpisodes,
         MarkerCollapseCount, CollapseObservedBy, EpisodeCount,
-        BaselineResetCount, PeakBaselineOpsPerTick, WorstRecentOpsPerTick,
+        BaselineResetCount, PeakBaselineOpsPerSecond, WorstRecentOpsPerSecond,
         WorstFractionOfBaseline, FirstCollapseAtIso, Episodes.
     #>
     [CmdletBinding()]
@@ -3625,7 +4249,12 @@ function Get-IoSessionReadRateRecord {
     if ($Session.IoClosedEpisodes) { $episodes += @($Session.IoClosedEpisodes) }
     # The episode still running has not been stamped anywhere, and on a session
     # that ends mid-collapse it is the ONLY one that carries the collapse.
-    $live = New-IoEpisodeRecord -Session $Session
+    #
+    # ONLY when one is actually running (#87). Episodes are closed at RELEASE
+    # now, so a recording that ended with no port held has already stamped its
+    # last episode into the ledger -- building a live record as well would enter
+    # the same episode twice, inflating EpisodeCount and CollapseEpisodes.
+    $live = if ($Session.IoEpisodeId) { New-IoEpisodeRecord -Session $Session } else { $null }
     if ($live) { $episodes += $live }
     $episodes = @($episodes | Where-Object { $_ })
 
@@ -3670,15 +4299,15 @@ function Get-IoSessionReadRateRecord {
     # to 'NoBaseline' and was discarded by New-IoEpisodeRecord. BaselineResetCount
     # was 0 throughout, which is why gating on it does not catch this (issue #63).
     $announcedAt  = $Session.IoBaselineAnnouncedAt
-    $announcedOps = [int]$Session.IoBaselineAnnouncedOpsPerTick
+    $announcedOps = [double]$Session.IoBaselineAnnouncedOpsPerSecond
     $announced    = ($null -ne $announcedAt -and $announcedOps -gt 0)
 
     $peak = 0
     foreach ($e in $episodes) {
-        if ([int]$e.BaselineOpsPerTick -gt $peak) { $peak = [int]$e.BaselineOpsPerTick }
+        if ([double]$e.BaselineOpsPerSecond -gt $peak) { $peak = [double]$e.BaselineOpsPerSecond }
     }
     foreach ($m in $markerCollapsed) {
-        if ([int]$m.IoBaselineOpsPerTick -gt $peak) { $peak = [int]$m.IoBaselineOpsPerTick }
+        if ([double]$m.IoBaselineOpsPerSecond -gt $peak) { $peak = [double]$m.IoBaselineOpsPerSecond }
     }
     # A peak below the rate that was ANNOUNCED is not a measurement, it is
     # erosion. Reporting 0 here is what produced the finding that read
@@ -3687,21 +4316,21 @@ function Get-IoSessionReadRateRecord {
 
     # ── The worst observation, as ONE pair from ONE channel ──────────────────
     # WorstFractionOfBaseline used to be read off the session by the bundle while
-    # WorstRecentOpsPerTick was read off this record, so the manifest carried two
+    # WorstRecentOpsPerSecond was read off this record, so the manifest carried two
     # halves of one observation assembled from two objects -- and they contradicted
     # (0% beside null). They are chosen together here: whichever channel saw the
     # lowest fraction supplies BOTH numbers, so they always describe one moment.
     $worstCandidates = @()
     foreach ($e in $collapsed) {
-        $worstCandidates += [pscustomobject]@{ Fraction = $e.FractionOfBaseline; Recent = [int]$e.RecentOpsPerTick }
+        $worstCandidates += [pscustomobject]@{ Fraction = $e.FractionOfBaseline; Recent = [double]$e.RecentOpsPerSecond }
     }
     foreach ($m in $markerCollapsed) {
-        $worstCandidates += [pscustomobject]@{ Fraction = $m.IoFractionOfBaseline; Recent = [int]$m.IoRecentOpsPerTick }
+        $worstCandidates += [pscustomobject]@{ Fraction = $m.IoFractionOfBaseline; Recent = [double]$m.IoRecentOpsPerSecond }
     }
     if ($null -ne $Session.IoWorstFractionOfBaseline) {
         $worstCandidates += [pscustomobject]@{
             Fraction = $Session.IoWorstFractionOfBaseline
-            Recent   = [int]$Session.IoWorstRecentOpsPerTick
+            Recent   = [double]$Session.IoWorstRecentOpsPerSecond
         }
     }
     $worst = $null
@@ -3711,8 +4340,8 @@ function Get-IoSessionReadRateRecord {
     # A collapsed observation with no fraction attached still carries a rate, and
     # dropping it would put null in the field a finding quotes.
     $worstRecent = if ($worst) { $worst.Recent } else {
-        $bare = @(@($collapsed | ForEach-Object { [int]$_.RecentOpsPerTick }) +
-                  @($markerCollapsed | ForEach-Object { [int]$_.IoRecentOpsPerTick }))
+        $bare = @(@($collapsed | ForEach-Object { [double]$_.RecentOpsPerSecond }) +
+                  @($markerCollapsed | ForEach-Object { [double]$_.IoRecentOpsPerSecond }))
         if ($bare.Count -gt 0) { ($bare | Measure-Object -Minimum).Minimum } else { $null }
     }
     $worstFraction = if ($worst) { $worst.Fraction } else { $null }
@@ -3735,7 +4364,7 @@ function Get-IoSessionReadRateRecord {
     #
     # 'Stable' requires a baseline to have actually been ESTABLISHED, which is
     # what an episode verdict other than NoBaseline means. A sub-floor read rate
-    # leaves BaselineOpsPerTick nonzero while the verdict stays NoBaseline, so
+    # leaves BaselineOpsPerSecond nonzero while the verdict stays NoBaseline, so
     # peak alone would call an unmeasurable session stable.
     # A marker stamped 'Collapsed' against a real baseline is itself proof a
     # baseline was established, so it counts here too -- otherwise the record
@@ -3744,7 +4373,7 @@ function Get-IoSessionReadRateRecord {
     $ledgerBaseline = (@($episodes | Where-Object {
         $_.Verdict -in @('Streaming', 'Degrading', 'Collapsed')
     }).Count -gt 0) -or
-        (@($markerCollapsed | Where-Object { [int]$_.IoBaselineOpsPerTick -gt 0 }).Count -gt 0)
+        (@($markerCollapsed | Where-Object { [double]$_.IoBaselineOpsPerSecond -gt 0 }).Count -gt 0)
     # An announcement is proof on its own. "BaselineEstablished false while
     # ReadBaselineAnnouncedAtUtc is populated" is an impossible state and the
     # record must not be able to emit it.
@@ -3758,7 +4387,7 @@ function Get-IoSessionReadRateRecord {
     # Held-and-falling is the fault shape; released-and-falling is a clinic
     # finishing a session. Same gate the findings use.
     $terminalDegrading = ($Session.IoVerdict -eq 'Degrading' -and $Session.StreamingState -eq 'Active')
-    $dipsBeyondTeardown = ([int]$Session.IoDegradedTicks -gt $script:IoCollapseTicks)
+    $dipsBeyondTeardown = ([double]$Session.IoDegradedSeconds -gt $script:IoCollapseSeconds)
 
     # A marker counts here exactly as an episode does. It is a measurement the
     # operator stood next to, and it is the only channel that samples the moment
@@ -3811,13 +4440,13 @@ function Get-IoSessionReadRateRecord {
     return [pscustomobject]@{
         PSTypeName             = 'WinConfig.FlightRecorder.IoSessionReadRate'
         EverCollapsed          = $everCollapsed
-        # IoDegradedTicks is counted here too. Capture 31D0729CA5B8 shipped
+        # IoDegradedSeconds is counted here too. Capture 31D0729CA5B8 shipped
         # EverDegrading false beside Outcome 'Degraded' and
         # MeaningfullyDegraded true, in one object -- the outcome was derived
         # from the tick counter while this field looked only at episodes.
         EverDegrading          = ((@($episodes | Where-Object { $_.Degrading }).Count -gt 0) -or
                                   (@($markers | Where-Object { $_.IoVerdict -eq 'Degrading' }).Count -gt 0) -or
-                                  ([int]$Session.IoDegradedTicks -gt 0))
+                                  ([double]$Session.IoDegradedSeconds -gt 0))
         # Episodes and markers are counted SEPARATELY on purpose. Folding a
         # marker into CollapseEpisodes would claim an episode the ledger never
         # closed; dropping it would lose the only channel that saw the collapse.
@@ -3828,8 +4457,8 @@ function Get-IoSessionReadRateRecord {
         CollapseObservedBy     = $collapseObservedBy
         EpisodeCount           = $episodes.Count
         BaselineResetCount     = [int]$Session.IoBaselineResetCount
-        PeakBaselineOpsPerTick = $peak
-        WorstRecentOpsPerTick  = $worstRecent
+        PeakBaselineOpsPerSecond = $peak
+        WorstRecentOpsPerSecond  = $worstRecent
         # Paired with the line above by construction; see the selection block.
         WorstFractionOfBaseline = $worstFraction
         FirstCollapseAtIso     = $firstCollapseIso
@@ -3842,12 +4471,38 @@ function Get-IoSessionReadRateRecord {
         # this capture, whatever EverCollapsed says, and a reader must be told
         # that rather than left to read "false" as "nothing went wrong".
         BaselineLostAfterAnnouncement = $baselineLostAfterAnnouncement
-        AnnouncedBaselineOpsPerTick   = if ($announced) { $announcedOps } else { $null }
+        AnnouncedBaselineOpsPerSecond   = if ($announced) { $announcedOps } else { $null }
         # Seconds the recording ran on after read activity stopped.
         IdleTailSeconds        = $idleTailSeconds
         # The claim a badge should be built from. A terminal 'Degrading' caused
         # by teardown is NOT this.
         MeaningfullyDegraded   = ($outcome -eq 'Degraded')
+        # How often NO.exe's held-port set changed hands WITHOUT the set ever
+        # emptying, across the whole recording (#85). >0 means at least one
+        # episode's baseline covers more than one port handle -- deliberately,
+        # because the read counter is process-wide and a reset would cost more
+        # evidence than the precision is worth, but the reader is told rather
+        # than left to assume an episode is one handle.
+        HandleChangeCount      = [int]$Session.HeldPortSetChangeCount
+        # THE JOIN #87 EXISTS FOR: markers that fall inside an episode which
+        # collapsed, matched on the EpisodeId the marker RECORDED at the time.
+        #
+        # Deliberately NOT the same claim as MarkerCollapseCount above, which
+        # counts markers whose OWN verdict was Collapsed at the marked instant.
+        # DB98B6EE3324 is why they must stay separate: all six markers stamped
+        # 'NoBaseline' -- the detector was inside its rebuild window -- while the
+        # episode they sat in ended Collapsed at 7% of a 60 baseline. The marker
+        # channel was blind and the episode channel was not, and a record that
+        # reported only the first said the corpus pattern had broken when it had
+        # not.
+        #
+        # Joined on a recorded id, never re-derived from timestamps: that would
+        # be a second answerer for a question the marker already answers.
+        MarkerInCollapsedEpisodeCount = @(
+            $markers | Where-Object {
+                $_.EpisodeId -and $_.EpisodeId -in @($collapsed | ForEach-Object { $_.EpisodeId })
+            }
+        ).Count
     }
 }
 
@@ -3927,6 +4582,8 @@ Export-ModuleMember -Function @(
     # built from the same answer the findings are, not from the live last-tick
     # fields that a port re-open silently resets.
     'New-IoEpisodeRecord',
+    'Start-IoEpisode',
+    'Close-IoEpisode',
     # Invasiveness accounting (#83). Exported so the manifest is built from the
     # same summariser the tests assert on, rather than a second one at the call
     # site -- the channel-mismatch pattern this repo keeps re-filing.
