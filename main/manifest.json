@@ -1,165 +1,165 @@
 {
-  "source_ref": "e4d16b08a814bda0743a2941d87bbf8aa25d0a9e",
   "branch": "main",
-  "build_id": "31548714727-1",
-  "timestamp": "2026-08-12T00:02:08.0381698Z",
   "schema_version": "2.0",
   "event": "push",
+  "timestamp": "2026-08-12T00:16:18.9133836Z",
+  "build_id": "31549593798-1",
+  "source_ref": "7c6067e4ab1e90aa747ed264f2934a4b78025756",
   "artifacts": [
     {
-      "size": 2001,
       "path": "Win11Config.ps1",
-      "sha256": "d1278321cdcd5c0759d3dfa773e964cda8d254ccdfd7f08dce12f878d317fff9"
+      "sha256": "d1278321cdcd5c0759d3dfa773e964cda8d254ccdfd7f08dce12f878d317fff9",
+      "size": 2001
     },
     {
-      "size": 704447,
       "path": "src/Win11Config.App.ps1",
-      "sha256": "e0d311a33ad6b5a3151b6cd75301409aa29cecde2821f832f9a0b5e9262d7342"
+      "sha256": "e0d311a33ad6b5a3151b6cd75301409aa29cecde2821f832f9a0b5e9262d7342",
+      "size": 704447
     },
     {
-      "size": 330,
       "path": "src/VERSION.psd1",
-      "sha256": "ff6ee1fdba00afd4e7713d356ed92d752ac386a4528909aa02e29e5c68778622"
+      "sha256": "ff6ee1fdba00afd4e7713d356ed92d752ac386a4528909aa02e29e5c68778622",
+      "size": 330
     },
     {
-      "size": 4446,
       "path": "src/RUNTIME_DEPENDENCIES.psd1",
-      "sha256": "df00283d8ddc37fbc06d22a2f5fe0a2a6e8011ccc76bc444f311873551032ccd"
+      "sha256": "df00283d8ddc37fbc06d22a2f5fe0a2a6e8011ccc76bc444f311873551032ccd",
+      "size": 4446
     },
     {
-      "size": 14600,
       "path": "src/Manifest/WinConfig.Tools.psd1",
-      "sha256": "2a060e104c5743515c2f738aae7d550585b5692dc794e1de316a455f8a384197"
+      "sha256": "2a060e104c5743515c2f738aae7d550585b5692dc794e1de316a455f8a384197",
+      "size": 14600
     },
     {
-      "size": 8673,
       "path": "src/Manifest/WinConfig.Parity.psd1",
-      "sha256": "b754f79f66d8c62af40ea0e5f4453c1212f65714534f0f1edc4e499c03637e31"
+      "sha256": "b754f79f66d8c62af40ea0e5f4453c1212f65714534f0f1edc4e499c03637e31",
+      "size": 8673
     },
     {
-      "size": 542,
       "path": "src/Config/WinConfig.DiagnosticsConfig.psd1",
-      "sha256": "68e26cfc587e4d808fbcc98e89a88dcc3c0dd1b342029e3c9c1c8cf31170680f"
+      "sha256": "68e26cfc587e4d808fbcc98e89a88dcc3c0dd1b342029e3c9c1c8cf31170680f",
+      "size": 542
     },
     {
-      "size": 3686,
       "path": "scripts/Invoke-DiagnosticConsole.ps1",
-      "sha256": "8672726bc5875f632328dca7a679dec8eef825de835bc3e93255c14edada53dc"
+      "sha256": "8672726bc5875f632328dca7a679dec8eef825de835bc3e93255c14edada53dc",
+      "size": 3686
     },
     {
-      "size": 530,
       "path": "scripts/Run-DISMRestoreHealth.ps1",
-      "sha256": "bc9477a5664430cb0ba3b2c6bfe2f802ed64f56c11fb15a3e8b5102e93b2ef79"
+      "sha256": "bc9477a5664430cb0ba3b2c6bfe2f802ed64f56c11fb15a3e8b5102e93b2ef79",
+      "size": 530
     },
     {
-      "size": 487,
       "path": "scripts/Run-SFCScannow.ps1",
-      "sha256": "5beaeb279faa19fcad4a2f8558b5cb308694b798a62f8977e04dcbf645784f54"
+      "sha256": "5beaeb279faa19fcad4a2f8558b5cb308694b798a62f8977e04dcbf645784f54",
+      "size": 487
     },
     {
-      "size": 8421,
       "path": "src/Modules/ModuleLoader.psm1",
-      "sha256": "d60c98250c563769006e9d92c9ad0249cb855bd0d2d4de7408ab831aca6e8f29"
+      "sha256": "d60c98250c563769006e9d92c9ad0249cb855bd0d2d4de7408ab831aca6e8f29",
+      "size": 8421
     },
     {
-      "size": 14749,
       "path": "src/Modules/Paths.psm1",
-      "sha256": "4b479d70c53bcfbfdbae19d9656f0827a4d1500c70513372b77ac24358818a25"
+      "sha256": "4b479d70c53bcfbfdbae19d9656f0827a4d1500c70513372b77ac24358818a25",
+      "size": 14749
     },
     {
-      "size": 8071,
       "path": "src/Modules/ExecutionIntent.psm1",
-      "sha256": "a4a8a888767cee35cee965d64ee1215bb6c282c21cebad277413c25267ef96fb"
+      "sha256": "a4a8a888767cee35cee965d64ee1215bb6c282c21cebad277413c25267ef96fb",
+      "size": 8071
     },
     {
-      "size": 15513,
       "path": "src/Modules/DiagnosticTypes.psm1",
-      "sha256": "e72022251c07915668bd2bb367865d2904fc25e5b87d7368fa50897ba023b88f"
+      "sha256": "e72022251c07915668bd2bb367865d2904fc25e5b87d7368fa50897ba023b88f",
+      "size": 15513
     },
     {
-      "size": 15592,
       "path": "src/Modules/Console.psm1",
-      "sha256": "755af106bbafeb59717816d948d87c1e7bff2804696143bd617b24c6890bc570"
+      "sha256": "755af106bbafeb59717816d948d87c1e7bff2804696143bd617b24c6890bc570",
+      "size": 15592
     },
     {
-      "size": 18109,
       "path": "src/Modules/Env.psm1",
-      "sha256": "24d1476a7c25757d22ee0f8b631b3d82db16125874fb56006974988dee8f9fe9"
+      "sha256": "24d1476a7c25757d22ee0f8b631b3d82db16125874fb56006974988dee8f9fe9",
+      "size": 18109
     },
     {
-      "size": 4172,
       "path": "src/Modules/UiAction.psm1",
-      "sha256": "26865143416cd647870da49fd8bf7ca5f61e461b8d78b877d681ac02981af3e6"
+      "sha256": "26865143416cd647870da49fd8bf7ca5f61e461b8d78b877d681ac02981af3e6",
+      "size": 4172
     },
     {
-      "size": 7632,
       "path": "src/Modules/StagingAssertions.psm1",
-      "sha256": "ccb0a065790789d2e3433dac8a58f8191e6a2efa610eede33aab3ac58484c4d1"
+      "sha256": "ccb0a065790789d2e3433dac8a58f8191e6a2efa610eede33aab3ac58484c4d1",
+      "size": 7632
     },
     {
-      "size": 25004,
       "path": "src/Logging/Logger.psm1",
-      "sha256": "b6ae9a66bfe1ab6c7b47c448551965309c8f9b93ce56bf669133d522130d7017"
+      "sha256": "b6ae9a66bfe1ab6c7b47c448551965309c8f9b93ce56bf669133d522130d7017",
+      "size": 25004
     },
     {
-      "size": 60785,
       "path": "src/Modules/SessionOperationLedger.psm1",
-      "sha256": "1592b508c7a3437001dc5ea99b3b1b451eee40a3b815a684e4c7f76f43a3b054"
+      "sha256": "1592b508c7a3437001dc5ea99b3b1b451eee40a3b815a684e4c7f76f43a3b054",
+      "size": 60785
     },
     {
-      "size": 18529,
       "path": "src/Modules/PpfFingerprint.psm1",
-      "sha256": "b868f988a98f3cbddc7541b7737cf1ea4ac6a73df2a1305ef4638008eda103c5"
+      "sha256": "b868f988a98f3cbddc7541b7737cf1ea4ac6a73df2a1305ef4638008eda103c5",
+      "size": 18529
     },
     {
-      "size": 13842,
       "path": "src/Modules/ActionTiers.psm1",
-      "sha256": "965b977bfab8abc518a88e8dcf1670a5cc33cc035b1b0a7c20681e033a5c42f7"
+      "sha256": "965b977bfab8abc518a88e8dcf1670a5cc33cc035b1b0a7c20681e033a5c42f7",
+      "size": 13842
     },
     {
-      "size": 18254,
       "path": "src/Modules/ToolAsync.psm1",
-      "sha256": "71de544cef530e7db30baff0ee294cf17063c649777837ca83a7483e74441a82"
+      "sha256": "71de544cef530e7db30baff0ee294cf17063c649777837ca83a7483e74441a82",
+      "size": 18254
     },
     {
-      "size": 44660,
       "path": "src/Modules/DryRun.psm1",
-      "sha256": "86890340e5f0ecd0052c39c0de9bfceed5972a3060262f490b4caf530c97e048"
+      "sha256": "86890340e5f0ecd0052c39c0de9bfceed5972a3060262f490b4caf530c97e048",
+      "size": 44660
     },
     {
-      "size": 7563,
       "path": "src/Modules/DiagnosticsPackage.psm1",
-      "sha256": "e5bb7d4b8fcd9e17b81a1d63365828fb40705fe4e57ac0e8ca5a8a6452ed4550"
+      "sha256": "e5bb7d4b8fcd9e17b81a1d63365828fb40705fe4e57ac0e8ca5a8a6452ed4550",
+      "size": 7563
     },
     {
-      "size": 11178,
       "path": "src/Modules/DiagnosticsUpload.psm1",
-      "sha256": "97940508b15b3e59559e9cc1125347bdf0ad4baaa8fd4b6f565d6a8f8f1ea42f"
+      "sha256": "97940508b15b3e59559e9cc1125347bdf0ad4baaa8fd4b6f565d6a8f8f1ea42f",
+      "size": 11178
     },
     {
-      "size": 118798,
       "path": "src/Modules/SupportBundle.psm1",
-      "sha256": "bce9282d71bb42a35460c2c64fdef9bd0b8869804593842eaaeb7d17883beee0"
+      "sha256": "bce9282d71bb42a35460c2c64fdef9bd0b8869804593842eaaeb7d17883beee0",
+      "size": 118798
     },
     {
-      "size": 40797,
       "path": "src/Modules/MachineIdentifiers.psm1",
-      "sha256": "1f7ca4e26492e92396cd2b550ebee0cd0d2b8cd69f44bc33ef902c0e787d0751"
+      "sha256": "1f7ca4e26492e92396cd2b550ebee0cd0d2b8cd69f44bc33ef902c0e787d0751",
+      "size": 40797
     },
     {
-      "size": 327336,
       "path": "src/Modules/BluetoothProbe.psm1",
-      "sha256": "29d3b80216cb637c038d9e7dff441a0ed8d3b4e9503c149ad95983ed7574b7a6"
+      "sha256": "29d3b80216cb637c038d9e7dff441a0ed8d3b4e9503c149ad95983ed7574b7a6",
+      "size": 327336
     },
     {
-      "size": 52737,
       "path": "src/Modules/TargetDeviceWatch.psm1",
-      "sha256": "0d78e8db272b8814a5f7c1f4f85ad1887bed89c7342a0f38c638f9b6d3eb0dd7"
+      "sha256": "0d78e8db272b8814a5f7c1f4f85ad1887bed89c7342a0f38c638f9b6d3eb0dd7",
+      "size": 52737
     },
     {
-      "size": 343454,
       "path": "src/Modules/BluetoothDeviceProbe.psm1",
-      "sha256": "bdc384fa8144b2369b5b40f2b687535e58a7fe2e5313acb6ade8fb24514944dd"
+      "sha256": "bdc384fa8144b2369b5b40f2b687535e58a7fe2e5313acb6ade8fb24514944dd",
+      "size": 343454
     }
   ]
 }
