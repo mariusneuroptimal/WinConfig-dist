@@ -4535,15 +4535,88 @@ $buttonHandlers = @{
             # Size to fit the screen — remote desktop and small displays may have
             # less usable area than expected, so cap to 90% of the working area.
             #
+            # ── DISPLAY SCALE ────────────────────────────────────────────────
+            #
+            # 🔴 FONTS SCALE WITH DPI, HAND-WRITTEN PIXELS DO NOT. Every font
+            # below is specified in POINTS, so on a 200 % display Windows renders
+            # it at twice the pixel height. Every geometry constant in this panel
+            # was a raw pixel count. The two drifted apart by a factor of two,
+            # and on an SP9 at 2880x1920 / 200 % the result was: headings drawn
+            # on top of the panels they label, every caption ellipsised
+            # ("Bluetooth rea...", "Hold (COM5"), panel labels sliced off at the
+            # tile boundary, and the verdict cut in half.
+            #
+            # WinForms auto-scaling does NOT rescue this. AutoScaleMode::Dpi does
+            # not reliably fire for a CODE-BUILT form -- the layout stays at its
+            # birth DPI -- which this file already knew about the action bar and
+            # then repeated here.
+            #
+            # So: ONE factor, read from the real device context, applied to every
+            # constant. At 96 DPI it is exactly 1.0 and the layout is unchanged
+            # from what was tested; at 200 % everything moves together.
+            #
+            # $script:BtViewScaleOverride is the seam a test uses to lay the
+            # window out at a scale the test machine does not have. Production
+            # never sets it.
+            $script:BtViewScale = 1.0
+            if ($script:BtViewScaleOverride) {
+                $script:BtViewScale = [double]$script:BtViewScaleOverride
+            } else {
+                try {
+                    $btDpiG = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+                    if ($btDpiG.DpiX -gt 0) { $script:BtViewScale = [double]$btDpiG.DpiX / 96.0 }
+                    $btDpiG.Dispose()
+                } catch { $script:BtViewScale = 1.0 }
+            }
+            if ($script:BtViewScale -lt 1.0) { $script:BtViewScale = 1.0 }
+
+            # Every tuned constant, in one table, already scaled. The painters and
+            # the layout function read from HERE and never from a literal -- a
+            # literal that survives in one of the three is exactly how the
+            # headings ended up overlapping the panels.
+            $btS = $script:BtViewScale
+            $script:BtViewM = @{
+                Pad        = [int](24  * $btS)
+                TopY       = [int](16  * $btS)
+                TileWMin   = [int](92  * $btS)
+                TileWMax   = [int](190 * $btS)
+                TileWSlack = [int](96  * $btS)
+                GapMin     = [int](22  * $btS)
+                GapMax     = [int](150 * $btS)
+                ConnH      = [int](116 * $btS)
+                SigH       = [int](104 * $btS)
+                BadgeR     = [int](16  * $btS)
+                BadgeTop   = [int](10  * $btS)
+                HeadH      = [int](16  * $btS)
+                # The three gaps the vertical budget is allowed to spend, in the
+                # order it spends them. Named by ROLE, not by the pair they sit
+                # between, so the squeeze code cannot silently shrink one it was
+                # never meant to touch.
+                GapSmall   = [int](6   * $btS)
+                GapMed     = [int](22  * $btS)
+                GapBig     = [int](22  * $btS)
+                LabelH     = [int](19  * $btS)
+                LineH      = [int](15  * $btS)
+                VerdictH   = [int](28  * $btS)
+                ContextH   = [int](18  * $btS)
+                FootH      = [int](16  * $btS)
+                EventsH    = [int](96  * $btS)
+                BadgeW     = [int](15  * $btS)
+                BadgeH     = [int](13  * $btS)
+                Pen        = [float][Math]::Max(2.0, (2.0 * $btS))
+            }
+
             # Sized to hold the whole diagram plus the session-events block
-            # without a scrollbar at the default size. It is a measured figure,
-            # not a guess: the view panel lays out to roughly 530 px of content,
-            # and the header, phase strip and status bar take about 210 px.
+            # without a scrollbar at the default size, AT THIS DISPLAY'S SCALE.
+            # The 860x880 figure is measured at 96 DPI: the view panel lays out
+            # to roughly 530 px of content and the header, phase strip and status
+            # bar take about 210 px. Unscaled, it produced a small window full of
+            # double-size text.
             $btScreen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-            $btFormW = [Math]::Min(860, [int]($btScreen.Width * 0.9))
-            $btFormH = [Math]::Min(880, [int]($btScreen.Height * 0.9))
+            $btFormW = [Math]::Min([int](860 * $btS), [int]($btScreen.Width * 0.9))
+            $btFormH = [Math]::Min([int](880 * $btS), [int]($btScreen.Height * 0.9))
             $btForm.Size = New-Object System.Drawing.Size($btFormW, $btFormH)
-            $btForm.MinimumSize = New-Object System.Drawing.Size(560, 420)
+            $btForm.MinimumSize = New-Object System.Drawing.Size([int](560 * $btS), [int](420 * $btS))
 
             # ── Colours, fonts and glyph geometry for the visual panel ────────
             #
@@ -4578,11 +4651,10 @@ $buttonHandlers = @{
             $script:BtViewFontNote    = New-Object System.Drawing.Font("Segoe UI", 7.5)
             $script:BtViewFontGlyph   = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
             $script:BtViewFontBadge   = New-Object System.Drawing.Font("Segoe UI", 6.75, [System.Drawing.FontStyle]::Bold)
-            # Badge geometry, in ONE place. The edge painter draws its connector
-            # through the badge centres, so a radius that lived in two functions
-            # would put the line through empty space the moment one moved.
-            $script:BtViewBadgeR   = 16
-            $script:BtViewBadgeTop = 10
+            # Badge geometry lives in $script:BtViewM (above), in ONE place: the
+            # edge painter draws its connector through the badge centres, so a
+            # radius that lived in two functions would put the line through empty
+            # space the moment one moved -- or the moment the display scaled.
 
             # ── Painters ──────────────────────────────────────────────────────
             #
@@ -4614,42 +4686,47 @@ $buttonHandlers = @{
                     $ink = [System.Drawing.Color]::FromArgb(112, 112, 120)
                 }
 
+                $m = $script:BtViewM
                 if ($t.Focus) {
                     $fill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(31, 31, 39))
                     $g.FillRectangle($fill, 0, 0, $w, $h)
                     $fill.Dispose()
-                    $ring = New-Object System.Drawing.Pen($col, 2)
+                    $ring = New-Object System.Drawing.Pen($col, $m.Pen)
                     $g.DrawRectangle($ring, 1, 1, ($w - 3), ($h - 3))
                     $ring.Dispose()
                 } elseif ($t.Attention) {
                     # A SECOND independent root, marked but not headlined. Two
                     # branches down at once is materially different from one, and
                     # the verdict line can only carry one of them.
-                    $rule = New-Object System.Drawing.Pen($col, 2)
+                    $rule = New-Object System.Drawing.Pen($col, $m.Pen)
                     $g.DrawLine($rule, 12, ($h - 3), ($w - 12), ($h - 3))
                     $rule.Dispose()
                 }
 
-                $r  = $script:BtViewBadgeR
+                $r  = $m.BadgeR
                 $cx = [int]($w / 2)
-                $cy = $script:BtViewBadgeTop + $r
-                $pen = New-Object System.Drawing.Pen($col, 2)
+                $cy = $m.BadgeTop + $r
+                $pen = New-Object System.Drawing.Pen($col, $m.Pen)
                 $g.DrawEllipse($pen, ($cx - $r), ($cy - $r), (2 * $r), (2 * $r))
                 # THE GLYPH IS THE SECOND SIGNAL. Tick, cross, bar and question
                 # mark are different SHAPES, so the state survives a reader who
                 # cannot separate the palette and a screenshot that has been
                 # through two rounds of phone compression.
+                #
+                # Every offset is a FRACTION OF THE RADIUS, not a pixel count, so
+                # the glyph keeps its proportions at any display scale.
+                $gx = [int](0.44 * $r); $gy = [int](0.31 * $r); $gd = [int](0.38 * $r)
                 switch ($t.Glyph) {
                     'Check' {
-                        $g.DrawLine($pen, ($cx - 7), $cy, ($cx - 2), ($cy + 5))
-                        $g.DrawLine($pen, ($cx - 2), ($cy + 5), ($cx + 7), ($cy - 5))
+                        $g.DrawLine($pen, ($cx - $gx), $cy, ($cx - [int](0.12 * $r)), ($cy + $gy))
+                        $g.DrawLine($pen, ($cx - [int](0.12 * $r)), ($cy + $gy), ($cx + $gx), ($cy - $gy))
                     }
                     'Cross' {
-                        $g.DrawLine($pen, ($cx - 6), ($cy - 6), ($cx + 6), ($cy + 6))
-                        $g.DrawLine($pen, ($cx + 6), ($cy - 6), ($cx - 6), ($cy + 6))
+                        $g.DrawLine($pen, ($cx - $gd), ($cy - $gd), ($cx + $gd), ($cy + $gd))
+                        $g.DrawLine($pen, ($cx + $gd), ($cy - $gd), ($cx - $gd), ($cy + $gd))
                     }
                     'Dash' {
-                        $g.DrawLine($pen, ($cx - 7), $cy, ($cx + 7), $cy)
+                        $g.DrawLine($pen, ($cx - $gx), $cy, ($cx + $gx), $cy)
                     }
                     default {
                         $sym = '?'
@@ -4677,7 +4754,8 @@ $buttonHandlers = @{
                 # belonging to neither.
                 if ($t.Historical) {
                     $hc = [System.Drawing.Color]::FromArgb(176, 156, 104)
-                    $bw = 15; $bh = 13; $bx = $cx + $r + 5; $by = $cy - 6
+                    $bw = $m.BadgeW; $bh = $m.BadgeH
+                    $bx = $cx + $r + [int](5 * $script:BtViewScale); $by = $cy - [int]($bh / 2)
                     $hp = New-Object System.Drawing.Pen($hc, 1)
                     $g.DrawRectangle($hp, $bx, $by, $bw, $bh)
                     $hp.Dispose()
@@ -4693,12 +4771,12 @@ $buttonHandlers = @{
                 $sf.Alignment = [System.Drawing.StringAlignment]::Center
                 $sf.LineAlignment = [System.Drawing.StringAlignment]::Near
                 $sf.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
-                $y = $cy + $r + 8
+                $y = $cy + $r + [int](8 * $script:BtViewScale)
 
                 $lb = New-Object System.Drawing.SolidBrush($ink)
-                $g.DrawString([string]$t.Label, $script:BtViewFontLabel, $lb, (New-Object System.Drawing.RectangleF(2, $y, ($w - 4), 18)), $sf)
+                $g.DrawString([string]$t.Label, $script:BtViewFontLabel, $lb, (New-Object System.Drawing.RectangleF(2, $y, ($w - 4), $m.LabelH)), $sf)
                 $lb.Dispose()
-                $y += 19
+                $y += $m.LabelH
 
                 # THE NOTE AND THE CAVEAT ARE ANCHORED TO THE BOTTOM, and the
                 # caption takes what is left between them. Flowing all three from
@@ -4712,18 +4790,19 @@ $buttonHandlers = @{
                 # not this tile draws one. Letting the text claim them when there
                 # is no rule would make the layout depend on the diagnostic state,
                 # and the one tile that ever collides is the one being pointed at.
-                $bottom = $h - 4
+                $bottom = $h - [int](4 * $script:BtViewScale)
+                $lineH = $m.LineH
                 if ($t.Caveat) {
                     $vb = New-Object System.Drawing.SolidBrush($script:BtViewInkCaveat)
-                    $g.DrawString([string]$t.Caveat, $script:BtViewFontNote, $vb, (New-Object System.Drawing.RectangleF(2, ($bottom - 15), ($w - 4), 14)), $sf)
+                    $g.DrawString([string]$t.Caveat, $script:BtViewFontNote, $vb, (New-Object System.Drawing.RectangleF(2, ($bottom - $lineH), ($w - 4), $lineH)), $sf)
                     $vb.Dispose()
-                    $bottom -= 15
+                    $bottom -= $lineH
                 }
                 if ($t.Note) {
                     $nb = New-Object System.Drawing.SolidBrush($script:BtViewInkDim)
-                    $g.DrawString([string]$t.Note, $script:BtViewFontNote, $nb, (New-Object System.Drawing.RectangleF(2, ($bottom - 15), ($w - 4), 14)), $sf)
+                    $g.DrawString([string]$t.Note, $script:BtViewFontNote, $nb, (New-Object System.Drawing.RectangleF(2, ($bottom - $lineH), ($w - 4), $lineH)), $sf)
                     $nb.Dispose()
-                    $bottom -= 15
+                    $bottom -= $lineH
                 }
 
                 # The caption is the state IN WORDS. Colour is decoration on top
@@ -4733,7 +4812,7 @@ $buttonHandlers = @{
                 $capCol = $ink
                 if (-not $t.Blocked -and $t.Level -in @('Failed', 'Degraded')) { $capCol = $col }
                 $capH = $bottom - $y - 2
-                if ($capH -lt 15) { $capH = 15 }
+                if ($capH -lt $lineH) { $capH = $lineH }
                 $cb = New-Object System.Drawing.SolidBrush($capCol)
                 $g.DrawString([string]$t.Caption, $script:BtViewFontCaption, $cb, (New-Object System.Drawing.RectangleF(4, $y, ($w - 8), $capH)), $sf)
                 $cb.Dispose()
@@ -4760,20 +4839,25 @@ $buttonHandlers = @{
                 $col = [System.Drawing.Color]::FromArgb([int]($col.R * 0.8), [int]($col.G * 0.8), [int]($col.B * 0.8))
                 $g = $e.Graphics
                 $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-                $y = $tiles[0].Top + $script:BtViewBadgeTop + $script:BtViewBadgeR
-                $pen = New-Object System.Drawing.Pen($col, 2)
+                $m = $script:BtViewM
+                # Through the badge CENTRES, read from the shared metrics -- the
+                # one number the tile painter and this one both depend on.
+                $y = $tiles[0].Top + $m.BadgeTop + $m.BadgeR
+                $s = $script:BtViewScale
+                $gapHalf = [int](9 * $s); $xArm = [int](5 * $s); $inset = [int](3 * $s)
+                $pen = New-Object System.Drawing.Pen($col, $m.Pen)
                 if ($state -ne 'Live') { $pen.DashStyle = [System.Drawing.Drawing2D.DashStyle]::Dot }
                 for ($i = 0; $i -lt ($tiles.Count - 1); $i++) {
-                    $x1 = $tiles[$i].Right + 3
-                    $x2 = $tiles[$i + 1].Left - 3
-                    if (($x2 - $x1) -lt 16) { continue }
+                    $x1 = $tiles[$i].Right + $inset
+                    $x2 = $tiles[$i + 1].Left - $inset
+                    if (($x2 - $x1) -lt (16 * $s)) { continue }
                     if ($state -eq 'Broken') {
                         $mid = [int](($x1 + $x2) / 2)
-                        $g.DrawLine($pen, $x1, $y, ($mid - 9), $y)
-                        $g.DrawLine($pen, ($mid + 9), $y, $x2, $y)
-                        $xp = New-Object System.Drawing.Pen($col, 2)
-                        $g.DrawLine($xp, ($mid - 5), ($y - 5), ($mid + 5), ($y + 5))
-                        $g.DrawLine($xp, ($mid + 5), ($y - 5), ($mid - 5), ($y + 5))
+                        $g.DrawLine($pen, $x1, $y, ($mid - $gapHalf), $y)
+                        $g.DrawLine($pen, ($mid + $gapHalf), $y, $x2, $y)
+                        $xp = New-Object System.Drawing.Pen($col, $m.Pen)
+                        $g.DrawLine($xp, ($mid - $xArm), ($y - $xArm), ($mid + $xArm), ($y + $xArm))
+                        $g.DrawLine($xp, ($mid + $xArm), ($y - $xArm), ($mid - $xArm), ($y + $xArm))
                         $xp.Dispose()
                     } else {
                         $g.DrawLine($pen, $x1, $y, $x2, $y)
@@ -4794,19 +4878,64 @@ $buttonHandlers = @{
                 if (-not $script:BtView) { return }
                 $p = $script:BtView.Panel
                 if (-not $p) { return }
+                $m = $script:BtViewM
                 $w = $p.ClientSize.Width
-                if ($w -lt 240) { return }
-                $pad = 24
+                if ($w -lt (240 * $script:BtViewScale)) { return }
+                $pad = $m.Pad
                 $rowW = $w - (2 * $pad)
 
-                $tileW = [Math]::Max(92, [Math]::Min(190, [int](($rowW - 96) / 3)))
-                $gap   = [Math]::Max(22, [Math]::Min(150, [int](($rowW - (3 * $tileW)) / 2)))
+                $tileW = [Math]::Max($m.TileWMin, [Math]::Min($m.TileWMax, [int](($rowW - $m.TileWSlack) / 3)))
+                $gap   = [Math]::Max($m.GapMin, [Math]::Min($m.GapMax, [int](($rowW - (3 * $tileW)) / 2)))
                 $x0    = [int](($rowW - ((3 * $tileW) + (2 * $gap))) / 2)
                 if ($x0 -lt 0) { $x0 = 0 }
 
-                $y = 16
-                $script:BtView.ConnHeading.SetBounds($pad, $y, $rowW, 16)
-                $y += 22
+                # ── Vertical budget ──────────────────────────────────────────
+                #
+                # The blocks below have a natural height. On a scaled display
+                # that height doubles while the SCREEN does not, so on a 150 %
+                # 1080p box the verdict -- the one line the whole redesign exists
+                # to deliver -- falls below the fold and the operator has to
+                # scroll to find out whether anything is wrong.
+                #
+                # So the layout SPENDS a budget rather than asserting a size.
+                # What gets cut, in order, is what costs least: the session-event
+                # rows first (down to three, they are a tail), then the gaps
+                # between blocks (down to a floor). The text-bearing tile heights
+                # are never squeezed -- shrinking those clips the captions, which
+                # is the defect this whole pass is fixing.
+                $connH = $m.ConnH
+                $sigH  = $m.SigH
+                $gapSmall = $m.GapSmall; $gapMed = $m.GapMed; $gapBig = $m.GapBig
+                $eventsH  = $m.EventsH
+                $availH   = $p.ClientSize.Height
+                $fixedH   = $m.TopY + (2 * $m.HeadH) + $connH + $sigH + $m.VerdictH +
+                            $m.ContextH + 2 + $m.FootH + $m.LineH + 3 + [int](8 * $script:BtViewScale)
+                $need = $fixedH + (2 * $gapSmall) + (2 * $gapMed) + $gapBig + $eventsH
+                if ($availH -gt 0 -and $need -gt $availH) {
+                    # 1. Event rows. Three is the floor: fewer stops being a
+                    #    timeline, and the raw log still holds every line.
+                    $minEventsH = 3 * $m.LineH
+                    $take = [Math]::Min(($need - $availH), ($eventsH - $minEventsH))
+                    if ($take -gt 0) { $eventsH -= $take; $need -= $take }
+                }
+                if ($availH -gt 0 -and $need -gt $availH) {
+                    # 2. Gaps, proportionally, to a floor of 4 scaled px.
+                    $floor = [int](4 * $script:BtViewScale)
+                    $gapTotal = (2 * $gapSmall) + (2 * $gapMed) + $gapBig
+                    $gapFloor = 5 * $floor
+                    $want = $gapTotal - ($need - $availH)
+                    if ($want -lt $gapFloor) { $want = $gapFloor }
+                    $q = if ($gapTotal -gt 0) { [double]$want / $gapTotal } else { 1.0 }
+                    $gapSmall = [Math]::Max($floor, [int]($gapSmall * $q))
+                    $gapMed   = [Math]::Max($floor, [int]($gapMed   * $q))
+                    $gapBig   = [Math]::Max($floor, [int]($gapBig   * $q))
+                }
+                # Anything still over spills to AutoScroll, which is reachable --
+                # unlike the clipping this window has a history of.
+
+                $y = $m.TopY
+                $script:BtView.ConnHeading.SetBounds($pad, $y, $rowW, $m.HeadH)
+                $y += $m.HeadH + $gapSmall
 
                 # Tile heights are MEASURED against what a tile can carry, not
                 # picked to look right on the healthy screen. A connection tile
@@ -4815,16 +4944,17 @@ $buttonHandlers = @{
                 # caveat and stops one line earlier. Too short and the note is
                 # silently clipped -- which is how "Registered, idle / nobody is
                 # using it" loses the half that says it is not a fault.
-                $connH = 122
+                #
+                # Both come from the scaled metrics table. Left as raw pixels
+                # they held their 96-DPI size while the text inside them doubled.
                 $script:BtView.ConnRow.SetBounds($pad, $y, $rowW, $connH)
-                $y += $connH + 22
+                $y += $connH + $gapMed
 
-                $script:BtView.SigHeading.SetBounds($pad, $y, $rowW, 16)
-                $y += 20
+                $script:BtView.SigHeading.SetBounds($pad, $y, $rowW, $m.HeadH)
+                $y += $m.HeadH + $gapSmall
 
-                $sigH = 108
                 $script:BtView.SigRow.SetBounds($pad, $y, $rowW, $sigH)
-                $y += $sigH + 20
+                $y += $sigH + $gapMed
 
                 foreach ($row in @(@{ R = $script:BtView.ConnRow; H = $connH }, @{ R = $script:BtView.SigRow; H = $sigH })) {
                     $i = 0
@@ -4834,18 +4964,18 @@ $buttonHandlers = @{
                     }
                 }
 
-                $script:BtView.Verdict.SetBounds($pad, $y, $rowW, 28)
-                $y += 28
-                $script:BtView.Context.SetBounds($pad, $y, $rowW, 18)
-                $y += 20
-                $script:BtView.Footnote.SetBounds($pad, $y, $rowW, 16)
-                $y += 28
+                $script:BtView.Verdict.SetBounds($pad, $y, $rowW, $m.VerdictH)
+                $y += $m.VerdictH
+                $script:BtView.Context.SetBounds($pad, $y, $rowW, $m.ContextH)
+                $y += $m.ContextH + [int](2 * $script:BtViewScale)
+                $script:BtView.Footnote.SetBounds($pad, $y, $rowW, $m.FootH)
+                $y += $m.FootH + $gapBig
 
-                $script:BtView.EventsHeading.SetBounds($pad, $y, [int]($rowW * 0.6), 15)
+                $script:BtView.EventsHeading.SetBounds($pad, $y, [int]($rowW * 0.6), $m.LineH)
                 $script:BtView.TechToggle.Left = $pad + $rowW - $script:BtView.TechToggle.Width
-                $script:BtView.TechToggle.Top  = $y - 4
-                $y += 18
-                $script:BtView.EventsPanel.SetBounds($pad, $y, $rowW, 96)
+                $script:BtView.TechToggle.Top  = $y - [int](4 * $script:BtViewScale)
+                $y += $m.LineH + [int](3 * $script:BtViewScale)
+                $script:BtView.EventsPanel.SetBounds($pad, $y, $rowW, $eventsH)
             }
 
             # ── Renderer ──────────────────────────────────────────────────────
@@ -4967,7 +5097,7 @@ $buttonHandlers = @{
                 # line in the technical view, opened as a column four words wide.
                 # Recomputed here from the container that actually has a width.
                 if ($tp.Visible) {
-                    $maxW = $tp.ClientSize.Width - 32
+                    $maxW = $tp.ClientSize.Width - [int](32 * $script:BtViewScale)
                     if ($maxW -gt 100) {
                         foreach ($lbl in @($script:BtView.ScopeLabel, $script:BtView.BoundaryLabel)) {
                             if ($lbl) { $lbl.MaximumSize = New-Object System.Drawing.Size($maxW, 0) }
@@ -5168,7 +5298,7 @@ $buttonHandlers = @{
             # are unchanged, so the abort/packaging wording still lands here.
             $btBanner = New-Object System.Windows.Forms.Panel
             $btBanner.Dock = [System.Windows.Forms.DockStyle]::Top
-            $btBanner.Height = 30
+            $btBanner.Height = [int](30 * $script:BtViewScale)
             $btBanner.BackColor = [System.Drawing.Color]::FromArgb(30, 50, 80)
 
             $btBannerLabel = New-Object System.Windows.Forms.Label
@@ -5183,7 +5313,7 @@ $buttonHandlers = @{
             # Anomaly confirmation bar (initially hidden, shown when anomaly detected)
             $btAnomalyBar = New-Object System.Windows.Forms.Panel
             $btAnomalyBar.Dock = [System.Windows.Forms.DockStyle]::Top
-            $btAnomalyBar.Height = 40
+            $btAnomalyBar.Height = [int](40 * $script:BtViewScale)
             $btAnomalyBar.BackColor = [System.Drawing.Color]::FromArgb(180, 130, 20)
             $btAnomalyBar.Visible = $false
 
@@ -6069,7 +6199,7 @@ $buttonHandlers = @{
                 # given a maximum width, and an unwrapped sentence this long forces
                 # the panel wider than the form -- the clipping failure mode #64
                 # was about. Recomputed each render so it survives a resize.
-                $maxW = $btChainPanel.ClientSize.Width - 24
+                $maxW = $btChainPanel.ClientSize.Width - [int](24 * $script:BtViewScale)
                 if ($maxW -gt 100 -and $btBoundaryLabel.MaximumSize.Width -ne $maxW) {
                     $btBoundaryLabel.MaximumSize = New-Object System.Drawing.Size($maxW, 0)
                 }
@@ -6626,7 +6756,7 @@ $buttonHandlers = @{
             # recording into a labelled sample instead of an anonymous one.
             $script:BtRec_MarkRequested = $false
             $btMarkBox = New-Object System.Windows.Forms.TextBox
-            $btMarkBox.Width = 110
+            $btMarkBox.Width = [int](110 * $script:BtViewScale)
             $btMarkBox.Margin = New-Object System.Windows.Forms.Padding(0, 3, 0, 0)
             # Lighter than the (now dark) status bar behind it. At 35,35,35 on a
             # 28,28,34 panel the field was invisible until it was clicked, and an
