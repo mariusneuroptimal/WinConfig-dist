@@ -1635,6 +1635,193 @@ function Get-ProbeStateConsistency {
 }
 
 # =============================================================================
+# TARGET BINDING
+# =============================================================================
+
+function Get-BtTargetBinding {
+    <#
+    .SYNOPSIS
+        Pure. Says WHICH headset this recording is about and how strongly that
+        is known. A PREREQUISITE for the diagnostic chain, not a node in it.
+    .DESCRIPTION
+        THE DEFECT THIS CLOSES. A recording could simultaneously print
+        "NO HEADSET SELECTED -- this recording is not scoped to a device" in the
+        identity strip and "FIRST FAILING STEP: adapter present -> Windows
+        pairing record" in the chain. Those two sentences cannot both be safe.
+        If you do not know which headset you are diagnosing, you cannot say its
+        pairing record is the first failure -- you only know that the candidate
+        the recorder happened to fall back on has no device record right now.
+
+        Target identity is NOT another health node, and modelling it as one
+        would be wrong twice over. It is not a thing that is healthy or broken:
+        it is the SCOPE that decides whether any device-scoped health claim is
+        admissible at all. A node would also sit inside the dependency walk and
+        start blocking siblings, which would turn "we do not know which headset"
+        into "the headset is at fault" -- the exact confusion being removed.
+
+          Explicit    an operator chose this MAC. Not second-guessed.
+          Unique      positive evidence pins exactly one candidate: it is the
+                      only NeurOptimal on the box, or the only one holding a
+                      COM port. Either is a fact about the world, not a
+                      tie-break over an unordered list.
+          Inferred    a candidate is NAMED but not confirmed -- typically
+                      recovered from a BTHPORT pairing record when PnP had no
+                      device node at all (the FI-014 shape). Enough to say what
+                      is probably being looked at, never enough to convict it.
+          Ambiguous   several candidates, none distinguished.
+          Unscoped    no defensible target.
+          Unknown     the caller stated no binding. NOT a synonym for Unscoped:
+                      it means nothing answered, which is the honest rendering
+                      of an absent measurement and is what a stale caller
+                      produces. The wiring assertion in the suite is what stops
+                      that from being how this feature quietly dies.
+
+        THIS FUNCTION NEVER SELECTS. Select-BluetoothSessionTarget is the single
+        answerer for "which headset", and it deliberately refuses to guess --
+        capture 8E39860E4AF2 recorded a clean 37-minute session on Arc 000013
+        while watching Arc 000019 in a drawer, because a first-match pick over
+        an unordered enumeration silently chose. Anything here that ranked
+        candidates would be a second selector, and two selectors disagreeing is
+        how one capture came to describe two headsets.
+
+        'Inferred' is therefore a NAME FOR A STATE THAT ALREADY HAPPENS, not a
+        new licence to pick: when PnP holds no NeurOptimal node the app already
+        falls back to the pairing record for a MAC, and until now that fallback
+        arrived at the chain wearing the same face as a confirmed selection.
+    .PARAMETER SessionTarget
+        A Select-BluetoothSessionTarget result, or $null when selection never
+        ran (an older module copy, or a recording that failed before it).
+    .PARAMETER RecordCandidateMac
+        MAC recovered from a BTHPORT pairing record when PnP had no node. This
+        is what makes the difference between Inferred and Unscoped.
+    .PARAMETER RecordCandidateName
+        Friendly name for that record, when the record carries one.
+    .OUTPUTS
+        [pscustomobject] Binding, Confirmed, LocalizationScope, Mac, Name,
+        Reason, Evidence, Summary, CandidateCount.
+    #>
+    [CmdletBinding()]
+    param(
+        $SessionTarget,
+        [string]$RecordCandidateMac,
+        [string]$RecordCandidateName
+    )
+
+    # Set-StrictMode -Version Latest is in force at module scope: reading a
+    # property that does not exist THROWS rather than returning $null. The
+    # session target can legitimately come from an older module copy with a
+    # narrower shape, so every read goes through this.
+    $prop = {
+        param($Obj, [string]$Name)
+        if (-not $Obj) { return $null }
+        if ($Obj -is [hashtable]) { if ($Obj.ContainsKey($Name)) { return $Obj[$Name] } else { return $null } }
+        if ($Obj.PSObject.Properties.Name -contains $Name) { return $Obj.$Name }
+        return $null
+    }
+
+    $mode     = [string](& $prop $SessionTarget 'Mode')
+    $reason   = [string](& $prop $SessionTarget 'Reason')
+    $mac      = [string](& $prop $SessionTarget 'Mac')
+    $name     = [string](& $prop $SessionTarget 'Name')
+    $resolved = [bool]  (& $prop $SessionTarget 'IsResolved')
+    $cands    = @(& $prop $SessionTarget 'Candidates')
+
+    $recMac  = ([string]$RecordCandidateMac -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+    $recName = [string]$RecordCandidateName
+
+    $binding  = 'Unknown'
+    $bReason  = 'NoSelectionRun'
+    $evidence = 'Nothing in this recording stated which headset it is about.'
+
+    if ($SessionTarget) {
+        switch ($mode) {
+            'Explicit' {
+                $binding = 'Explicit'; $bReason = 'OperatorSelected'
+                $evidence = 'The operator chose this headset for the recording.'
+            }
+            'Automatic' {
+                if ($resolved -and $reason -eq 'SoleActiveComPort') {
+                    $binding = 'Unique'; $bReason = 'SoleActiveComPort'
+                    $evidence = 'Several NeurOptimal headsets are paired, and this is the only one whose COM port a process is holding -- the one signal that means something is talking to it right now.'
+                } elseif ($resolved) {
+                    $binding = 'Unique'; $bReason = 'SingleCandidate'
+                    $evidence = 'This is the only NeurOptimal headset Windows knows about on this PC, so there is nothing to confuse it with.'
+                } else {
+                    # Exactly one candidate, but no MAC to pin it to. Identity is
+                    # by NAME only, which the watch config can still match on --
+                    # so this is a real candidate, and it is not confirmed.
+                    $binding = 'Inferred'; $bReason = 'NameOnlyNoMac'
+                    $evidence = 'One NeurOptimal headset was found but its Bluetooth address could not be read, so it is identified by name only.'
+                }
+            }
+            'AmbiguousRequiresChoice' {
+                $binding = 'Ambiguous'; $bReason = 'MultipleCandidates'
+                $evidence = "$($cands.Count) NeurOptimal headsets are paired on this PC and nothing distinguishes which one this session is about."
+                $mac = $null; $name = $null
+            }
+            default {
+                # 'None' -- selection ran and found nothing to select.
+                $binding = 'Unscoped'; $bReason = 'NoCandidates'
+                $evidence = 'Windows is not showing a NeurOptimal device node for any headset on this PC, so there was no candidate to select.'
+                $mac = $null; $name = $null
+            }
+        }
+    }
+
+    # The historical fallback. It only ever UPGRADES Unscoped/Unknown -- it must
+    # never overwrite a selection that was actually made, because the record
+    # ranking deliberately prefers the NODELESS device (the FI-014 case) and
+    # that is precisely not the headset in a live clinical session.
+    if ($recMac -and $binding -in @('Unscoped', 'Unknown')) {
+        $binding  = 'Inferred'
+        $bReason  = 'HistoricalPairingRecord'
+        $mac      = $recMac
+        $name     = if ($recName) { $recName } else { $null }
+        $evidence = 'This headset was named by a stored Windows pairing record, not by a device Windows is showing now. The PC has met it before; it is not enumerated at the moment.'
+    }
+
+    # Confirmed means "a device-specific conclusion is admissible", nothing
+    # softer. Inferred is deliberately NOT confirmed: a named candidate is
+    # enough to tell an operator what is probably being looked at, and not
+    # enough to convict it of the failure.
+    $confirmed = ($binding -in @('Explicit', 'Unique'))
+    $scope = switch ($binding) {
+        'Explicit'  { 'Confirmed' }
+        'Unique'    { 'Confirmed' }
+        'Inferred'  { 'Provisional' }
+        'Ambiguous' { 'Suspended' }
+        'Unscoped'  { 'Suspended' }
+        default     { 'Unstated' }
+    }
+
+    $label = if ($name -and $mac) { "$name ($mac)" }
+             elseif ($name)       { $name }
+             elseif ($mac)        { $mac }
+             else                 { $null }
+
+    $summary = switch ($scope) {
+        'Confirmed'   { "Target: $label. $evidence" }
+        'Provisional' { "TARGET NOT CONFIRMED. Candidate: $(if ($label) { $label } else { 'unnamed' }). $evidence" }
+        'Suspended'   { "TARGET NOT CONFIRMED. $evidence" }
+        default       { "TARGET NOT STATED. $evidence" }
+    }
+
+    return [pscustomobject]@{
+        PSTypeName        = 'WinConfig.FlightRecorder.TargetBinding'
+        Binding           = $binding
+        Confirmed         = $confirmed
+        LocalizationScope = $scope
+        Mac               = $mac
+        Name              = $name
+        Label             = $label
+        Reason            = $bReason
+        Evidence          = $evidence
+        Summary           = $summary
+        CandidateCount    = $cands.Count
+    }
+}
+
+# =============================================================================
 # DIAGNOSTIC CHAIN
 # =============================================================================
 
@@ -1697,6 +1884,16 @@ function Get-BtDiagnosticChain {
         Host and OS are not nodes either -- they do not fail in a way that
         produces a Bluetooth boundary, so they would be permanent green.
 
+        TARGET IDENTITY IS A PREREQUISITE, NOT A NODE. Every node from Pairing
+        down is a claim ABOUT A PARTICULAR HEADSET. If the recording could not
+        establish which headset that is, those readings are still real -- they
+        are simply not attributable, and a boundary drawn across them names a
+        failure in a device nobody identified. TargetBinding therefore gates the
+        CLAIM, not the readings: the nodes keep their measured health, and the
+        localization sentence downgrades to provisional or refuses to name a
+        boundary at all. Dimming the readings instead would hide evidence that
+        was honestly obtained, which is the same class of error in reverse.
+
         WHY UnavailablePorts DOES NOT SET A HEALTH HERE. A registered port that
         will not open is already judged, with the FI-012 hedge, by
         Get-ProbeStateConsistency. Judging it a second time in this function
@@ -1712,6 +1909,29 @@ function Get-BtDiagnosticChain {
         INDEPENDENT of PortHoldObserved: read-rate sampling reads NO.exe's own
         counters and opens no port, so it survives the non-intrusive arm and is
         the only data-flow channel left there.
+    .PARAMETER TargetBinding
+        Get-BtTargetBinding's Binding: Explicit / Unique / Inferred / Ambiguous
+        / Unscoped. Defaults to 'Unknown' -- the caller stated nothing -- which
+        leaves today's wording untouched rather than suspending localization on
+        every stale caller. 'Unknown' is visible in the output and in
+        chain.jsonl precisely so a broken wiring shows up as a state rather
+        than as silence.
+    .PARAMETER TargetLabelName
+        Friendly name of the bound or candidate headset, for the sentence.
+    .PARAMETER TargetLabelMac
+        Its MAC, for the sentence.
+    .PARAMETER TargetBindingEvidence
+        One sentence on WHERE that identity came from, from Get-BtTargetBinding.
+        Passed rather than re-derived: a second place that explains the binding
+        is a second place that can disagree with the first.
+    .PARAMETER PairingRecordPresent
+        $true when Windows holds a BTHPORT pairing record for the target,
+        $false when it is known not to, $null when nothing looked. Kept
+        separate from the PnP device node because they are different Windows
+        concepts and "Headset paired: Not found" collapses them: the FI-014
+        shape is a record that is PRESENT while the device node is ABSENT, and
+        a reader told only "not paired" will go and re-pair a headset whose
+        pairing key was never the problem.
     .OUTPUTS
         PSCustomObject (PSTypeName WinConfig.FlightRecorder.DiagnosticChain).
     #>
@@ -1733,7 +1953,13 @@ function Get-BtDiagnosticChain {
         [System.Nullable[double]]$IoFractionOfBaseline,
         [System.Nullable[double]]$IoRecentOpsPerSecond,
         [System.Nullable[double]]$IoBaselineOpsPerSecond,
-        [hashtable]$AdapterInfo
+        [hashtable]$AdapterInfo,
+        [ValidateSet('Explicit', 'Unique', 'Inferred', 'Ambiguous', 'Unscoped', 'Unknown')]
+        [string]$TargetBinding = 'Unknown',
+        [string]$TargetLabelName,
+        [string]$TargetLabelMac,
+        [string]$TargetBindingEvidence,
+        [System.Nullable[bool]]$PairingRecordPresent
     )
 
     $held = @($HeldPorts | Where-Object { $_ })
@@ -1808,8 +2034,36 @@ function Get-BtDiagnosticChain {
     if ($pairHealth -eq 'Healthy') {
         $pairEv += (New-ChainEvidence 'Inferred' 'Windows holds a pairing record for this headset. That is a stored key, not a live connection.')
     }
+    # TWO WINDOWS CONCEPTS, KEPT APART. A stored BTHPORT pairing record and a
+    # currently-enumerated PnP device node are different facts, and "Headset
+    # paired: Not found" collapses them into one. FI-014 is exactly the state
+    # where they disagree -- record present, node absent -- and a reader told
+    # only "not paired" re-pairs a headset whose pairing key was never at fault.
+    #
+    # The chip count stays at eight. This rides on the DETAIL and the evidence,
+    # which is where a distinction this specific belongs: a ninth chip would be
+    # permanently green on every healthy box and would be skipped by the time it
+    # mattered.
+    $pairTitle = 'Windows device'
+    $pairEdge  = 'adapter present -> Windows device enumeration'
+    if ($pairHealth -ne 'Healthy' -and $PairingRecordPresent -eq $true) {
+        $pairText = 'Record only, no device'
+        $pairEdge = 'stored pairing record -> Windows device enumeration'
+        $pairEv += (New-ChainEvidence 'Historical' 'Windows still holds a stored pairing record (BTHPORT) for this headset, so this PC has met it before.')
+        $pairEv += (New-ChainEvidence 'Observed' 'What is missing is the live device node: Windows is not enumerating the headset right now, which is why it shows as not paired.')
+        $pairEv += (New-ChainEvidence 'Inferred' 'A record without a device node does NOT mean the pairing key is wrong. Re-pairing is not automatically the remedy -- one such headset re-paired successfully with the record left in place.')
+    } elseif ($pairHealth -ne 'Healthy' -and $PairingRecordPresent -eq $false) {
+        $pairEdge = 'adapter present -> Windows pairing record'
+        $pairEv += (New-ChainEvidence 'Observed' 'Windows holds no stored pairing record for this headset either, so this is an unpaired device rather than one that lost its device node.')
+    } elseif ($pairHealth -ne 'Healthy') {
+        $pairEv += (New-ChainEvidence 'NotObserved' 'Whether Windows still holds a stored pairing record for this headset was not checked, so "not paired" here is about the live device node only.')
+    }
     [void]$nodes.Add(@{
-        Id = 'Pairing'; Title = 'Headset paired'; EdgeLabel = 'adapter present -> Windows pairing record'; DependsOn = @('Adapter')
+        # Id remains Pairing for artifact compatibility. The visible title and
+        # boundary name the fact this node actually tests: live PnP device
+        # enumeration. Pairing history is evidence on that node, not a failed
+        # step when the BTHPORT record is demonstrably present.
+        Id = 'Pairing'; Title = $pairTitle; EdgeLabel = $pairEdge; DependsOn = @('Adapter')
         Health = $pairHealth; Observation = 'Observed'; Detail = $pairText; Evidence = $pairEv
     })
 
@@ -1833,7 +2087,7 @@ function Get-BtDiagnosticChain {
         $comEv += (New-ChainEvidence 'Historical' 'A registered COM port is what a previous successful pairing left behind. It survives a flat battery, a headset in a drawer and a broken driver, so it does NOT show that anything is connected now.')
     }
     [void]$nodes.Add(@{
-        Id = 'ComPorts'; Title = 'COM ports registered'; EdgeLabel = 'pairing record -> virtual serial ports'; DependsOn = @('Pairing')
+        Id = 'ComPorts'; Title = 'COM ports registered'; EdgeLabel = 'Windows device enumeration -> virtual serial ports'; DependsOn = @('Pairing')
         Health = $comHealth; Observation = 'Historical'; Detail = $comDetail; Evidence = $comEv
     })
 
@@ -1869,7 +2123,7 @@ function Get-BtDiagnosticChain {
         $linkEv += (New-ChainEvidence 'NotObserved' 'The radio link state could not be read. This check needs administrator rights and a discovered device.')
     }
     [void]$nodes.Add(@{
-        Id = 'RadioLink'; Title = 'Live radio link'; EdgeLabel = 'pairing record -> live wireless link'; DependsOn = @('Adapter', 'Pairing')
+        Id = 'RadioLink'; Title = 'Live radio link'; EdgeLabel = 'Windows device enumeration -> live wireless link'; DependsOn = @('Adapter', 'Pairing')
         Health = $linkHealth; Observation = $linkObs; Detail = $linkDetail; Evidence = $linkEv
     })
 
@@ -1914,6 +2168,19 @@ function Get-BtDiagnosticChain {
         $holdDetail = if ($held.Count -gt 0) { "Held ($($held -join ', '))" } else { 'Held' }
         $holdEv += (New-ChainEvidence 'Observed' "A process is holding $(if ($held.Count -gt 0) { $held -join ', ' } else { 'the headset''s COM port' }).")
         $holdEv += (New-ChainEvidence 'Inferred' 'A held port means some process believes it has a session. It does NOT mean data is flowing: NeurOptimal keeps the port open whether or not the headset sends a single sample.')
+    } elseif ($StreamState -eq 'Stopped' -and $ports.Count -eq 0) {
+        # NOT Idle. 'Stopped' with no registered port is the port-open probe
+        # finding nothing to open -- an absent measurement, and the standing
+        # rule is that an absent measurement renders as absent. Reported as
+        # Idle it reads "we checked, nobody is using it", which is a statement
+        # about a port that does not exist. This is the same defect as an unset
+        # numeric serialising as 0 in a field whose 0 is meaningful.
+        #
+        # This node is BlockedBy ComPorts in that state anyway, so the boundary
+        # does not move; what changes is that the chip stops claiming a reading.
+        $holdHealth = 'Unknown'; $holdObs = 'NotObserved'
+        $holdDetail = 'No port to watch'
+        $holdEv += (New-ChainEvidence 'NotObserved' 'There is no registered COM port for this headset, so there was nothing for the port-open probe to test. This is not a report that the port is free -- there is no port.')
     } elseif ($StreamState -eq 'Stopped') {
         $holdHealth = 'Idle'
         $holdEv += (New-ChainEvidence 'Observed' 'No process is holding the headset''s COM port.')
@@ -2016,6 +2283,16 @@ function Get-BtDiagnosticChain {
     $blocked  = @($nodes | Where-Object { $_.BlockedBy } | ForEach-Object { $_.Id })
     $verified = @($nodes | Where-Object { $_.Health -eq 'Healthy' } | ForEach-Object { $_.Id })
 
+    # A SECOND, NARROWER SET, under its own name -- never a second meaning for
+    # $blocked. BlockedNodeIds is the dependency walk's complete answer and stays
+    # that. What the SENTENCE may claim is smaller: EEG is NotMeasurable on every
+    # tick of every recording, so "EEG is a consequence of this failure" asserts
+    # that but for this fault it would have been measurable. It never is. That is
+    # the same reason NotMeasurable roots are excluded from the second-root
+    # clause below, and the two exclusions must agree or the EEG caveat is
+    # suppressed as a root and counted as a consequence in the same sentence.
+    $consequences = @($nodes | Where-Object { $_.BlockedBy -and $_.Observation -ne 'NotMeasurable' } | ForEach-Object { $_.Id })
+
     # Which root to headline. Severity first so a real failure is never hidden
     # behind an idle sibling branch, display order as the tie-break so the answer
     # does not flicker between two equally-severe roots from tick to tick.
@@ -2047,6 +2324,29 @@ function Get-BtDiagnosticChain {
         default    { if ($boundaryNode.Observation -eq 'NotMeasurable') { 'LimitOfTool' } else { 'NotObserved' } }
     }
 
+    # ── Localization SCOPE: is a device-scoped claim admissible at all? ───────
+    # Derived from the target binding and nothing else, and applied to the
+    # CLAIM rather than to the readings. Every node from Pairing down describes
+    # a particular headset; if the recording never established which one, the
+    # readings remain honest and the attribution does not.
+    #
+    # Unstated is not Suspended. A caller that says nothing has not told us the
+    # target is unknown -- it has told us nothing -- so the sentence is left
+    # exactly as it was rather than degraded on a guess. It is emitted, so a
+    # wiring break shows up in chain.jsonl as a state instead of as silence.
+    $localizationScope = switch ($TargetBinding) {
+        'Explicit'  { 'Confirmed' }
+        'Unique'    { 'Confirmed' }
+        'Inferred'  { 'Provisional' }
+        'Ambiguous' { 'Suspended' }
+        'Unscoped'  { 'Suspended' }
+        default     { 'Unstated' }
+    }
+    $targetLabel = if ($TargetLabelName -and $TargetLabelMac) { "$TargetLabelName ($TargetLabelMac)" }
+                   elseif ($TargetLabelName) { $TargetLabelName }
+                   elseif ($TargetLabelMac)  { $TargetLabelMac }
+                   else { $null }
+
     # Discrete, and about the LOCALIZATION claim rather than about the world. A
     # boundary the probe watched directly is a strong claim; a boundary that is
     # just where the readings ran out is a weak one. No numeric score: nothing
@@ -2054,6 +2354,13 @@ function Get-BtDiagnosticChain {
     $confidence = if ($boundaryNode.Health -eq 'Failed' -and $boundaryNode.Observation -eq 'Observed') { 'High' }
                   elseif ($boundaryNode.Health -in @('Degraded', 'Idle') -and $boundaryNode.Observation -eq 'Observed') { 'Medium' }
                   else { 'Low' }
+    # CAPPED by scope, because confidence is a claim about the localization and
+    # the localization is only as good as the identity it is scoped to. A
+    # boundary observed directly on a headset nobody identified was reading
+    # 'High' -- the strongest label this function has -- on the one screen where
+    # the identity was simultaneously printed as unknown.
+    if ($localizationScope -eq 'Provisional' -and $confidence -eq 'High') { $confidence = 'Medium' }
+    if ($localizationScope -eq 'Suspended') { $confidence = 'Low' }
 
     # THE EDGE LABEL IS THE BOUNDARY STATEMENT. "pairing record -> live wireless
     # link" already names the verified side and the unverified side, so a
@@ -2074,6 +2381,36 @@ function Get-BtDiagnosticChain {
         'LimitOfTool' { "All $verifiedCount measurable steps verified. '$($boundaryNode.Title)' is beyond what this tool can measure, so this is NOT proof the session is good." }
         default       { "Chain stops at '$($boundaryNode.Title)': NOT OBSERVED -- nothing that depends on it is ruled in or out.  ($verifiedCount of $totalCount verified.)" }
     }
+
+    # ── The scope gate on the sentence ───────────────────────────────────────
+    # SUSPENDED replaces the boundary claim outright. "FIRST FAILING STEP:
+    # adapter present -> Windows pairing record" alongside "no headset selected"
+    # is a failure attributed to a device this recording never identified. The
+    # counts survive, because how much was verified is true whatever the
+    # readings are about.
+    #
+    # PROVISIONAL keeps the boundary and marks it. A named candidate is a real
+    # working hypothesis and withholding it would throw away the most useful
+    # thing on the screen; presenting it as settled is what this fixes.
+    #
+    # Deliberately does NOT touch Idle or LimitOfTool: neither attributes a
+    # fault to a device, so neither is weakened by not knowing which device.
+    #
+    # The WHERE-FROM sentence is NOT inlined here. It travels as TargetEvidence,
+    # which chain.jsonl records and the window puts on its own scope line. Two
+    # paragraphs in the boundary label is how the conclusion stops being read at
+    # all, and this line is the highest-value one in the window.
+    if ($localizationScope -eq 'Suspended' -and $localization -in @('Failure', 'Degrading', 'NotObserved')) {
+        $why = if ($TargetBinding -eq 'Ambiguous') {
+            'more than one NeurOptimal headset is paired here and this recording was never told which one this session is about'
+        } else {
+            'this recording is not scoped to a headset'
+        }
+        $summary = "TARGET NOT CONFIRMED -- $why. LOCALIZATION SUSPENDED: the readings below are real, but nothing attributes them to a known device, so no failing step is named. ($verifiedCount of $totalCount steps verified.) Identify the headset to localize this."
+    } elseif ($localizationScope -eq 'Provisional' -and $localization -in @('Failure', 'Degrading', 'NotObserved')) {
+        $cand = if ($targetLabel) { "candidate: $targetLabel" } else { 'candidate not named' }
+        $summary = "TARGET NOT CONFIRMED ($cand) -- PROVISIONAL. $summary"
+    }
     # A second root is reported rather than dropped. Two independent branches
     # being down at once is a materially different situation from one, and the
     # headline can only carry one of them.
@@ -2092,9 +2429,13 @@ function Get-BtDiagnosticChain {
     # Counted, not listed. Which steps are consequences is already carried by the
     # dimmed chips; what the sentence has to add is that they are consequences at
     # all -- the "four problems" reading this whole function exists to prevent.
-    if ($blocked.Count -gt 0) {
-        $stepWord = if ($blocked.Count -eq 1) { 'step below is a consequence' } else { 'steps below are consequences' }
-        $summary += " $($blocked.Count) $stepWord of this, not separate problems."
+    #
+    # $consequences, NOT $blocked: see the note where it is built. And not at all
+    # when localization is suspended, because "consequences of THIS" points at a
+    # boundary the sentence has just refused to name.
+    if ($consequences.Count -gt 0 -and $localizationScope -ne 'Suspended') {
+        $stepWord = if ($consequences.Count -eq 1) { 'step below is a consequence' } else { 'steps below are consequences' }
+        $summary += " $($consequences.Count) $stepWord of this, not separate problems."
     }
 
     $nodeObjects = @($nodes | ForEach-Object {
@@ -2126,7 +2467,23 @@ function Get-BtDiagnosticChain {
         BoundaryNodeId  = $boundaryNode.Id
         BoundaryEdge    = $boundaryNode.EdgeLabel
         BlockedNodeIds  = $blocked
+        # Its own name, alongside BlockedNodeIds rather than instead of it. One
+        # field, one answerer: BlockedNodeIds is the dependency walk, this is the
+        # subset the operator sentence is entitled to call consequences.
+        ConsequenceNodeIds = $consequences
         Localization    = $localization
+        # Scope is reported SEPARATELY from Localization, not folded into it.
+        # "where does the chain stop" and "may this recording attribute that to a
+        # device" are different questions, and a single enum carrying both would
+        # make an unscoped failure indistinguishable from an idle box.
+        TargetBinding     = $TargetBinding
+        TargetConfirmed   = ($TargetBinding -in @('Explicit', 'Unique'))
+        TargetLabel       = $targetLabel
+        # Echoed, not re-derived. The window's scope line and chain.jsonl both
+        # need "where did this identity come from", and Get-BtTargetBinding is
+        # the one place that answers it.
+        TargetEvidence    = $TargetBindingEvidence
+        LocalizationScope = $localizationScope
         Confidence      = $confidence
         Summary         = $summary
     }
@@ -2550,6 +2907,10 @@ function New-DeviceProbeSession {
         BtLinkEnteredAt          = $null
         BtLinkFlapCount          = 0
         BtLinkEverConnected      = $false
+        # Cross-evidence context findings are latched for the run. A scope
+        # mismatch can disappear from the live inputs when NeurOptimal exits;
+        # the saved capture must still say that it was observed.
+        ScopeFindings            = @()
         # Seeded to the DISABLED state rather than 'Stopped' when the active
         # probe is off, and that is load-bearing twice over. It keeps a
         # measurement word out of a capture that took no measurement; and
@@ -4471,6 +4832,14 @@ function Get-ProbeObservationCoverage {
     .PARAMETER Target
         Optional Select-BluetoothSessionTarget result, for rival-candidate
         evidence.
+    .PARAMETER AppRunningSeconds
+        How long NeurOptimal has continuously been observed running. This is
+        presentation-independent input to the scope-conflict rule: once the app
+        has been up long enough to expect a session but the candidate has never
+        linked, the recorder may be observing the wrong headset.
+    .PARAMETER ScopeWarningThresholdSeconds
+        Minimum app-running time before silence becomes a scope warning. Kept
+        explicit and injectable so the rule can be tested without a clock.
     .OUTPUTS
         [pscustomobject] Level, Reasons, Summary, DataFlowMeasured and the raw
         evidence booleans.
@@ -4486,7 +4855,11 @@ function Get-ProbeObservationCoverage {
     param(
         [Parameter(Mandatory)]$Session,
         $WatchState,
-        $Target
+        $Target,
+        [ValidateRange(0, 2147483647)]
+        [int]$AppRunningSeconds = 0,
+        [ValidateRange(1, 2147483647)]
+        [int]$ScopeWarningThresholdSeconds = 120
     )
 
     $linked     = [bool]$Session.BtLinkEverConnected
@@ -4627,6 +5000,43 @@ function Get-ProbeObservationCoverage {
         $reasons += 'Read-rate samples were taken but no baseline was ever established, so data flow was NOT assessed -- the absence of a read-collapse finding here means nothing was measured, not that nothing was wrong.'
     }
 
+    # Structured cross-evidence findings. These are NOT component failures and
+    # do not enter the health DAG: they question whether the graph describes the
+    # same headset as the running application. Keeping this classification on
+    # the coverage object makes the live strip, saved probe-session.json and any
+    # offline consumer read one answer instead of parsing warning prose.
+    $findings = @($Session.ScopeFindings | Where-Object { $_ })
+    $scopeMismatch = $rivalActive -or
+        ($AppRunningSeconds -ge $ScopeWarningThresholdSeconds -and -not $linked)
+    if ($scopeMismatch) {
+        $candidate = if ($Target -and $Target.Name) { [string]$Target.Name } else { 'the candidate headset' }
+        $observed = New-Object System.Collections.ArrayList
+        if ($AppRunningSeconds -ge $ScopeWarningThresholdSeconds) {
+            [void]$observed.Add("NeurOptimal has been running for $([int]($AppRunningSeconds / 60)) minute(s).")
+        }
+        if (-not $linked) { [void]$observed.Add("$candidate never linked during this capture.") }
+        if ($heldPortObserved -and -not $heldPort) {
+            [void]$observed.Add("No process ever held $candidate's COM port during this capture.")
+        } elseif (-not $heldPortObserved) {
+            [void]$observed.Add('COM port ownership was not observed because the active port-open probe was disabled.')
+        }
+        if ($rivalActive) {
+            [void]$observed.Add('Another paired NeurOptimal headset held a COM port while this candidate was idle.')
+        }
+        $finding = [pscustomobject]@{
+            PSTypeName  = 'WinConfig.FlightRecorder.DiagnosticFinding'
+            FindingKind = 'EvidenceConflict'
+            Code        = 'ScopeMismatchSuspected'
+            Severity    = if ($rivalActive) { 'High' } else { 'Warning' }
+            Title       = 'SCOPE MISMATCH SUSPECTED'
+            Summary     = 'Recorder may not be scoped to the headset NeurOptimal is using.'
+            Evidence    = @($observed)
+        }
+        # One finding per code. Keep the latest evidence (not two copies) when
+        # this pure function is called on every UI tick.
+        $findings = @($findings | Where-Object { $_.Code -ne $finding.Code }) + @($finding)
+    }
+
     # Level is NOT weakened by this. It answers "were all the channels seen?",
     # stays categorical, and a capture that linked, held the port and sampled
     # reads has seen them all. The honesty belongs in the sentence a human
@@ -4668,6 +5078,7 @@ function Get-ProbeObservationCoverage {
         PSTypeName        = 'WinConfig.FlightRecorder.ObservationCoverage'
         Level             = $level
         Reasons           = @($reasons)
+        Findings          = @($findings)
         Summary           = $summary
         TargetEverLinked  = $linked
         # TRI-STATE: $true / $false / $null-for-not-observed. Consumers that
@@ -5495,6 +5906,11 @@ Export-ModuleMember -Function @(
     # verified part of the chain end" -- deriving it a second time at the render
     # site is the channel-mismatch class this repo keeps re-filing.
     'Get-BtDiagnosticChain',
+    # Target identity, as a diagnostic-context property rather than a health
+    # node. Exported for the same reason the chain is: the window, chain.jsonl
+    # and the tests must read ONE answer to "which headset is this about, and
+    # how strongly is that known".
+    'Get-BtTargetBinding',
     'Initialize-ProcessIoApi',
     'Get-ProcessIoSample',
     'Add-IoReadRateSample',

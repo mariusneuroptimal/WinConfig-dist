@@ -4699,6 +4699,24 @@ $buttonHandlers = @{
             $btChainPanel.Visible = $false
             $btForm.Controls.Add($btChainPanel)
 
+            # SCOPE, ABOVE THE EVIDENCE. Which headset this chain describes is a
+            # prerequisite for reading any chip under it, not a detail beside
+            # them -- so it sits on its own line at the top rather than
+            # competing with the node row.
+            #
+            # This is a renderer of Get-BtDiagnosticChain's binding fields, NOT
+            # a second reader of the session target. The identity strip further
+            # down answers "what is this recording watching"; this answers "is
+            # the conclusion below entitled to name a device", and both are fed
+            # from the one selection.
+            $btScopeLabel = New-Object System.Windows.Forms.Label
+            $btScopeLabel.Text = "Target: (resolving...)"
+            $btScopeLabel.AutoSize = $true
+            $btScopeLabel.Margin = New-Object System.Windows.Forms.Padding(2, 0, 0, 3)
+            $btScopeLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+            $btScopeLabel.ForeColor = [System.Drawing.Color]::FromArgb(170, 170, 170)
+            $btChainPanel.Controls.Add($btScopeLabel)
+
             $btChainRow = New-Object System.Windows.Forms.FlowLayoutPanel
             $btChainRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
             $btChainRow.WrapContents = $true
@@ -5114,6 +5132,28 @@ $buttonHandlers = @{
                 if (-not $Chain -or -not $btChainPanel) { return }
                 if (-not $btChainPanel.Visible) { $btChainPanel.Visible = $true }
 
+                # ── Scope line ───────────────────────────────────────────────
+                # Marker word AND colour. A confirmed target is stated plainly
+                # and quietly; an unconfirmed one leads with the words, because
+                # this is the line that stops a reader acting on a boundary
+                # attributed to a headset nobody identified.
+                if ($btScopeLabel) {
+                    $sText = switch ($Chain.LocalizationScope) {
+                        'Confirmed'   { "TARGET: $(if ($Chain.TargetLabel) { $Chain.TargetLabel } else { 'confirmed' })  --  $($Chain.TargetEvidence)" }
+                        'Provisional' { "[?] TARGET NOT CONFIRMED  --  candidate: $(if ($Chain.TargetLabel) { $Chain.TargetLabel } else { 'not named' }).  $($Chain.TargetEvidence)  Everything below is provisional." }
+                        'Suspended'   { "[!] TARGET NOT CONFIRMED  --  $($Chain.TargetEvidence)  No failing step can be attributed to a device until the headset is identified." }
+                        default       { "[?] TARGET NOT STATED  --  this recording did not record which headset the chain below describes." }
+                    }
+                    $sCol = switch ($Chain.LocalizationScope) {
+                        'Confirmed'   { [System.Drawing.Color]::FromArgb(150, 170, 150) }
+                        'Provisional' { [System.Drawing.Color]::FromArgb(225, 190, 110) }
+                        'Suspended'   { [System.Drawing.Color]::FromArgb(240, 150, 110) }
+                        default       { [System.Drawing.Color]::FromArgb(150, 185, 235) }
+                    }
+                    if ($btScopeLabel.Text -ne $sText) { $btScopeLabel.Text = $sText }
+                    if ($btScopeLabel.ForeColor -ne $sCol) { $btScopeLabel.ForeColor = $sCol }
+                }
+
                 foreach ($node in $Chain.Nodes) {
                     # Marker text AND colour, never colour alone. Roughly one man
                     # in twelve cannot separate this palette's green from its red,
@@ -5189,6 +5229,12 @@ $buttonHandlers = @{
                 if ($maxW -gt 100 -and $btBoundaryLabel.MaximumSize.Width -ne $maxW) {
                     $btBoundaryLabel.MaximumSize = New-Object System.Drawing.Size($maxW, 0)
                 }
+                # The scope line needs the same treatment for the same reason:
+                # it is a sentence, not a chip, and an unwrapped one pushes the
+                # panel wider than the form (#64).
+                if ($btScopeLabel -and $maxW -gt 100 -and $btScopeLabel.MaximumSize.Width -ne $maxW) {
+                    $btScopeLabel.MaximumSize = New-Object System.Drawing.Size($maxW, 0)
+                }
             }
 
             # Computes the chain from live session state, renders it, and
@@ -5242,6 +5288,66 @@ $buttonHandlers = @{
                     IoSamplesTotal      = [int]$btProbeSession.IoSamplesTotal
                     AdapterInfo         = $btProbeSession.AdapterInfo
                 }
+
+                # ── Target binding: the PREREQUISITE for any device-scoped
+                # claim below. Computed here, at the one place the chain's
+                # inputs are assembled, for the same reason everything else in
+                # this hashtable is: a second mapping is a second thing that can
+                # drift, and a drift here would show the operator one scope and
+                # write another to the capture.
+                #
+                # The chain used to be able to print "FIRST FAILING STEP:
+                # adapter present -> Windows pairing record" while the identity
+                # strip two lines above printed "NO HEADSET SELECTED". Those
+                # cannot both be safe: without knowing which headset, the
+                # honest claim is that the fallback CANDIDATE has no device
+                # record, not that the session's headset failed to pair.
+                $btBinding = $null
+                if (Get-Command Get-BtTargetBinding -ErrorAction SilentlyContinue) {
+                    # The record MAC is only ever a FALLBACK identity, and it is
+                    # read from the session's own resolved value rather than
+                    # re-resolved here. It is populated exactly when PnP had no
+                    # node -- which is the state that produced this defect.
+                    $btRecMac  = if ($btProbeSession.PairingTargetSource -eq 'PairingRecord') { [string]$btProbeSession.PairingTargetMac } else { '' }
+                    $btRecName = ''
+                    if ($btRecMac -and $btProbeSession.PairingRecord) {
+                        $btRecName = [string](@($btProbeSession.PairingRecord.Records |
+                            Where-Object { $_ -and $_.Mac -and (([string]$_.Mac -replace '[^0-9A-Fa-f]','').ToUpperInvariant() -eq ($btRecMac -replace '[^0-9A-Fa-f]','').ToUpperInvariant()) } |
+                            ForEach-Object { $_.Name } | Select-Object -First 1))
+                    }
+                    $btBinding = try {
+                        Get-BtTargetBinding -SessionTarget $btProbeSession.SessionTarget `
+                            -RecordCandidateMac $btRecMac -RecordCandidateName $btRecName
+                    } catch { $null }
+                }
+                if ($btBinding) {
+                    $chainArgs.TargetBinding         = $btBinding.Binding
+                    $chainArgs.TargetLabelName       = [string]$btBinding.Name
+                    $chainArgs.TargetLabelMac        = [string]$btBinding.Mac
+                    $chainArgs.TargetBindingEvidence = [string]$btBinding.Evidence
+                }
+                # TargetState, and ONLY when the check was scoped. Records[] is
+                # every BTHPORT record on the box, so counting it would report
+                # "this headset has a pairing record" because a mouse does --
+                # a fabricated observation, and the same trap OrphanCount sets
+                # by reading 0 on an unscoped run.
+                #
+                # $null when nothing looked, never $false. $false is the claim
+                # "Windows holds no pairing record for this headset", and the
+                # chain's Pairing node says exactly that in words -- so an
+                # unchecked record must not arrive wearing it.
+                # The presence test handles BOTH shapes on purpose: this record is
+                # a hashtable today, and a PSObject.Properties test alone would
+                # read $false against it and silently never wire the field --
+                # which is the failure mode where a detector nobody feeds
+                # produces no field data.
+                $btPr = $btProbeSession.PairingRecord
+                $btPrHasState = $false
+                if ($btPr -is [hashtable]) { $btPrHasState = $btPr.ContainsKey('TargetState') }
+                elseif ($btPr)             { $btPrHasState = ($btPr.PSObject.Properties.Name -contains 'TargetState') }
+                if ($btPr -and $btPr.Scoped -and $btPrHasState -and $btPr.TargetState) {
+                    $chainArgs.PairingRecordPresent = ([string]$btPr.TargetState -ne 'NoRecord')
+                }
                 if ($null -ne $btProbeSession.IoFractionOfBaseline)   { $chainArgs.IoFractionOfBaseline   = [double]$btProbeSession.IoFractionOfBaseline }
                 if ($null -ne $btProbeSession.IoRecentOpsPerSecond)   { $chainArgs.IoRecentOpsPerSecond   = [double]$btProbeSession.IoRecentOpsPerSecond }
                 if ($null -ne $btProbeSession.IoBaselineOpsPerSecond) { $chainArgs.IoBaselineOpsPerSecond = [double]$btProbeSession.IoBaselineOpsPerSecond }
@@ -5254,9 +5360,16 @@ $buttonHandlers = @{
                 # degrading below the boundary is a real change in what this
                 # recorder believes, and a file that only recorded boundary moves
                 # would render those ticks as "nothing happened".
+                # The BINDING is part of the key. A recording that starts
+                # unscoped and later resolves its target (the late-MAC path
+                # below) has changed what this recorder believes it is
+                # describing, which is at least as material as a node moving --
+                # and with the boundary gated on scope, the summary changes with
+                # it. Keyed on nodes alone, that transition wrote no line.
                 $key = ($chain.Nodes | ForEach-Object {
                     "$($_.Id)=$($_.Health)/$($_.Observation)/$(if ($_.BlockedBy) { $_.BlockedBy } else { '-' })"
                 }) -join ';'
+                $key = "$($chain.TargetBinding)/$($chain.LocalizationScope)|$key"
 
                 if ($btDiagRun -and $key -ne $script:BtChain_LastBoundaryKey) {
                     $wrote = Add-WinConfigDiagnosticJsonLine -RunFolder $btDiagRun.RunFolder -Name 'chain.jsonl' -Depth 6 -Data ([ordered]@{
@@ -5265,9 +5378,20 @@ $buttonHandlers = @{
                         BoundaryEdge   = $chain.BoundaryEdge
                         Localization   = $chain.Localization
                         Confidence     = $chain.Confidence
+                        # Scope travels with every line, not just the ones where
+                        # it is bad. A reader scoring an archived capture has to
+                        # be able to ask "was this boundary even attributable?"
+                        # of any line, and an absent field would be answered
+                        # optimistically.
+                        TargetBinding     = $chain.TargetBinding
+                        TargetConfirmed   = $chain.TargetConfirmed
+                        TargetLabel       = $chain.TargetLabel
+                        TargetEvidence    = $chain.TargetEvidence
+                        LocalizationScope = $chain.LocalizationScope
                         Verified       = @($chain.VerifiedNodeIds)
                         Roots          = @($chain.RootNodeIds)
                         Blocked        = @($chain.BlockedNodeIds)
+                        Consequences   = @($chain.ConsequenceNodeIds)
                         Summary        = $chain.Summary
                         Nodes          = @($chain.Nodes | ForEach-Object {
                             [ordered]@{ Id = $_.Id; Health = $_.Health; Observation = $_.Observation; BlockedBy = $_.BlockedBy; Detail = $_.Detail }
@@ -5330,14 +5454,6 @@ $buttonHandlers = @{
                 }
                 if ($btIdentityDetailLabel.ForeColor -ne $dCol) { $btIdentityDetailLabel.ForeColor = $dCol }
 
-                $cov = $null
-                if (Get-Command Get-ProbeObservationCoverage -ErrorAction SilentlyContinue) {
-                    $cov = try {
-                        Get-ProbeObservationCoverage -Session $btProbeSession -WatchState $btProbeWatch `
-                            -Target $btProbeSession.SessionTarget
-                    } catch { $null }
-                }
-
                 # How long NeurOptimal has been up. Not-yet-observed is the NORMAL
                 # state before a session starts, so it is only worth escalating
                 # once a session could reasonably have been expected. This is
@@ -5353,6 +5469,25 @@ $buttonHandlers = @{
                 $noUpSec = if ($script:BtRec_NoRunningSince) {
                     ((Get-Date) - $script:BtRec_NoRunningSince).TotalSeconds
                 } else { 0 }
+
+                # The duration is evidence supplied to the pure coverage rule;
+                # this renderer does not decide whether silence is a scope
+                # conflict. The returned structured finding is also persisted in
+                # probe-session.json, so the warning survives the screenshot.
+                $cov = $null
+                if (Get-Command Get-ProbeObservationCoverage -ErrorAction SilentlyContinue) {
+                    $cov = try {
+                        Get-ProbeObservationCoverage -Session $btProbeSession -WatchState $btProbeWatch `
+                            -Target $btProbeSession.SessionTarget -AppRunningSeconds ([int]$noUpSec) `
+                            -ScopeWarningThresholdSeconds $btCoverageEscalateSec
+                    } catch { $null }
+                }
+                if ($cov) {
+                    # Latch context findings on the session so a contradiction
+                    # observed live remains in the closing Coverage object even
+                    # if NeurOptimal exits before Stop is pressed.
+                    $btProbeSession.ScopeFindings = @($cov.Findings)
+                }
 
                 $cText = 'Measurement status unavailable'
                 $cCol  = [System.Drawing.Color]::FromArgb(190, 190, 190)
@@ -5388,25 +5523,26 @@ $buttonHandlers = @{
                             if (-not $noUp) {
                                 $cText = 'Waiting for the headset session -- start NeurOptimal and begin a session'
                                 $cCol  = $neutral
-                            } elseif ($noUpSec -lt $btCoverageEscalateSec) {
+                            } else {
                                 $cText = 'Waiting for session activity on this headset -- NeurOptimal is running'
                                 $cCol  = $neutral
-                            } else {
-                                # A session was expected by now and still is not
-                                # visible. THIS is the moment worth escalating.
-                                $cText = "[!] NeurOptimal has been running for $([int]($noUpSec / 60)) min but this headset has not linked and its COM port has not been held -- the recorder may be watching the wrong headset"
-                                $cCol  = [System.Drawing.Color]::FromArgb(255, 140, 140)
                             }
                         }
                     }
-                    # The single strongest wrong-headset signal, and the one the
-                    # void capture would have shown within seconds of the session
-                    # starting. It outranks the level and the waiting-is-normal
-                    # softening above: another headset being active is never the
-                    # expected state.
-                    if ($cov.RivalWasActive) {
-                        $cText = '[!] ANOTHER paired NeurOptimal headset is in use while this one is idle -- you are probably recording the WRONG headset. Stop, power on only the headset you are using, and record again.'
-                        $cCol  = [System.Drawing.Color]::FromArgb(255, 120, 120)
+                    # Context findings outrank component/coverage status, but
+                    # they do not turn a graph node red. The module classifies
+                    # this as EvidenceConflict: the likely defect is scope, not
+                    # necessarily Bluetooth or NeurOptimal.
+                    $scopeFinding = @($cov.Findings | Where-Object { $_.Code -eq 'ScopeMismatchSuspected' } | Select-Object -First 1)
+                    if ($scopeFinding.Count -gt 0) {
+                        $finding = $scopeFinding[0]
+                        $evidenceText = @($finding.Evidence | Where-Object { $_ }) -join ' '
+                        $cText = "[!] $($finding.Title) -- $evidenceText $($finding.Summary)"
+                        $cCol  = if ($finding.Severity -eq 'High') {
+                            [System.Drawing.Color]::FromArgb(255, 120, 120)
+                        } else {
+                            [System.Drawing.Color]::FromArgb(255, 140, 140)
+                        }
                     }
                 }
                 if ($btCoverageLabel.Text -ne $cText) { $btCoverageLabel.Text = $cText }
