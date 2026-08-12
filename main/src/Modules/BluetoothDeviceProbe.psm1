@@ -585,9 +585,8 @@ function Test-IoReadCollapse {
 
         Returns Verdict:
           Collapsed     rate fell below the fraction of baseline and stayed there
-          Degrading     at least one tick has fallen below the collapse limit but
-                        the debounce is not satisfied yet -- a collapse in
-                        progress, or an intermittent one
+          Degrading     the newest interval is below the collapse limit but the
+                        debounce is not satisfied yet -- a collapse in progress
           Streaming     a baseline is established and the rate is holding
           NoBaseline    not enough samples, or the baseline rate is too low to
                         collapse from -- explicitly NOT a clean bill of health
@@ -783,10 +782,18 @@ function Test-IoReadCollapse {
 
     if ($contig -ge $script:IoCollapseSeconds) {
         $result.Verdict = 'Collapsed'
-    } elseif ($result.DegradedIntervals -gt 0) {
-        # Some of the window is already under the limit. Not enough to fire a
-        # fault -- deliberately, so a scheduling hiccup cannot -- but saying
-        # "Streaming" here is what let a marked 12006 record itself as healthy.
+    } elseif ($contig -gt 0) {
+        # The NEWEST interval is under the limit. Not enough to fire a fault --
+        # deliberately, so a scheduling hiccup cannot -- but saying "Streaming"
+        # here is what let a marked 12006 record itself as healthy.
+        #
+        # DegradedIntervals deliberately remembers every low interval in the
+        # trailing window, but it must not drive the LIVE verdict after reads
+        # have recovered. Capture 961FAB4BC165 ended at 777.9/s against a
+        # 145.4/s baseline (535% of normal) and still rendered "Reads falling"
+        # solely because one earlier low interval remained in the 12-second
+        # window. The session-long dip counter keeps that observation; the live
+        # state answers what is happening now.
         $result.Verdict = 'Degrading'
     } else {
         $result.Verdict = 'Streaming'
@@ -2261,7 +2268,7 @@ function Get-BtDiagnosticChain {
     } else {
         switch ($IoVerdict) {
             'Streaming'  { $dataHealth = 'Healthy';  $dataDetail = 'Reads steady' }
-            'Degrading'  { $dataHealth = 'Degraded'; $dataDetail = 'Reads falling' }
+            'Degrading'  { $dataHealth = 'Degraded'; $dataDetail = 'Possible read pause' }
             'Collapsed'  { $dataHealth = 'Failed';   $dataDetail = 'Reads collapsed' }
             'NoBaseline' { $dataHealth = 'Unknown';  $dataDetail = 'No baseline yet' }
             default      { $dataHealth = 'Unknown';  $dataDetail = $IoVerdict }

@@ -1,10 +1,9 @@
 {
-  "schema_version": "2.0",
-  "event": "push",
+  "source_ref": "59e4fc9003275f9c9e0f0e4777eeea0887578c66",
+  "timestamp": "2026-08-12T17:18:18.8538664Z",
   "branch": "main",
-  "timestamp": "2026-08-12T15:28:26.3550405Z",
-  "build_id": "31612461594-1",
-  "source_ref": "773002c1fbaad26b45c76567be6290338bf8fe12",
+  "event": "push",
+  "schema_version": "2.0",
   "artifacts": [
     {
       "sha256": "d1278321cdcd5c0759d3dfa773e964cda8d254ccdfd7f08dce12f878d317fff9",
@@ -157,9 +156,10 @@
       "size": 53834
     },
     {
-      "sha256": "933e1f7d63cb3fee35d903935ce0c9089278334cff041ed0dd6c18bdf4bb839e",
+      "sha256": "8c03f966a3571320ba23cc1b286e0b76974e021a86efa0825bc3f71c9f56ebe9",
       "path": "src/Modules/BluetoothDeviceProbe.psm1",
-      "size": 382420
+      "size": 382868
     }
-  ]
+  ],
+  "build_id": "31621919560-1"
 }
