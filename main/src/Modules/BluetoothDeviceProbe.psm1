@@ -2101,20 +2101,33 @@ function Get-BtDiagnosticChain {
     # power switch explains).
     $linkHealth = 'Unknown'; $linkObs = 'Observed'; $linkEv = @()
     $linkDetail = Get-ProbeStateUserText -Kind btlink -State $BtLinkState -Short
+    # WHY the link reads as it does, as a token rather than as prose. Health
+    # alone cannot separate "was up and dropped" from "never came up while a
+    # port is held", and both are 'Failed'. A renderer that needed the
+    # distinction had two options: parse the evidence sentences (fragile), or
+    # re-derive it from BtLinkEverConnected (a second answerer to a question
+    # this branch has just answered). Neither is acceptable, so the branch
+    # states its own reason. It is additive: nothing consumes it as a verdict,
+    # and chain.jsonl's node projection is unchanged.
+    $linkCause = 'NotRead'
     if ($BtLinkState -eq 'Connected') {
         $linkHealth = 'Healthy'
+        $linkCause = 'Connected'
         $linkEv += (New-ChainEvidence 'Observed' 'The Bluetooth radio reports an active link to this headset.')
     } elseif ($BtLinkState -eq 'NotConnected') {
         if ($StreamState -eq 'Active') {
             $linkHealth = 'Failed'
+            $linkCause = 'PortHeldWithoutLink'
             $linkEv += (New-ChainEvidence 'Observed' 'The radio reports no link to this headset, while a process is holding its COM port.')
             $linkEv += (New-ChainEvidence 'Inferred' 'Something believes it has a session over a link that is not there. This is the shape "Arc not detected" takes from the OS side.')
         } elseif ($BtLinkEverConnected) {
             $linkHealth = 'Failed'
+            $linkCause = 'Dropped'
             $linkEv += (New-ChainEvidence 'Observed' 'The radio reports no link now, but it DID report one earlier in this same recording.')
             $linkEv += (New-ChainEvidence 'Inferred' 'A link that was up and is now down is a drop. Being switched off does not explain a link that existed minutes ago.')
         } else {
             $linkHealth = 'Idle'
+            $linkCause = 'IdleNoSession'
             $linkEv += (New-ChainEvidence 'Observed' 'The radio reports no active link to this headset.')
             $linkEv += (New-ChainEvidence 'Inferred' 'This is NORMAL between sessions. This headset holds no Bluetooth profile open while idle, so a healthy Arc sitting on the desk reads exactly like this. It is only a fault if it happens DURING a session.')
         }
@@ -2125,6 +2138,7 @@ function Get-BtDiagnosticChain {
     [void]$nodes.Add(@{
         Id = 'RadioLink'; Title = 'Live radio link'; EdgeLabel = 'Windows device enumeration -> live wireless link'; DependsOn = @('Adapter', 'Pairing')
         Health = $linkHealth; Observation = $linkObs; Detail = $linkDetail; Evidence = $linkEv
+        Cause = $linkCause
     })
 
     # ── 5. Application ────────────────────────────────────────────────────────
@@ -2448,6 +2462,11 @@ function Get-BtDiagnosticChain {
             Health       = $_.Health
             Observation  = $_.Observation
             Detail       = $_.Detail
+            # $null on every node that does not set one. ContainsKey rather than
+            # a bare property read: this module runs under Set-StrictMode, where
+            # reading an absent hashtable key THROWS rather than returning
+            # $null, so "additive" has to be spelled out.
+            Cause        = $(if ($_.ContainsKey('Cause')) { $_.Cause } else { $null })
             BlockedBy    = $_.BlockedBy
             IsRoot       = ($null -eq $_.BlockedBy -and $_.Health -ne 'Healthy')
             Evidence     = @($_.Evidence)
@@ -2487,6 +2506,454 @@ function Get-BtDiagnosticChain {
         Confidence      = $confidence
         Summary         = $summary
     }
+}
+
+# =============================================================================
+# RECORDER VIEW MODEL  (presentation mapping -- decides nothing)
+# =============================================================================
+
+function Get-BtRecorderView {
+    <#
+    .SYNOPSIS
+        Pure. Projects a Get-BtDiagnosticChain result onto the six panels the
+        Flight Recorder window draws, plus one plain-language verdict.
+    .DESCRIPTION
+        WHAT THIS IS FOR. The chain is eight nodes, five health values, five
+        observation values and a boundary sentence written for a triage
+        engineer. The operator in a clinic has three questions -- is it working,
+        roughly where is the problem, has anything changed -- and the old window
+        answered them with a wall of chips and prose. This maps the SAME chain
+        object onto a picture: three connection panels and three supporting
+        signals.
+
+        IT DECIDES NOTHING. Every health value, observation, BlockedBy and the
+        boundary itself are read off the chain unchanged. There is no second
+        opinion here about what is wrong, because a second opinion is the
+        channel-mismatch defect this repo has filed nine instances of: the
+        moment two answerers disagree, whichever one a human happens to be
+        looking at wins. What this function chooses is only which panel a node
+        appears in, which short word to print, and which glyph to draw.
+
+        THE PICTURE IS NOT THE DEPENDENCY GRAPH, and the difference is
+        deliberate. The connection row is Host - Wireless - Arc. The supporting
+        signals -- NeurOptimal, COM, Data -- are drawn UNCONNECTED, side by
+        side, because they do not form a chain:
+
+          * NeurOptimal has no Bluetooth dependency at all. Chaining it under
+            the radio would report "NeurOptimal is closed" as a consequence of a
+            dead link, which is false and sends the operator to the wrong layer.
+          * COM registration is HISTORICAL. Registered ports are what an earlier
+            successful pairing left behind; they survive a flat battery and a
+            headset in a drawer. Drawing them downstream of the live link would
+            make every idle box show a broken COM layer.
+          * Data activity is a measurement of read operations, not proof of a
+            valid EEG session.
+
+        WHAT THE COM PANEL MERGES, AND THE RULE IT USES. Two chain nodes land in
+        one panel: ComPorts (are ports registered -- historical) and PortHold
+        (is a process holding one right now -- observed, or NOT observed in the
+        non-intrusive arm). One panel showing two facts must never let the
+        stronger-sounding one speak for the weaker, so the precedence is fixed
+        and stated:
+
+          1. no ports registered            -> the registration failure wins
+          2. hold was NOT observed          -> says so; never reads as 'idle'
+          3. a port is held                 -> current, positive, Observed
+          4. registered but nobody holds it -> Idle + a HISTORICAL marker
+          5. anything else                  -> carries PortHold's own reading
+
+        Rule 4 is the one that matters: an idle registered port must not look
+        like a live connection, and it must not look like a fault either.
+
+        EEG IS NOT A PANEL. It is a permanent footnote. Every measurable step
+        going green does not prove the session is good, and a node that is
+        NotMeasurable on every tick of every recording would be skipped by the
+        time it mattered. As a footnote under the verdict it is read at exactly
+        the moment the reader is drawing the conclusion it limits.
+
+        TARGET IDENTITY GATES THE ARC PANEL, NOT THE READINGS. When the chain
+        reports LocalizationScope 'Suspended' the recording never established
+        which headset it is describing, so the Arc panel shows "Not confirmed"
+        rather than a device-specific verdict. The other panels keep their
+        measured faces: those readings are honest, they are simply not
+        attributable.
+    .PARAMETER Chain
+        A WinConfig.FlightRecorder.DiagnosticChain from Get-BtDiagnosticChain.
+    .OUTPUTS
+        PSCustomObject (PSTypeName WinConfig.FlightRecorder.RecorderView).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Chain)
+
+    $byId = @{}
+    foreach ($n in @($Chain.Nodes)) { if ($n -and $n.Id) { $byId[$n.Id] = $n } }
+
+    # Marker text AND a shape, never colour alone. Roughly one man in twelve
+    # cannot separate this palette's green from its red, and these windows are
+    # read over the phone from a screenshot.
+    #
+    # Local, NOT script:-scoped. A script:-scoped inner function would be
+    # redefined into module scope on every call and would outlive this one.
+    function Resolve-TileFace {
+        param([string]$Health, [string]$Observation)
+        switch ($Health) {
+            'Healthy'  { return @{ Marker = '[ok]';   Glyph = 'Check';    Level = 'Healthy'  } }
+            'Failed'   { return @{ Marker = '[!]';    Glyph = 'Cross';    Level = 'Failed'   } }
+            'Degraded' { return @{ Marker = '[~]';    Glyph = 'Warn';     Level = 'Degraded' } }
+            'Idle'     { return @{ Marker = '[idle]'; Glyph = 'Dash';     Level = 'Idle'     } }
+        }
+        if ($Observation -eq 'NotMeasurable') { return @{ Marker = '[n/a]'; Glyph = 'NotApplicable'; Level = 'NotMeasurable' } }
+        return @{ Marker = '[?]'; Glyph = 'Question'; Level = 'Unknown' }
+    }
+
+    function New-ViewTile {
+        param(
+            [string]$Slot, [string]$Label, $Node, [string]$Caption,
+            [hashtable]$Face, [string]$Note, [string]$Caveat, [array]$NodeIds
+        )
+        $f = if ($Face) { $Face } else { Resolve-TileFace $Node.Health $Node.Observation }
+        return [pscustomobject]@{
+            PSTypeName  = 'WinConfig.FlightRecorder.RecorderViewTile'
+            Slot        = $Slot
+            Label       = $Label
+            Marker      = $f.Marker
+            Glyph       = $f.Glyph
+            Level       = $f.Level
+            Caption     = $Caption
+            # A note is context on a reading that WAS taken ("checked at start").
+            # A caveat is a warning that limits what the reading may be used for
+            # ("target not confirmed"). They are rendered differently, so they
+            # are separate fields rather than one string a renderer has to
+            # classify.
+            Note        = $Note
+            Caveat      = $Caveat
+            # Historical is its own axis, never folded into Level. A fact that
+            # was true earlier and was not re-checked must not draw the same as
+            # a live healthy reading.
+            Historical  = [bool]($Node -and $Node.Observation -eq 'Historical')
+            Blocked     = [bool]($Node -and $Node.BlockedBy)
+            BlockedBy   = $(if ($Node) { $Node.BlockedBy } else { $null })
+            NodeId      = $(if ($Node) { $Node.Id } else { $null })
+            NodeIds     = @($(if ($NodeIds) { $NodeIds } elseif ($Node) { @($Node.Id) } else { @() }))
+            Node        = $Node
+        }
+    }
+
+    # ── Host / System  <- Adapter ─────────────────────────────────────────────
+    # Historical by construction: the adapter is read once, at recording start.
+    # The note says so rather than letting a start-of-run reading pass as live.
+    $adapter = $byId['Adapter']
+    $hostCaption = switch ($adapter.Health) {
+        'Healthy' { 'Bluetooth ready' }
+        'Failed'  { $adapter.Detail }
+        default   { 'Not read' }
+    }
+    $hostNote = if ($adapter.Observation -eq 'Historical') { 'read at start' } else { '' }
+    $tileHost = New-ViewTile -Slot 'Host' -Label 'Host / System' -Node $adapter -Caption $hostCaption -Note $hostNote
+
+    # ── Wireless  <- RadioLink ────────────────────────────────────────────────
+    # Cause, not health, chooses the words. 'Failed' covers both a link that
+    # dropped and a link that was never there while a port is held, and telling
+    # an operator "connection lost" about the second is a claim the reading does
+    # not support.
+    $link = $byId['RadioLink']
+    $wirelessCaption = switch ($link.Health) {
+        'Healthy' { 'Connected' }
+        'Failed'  {
+            switch ([string]$link.Cause) {
+                'Dropped'             { 'Connection lost' }
+                'PortHeldWithoutLink' { 'No link' }
+                default               { 'No link' }
+            }
+        }
+        'Idle'    { 'Not connected' }
+        default   { 'Not read' }
+    }
+    # Idle is a legitimately-negative reading, not a fault, and the note is
+    # where that is said in the panel rather than in a paragraph below it.
+    $wirelessNote = if ($link.Health -eq 'Idle') { 'normal between sessions' } else { '' }
+    $tileWireless = New-ViewTile -Slot 'Wireless' -Label 'Wireless' -Node $link -Caption $wirelessCaption -Note $wirelessNote
+
+    # ── Arc  <- Pairing, gated by target identity ─────────────────────────────
+    $pair = $byId['Pairing']
+    $arcFace   = $null
+    $arcCaveat = ''
+    $arcCaption = switch ($pair.Health) {
+        'Healthy'  { 'Identified' }
+        'Degraded' { 'More than one match' }
+        default    { $pair.Detail }
+    }
+    if ($Chain.LocalizationScope -eq 'Suspended') {
+        # The Pairing reading here is about a fallback candidate, so printing it
+        # under a panel labelled "Arc" would name a device this recording never
+        # identified. The reading is not discarded -- it is still on the node and
+        # in the details -- but the panel stops claiming it describes the Arc.
+        $arcFace    = @{ Marker = '[?]'; Glyph = 'Question'; Level = 'Unknown' }
+        $arcCaption = 'Not confirmed'
+        $arcCaveat  = if ($Chain.TargetLabel) { "Candidate: $($Chain.TargetLabel)" } else { 'No candidate named' }
+    } elseif ($Chain.LocalizationScope -eq 'Provisional') {
+        $arcCaveat = 'Target not confirmed'
+    }
+    $tileArc = New-ViewTile -Slot 'Arc' -Label 'Arc' -Node $pair -Caption $arcCaption -Face $arcFace -Caveat $arcCaveat
+
+    # ── NeurOptimal  <- App ───────────────────────────────────────────────────
+    $app = $byId['App']
+    $appCaption = switch ($app.Health) {
+        'Healthy' { 'Running' }
+        'Idle'    { 'Not running' }
+        default   { 'Not read' }
+    }
+    $appNote = if ($app.Health -eq 'Idle') { 'not a fault' } else { '' }
+    $tileApp = New-ViewTile -Slot 'App' -Label 'NeurOptimal' -Node $app -Caption $appCaption -Note $appNote
+
+    # ── COM  <- ComPorts + PortHold, by the precedence in the header ──────────
+    $com  = $byId['ComPorts']
+    $hold = $byId['PortHold']
+    $comNode = $hold
+    $comCaption = $hold.Detail
+    $comNote = ''
+    if ($com.Health -eq 'Failed') {
+        $comNode    = $com
+        $comCaption = 'None registered'
+    } elseif ($hold.Observation -eq 'NotObserved') {
+        # Never 'idle'. Nothing looked, and an unread sensor that draws like a
+        # reading is the silence a reader fills in with "fine".
+        $comCaption = $hold.Detail
+    } elseif ($hold.Health -eq 'Healthy') {
+        # Deliberately NOT "held by NO.exe". The hold test opens a port and
+        # observes that it is refused; that proves SOME process owns it and
+        # nothing here binds the handle to NeurOptimal (issue #93).
+        $comCaption = $hold.Detail
+        $comNote    = 'a process owns it'
+    } elseif ($hold.Health -eq 'Idle') {
+        $comCaption = 'Registered, idle'
+        $comNote    = 'nobody is using it'
+    }
+    # The HISTORICAL marker rides on the panel when registration is the only
+    # positive fact left -- ports exist, and we LOOKED and nobody is holding
+    # one. Without it, "COM ok" during a dropped link reads as live
+    # connectivity.
+    #
+    # Not on the not-observed path, deliberately. There the panel is reporting
+    # that nothing was measured, and an H badge beside it would advertise a
+    # historical POSITIVE that this recording is not entitled to lean on.
+    $comHistorical = ($com.Observation -eq 'Historical' -and $com.Health -eq 'Healthy' -and $hold.Health -eq 'Idle')
+    $tileCom = New-ViewTile -Slot 'Com' -Label 'COM' -Node $comNode -Caption $comCaption -Note $comNote -NodeIds @('ComPorts', 'PortHold')
+    # Assigned after construction: New-ViewTile derives Historical from ONE
+    # node, and this panel's historical-ness is a fact about the pair.
+    $tileCom.Historical = [bool]$comHistorical
+
+    # ── Data  <- DataFlow ─────────────────────────────────────────────────────
+    $data = $byId['DataFlow']
+    $tileData = New-ViewTile -Slot 'Data' -Label 'Data' -Node $data -Caption $data.Detail
+
+    # ── The connecting edges ──────────────────────────────────────────────────
+    # Both edges carry the WIRELESS state, because the wireless node IS the
+    # link. Giving them independent states would invent a distinction nothing
+    # measures.
+    $edgeState = switch ($tileWireless.Level) {
+        'Healthy'  { 'Live' }
+        'Failed'   { 'Broken' }
+        'Degraded' { 'Degrading' }
+        'Idle'     { 'Idle' }
+        default    { 'Unknown' }
+    }
+
+    # ── Where the eye should go ───────────────────────────────────────────────
+    # One focus panel, from the chain's own boundary node. Not "every non-green
+    # panel": painting the consequences too is the four-problems-one-cause
+    # reading the chain exists to prevent.
+    $slotOfNode = @{
+        Adapter = 'Host'; Pairing = 'Arc'; RadioLink = 'Wireless'
+        App = 'App'; ComPorts = 'Com'; PortHold = 'Com'; DataFlow = 'Data'
+        Eeg = $null
+    }
+    $focusSlot = if ($Chain.LocalizationScope -eq 'Suspended') { 'Arc' }
+                 elseif ($slotOfNode.ContainsKey([string]$Chain.BoundaryNodeId)) { $slotOfNode[[string]$Chain.BoundaryNodeId] }
+                 else { $null }
+
+    # A SECOND independent root is marked too, and only a root. Two branches
+    # being down at once is materially different from one, and the headline can
+    # only carry one of them. NotMeasurable roots are excluded: Eeg is a root on
+    # every healthy tick.
+    $attention = New-Object System.Collections.ArrayList
+    if ($focusSlot) { [void]$attention.Add($focusSlot) }
+    foreach ($rootId in @($Chain.RootNodeIds)) {
+        if ([string]$rootId -eq [string]$Chain.BoundaryNodeId) { continue }
+        $rootNode = $byId[[string]$rootId]
+        if (-not $rootNode -or $rootNode.Observation -eq 'NotMeasurable') { continue }
+        $slot = $slotOfNode[[string]$rootId]
+        if ($slot -and $slot -notin $attention) { [void]$attention.Add($slot) }
+    }
+
+    # ── One sentence ──────────────────────────────────────────────────────────
+    # The technical localization ("FIRST FAILING STEP: pairing record -> live
+    # wireless link (4 of 8)") is not deleted -- it is Chain.Summary and it
+    # still renders in the technical details. What goes on the main screen is
+    # the thing a non-technical operator can act on.
+    $boundary = $byId[[string]$Chain.BoundaryNodeId]
+    $verdict = 'The recorder could not summarise this state.'
+    $verdictLevel = 'Unknown'
+    if ($Chain.LocalizationScope -eq 'Suspended') {
+        $verdict = 'The target Arc has not been confirmed.'
+        $verdictLevel = 'Unscoped'
+    } elseif ($Chain.Localization -eq 'LimitOfTool') {
+        $verdict = 'Everything measurable is working.'
+        $verdictLevel = 'Healthy'
+    } else {
+        $verdictLevel = switch ($Chain.Localization) {
+            'Failure'   { 'Failure' }
+            'Degrading' { 'Degrading' }
+            'Idle'      { 'Idle' }
+            default     { 'Unknown' }
+        }
+        $verdict = switch ([string]$Chain.BoundaryNodeId) {
+            'Adapter' {
+                if ($boundary.Health -eq 'Failed') { "This PC's Bluetooth adapter is not available." }
+                else { "This PC's Bluetooth adapter was not read." }
+            }
+            'Pairing' {
+                if ($boundary.Detail -eq 'Record only, no device') { 'Windows is not seeing the Arc, although it is still paired with it.' }
+                elseif ($boundary.Health -eq 'Degraded') { 'More than one Arc matches -- which one is in use is not certain.' }
+                elseif ($boundary.Health -eq 'Failed') { 'Windows is not seeing the Arc.' }
+                else { 'Windows could not be asked about the Arc.' }
+            }
+            'RadioLink' {
+                switch ([string]$boundary.Cause) {
+                    'Dropped'             { 'Wireless connection to the Arc was lost.' }
+                    'PortHeldWithoutLink' { "The Arc's COM port is held open, but there is no wireless connection." }
+                    'IdleNoSession'       { 'No wireless connection yet -- this is normal before a session starts.' }
+                    default               { 'The wireless connection could not be read.' }
+                }
+            }
+            'App' {
+                if ($boundary.Health -eq 'Idle') { 'NeurOptimal is not running.' }
+                else { 'Whether NeurOptimal is running could not be read.' }
+            }
+            'ComPorts' {
+                if ($boundary.Health -eq 'Failed') { 'No COM ports are registered for the Arc.' }
+                else { "The Arc's COM ports could not be read." }
+            }
+            'PortHold' {
+                if ($boundary.Health -eq 'Idle') { "NeurOptimal has not opened the Arc's COM connection." }
+                elseif ($boundary.Observation -eq 'NotObserved') { 'COM port ownership was not measured during this recording.' }
+                else { "The Arc's COM connection could not be read." }
+            }
+            'DataFlow' {
+                if ($boundary.Health -eq 'Failed') { 'The connection is present, but data activity has stopped.' }
+                elseif ($boundary.Health -eq 'Degraded') { 'The connection is present, but data activity is falling.' }
+                elseif ($boundary.Observation -eq 'NotObserved') { 'Data activity was not measured during this recording.' }
+                else { 'No data baseline has been established yet.' }
+            }
+            default { "The recorder stopped at '$($boundary.Title)'." }
+        }
+    }
+
+    # One short clause of context, and only when it changes what the reader
+    # should do. "NeurOptimal is still running" beside a wireless fault is the
+    # difference between blaming the app and blaming the link.
+    $verdictContext = ''
+    if ($verdictLevel -in @('Failure', 'Degrading') -and $focusSlot -ne 'App' -and $app.Health -eq 'Healthy') {
+        $verdictContext = 'NeurOptimal is still running.'
+    }
+
+    return [pscustomobject]@{
+        PSTypeName     = 'WinConfig.FlightRecorder.RecorderView'
+        Connection     = @($tileHost, $tileWireless, $tileArc)
+        Signals        = @($tileApp, $tileCom, $tileData)
+        EdgeState      = $edgeState
+        FocusSlot      = $focusSlot
+        AttentionSlots = @($attention)
+        Verdict        = $verdict
+        VerdictLevel   = $verdictLevel
+        VerdictContext = $verdictContext
+        # Permanent, and permanently outside the panels. Nothing this tool
+        # measures certifies session quality.
+        Footnote       = 'EEG signal quality cannot be measured by this tool.'
+        TargetState    = $Chain.LocalizationScope
+        TargetLabel    = $Chain.TargetLabel
+        # Echoed, never re-derived. The header line, the details view and
+        # chain.jsonl must all read one answer to "where did this identity come
+        # from".
+        TargetEvidence = $Chain.TargetEvidence
+        # The engineer-facing sentence, carried through unchanged so the
+        # technical details view renders the same words the capture records.
+        TechnicalSummary = $Chain.Summary
+    }
+}
+
+function Get-BtRecorderEventText {
+    <#
+    .SYNOPSIS
+        Pure. Turns one probe event into the short transition phrase the
+        "Session events" list shows, or $null if it is not worth a line.
+    .DESCRIPTION
+        The old window showed every event and every heartbeat, so a 30-minute
+        recording scrolled roughly 200 lines past the operator and the three
+        that mattered were indistinguishable from the rest. This is the filter:
+        STATE TRANSITIONS ONLY, in the operator's words.
+
+        RETURNING $null IS A REAL ANSWER and is the common case. Anything this
+        function drops is still written to events.jsonl and still printed in the
+        raw technical log -- nothing is lost from the capture, it is simply not
+        promoted to the summary list. Filtering at render time rather than at
+        collection time is deliberate: a filter in the collector would remove
+        evidence from the record, which is the one thing this redesign must not
+        do.
+    .OUTPUTS
+        [hashtable] @{ Text; Level } or $null.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Kind,
+        [string]$State,
+        [string]$Level = 'INFO'
+    )
+
+    $text = $null
+    switch ($Kind) {
+        'BTLINK' {
+            if ($State -eq 'Connected')    { $text = 'Wireless connected' }
+            if ($State -eq 'NotConnected') { $text = 'Wireless disconnected' }
+        }
+        'STREAM' {
+            # State carries a duration suffix on stop ("Stopped (12s)"), so this
+            # matches a prefix rather than the whole value.
+            if ($State -eq 'Active')            { $text = 'COM connection opened' }
+            elseif ($State -like 'Stopped*')    { $text = 'COM connection released' }
+            elseif ($State -eq 'ReadBaseline')  { $text = 'Data baseline established' }
+            elseif ($State -eq 'HeldPortsChanged') { $text = 'COM ports changed hands' }
+        }
+        'ANOMALY' {
+            switch ($State) {
+                'StreamStalled'       { $text = 'Data flow stalled' }
+                'ReadRateCollapsed'   { $text = 'Data flow collapsed' }
+                'AppNotResponding'    { $text = 'NeurOptimal stopped responding' }
+                'SustainedComMissing' { $text = 'COM ports missing' }
+                default               { $text = 'Diagnostic finding' }
+            }
+        }
+        'process' {
+            if ($State -eq 'Running')    { $text = 'NeurOptimal started' }
+            if ($State -eq 'NotRunning') { $text = 'NeurOptimal stopped' }
+        }
+        'device' {
+            switch ($State) {
+                'Missing'   { $text = 'Arc no longer seen by Windows' }
+                'Ambiguous' { $text = 'More than one Arc matches' }
+                'SeenByPnp' { $text = 'Arc seen but not paired' }
+                default     { $text = 'Arc seen by Windows' }
+            }
+        }
+        'comport' {
+            if ($State -eq 'ComPortMissing')      { $text = 'COM ports gone' }
+            elseif ($State -eq 'ComPortAmbiguous'){ $text = 'COM ports ambiguous' }
+            elseif ($State -eq 'ComPortFound')    { $text = 'COM ports registered' }
+        }
+    }
+
+    if (-not $text) { return $null }
+    return @{ Text = $text; Level = $Level }
 }
 
 # =============================================================================
@@ -5911,6 +6378,12 @@ Export-ModuleMember -Function @(
     # and the tests must read ONE answer to "which headset is this about, and
     # how strongly is that known".
     'Get-BtTargetBinding',
+    # Presentation mapping for the recorder window. Exported so the panel
+    # arrangement and the plain-language verdict are testable without a form,
+    # and so the window has exactly one place that turns chain state into
+    # something an operator reads.
+    'Get-BtRecorderView',
+    'Get-BtRecorderEventText',
     'Initialize-ProcessIoApi',
     'Get-ProcessIoSample',
     'Add-IoReadRateSample',

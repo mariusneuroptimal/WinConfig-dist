@@ -4534,33 +4534,573 @@ $buttonHandlers = @{
 
             # Size to fit the screen — remote desktop and small displays may have
             # less usable area than expected, so cap to 90% of the working area.
+            #
+            # Sized to hold the whole diagram plus the session-events block
+            # without a scrollbar at the default size. It is a measured figure,
+            # not a guess: the view panel lays out to roughly 530 px of content,
+            # and the header, phase strip and status bar take about 210 px.
             $btScreen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-            $btFormW = [Math]::Min(780, [int]($btScreen.Width * 0.9))
-            $btFormH = [Math]::Min(700, [int]($btScreen.Height * 0.9))
+            $btFormW = [Math]::Min(860, [int]($btScreen.Width * 0.9))
+            $btFormH = [Math]::Min(880, [int]($btScreen.Height * 0.9))
             $btForm.Size = New-Object System.Drawing.Size($btFormW, $btFormH)
-            $btForm.MinimumSize = New-Object System.Drawing.Size(500, 400)
+            $btForm.MinimumSize = New-Object System.Drawing.Size(560, 420)
 
-            # Bottom status bar (add first — docking is processed in reverse add order).
-            # AutoSize + TopDown flow: the panel reserves exactly the height its content
-            # needs, so on scaled/high-DPI displays the labels and action buttons grow
-            # with the font instead of overflowing a fixed-height panel and clipping the
-            # Stop/Upload and Abort buttons. Do NOT set a fixed Height here.
+            # ── Colours, fonts and glyph geometry for the visual panel ────────
+            #
+            # script:-scoped on purpose. A Paint handler does NOT run in the
+            # scope it was written in, so a local $btViewColors would resolve to
+            # nothing at paint time and the panel would draw blank on a field
+            # machine -- the same failure class as a dead Add_Click button.
+            #
+            # Colour is never the only status signal. Every panel also carries a
+            # distinct GLYPH SHAPE (tick / cross / bar / question mark) and a
+            # short state WORD, because roughly one man in twelve cannot
+            # separate this palette's green from its red and these windows get
+            # read over the phone from a screenshot.
+            $script:BtViewColors = @{
+                Healthy       = [System.Drawing.Color]::FromArgb(105, 200, 130)
+                Failed        = [System.Drawing.Color]::FromArgb(235,  95,  95)
+                Degraded      = [System.Drawing.Color]::FromArgb(228, 178,  60)
+                Idle          = [System.Drawing.Color]::FromArgb(140, 140, 150)
+                # Blue-grey for "nobody looked", NOT the neutral grey the
+                # measured-but-idle states use. Grey is what an operator reads as
+                # "fine, nothing happening"; an unread sensor must not look the
+                # same as a reading.
+                Unknown       = [System.Drawing.Color]::FromArgb(120, 155, 205)
+                NotMeasurable = [System.Drawing.Color]::FromArgb(125, 125, 125)
+            }
+            $script:BtViewInk       = [System.Drawing.Color]::FromArgb(226, 226, 232)
+            $script:BtViewInkDim    = [System.Drawing.Color]::FromArgb(140, 140, 150)
+            $script:BtViewInkCaveat = [System.Drawing.Color]::FromArgb(228, 178,  60)
+            $script:BtViewBack      = [System.Drawing.Color]::FromArgb(20, 20, 25)
+            $script:BtViewFontLabel   = New-Object System.Drawing.Font("Segoe UI", 9.75, [System.Drawing.FontStyle]::Bold)
+            $script:BtViewFontCaption = New-Object System.Drawing.Font("Segoe UI", 9)
+            $script:BtViewFontNote    = New-Object System.Drawing.Font("Segoe UI", 7.5)
+            $script:BtViewFontGlyph   = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
+            $script:BtViewFontBadge   = New-Object System.Drawing.Font("Segoe UI", 6.75, [System.Drawing.FontStyle]::Bold)
+            # Badge geometry, in ONE place. The edge painter draws its connector
+            # through the badge centres, so a radius that lived in two functions
+            # would put the line through empty space the moment one moved.
+            $script:BtViewBadgeR   = 16
+            $script:BtViewBadgeTop = 10
+
+            # ── Painters ──────────────────────────────────────────────────────
+            #
+            # Everything a panel needs is on its own Tag. A Paint handler does
+            # NOT run in the scope it was written in -- a captured local would
+            # resolve to nothing at paint time -- so the handler reads $sender
+            # and script:-scoped state and nothing else.
+            #
+            # ONE scriptblock serves all six panels. Six near-identical handlers
+            # is six places for the historical marker to be forgotten in five.
+            $script:BtViewTilePaint = {
+                param($sender, $e)
+                $t = $sender.Tag
+                if (-not $t) { return }
+                $g = $e.Graphics
+                $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+                $w = $sender.ClientSize.Width
+                $h = $sender.ClientSize.Height
+                if ($w -lt 20 -or $h -lt 20) { return }
+
+                $col = $script:BtViewColors[$t.Level]
+                if (-not $col) { $col = $script:BtViewColors['Unknown'] }
+                $ink = $script:BtViewInk
+                # A CONSEQUENCE RECEDES. It keeps its own marker and its own
+                # reading -- both were honestly obtained -- but it is dimmed so it
+                # does not read as a second, separate problem to chase.
+                if ($t.Blocked) {
+                    $col = [System.Drawing.Color]::FromArgb([int]($col.R * 0.45), [int]($col.G * 0.45), [int]($col.B * 0.45))
+                    $ink = [System.Drawing.Color]::FromArgb(112, 112, 120)
+                }
+
+                if ($t.Focus) {
+                    $fill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(31, 31, 39))
+                    $g.FillRectangle($fill, 0, 0, $w, $h)
+                    $fill.Dispose()
+                    $ring = New-Object System.Drawing.Pen($col, 2)
+                    $g.DrawRectangle($ring, 1, 1, ($w - 3), ($h - 3))
+                    $ring.Dispose()
+                } elseif ($t.Attention) {
+                    # A SECOND independent root, marked but not headlined. Two
+                    # branches down at once is materially different from one, and
+                    # the verdict line can only carry one of them.
+                    $rule = New-Object System.Drawing.Pen($col, 2)
+                    $g.DrawLine($rule, 12, ($h - 3), ($w - 12), ($h - 3))
+                    $rule.Dispose()
+                }
+
+                $r  = $script:BtViewBadgeR
+                $cx = [int]($w / 2)
+                $cy = $script:BtViewBadgeTop + $r
+                $pen = New-Object System.Drawing.Pen($col, 2)
+                $g.DrawEllipse($pen, ($cx - $r), ($cy - $r), (2 * $r), (2 * $r))
+                # THE GLYPH IS THE SECOND SIGNAL. Tick, cross, bar and question
+                # mark are different SHAPES, so the state survives a reader who
+                # cannot separate the palette and a screenshot that has been
+                # through two rounds of phone compression.
+                switch ($t.Glyph) {
+                    'Check' {
+                        $g.DrawLine($pen, ($cx - 7), $cy, ($cx - 2), ($cy + 5))
+                        $g.DrawLine($pen, ($cx - 2), ($cy + 5), ($cx + 7), ($cy - 5))
+                    }
+                    'Cross' {
+                        $g.DrawLine($pen, ($cx - 6), ($cy - 6), ($cx + 6), ($cy + 6))
+                        $g.DrawLine($pen, ($cx + 6), ($cy - 6), ($cx - 6), ($cy + 6))
+                    }
+                    'Dash' {
+                        $g.DrawLine($pen, ($cx - 7), $cy, ($cx + 7), $cy)
+                    }
+                    default {
+                        $sym = '?'
+                        if ($t.Glyph -eq 'Warn')          { $sym = '!' }
+                        if ($t.Glyph -eq 'NotApplicable') { $sym = 'n/a' }
+                        $gf = $(if ($sym -eq 'n/a') { $script:BtViewFontNote } else { $script:BtViewFontGlyph })
+                        $gb = New-Object System.Drawing.SolidBrush($col)
+                        $gs = New-Object System.Drawing.StringFormat
+                        $gs.Alignment = [System.Drawing.StringAlignment]::Center
+                        $gs.LineAlignment = [System.Drawing.StringAlignment]::Center
+                        $g.DrawString($sym, $gf, $gb, (New-Object System.Drawing.RectangleF(($cx - $r), ($cy - $r), (2 * $r), (2 * $r))), $gs)
+                        $gb.Dispose(); $gs.Dispose()
+                    }
+                }
+                $pen.Dispose()
+
+                # HISTORICAL MARKER. A fact that was true earlier and was not
+                # re-checked on this tick must not draw like a live healthy
+                # reading -- "COM ok" during a dropped link is exactly how a
+                # reader concludes the link is fine.
+                #
+                # Drawn against the status circle rather than in the panel
+                # corner: with no panel border to anchor it, a corner badge
+                # floats in the whitespace between two panels and reads as
+                # belonging to neither.
+                if ($t.Historical) {
+                    $hc = [System.Drawing.Color]::FromArgb(176, 156, 104)
+                    $bw = 15; $bh = 13; $bx = $cx + $r + 5; $by = $cy - 6
+                    $hp = New-Object System.Drawing.Pen($hc, 1)
+                    $g.DrawRectangle($hp, $bx, $by, $bw, $bh)
+                    $hp.Dispose()
+                    $hb = New-Object System.Drawing.SolidBrush($hc)
+                    $hs = New-Object System.Drawing.StringFormat
+                    $hs.Alignment = [System.Drawing.StringAlignment]::Center
+                    $hs.LineAlignment = [System.Drawing.StringAlignment]::Center
+                    $g.DrawString('H', $script:BtViewFontBadge, $hb, (New-Object System.Drawing.RectangleF($bx, $by, $bw, $bh)), $hs)
+                    $hb.Dispose(); $hs.Dispose()
+                }
+
+                $sf = New-Object System.Drawing.StringFormat
+                $sf.Alignment = [System.Drawing.StringAlignment]::Center
+                $sf.LineAlignment = [System.Drawing.StringAlignment]::Near
+                $sf.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
+                $y = $cy + $r + 8
+
+                $lb = New-Object System.Drawing.SolidBrush($ink)
+                $g.DrawString([string]$t.Label, $script:BtViewFontLabel, $lb, (New-Object System.Drawing.RectangleF(2, $y, ($w - 4), 18)), $sf)
+                $lb.Dispose()
+                $y += 19
+
+                # THE NOTE AND THE CAVEAT ARE ANCHORED TO THE BOTTOM, and the
+                # caption takes what is left between them. Flowing all three from
+                # the top made the last line's visibility depend on how tall the
+                # caption happened to measure -- a two-word caption fitted and a
+                # wrapped one silently pushed "not a fault" off the bottom edge.
+                # Losing that half of the line turns an idle reading into what
+                # looks like a failure, which is the exact misreading this
+                # redesign exists to stop, produced by a layout accident.
+                # The bottom 4px are reserved for the second-root rule, whether or
+                # not this tile draws one. Letting the text claim them when there
+                # is no rule would make the layout depend on the diagnostic state,
+                # and the one tile that ever collides is the one being pointed at.
+                $bottom = $h - 4
+                if ($t.Caveat) {
+                    $vb = New-Object System.Drawing.SolidBrush($script:BtViewInkCaveat)
+                    $g.DrawString([string]$t.Caveat, $script:BtViewFontNote, $vb, (New-Object System.Drawing.RectangleF(2, ($bottom - 15), ($w - 4), 14)), $sf)
+                    $vb.Dispose()
+                    $bottom -= 15
+                }
+                if ($t.Note) {
+                    $nb = New-Object System.Drawing.SolidBrush($script:BtViewInkDim)
+                    $g.DrawString([string]$t.Note, $script:BtViewFontNote, $nb, (New-Object System.Drawing.RectangleF(2, ($bottom - 15), ($w - 4), 14)), $sf)
+                    $nb.Dispose()
+                    $bottom -= 15
+                }
+
+                # The caption is the state IN WORDS. Colour is decoration on top
+                # of it, never the carrier -- which is why it is the one element
+                # that gets the slack and is trimmed with an ellipsis rather than
+                # dropped.
+                $capCol = $ink
+                if (-not $t.Blocked -and $t.Level -in @('Failed', 'Degraded')) { $capCol = $col }
+                $capH = $bottom - $y - 2
+                if ($capH -lt 15) { $capH = 15 }
+                $cb = New-Object System.Drawing.SolidBrush($capCol)
+                $g.DrawString([string]$t.Caption, $script:BtViewFontCaption, $cb, (New-Object System.Drawing.RectangleF(4, $y, ($w - 8), $capH)), $sf)
+                $cb.Dispose()
+                $sf.Dispose()
+            }
+
+            # The two connectors. Both carry the WIRELESS state, because the
+            # wireless panel IS the link -- giving them independent states would
+            # invent a distinction nothing measures. A broken edge is drawn with a
+            # gap and a cross; an idle or unread edge is dotted, so "no traffic
+            # right now" and "broken" are not the same picture.
+            $script:BtViewEdgePaint = {
+                param($sender, $e)
+                $tiles = @($sender.Controls | Sort-Object -Property Left)
+                if ($tiles.Count -lt 2) { return }
+                $state = [string]$sender.Tag
+                $col = switch ($state) {
+                    'Live'      { $script:BtViewColors['Healthy'] }
+                    'Broken'    { $script:BtViewColors['Failed'] }
+                    'Degrading' { $script:BtViewColors['Degraded'] }
+                    'Idle'      { $script:BtViewColors['Idle'] }
+                    default     { $script:BtViewColors['Unknown'] }
+                }
+                $col = [System.Drawing.Color]::FromArgb([int]($col.R * 0.8), [int]($col.G * 0.8), [int]($col.B * 0.8))
+                $g = $e.Graphics
+                $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+                $y = $tiles[0].Top + $script:BtViewBadgeTop + $script:BtViewBadgeR
+                $pen = New-Object System.Drawing.Pen($col, 2)
+                if ($state -ne 'Live') { $pen.DashStyle = [System.Drawing.Drawing2D.DashStyle]::Dot }
+                for ($i = 0; $i -lt ($tiles.Count - 1); $i++) {
+                    $x1 = $tiles[$i].Right + 3
+                    $x2 = $tiles[$i + 1].Left - 3
+                    if (($x2 - $x1) -lt 16) { continue }
+                    if ($state -eq 'Broken') {
+                        $mid = [int](($x1 + $x2) / 2)
+                        $g.DrawLine($pen, $x1, $y, ($mid - 9), $y)
+                        $g.DrawLine($pen, ($mid + 9), $y, $x2, $y)
+                        $xp = New-Object System.Drawing.Pen($col, 2)
+                        $g.DrawLine($xp, ($mid - 5), ($y - 5), ($mid + 5), ($y + 5))
+                        $g.DrawLine($xp, ($mid + 5), ($y - 5), ($mid - 5), ($y + 5))
+                        $xp.Dispose()
+                    } else {
+                        $g.DrawLine($pen, $x1, $y, $x2, $y)
+                    }
+                }
+                $pen.Dispose()
+            }
+
+            # ── Layout ────────────────────────────────────────────────────────
+            #
+            # Laid out by hand from the panel's own client size rather than by a
+            # nest of AutoSize containers, because the whitespace IS the design
+            # here and an AutoSize stack gives it away first. AutoScroll on the
+            # panel is the safety net for a display too short to hold it all --
+            # this window's history is of controls clipping rather than reflowing
+            # (#64), and content that runs off the bottom is the same defect.
+            function script:Set-BtRecorderViewLayout {
+                if (-not $script:BtView) { return }
+                $p = $script:BtView.Panel
+                if (-not $p) { return }
+                $w = $p.ClientSize.Width
+                if ($w -lt 240) { return }
+                $pad = 24
+                $rowW = $w - (2 * $pad)
+
+                $tileW = [Math]::Max(92, [Math]::Min(190, [int](($rowW - 96) / 3)))
+                $gap   = [Math]::Max(22, [Math]::Min(150, [int](($rowW - (3 * $tileW)) / 2)))
+                $x0    = [int](($rowW - ((3 * $tileW) + (2 * $gap))) / 2)
+                if ($x0 -lt 0) { $x0 = 0 }
+
+                $y = 16
+                $script:BtView.ConnHeading.SetBounds($pad, $y, $rowW, 16)
+                $y += 22
+
+                # Tile heights are MEASURED against what a tile can carry, not
+                # picked to look right on the healthy screen. A connection tile
+                # must fit badge + label + caption + note + caveat, because the
+                # Arc tile carries a target caveat; a supporting tile has no
+                # caveat and stops one line earlier. Too short and the note is
+                # silently clipped -- which is how "Registered, idle / nobody is
+                # using it" loses the half that says it is not a fault.
+                $connH = 122
+                $script:BtView.ConnRow.SetBounds($pad, $y, $rowW, $connH)
+                $y += $connH + 22
+
+                $script:BtView.SigHeading.SetBounds($pad, $y, $rowW, 16)
+                $y += 20
+
+                $sigH = 108
+                $script:BtView.SigRow.SetBounds($pad, $y, $rowW, $sigH)
+                $y += $sigH + 20
+
+                foreach ($row in @(@{ R = $script:BtView.ConnRow; H = $connH }, @{ R = $script:BtView.SigRow; H = $sigH })) {
+                    $i = 0
+                    foreach ($tile in @($row.R.Controls)) {
+                        $tile.SetBounds(($x0 + ($i * ($tileW + $gap))), 0, $tileW, $row.H)
+                        $i++
+                    }
+                }
+
+                $script:BtView.Verdict.SetBounds($pad, $y, $rowW, 28)
+                $y += 28
+                $script:BtView.Context.SetBounds($pad, $y, $rowW, 18)
+                $y += 20
+                $script:BtView.Footnote.SetBounds($pad, $y, $rowW, 16)
+                $y += 28
+
+                $script:BtView.EventsHeading.SetBounds($pad, $y, [int]($rowW * 0.6), 15)
+                $script:BtView.TechToggle.Left = $pad + $rowW - $script:BtView.TechToggle.Width
+                $script:BtView.TechToggle.Top  = $y - 4
+                $y += 18
+                $script:BtView.EventsPanel.SetBounds($pad, $y, $rowW, 96)
+            }
+
+            # ── Renderer ──────────────────────────────────────────────────────
+            #
+            # A RENDERER ONLY. Every judgement -- which panel is the boundary,
+            # which readings are consequences, what the verdict says -- is made by
+            # Get-BtDiagnosticChain and mapped by Get-BtRecorderView, and read off
+            # the object here. A second place that works out what is wrong is a
+            # second place that can disagree with the first, and the one a human
+            # happens to be looking at wins.
+            function script:Update-BtRecorderPanel {
+                param($View, $Chain)
+                if (-not $View -or -not $script:BtView -or -not $script:BtView.Panel) { return }
+
+                # Repaint on CHANGE ONLY. This runs on the UI thread inside the
+                # probe tick, and the tick is already this window's bottleneck --
+                # an unconditional Invalidate of six panels plus two label
+                # assignments every three seconds buys nothing at a display whose
+                # finest unit is one state transition.
+                $key = (@(@($View.Connection) + @($View.Signals)) | ForEach-Object {
+                    "$($_.Slot)=$($_.Level)/$($_.Caption)/$($_.Note)/$($_.Caveat)/$($_.Historical)/$($_.Blocked)"
+                }) -join ';'
+                $key = "$key|$($View.EdgeState)|$($View.FocusSlot)|$(@($View.AttentionSlots) -join ',')|$($View.Verdict)|$($View.VerdictContext)|$($View.TargetState)|$($View.TargetLabel)"
+                if ($key -eq $script:BtView_LastKey) { return }
+                $script:BtView_LastKey = $key
+
+                $nodeById = @{}
+                if ($Chain) { foreach ($n in @($Chain.Nodes)) { if ($n -and $n.Id) { $nodeById[$n.Id] = $n } } }
+
+                foreach ($tv in @(@($View.Connection) + @($View.Signals))) {
+                    $tile = $script:BtView_Tiles[$tv.Slot]
+                    if (-not $tile) { continue }
+                    $tile.Tag = @{
+                        Slot       = $tv.Slot
+                        Label      = $tv.Label
+                        Caption    = $tv.Caption
+                        Marker     = $tv.Marker
+                        Glyph      = $tv.Glyph
+                        Level      = $tv.Level
+                        Note       = $tv.Note
+                        Caveat     = $tv.Caveat
+                        Historical = [bool]$tv.Historical
+                        Blocked    = [bool]$tv.Blocked
+                        BlockedBy  = $tv.BlockedBy
+                        Focus      = ($tv.Slot -eq $View.FocusSlot)
+                        Attention  = ($tv.Slot -ne $View.FocusSlot -and $tv.Slot -in @($View.AttentionSlots))
+                        # Every node behind the panel, so the evidence dialog can
+                        # show BOTH facts the COM panel merges rather than the one
+                        # that happened to win the precedence.
+                        Nodes      = @(@($tv.NodeIds) | ForEach-Object { $nodeById[$_] } | Where-Object { $_ })
+                    }
+                    # The marker text lives here as well as in the glyph: a
+                    # tooltip is the one place a reader can get the state as WORDS
+                    # without opening a dialog.
+                    $tip = "$($tv.Marker)  $($tv.Label): $($tv.Caption)"
+                    if ($tv.Historical) { $tip = "$tip`r`nH = historical. This was true earlier and was NOT re-checked just now." }
+                    if ($tv.Blocked)    { $tip = "$tip`r`nExplained by '$($tv.BlockedBy)'. A consequence, not a separate problem to chase." }
+                    if ($tv.Caveat)     { $tip = "$tip`r`n$($tv.Caveat)" }
+                    $script:BtView.Tooltip.SetToolTip($tile, "$tip`r`nClick for the evidence behind this.")
+                    $tile.Invalidate()
+                }
+
+                $script:BtView.ConnRow.Tag = $View.EdgeState
+                $script:BtView.ConnRow.Invalidate()
+
+                $vCol = switch ($View.VerdictLevel) {
+                    'Failure'   { $script:BtViewColors['Failed'] }
+                    'Degrading' { $script:BtViewColors['Degraded'] }
+                    'Idle'      { $script:BtViewInkDim }
+                    'Unscoped'  { $script:BtViewInkCaveat }
+                    'Unknown'   { $script:BtViewColors['Unknown'] }
+                    # Healthy is deliberately NOT green. A calm state should read
+                    # as calm, and a wall of green is what trains a reader to stop
+                    # looking at the line that will one day be red.
+                    default     { $script:BtViewInk }
+                }
+                if ($script:BtView.Verdict.Text -ne $View.Verdict) { $script:BtView.Verdict.Text = $View.Verdict }
+                if ($script:BtView.Verdict.ForeColor -ne $vCol)    { $script:BtView.Verdict.ForeColor = $vCol }
+                if ($script:BtView.Context.Text -ne $View.VerdictContext) { $script:BtView.Context.Text = $View.VerdictContext }
+
+                # Target uncertainty, prominently and simply. Hidden entirely when
+                # the target IS confirmed, so the line appearing is itself the
+                # signal -- the full binding evidence stays on the scope line in
+                # the technical details.
+                $tsText = switch ($View.TargetState) {
+                    'Provisional' { "Target not confirmed  --  candidate: $(if ($View.TargetLabel) { $View.TargetLabel } else { 'not named' })" }
+                    'Suspended'   { "TARGET NOT CONFIRMED  --  $(if ($View.TargetLabel) { "candidate: $($View.TargetLabel)" } else { 'no candidate named' })" }
+                    'Unstated'    { 'Target not stated by this recording' }
+                    default       { '' }
+                }
+                if ($script:BtView.TargetState.Text -ne $tsText) { $script:BtView.TargetState.Text = $tsText }
+                if ($script:BtView.TargetState.Visible -ne [bool]$tsText) { $script:BtView.TargetState.Visible = [bool]$tsText }
+            }
+
+            # Per-panel evidence, on click. Delegates to the SAME dialog the chain
+            # chips use, so the operator and the engineer read one account of the
+            # evidence. The COM panel opens both of the nodes it merges, in
+            # dependency order, rather than the one that won the precedence.
+            function script:Show-BtViewTileDetail {
+                param($Owner, $Tile)
+                if (-not $Tile -or -not $Tile.Tag) { return }
+                foreach ($n in @($Tile.Tag.Nodes)) {
+                    if ($n) { script:Show-BtChainNodeDetail -Owner $Owner -Node $n }
+                }
+            }
+
+            function script:Switch-BtTechnicalDetails {
+                if (-not $script:BtView -or -not $script:BtView.TechPanel) { return }
+                $tp = $script:BtView.TechPanel
+                $tp.Visible = -not $tp.Visible
+                if ($script:BtView.TechToggle) {
+                    $script:BtView.TechToggle.Text = $(if ($tp.Visible) { 'Hide technical details' } else { 'Technical details' })
+                }
+                # The scope and boundary lines are AutoSize labels that only wrap
+                # once they are given a maximum width, and that width is computed
+                # at render time from the panel they sit in. While the panel was
+                # hidden it had never been laid out, so the width they locked was
+                # the collapsed one -- and the boundary sentence, the highest-value
+                # line in the technical view, opened as a column four words wide.
+                # Recomputed here from the container that actually has a width.
+                if ($tp.Visible) {
+                    $maxW = $tp.ClientSize.Width - 32
+                    if ($maxW -gt 100) {
+                        foreach ($lbl in @($script:BtView.ScopeLabel, $script:BtView.BoundaryLabel)) {
+                            if ($lbl) { $lbl.MaximumSize = New-Object System.Drawing.Size($maxW, 0) }
+                        }
+                    }
+                }
+                script:Set-BtRecorderViewLayout
+            }
+
+            # Session events: transitions only, newest last, at most six.
+            function script:Add-BtRecorderEvent {
+                param([string]$Text, [string]$Level = 'INFO', $At)
+                if (-not $Text) { return }
+                if ($null -eq $script:BtRec_ViewEvents) { return }
+                $when = $(if ($At) { $At } else { Get-Date })
+                [void]$script:BtRec_ViewEvents.Add([pscustomobject]@{
+                    Time = $when.ToString('HH:mm:ss'); Text = $Text; Level = $Level
+                })
+                while ($script:BtRec_ViewEvents.Count -gt 6) { $script:BtRec_ViewEvents.RemoveAt(0) }
+                script:Update-BtRecorderEventList
+            }
+
+            function script:Update-BtRecorderEventList {
+                if (-not $script:BtView_EventLabels) { return }
+                $items = @($script:BtRec_ViewEvents)
+                for ($i = 0; $i -lt @($script:BtView_EventLabels).Count; $i++) {
+                    $lbl = $script:BtView_EventLabels[$i]
+                    if ($i -lt $items.Count) {
+                        $txt = "$($items[$i].Time)   $($items[$i].Text)"
+                        if ($lbl.Text -ne $txt) { $lbl.Text = $txt }
+                        $c = switch ($items[$i].Level) {
+                            'FAIL'   { $script:BtViewColors['Failed'] }
+                            'WARN'   { $script:BtViewColors['Degraded'] }
+                            'ACTION' { $script:BtViewInkCaveat }
+                            'OK'     { $script:BtViewInk }
+                            default  { $script:BtViewInkDim }
+                        }
+                        if ($lbl.ForeColor -ne $c) { $lbl.ForeColor = $c }
+                    } elseif ($lbl.Text -ne '') {
+                        $lbl.Text = ''
+                    }
+                }
+            }
+
+            # The glossary. Reachable from the technical panel and from the
+            # overflow menu, and it now explains the DIAGRAM as well as the chips
+            # -- including the two readings this window has historically been
+            # misread on: a registered COM port, and a radio link that is
+            # legitimately off between sessions.
+            function script:Show-BtRecorderGlossary {
+                param($Owner)
+                $g = @(
+                    "THE PICTURE"
+                    "  Host / System --- Wireless --- Arc     is the connection path."
+                    "  NeurOptimal    COM    Data             are separate observations."
+                    ""
+                    "The supporting three are NOT a chain and are deliberately drawn"
+                    "without arrows between them. NeurOptimal runs perfectly well with no"
+                    "headset; COM registration survives a headset that is switched off;"
+                    "and data activity is a count of read operations, not proof of EEG."
+                    ""
+                    "WHAT THE MARKERS MEAN"
+                    "  [ok]            Checked and good."
+                    "  [!]             Checked and FAILING. This is a problem."
+                    "  [~]             Checked and getting worse."
+                    "  [idle]          Checked, and legitimately not active right now."
+                    "                  NOT a fault. A headset with no session running"
+                    "                  reads like this, and so does a closed NeurOptimal."
+                    "  [not observed]  NOTHING CHECKED THIS. It is not good and not bad;"
+                    "                  there is no reading. Do not read it as 'fine'."
+                    "  [n/a]           This tool cannot measure it at all."
+                    "  H               HISTORICAL. True earlier, not re-checked just now."
+                    ""
+                    "A panel drawn dimmed is EXPLAINED BY another one -- a consequence,"
+                    "not a separate problem to chase. Hover it to see which."
+                    ""
+                    "THE THREE THINGS THAT GET CONFUSED"
+                    "  Registered   COM ports exist. Left behind by an earlier successful"
+                    "               pairing. They survive a flat battery and a headset in"
+                    "               a drawer, so they prove nothing about right now. This"
+                    "               is what the H marker on the COM panel means."
+                    "  Radio link   The live wireless connection. It is NORMAL for this"
+                    "               to be off between sessions -- this headset holds no"
+                    "               Bluetooth profile open while idle. Dropping DURING a"
+                    "               session is the event we are hunting."
+                    "  Port held    Some process is holding the headset's COM port."
+                    "               This is NOT the same as data flowing, and the test"
+                    "               does not prove WHICH process holds it. NeurOptimal"
+                    "               keeps the port open whether or not the headset sends"
+                    "               a single sample."
+                    ""
+                    "WHAT GREEN DOES NOT PROVE"
+                    "Every panel going green does not prove the EEG signal is good. It"
+                    "proves the transport underneath it is. This tool cannot read EEG"
+                    "content -- the port belongs to NeurOptimal, and opening it to look"
+                    "would take it away from the application."
+                    ""
+                    "USB suspend  A Windows power-saving feature that can shut down the"
+                    "             Bluetooth radio mid-session."
+                    ""
+                    "Click any panel for the raw evidence behind it. 'Technical details'"
+                    "opens the full eight-step chain and the complete log."
+                ) -join "`r`n"
+                [void][System.Windows.Forms.MessageBox]::Show($Owner, $g, "How to read this window",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Information)
+            }
+
+            # Bottom status bar. AutoSize + TopDown flow: the panel reserves
+            # exactly the height its content needs, so on scaled/high-DPI displays
+            # the labels and action buttons grow with the font instead of
+            # overflowing a fixed-height panel and clipping them. Do NOT set a
+            # fixed Height here. It is added to the form in the assembly block
+            # further down, not here -- dock order is add order and assembling in
+            # one place is what makes it reviewable.
             $btStatusPanel = New-Object System.Windows.Forms.FlowLayoutPanel
             $btStatusPanel.Dock = [System.Windows.Forms.DockStyle]::Bottom
             $btStatusPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
             $btStatusPanel.WrapContents = $false
             $btStatusPanel.AutoSize = $true
             $btStatusPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-            $btStatusPanel.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
-            $btStatusPanel.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 8)
-            $btForm.Controls.Add($btStatusPanel)
+            $btStatusPanel.BackColor = [System.Drawing.Color]::FromArgb(28, 28, 34)
+            $btStatusPanel.Padding = New-Object System.Windows.Forms.Padding(14, 8, 14, 10)
 
+            # Kept, but DEMOTED. The recording clock now lives in the header where
+            # the operator looks; this line carries the packaging/abort wording the
+            # steps below assign to it.
             $btElapsedLabel = New-Object System.Windows.Forms.Label
             $btElapsedLabel.Text = "Initializing..."
             $btElapsedLabel.AutoSize = $true
             $btElapsedLabel.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 1)
-            $btElapsedLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-            $btElapsedLabel.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
+            $btElapsedLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8.25)
+            $btElapsedLabel.ForeColor = [System.Drawing.Color]::FromArgb(150, 150, 158)
             $btStatusPanel.Controls.Add($btElapsedLabel)
 
             $btUploadLabel = New-Object System.Windows.Forms.Label
@@ -4568,7 +5108,7 @@ $buttonHandlers = @{
             $btUploadLabel.AutoSize = $true
             $btUploadLabel.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 1)
             $btUploadLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-            $btUploadLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
+            $btUploadLabel.ForeColor = [System.Drawing.Color]::FromArgb(150, 150, 158)
             $btStatusPanel.Controls.Add($btUploadLabel)
 
             # Shows where the package was saved on this PC (filled in when kept locally,
@@ -4578,12 +5118,25 @@ $buttonHandlers = @{
             $btLocalPathLabel.AutoSize = $true
             $btLocalPathLabel.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 2)
             $btLocalPathLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-            $btLocalPathLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
+            $btLocalPathLabel.ForeColor = [System.Drawing.Color]::FromArgb(150, 150, 158)
             $btStatusPanel.Controls.Add($btLocalPathLabel)
 
-            # Action-button row (left-to-right flow of AutoSize buttons). Stop/Abort are
-            # added here at recording start; Open Folder appears after packaging. AutoSize
-            # buttons never clip their text, and hidden buttons take no space in the flow.
+            # SECONDARY action row. The primary action -- Stop and Upload -- is NOT
+            # here any more: it lives in the header where it cannot be confused
+            # with the utilities beside it. What stays here is everything that
+            # must remain reachable without competing for the eye.
+            #
+            # The NO-code marker box and its button stay VISIBLE rather than
+            # moving into the overflow menu, and that is a deliberate exception
+            # to "group the secondary actions". The operator marker is currently
+            # the ONLY labelling channel this investigation has -- NO_messages.xml
+            # was measured empty and written seven minutes before the event it
+            # was supposed to describe -- so a redesign that costs the recorder
+            # its labels would be a regression in data collection dressed up as a
+            # simplification.
+            #
+            # Left-to-right flow of AutoSize buttons: AutoSize never clips text on
+            # a scaled display, and hidden buttons take no space in the flow.
             $btButtonRow = New-Object System.Windows.Forms.FlowLayoutPanel
             $btButtonRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
             $btButtonRow.WrapContents = $false
@@ -4609,19 +5162,21 @@ $buttonHandlers = @{
             })
             $btButtonRow.Controls.Add($btOpenFolderBtn)
 
-            # Top instruction banner (add second)
+            # Phase strip. SLIMMED from a 56px banner to a single quiet line: it
+            # says which of the three phases the run is in, which is worth one
+            # line and not a block. The control and every later assignment to it
+            # are unchanged, so the abort/packaging wording still lands here.
             $btBanner = New-Object System.Windows.Forms.Panel
             $btBanner.Dock = [System.Windows.Forms.DockStyle]::Top
-            $btBanner.Height = 56
+            $btBanner.Height = 30
             $btBanner.BackColor = [System.Drawing.Color]::FromArgb(30, 50, 80)
-            $btForm.Controls.Add($btBanner)
 
             $btBannerLabel = New-Object System.Windows.Forms.Label
             $btBannerLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
             $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 210, 255)
-            $btBannerLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+            $btBannerLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
             $btBannerLabel.TextAlign = "MiddleLeft"
-            $btBannerLabel.Padding = New-Object System.Windows.Forms.Padding(12, 0, 0, 0)
+            $btBannerLabel.Padding = New-Object System.Windows.Forms.Padding(18, 0, 0, 0)
             $btBannerLabel.Text = "Step 1 of 3 - Taking Bluetooth baseline snapshot, please wait..."
             $btBanner.Controls.Add($btBannerLabel)
 
@@ -4631,7 +5186,6 @@ $buttonHandlers = @{
             $btAnomalyBar.Height = 40
             $btAnomalyBar.BackColor = [System.Drawing.Color]::FromArgb(180, 130, 20)
             $btAnomalyBar.Visible = $false
-            $btForm.Controls.Add($btAnomalyBar)
 
             $btAnomalyLabel = New-Object System.Windows.Forms.Label
             $btAnomalyLabel.Text = "Stream stopped unexpectedly -- was this a manual stop?"
@@ -4669,21 +5223,46 @@ $buttonHandlers = @{
             $btAnomalyInvestBtn.Add_Click({ $script:BtAnomaly_Resolved = $true; $script:BtAnomaly_IsExpected = $false })
             $btAnomalyBar.Controls.Add($btAnomalyInvestBtn)
 
+            # ── TECHNICAL DETAILS, collapsed by default ───────────────────────
+            #
+            # Everything the old window put on the main screen at once lives in
+            # here: the eight-node chain with its per-node evidence, the target
+            # scope sentence, the engineer-facing boundary statement, the
+            # glossary and the full raw log.
+            #
+            # HIDDEN, NOT DELETED, and nothing here is removed from the capture.
+            # The window is still the only live view of a probe -- events.jsonl
+            # and chain.jsonl reach disk as they happen, but tick state does not
+            # -- so a fact that cannot be recovered from this panel is a fact a
+            # remote assistant reading a screenshot cannot obtain. Progressive
+            # disclosure is a change to what is DEFAULT, not to what exists.
+            $btTechPanel = New-Object System.Windows.Forms.Panel
+            $btTechPanel.Dock = [System.Windows.Forms.DockStyle]::Bottom
+            $btTechPanel.Height = [int]($btFormH * 0.45)
+            $btTechPanel.BackColor = [System.Drawing.Color]::FromArgb(25, 25, 30)
+            $btTechPanel.Visible = $false
+
             # ── Diagnostic chain strip ────────────────────────────────────────
             #
-            # REPLACES the five independent state indicators that used to live
-            # here (Device / COM / Radio / Port / NO.exe). They were rendered as
-            # five equals, and they are not equals: when the radio link is down,
-            # the port reading and everything under it are CONSEQUENCES. An
-            # operator reading five indicators counted four problems where there
-            # was one cause and three effects, and picked a remedy from the wrong
-            # layer.
+            # REPLACED the five independent state indicators that used to live at
+            # the top of the window (Device / COM / Radio / Port / NO.exe). They
+            # were rendered as five equals, and they are not equals: when the
+            # radio link is down, the port reading and everything under it are
+            # CONSEQUENCES. An operator reading five indicators counted four
+            # problems where there was one cause and three effects, and picked a
+            # remedy from the wrong layer.
             #
             # The strip is not kept alongside the chain. Two on-screen renderers
             # of one question is the channel-mismatch class this repo has filed
             # nine instances of -- the moment they disagree, the one a human
-            # happens to read wins. Get-BtDiagnosticChain is the single answerer
-            # and this panel is a renderer of it.
+            # happens to read wins. Get-BtDiagnosticChain is the single answerer,
+            # this panel is a renderer of it, and so is the visual panel above:
+            # BOTH are fed from one chain object through one mapping
+            # (Get-BtRecorderView), not from two reads of session state.
+            #
+            # It now sits inside the technical details rather than at the top of
+            # the window. Eight chips and a two-line boundary sentence is the
+            # engineer's view of the same state the diagram shows an operator.
             #
             # WrapContents is TRUE on the node row, deliberately. Eight chips do
             # not fit one line on a scaled display, and this form's history is of
@@ -4695,9 +5274,8 @@ $buttonHandlers = @{
             $btChainPanel.AutoSize = $true
             $btChainPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
             $btChainPanel.BackColor = [System.Drawing.Color]::FromArgb(25, 25, 30)
-            $btChainPanel.Padding = New-Object System.Windows.Forms.Padding(8, 5, 8, 6)
+            $btChainPanel.Padding = New-Object System.Windows.Forms.Padding(12, 8, 12, 8)
             $btChainPanel.Visible = $false
-            $btForm.Controls.Add($btChainPanel)
 
             # SCOPE, ABOVE THE EVIDENCE. Which headset this chain describes is a
             # prerequisite for reading any chip under it, not a detail beside
@@ -4746,73 +5324,39 @@ $buttonHandlers = @{
             $script:BtChain_NodeLabels = @{}
             $script:BtChain_LastBoundaryKey = $null
 
-            # Glossary for the five indicators above, on demand. These are the
-            # terms operators misread -- particularly "Port open", which does NOT
-            # mean data is flowing, and a radio link that is legitimately off
-            # while idle. Kept next to the thing it explains rather than dumped
-            # into the timeline at startup where it scrolls away unread.
+            # Glossary, on demand. These are the terms operators misread --
+            # particularly "COM port held", which does NOT mean data is flowing,
+            # and a radio link that is legitimately off while idle. Kept next to
+            # the thing it explains rather than dumped into the timeline at
+            # startup where it scrolls away unread.
+            #
+            # The handler delegates to a script:-scoped function so the same text
+            # is reachable from the overflow menu on the main screen. An
+            # Add_Click scriptblock does not run inside the scope it was written
+            # in, which is why the target is script:-scoped and the owner comes
+            # from the event rather than from a captured variable.
             $btGlossaryBtn = New-Object System.Windows.Forms.Button
             $btGlossaryBtn.Text = "What do these mean?"
             $btGlossaryBtn.AutoSize = $true
             $btGlossaryBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-            $btGlossaryBtn.Margin = New-Object System.Windows.Forms.Padding(12, 2, 4, 2)
+            $btGlossaryBtn.Margin = New-Object System.Windows.Forms.Padding(0, 4, 4, 2)
             $btGlossaryBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
             $btGlossaryBtn.BackColor = [System.Drawing.Color]::FromArgb(45, 45, 52)
             $btGlossaryBtn.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
             $btGlossaryBtn.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-            $btGlossaryBtn.Add_Click({
-                $g = @(
-                    "THE CHAIN"
-                    "Each step depends on the ones before it. The bold line underneath"
-                    "says how far the chain is VERIFIED and which step is the first that"
-                    "is not. Click any step to see the raw evidence behind it."
-                    ""
-                    "WHAT THE MARKERS MEAN"
-                    "  [ok]            Checked and good."
-                    "  [!]             Checked and FAILING. This is a problem."
-                    "  [~]             Checked and getting worse."
-                    "  [idle]          Checked, and legitimately not active right now."
-                    "                  NOT a fault. A headset with no session running"
-                    "                  reads like this, and so does a closed NeurOptimal."
-                    "  [not observed]  NOTHING CHECKED THIS. It is not good and not bad;"
-                    "                  there is no reading. Do not read it as 'fine'."
-                    "  [n/a]           This tool cannot measure it at all."
-                    ""
-                    "A step shown dimmed with a leading dot is EXPLAINED BY a step above"
-                    "it -- a consequence, not a separate problem to chase."
-                    ""
-                    "THE THREE THINGS THAT GET CONFUSED"
-                    "  Registered   COM ports exist. Left behind by an earlier successful"
-                    "               pairing. They survive a flat battery and a headset in"
-                    "               a drawer, so they prove nothing about right now."
-                    "  Radio link   The live wireless connection. It is NORMAL for this"
-                    "               to be off between sessions -- this headset holds no"
-                    "               Bluetooth profile open while idle. Dropping DURING a"
-                    "               session is the event we are hunting."
-                    "  Port held    Some process is holding the headset's COM port."
-                    "               This is NOT the same as data flowing. NeurOptimal"
-                    "               keeps the port open whether or not the headset sends"
-                    "               a single sample."
-                    ""
-                    "WHAT GREEN DOES NOT PROVE"
-                    "Every step going green does not prove the EEG signal is good. It"
-                    "proves the transport underneath it is. This tool cannot read EEG"
-                    "content -- the port belongs to NeurOptimal, and opening it to look"
-                    "would take it away from the application."
-                    ""
-                    "USB suspend  A Windows power-saving feature that can shut down the"
-                    "             Bluetooth radio mid-session."
-                ) -join "`r`n"
-                [void][System.Windows.Forms.MessageBox]::Show($g, "How to read the diagnostic chain",
-                    [System.Windows.Forms.MessageBoxButtons]::OK,
-                    [System.Windows.Forms.MessageBoxIcon]::Information)
-            })
+            $btGlossaryBtn.Add_Click({ script:Show-BtRecorderGlossary -Owner $this.FindForm() })
             $btChainPanel.Controls.Add($btGlossaryBtn)
 
-            # ── Always-visible "what am I watching, and am I seeing it?" strip ──
+            # ── HEADER: "what am I watching, and am I seeing it?" ─────────────
             #
             # Added last among the Top-docked controls, so it docks closest to the
             # top edge and is the first thing read.
+            #
+            # This is also where the PRIMARY action lives. Stop and Upload used to
+            # sit in the bottom row beside Abort, the NO-code box, Mark and Open
+            # Folder -- five controls of equal visual weight, one of which ends
+            # the recording and sends it to support. It is now the only emphasised
+            # control on the screen.
             #
             # Capture 8E39860E4AF2 (2026-08-07) measured Arc 019 -- switched off, in
             # a drawer -- while the operator ran a 37-minute session on Arc 013. The
@@ -4822,16 +5366,52 @@ $buttonHandlers = @{
             # was in front of the person who could have stopped the recording and
             # fixed it. Keeping them pinned is the reader-side half of the fix that
             # PR #57 made on the selector side.
-            $btIdentityPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+            # A two-column TableLayoutPanel rather than the old TopDown flow: the
+            # identity text grows down the left while the recording clock and the
+            # primary action sit right. AutoSize on both the panel and its columns
+            # so the header still reserves exactly the height its content needs on
+            # a scaled display -- the property #64 and #68 both turned on.
+            $btIdentityPanel = New-Object System.Windows.Forms.TableLayoutPanel
             $btIdentityPanel.Dock = [System.Windows.Forms.DockStyle]::Top
-            $btIdentityPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
-            $btIdentityPanel.WrapContents = $false
+            $btIdentityPanel.ColumnCount = 2
+            $btIdentityPanel.RowCount = 1
+            [void]$btIdentityPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+            [void]$btIdentityPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
             $btIdentityPanel.AutoSize = $true
             $btIdentityPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-            $btIdentityPanel.BackColor = [System.Drawing.Color]::FromArgb(18, 18, 22)
-            $btIdentityPanel.Padding = New-Object System.Windows.Forms.Padding(10, 6, 10, 6)
+            $btIdentityPanel.BackColor = [System.Drawing.Color]::FromArgb(16, 16, 20)
+            $btIdentityPanel.Padding = New-Object System.Windows.Forms.Padding(18, 10, 14, 10)
             $btIdentityPanel.Visible = $false
-            $btForm.Controls.Add($btIdentityPanel)
+
+            $btHeaderText = New-Object System.Windows.Forms.FlowLayoutPanel
+            $btHeaderText.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $btHeaderText.WrapContents = $false
+            $btHeaderText.AutoSize = $true
+            $btHeaderText.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btHeaderText.Margin = New-Object System.Windows.Forms.Padding(0)
+            $btIdentityPanel.Controls.Add($btHeaderText, 0, 0)
+
+            $btHeaderActions = New-Object System.Windows.Forms.FlowLayoutPanel
+            $btHeaderActions.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $btHeaderActions.WrapContents = $false
+            $btHeaderActions.AutoSize = $true
+            $btHeaderActions.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btHeaderActions.Anchor = [System.Windows.Forms.AnchorStyles]::Right
+            $btHeaderActions.Margin = New-Object System.Windows.Forms.Padding(12, 0, 0, 0)
+            $btIdentityPanel.Controls.Add($btHeaderActions, 1, 0)
+
+            # The recording clock, promoted out of the bottom status line. It is
+            # the one number an operator checks repeatedly while reproducing a
+            # fault, and it used to be an 9pt line at the bottom of the window
+            # next to five buttons.
+            $btTimerLabel = New-Object System.Windows.Forms.Label
+            $btTimerLabel.Text = ""
+            $btTimerLabel.AutoSize = $true
+            $btTimerLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 2, 4)
+            $btTimerLabel.Font = New-Object System.Drawing.Font("Segoe UI", 15, [System.Drawing.FontStyle]::Bold)
+            $btTimerLabel.ForeColor = [System.Drawing.Color]::FromArgb(210, 210, 218)
+            $btTimerLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+            $btHeaderActions.Controls.Add($btTimerLabel)
 
             # Findings raised BEFORE the recording loop starts, kept for the life
             # of the window (#68 item 3). The SERIALCOMM collision that carried a
@@ -4846,13 +5426,34 @@ $buttonHandlers = @{
             # show, and that is different from failing to read one.
             $script:BtRec_RunIdText = '(not assigned yet)'
 
+            $btTitleLabel = New-Object System.Windows.Forms.Label
+            $btTitleLabel.Text = "Bluetooth Flight Recorder"
+            $btTitleLabel.AutoSize = $true
+            $btTitleLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 1)
+            $btTitleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+            $btTitleLabel.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 132)
+            $btHeaderText.Controls.Add($btTitleLabel)
+
             $btTargetLabel = New-Object System.Windows.Forms.Label
             $btTargetLabel.Text = "Watching: (selecting headset...)"
             $btTargetLabel.AutoSize = $true
             $btTargetLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
-            $btTargetLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+            $btTargetLabel.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
             $btTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(235, 235, 235)
-            $btIdentityPanel.Controls.Add($btTargetLabel)
+            $btHeaderText.Controls.Add($btTargetLabel)
+
+            # Target uncertainty, simply and prominently, on its own line -- and
+            # hidden entirely when the target IS confirmed, so its presence is
+            # itself the signal. The full binding evidence stays in the technical
+            # details, on the scope line the chain feeds.
+            $btTargetStateLabel = New-Object System.Windows.Forms.Label
+            $btTargetStateLabel.Text = ""
+            $btTargetStateLabel.AutoSize = $true
+            $btTargetStateLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
+            $btTargetStateLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+            $btTargetStateLabel.ForeColor = [System.Drawing.Color]::FromArgb(240, 175, 90)
+            $btTargetStateLabel.Visible = $false
+            $btHeaderText.Controls.Add($btTargetStateLabel)
 
             # Run ID, and which COM port is the DATA channel and which is the
             # COMMAND channel. Issue #68 item 2.
@@ -4873,18 +5474,25 @@ $buttonHandlers = @{
             $btIdentityDetailLabel.AutoSize = $true
             $btIdentityDetailLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
             $btIdentityDetailLabel.Font = New-Object System.Drawing.Font("Consolas", 8)
-            $btIdentityDetailLabel.ForeColor = [System.Drawing.Color]::FromArgb(190, 190, 190)
-            $btIdentityPanel.Controls.Add($btIdentityDetailLabel)
+            $btIdentityDetailLabel.ForeColor = [System.Drawing.Color]::FromArgb(140, 140, 150)
+            $btHeaderText.Controls.Add($btIdentityDetailLabel)
 
             # Coverage line. Carries a text marker ([ok]/[~]/[!]) as well as colour,
             # so "not observed" is legible without relying on yellow-versus-red.
+            #
+            # It stays on the main screen and is NOT folded into the verdict, even
+            # though both are one-liners under a diagram. They answer different
+            # questions: the verdict says what the recorder believes about the
+            # HEADSET, and this says whether the recorder is seeing the session at
+            # all. Capture 8E39860E4AF2 is the case where the first was confident
+            # and the second was the actual defect.
             $btCoverageLabel = New-Object System.Windows.Forms.Label
             $btCoverageLabel.Text = "Waiting for a session -- nothing measured yet"
             $btCoverageLabel.AutoSize = $true
-            $btCoverageLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
-            $btCoverageLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-            $btCoverageLabel.ForeColor = [System.Drawing.Color]::FromArgb(190, 190, 190)
-            $btIdentityPanel.Controls.Add($btCoverageLabel)
+            $btCoverageLabel.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 0)
+            $btCoverageLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8.25)
+            $btCoverageLabel.ForeColor = [System.Drawing.Color]::FromArgb(140, 140, 150)
+            $btHeaderText.Controls.Add($btCoverageLabel)
 
             # Re-opens the startup findings for the life of the window (#68 item
             # 3). Hidden while there are none, so a clean start costs no space and
@@ -4905,17 +5513,20 @@ $buttonHandlers = @{
             # nothing at click time -- and the failure would be a dead button on a
             # field machine, invisible to every test here.
             $btStartupFindingsBtn.Add_Click({ script:Show-BtStartupFindings -Owner $this.FindForm() })
-            $btIdentityPanel.Controls.Add($btStartupFindingsBtn)
+            $btHeaderText.Controls.Add($btStartupFindingsBtn)
 
-            # Console output fills the space the docked panels leave.
+            # Console output fills the space the technical panel's docked children
+            # leave. It is the RAW log now -- every line that used to scroll past
+            # the operator still arrives here, unfiltered, and is still what the
+            # package's log artifact is written from.
             #
-            # 🔴 The Fill control must sit at CHILD INDEX 0, and "add last" does
-            # NOT achieve that. WinForms lays a container's children out from the
-            # HIGHEST index down, shrinking the remaining rectangle as it goes,
-            # so the control at index 0 is positioned LAST and is the one that
-            # receives what is left. Added last, this box got index 5, was laid
-            # out FIRST against the full client rectangle, and the four docked
-            # panels were then painted ON TOP of it.
+            # The Fill control must sit at CHILD INDEX 0 of its container, and
+            # "add last" does NOT achieve that. WinForms lays a container's
+            # children out from the HIGHEST index down, shrinking the remaining
+            # rectangle as it goes, so the control at index 0 is positioned LAST
+            # and is the one that receives what is left. Added last, this box got
+            # the highest index, was laid out FIRST against the full client
+            # rectangle, and the docked panels were then painted ON TOP of it.
             #
             # That is issue #64, measured: with a 900x600 client the log sat at
             # Top=0 Height=600 behind 136px of pinned panels and a 40px status
@@ -4934,11 +5545,232 @@ $buttonHandlers = @{
             $btOutputBox.ScrollBars = "Vertical"
             $btOutputBox.Dock = [System.Windows.Forms.DockStyle]::Fill
             Initialize-WinConfigGuiDiagnosticBox -Box $btOutputBox
-            $btForm.Controls.Add($btOutputBox)
-            $btForm.Controls.SetChildIndex($btOutputBox, 0)
+            $btTechPanel.Controls.Add($btChainPanel)
+            $btTechPanel.Controls.Add($btOutputBox)
+            $btTechPanel.Controls.SetChildIndex($btOutputBox, 0)
+
+            # =================================================================
+            # THE VISUAL PANEL
+            # =================================================================
+            #
+            # Six panels and two connectors, drawn rather than written. The
+            # arrangement carries a claim about causality, so it is worth being
+            # explicit about which claims it does and does not make:
+            #
+            #   CONNECTION        Host / System --- Wireless --- Arc
+            #   SUPPORTING        NeurOptimal      COM        Data
+            #
+            # The supporting three are drawn side by side with NO connectors,
+            # because they are observations rather than a chain:
+            #
+            #   * NeurOptimal has no Bluetooth dependency. Drawing it downstream
+            #     of the radio would report a closed application as a consequence
+            #     of a dead link, and send the operator to the wrong layer.
+            #   * COM registration is HISTORICAL -- what an earlier successful
+            #     pairing left behind. It survives a flat battery and a headset in
+            #     a drawer, so it cannot sit under the live link without making
+            #     every idle box show a broken COM layer.
+            #   * Data activity is a read-operation count, not proof of EEG.
+            #
+            # Nothing here decides anything. Get-BtRecorderView maps the chain
+            # onto these six slots and this code draws what it is handed.
+            $btViewPanel = New-Object System.Windows.Forms.Panel
+            $btViewPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $btViewPanel.BackColor = $script:BtViewBack
+            $script:BtView_Tiles = @{}
+            $script:BtView_LastKey = $null
+
+            $btConnHeading = New-Object System.Windows.Forms.Label
+            $btConnHeading.Text = "CONNECTION"
+            $btConnHeading.AutoSize = $false
+            $btConnHeading.Font = New-Object System.Drawing.Font("Segoe UI", 7.5, [System.Drawing.FontStyle]::Bold)
+            $btConnHeading.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 122)
+            $btConnHeading.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+            $btViewPanel.Controls.Add($btConnHeading)
+
+            $btConnRow = New-Object System.Windows.Forms.Panel
+            $btConnRow.BackColor = [System.Drawing.Color]::Transparent
+            $btConnRow.Tag = 'Unknown'
+            $btConnRow.Add_Paint($script:BtViewEdgePaint)
+            $btViewPanel.Controls.Add($btConnRow)
+
+            $btSigHeading = New-Object System.Windows.Forms.Label
+            $btSigHeading.Text = "SUPPORTING SIGNALS"
+            $btSigHeading.AutoSize = $false
+            $btSigHeading.Font = New-Object System.Drawing.Font("Segoe UI", 7.5, [System.Drawing.FontStyle]::Bold)
+            $btSigHeading.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 122)
+            $btSigHeading.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+            $btViewPanel.Controls.Add($btSigHeading)
+
+            $btSigRow = New-Object System.Windows.Forms.Panel
+            $btSigRow.BackColor = [System.Drawing.Color]::Transparent
+            $btViewPanel.Controls.Add($btSigRow)
+
+            # Six panels, created once, keyed by slot. Rebuilding controls every
+            # tick would churn the UI thread, which is already this window's
+            # bottleneck.
+            $btViewTooltip = New-Object System.Windows.Forms.ToolTip
+            $btViewTooltip.AutoPopDelay = 20000
+            $btViewTooltip.InitialDelay = 350
+            foreach ($spec in @(
+                @{ Slot = 'Host';     Row = $btConnRow },
+                @{ Slot = 'Wireless'; Row = $btConnRow },
+                @{ Slot = 'Arc';      Row = $btConnRow },
+                @{ Slot = 'App';      Row = $btSigRow  },
+                @{ Slot = 'Com';      Row = $btSigRow  },
+                @{ Slot = 'Data';     Row = $btSigRow  }
+            )) {
+                $tile = New-Object System.Windows.Forms.Panel
+                $tile.BackColor = [System.Drawing.Color]::Transparent
+                $tile.Cursor = [System.Windows.Forms.Cursors]::Hand
+                # The whole panel is the click target, and the text is PAINTED
+                # rather than placed in child labels: a child label would swallow
+                # the click and the evidence dialog would be unreachable from
+                # half the tile.
+                $tile.Add_Paint($script:BtViewTilePaint)
+                $tile.Add_Click({ script:Show-BtViewTileDetail -Owner $this.FindForm() -Tile $this })
+                $spec.Row.Controls.Add($tile)
+                $script:BtView_Tiles[$spec.Slot] = $tile
+            }
+
+            # The verdict. ONE sentence, in the operator's words. The engineer's
+            # sentence -- "FIRST FAILING STEP: <edge>. (6 of 8 steps verified.)" --
+            # is not deleted: it is Chain.Summary and it renders unchanged on the
+            # boundary line inside the technical details, and it is what
+            # chain.jsonl records.
+            $btVerdictLabel = New-Object System.Windows.Forms.Label
+            $btVerdictLabel.Text = ""
+            $btVerdictLabel.AutoSize = $false
+            $btVerdictLabel.Font = New-Object System.Drawing.Font("Segoe UI", 12)
+            $btVerdictLabel.ForeColor = $script:BtViewInk
+            $btVerdictLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+            $btViewPanel.Controls.Add($btVerdictLabel)
+
+            $btVerdictContextLabel = New-Object System.Windows.Forms.Label
+            $btVerdictContextLabel.Text = ""
+            $btVerdictContextLabel.AutoSize = $false
+            $btVerdictContextLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+            $btVerdictContextLabel.ForeColor = $script:BtViewInkDim
+            $btVerdictContextLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+            $btViewPanel.Controls.Add($btVerdictContextLabel)
+
+            # PERMANENT, and deliberately not a panel. Every measurable step going
+            # green is routinely read as "the session is fine". It is not: nothing
+            # in this tool validates EEG content. As a node in the chain it was
+            # NotMeasurable on every tick of every recording and readers learned to
+            # skip it; as a footnote under the verdict it is read at the moment the
+            # conclusion it limits is being drawn.
+            $btFootnoteLabel = New-Object System.Windows.Forms.Label
+            $btFootnoteLabel.Text = "EEG signal quality cannot be measured by this tool."
+            $btFootnoteLabel.AutoSize = $false
+            $btFootnoteLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+            $btFootnoteLabel.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 122)
+            $btFootnoteLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+            $btViewPanel.Controls.Add($btFootnoteLabel)
+
+            # ── Session events ────────────────────────────────────────────────
+            # TRANSITIONS ONLY, newest last, at most six. The heartbeat lines
+            # ("... watching [108s] Device: Paired | Port open") and every other
+            # repeated line stay in the raw log where they belong.
+            #
+            # This is a FILTER AT RENDER TIME, not at collection time: everything
+            # dropped here is still written to events.jsonl and still printed in
+            # the raw log. A filter in the collector would remove evidence from the
+            # capture, which is the one thing this redesign must not do.
+            $script:BtRec_ViewEvents = New-Object System.Collections.ArrayList
+            $btEventsHeading = New-Object System.Windows.Forms.Label
+            $btEventsHeading.Text = "SESSION EVENTS"
+            $btEventsHeading.AutoSize = $false
+            $btEventsHeading.Font = New-Object System.Drawing.Font("Segoe UI", 7.5, [System.Drawing.FontStyle]::Bold)
+            $btEventsHeading.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 122)
+            $btEventsHeading.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+            $btViewPanel.Controls.Add($btEventsHeading)
+
+            $btEventsPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+            $btEventsPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $btEventsPanel.WrapContents = $false
+            $btEventsPanel.AutoSize = $false
+            $btEventsPanel.BackColor = [System.Drawing.Color]::Transparent
+            $btViewPanel.Controls.Add($btEventsPanel)
+            $script:BtView_EventLabels = @()
+            for ($i = 0; $i -lt 6; $i++) {
+                $el = New-Object System.Windows.Forms.Label
+                $el.AutoSize = $true
+                $el.Text = ""
+                $el.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
+                $el.Font = New-Object System.Drawing.Font("Consolas", 8.5)
+                $el.ForeColor = $script:BtViewInkDim
+                $btEventsPanel.Controls.Add($el)
+                $script:BtView_EventLabels += $el
+            }
+
+            # The disclosure control. Unobtrusive, bottom-right, and the window
+            # opens with the details CLOSED.
+            $btTechToggleBtn = New-Object System.Windows.Forms.Button
+            $btTechToggleBtn.Text = "Technical details"
+            $btTechToggleBtn.AutoSize = $true
+            $btTechToggleBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btTechToggleBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btTechToggleBtn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(60, 60, 70)
+            $btTechToggleBtn.BackColor = $script:BtViewBack
+            $btTechToggleBtn.ForeColor = [System.Drawing.Color]::FromArgb(150, 150, 162)
+            $btTechToggleBtn.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+            $btTechToggleBtn.Add_Click({ script:Switch-BtTechnicalDetails })
+            $btViewPanel.Controls.Add($btTechToggleBtn)
+
+            # Laid out by hand, from the panel's own client size, so the diagram
+            # keeps its whitespace at every window size instead of a nested stack
+            # of AutoSize containers deciding it. Re-run on every resize.
+            #
+            # AutoScroll is the guard against the failure this window has a
+            # history of: on a display too short for the content, controls used to
+            # be CLIPPED rather than reachable (#64). Here they scroll.
+            $btViewPanel.AutoScroll = $true
+            $btViewPanel.Add_Resize({ script:Set-BtRecorderViewLayout })
+
+            # The control registry the layout, the renderer and the disclosure
+            # toggle read. script:-scoped because none of those run in the scope
+            # this file was written in.
+            $script:BtView = @{
+                Panel         = $btViewPanel
+                ConnHeading   = $btConnHeading
+                ConnRow       = $btConnRow
+                SigHeading    = $btSigHeading
+                SigRow        = $btSigRow
+                Verdict       = $btVerdictLabel
+                Context       = $btVerdictContextLabel
+                Footnote      = $btFootnoteLabel
+                EventsHeading = $btEventsHeading
+                EventsPanel   = $btEventsPanel
+                TechToggle    = $btTechToggleBtn
+                TechPanel     = $btTechPanel
+                TargetState   = $btTargetStateLabel
+                Tooltip       = $btViewTooltip
+                # Registered so the disclosure toggle can re-measure them; they
+                # are still rendered only by Update-BtChainPanel.
+                ScopeLabel    = $btScopeLabel
+                BoundaryLabel = $btBoundaryLabel
+            }
+
+            # =================================================================
+            # ASSEMBLY
+            # =================================================================
+            # Dock order IS add order, and getting it wrong is issue #64. Read it
+            # as: last added wins the outer edge. Bottom edge first (status bar
+            # outermost, technical panel above it), then the Top group from the
+            # inside out, and finally the Fill panel forced to child index 0 so it
+            # is laid out LAST and receives whatever rectangle is left.
+            $btForm.Controls.Add($btTechPanel)      # Bottom, inner
+            $btForm.Controls.Add($btStatusPanel)    # Bottom, outermost
+            $btForm.Controls.Add($btBanner)         # Top, innermost
+            $btForm.Controls.Add($btAnomalyBar)     # Top
+            $btForm.Controls.Add($btIdentityPanel)  # Top, outermost (header)
+            $btForm.Controls.Add($btViewPanel)      # Fill
+            $btForm.Controls.SetChildIndex($btViewPanel, 0)
 
             $btForm.Show()
             $btForm.Refresh()
+            script:Set-BtRecorderViewLayout
 
             function Write-BtLog {
                 param([string]$Message, [string]$Level = "INFO")
@@ -5127,10 +5959,22 @@ $buttonHandlers = @{
             # a second place that works out what is wrong is a second place that
             # can disagree with the first, and the one a human happens to be
             # looking at wins.
+            #
+            # It drives BOTH views: the visual panel an operator reads, through
+            # Get-BtRecorderView, and the eight chips an engineer reads inside the
+            # technical details. That is one chain object through one mapping, NOT
+            # two readers of session state -- which is the whole point.
             function Update-BtChainPanel {
                 param($Chain)
                 if (-not $Chain -or -not $btChainPanel) { return }
                 if (-not $btChainPanel.Visible) { $btChainPanel.Visible = $true }
+
+                # The operator's view first. It is the default screen, so a
+                # failure to render the chips below must not cost it.
+                if (Get-Command Get-BtRecorderView -ErrorAction SilentlyContinue) {
+                    $view = try { Get-BtRecorderView -Chain $Chain } catch { $null }
+                    if ($view) { script:Update-BtRecorderPanel -View $view -Chain $Chain }
+                }
 
                 # ── Scope line ───────────────────────────────────────────────
                 # Marker word AND colour. A confirmed target is stated plainly
@@ -5495,8 +6339,14 @@ $buttonHandlers = @{
                 if ($cov) {
                     switch ($cov.Level) {
                         'Observed' {
-                            $cText = '[ok] Observing this session -- headset linked, its COM port is held, data flow is being measured'
-                            $cCol  = [System.Drawing.Color]::FromArgb(120, 230, 130)
+                            # SHORTENED, not weakened. The three things it used to
+                            # enumerate -- headset linked, COM port held, data flow
+                            # measured -- are now three panels on the screen above
+                            # it, and restating them in a sentence is the duplicate
+                            # state this redesign removes. The LEVEL is unchanged
+                            # and still comes from Get-ProbeObservationCoverage.
+                            $cText = '[ok] Observing this session'
+                            $cCol  = [System.Drawing.Color]::FromArgb(120, 190, 130)
                         }
                         'Partial' {
                             $missing = @()
@@ -5720,6 +6570,10 @@ $buttonHandlers = @{
 
             Write-BtLog ""
             Write-BtLog "Step 2 of 3: Recording in progress" -Level "STEP"
+            # An empty events list on a fresh window is ambiguous -- it could mean
+            # nothing has happened yet or that the list is not wired. One seeded
+            # line removes the ambiguity, and it is a real transition.
+            script:Add-BtRecorderEvent -Text 'Recording started' -Level 'OK'
 
             # Check if deep probe modules are available
             $btDeepProbeAvailable = (Get-Command New-TargetDeviceConfiguration -ErrorAction SilentlyContinue) -and
@@ -5741,22 +6595,28 @@ $buttonHandlers = @{
                 }
             }
 
-            # AutoSize buttons in the bottom action row (see $btButtonRow above) so
-            # their text is never clipped on scaled displays. Inserted before the
-            # Open Folder button so they read left-to-right: Stop, Abort.
+            # THE PRIMARY ACTION, and now the only emphasised control on the
+            # screen. It sits in the header beside the recording clock rather than
+            # in the bottom row, where it used to be one of five same-weight
+            # buttons -- the one that ends the recording and sends it to support,
+            # rendered at the same size as "Open Folder".
+            #
+            # AutoSize so the text is never clipped on a scaled display, with
+            # padding rather than a fixed size to make it big.
             $script:BtRec_StopClicked = $false
             $btStopBtn = New-Object System.Windows.Forms.Button
             $btStopBtn.Text = "Stop and Upload"
             $btStopBtn.AutoSize = $true
             $btStopBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-            $btStopBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
-            $btStopBtn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
+            $btStopBtn.Padding = New-Object System.Windows.Forms.Padding(20, 9, 20, 9)
+            $btStopBtn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 2, 0)
+            $btStopBtn.Font = New-Object System.Drawing.Font("Segoe UI", 10.5, [System.Drawing.FontStyle]::Bold)
             $btStopBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btStopBtn.FlatAppearance.BorderSize = 0
             $btStopBtn.BackColor = [System.Drawing.Color]::FromArgb(200, 50, 50)
             $btStopBtn.ForeColor = [System.Drawing.Color]::White
             $btStopBtn.Add_Click({ $script:BtRec_StopClicked = $true })
-            $btButtonRow.Controls.Add($btStopBtn)
-            $btButtonRow.Controls.SetChildIndex($btStopBtn, 0)
+            $btHeaderActions.Controls.Add($btStopBtn)
 
             # Operator marker. The recorder can see the machine but not what
             # NeurOptimal is telling the person in front of it, and NO's error
@@ -5767,8 +6627,12 @@ $buttonHandlers = @{
             $script:BtRec_MarkRequested = $false
             $btMarkBox = New-Object System.Windows.Forms.TextBox
             $btMarkBox.Width = 110
-            $btMarkBox.Margin = New-Object System.Windows.Forms.Padding(16, 3, 0, 0)
-            $btMarkBox.BackColor = [System.Drawing.Color]::FromArgb(35, 35, 35)
+            $btMarkBox.Margin = New-Object System.Windows.Forms.Padding(0, 3, 0, 0)
+            # Lighter than the (now dark) status bar behind it. At 35,35,35 on a
+            # 28,28,34 panel the field was invisible until it was clicked, and an
+            # invisible input is an input nobody uses -- which for this one costs
+            # the recording its only label.
+            $btMarkBox.BackColor = [System.Drawing.Color]::FromArgb(48, 48, 56)
             $btMarkBox.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
             $btMarkBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
             $btMarkBox.Text = "NO code"
@@ -5793,21 +6657,39 @@ $buttonHandlers = @{
             $btMarkBtn.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
             $btMarkBtn.Add_Click({ $script:BtRec_MarkRequested = $true })
             $btButtonRow.Controls.Add($btMarkBtn)
+            $btButtonRow.Controls.SetChildIndex($btMarkBtn, 0)
+            $btButtonRow.Controls.SetChildIndex($btMarkBox, 0)
 
+            # ── Overflow ──────────────────────────────────────────────────────
+            # Abort and the glossary move behind one control. Neither is used in
+            # the normal flow, and both were previously competing with Stop and
+            # Upload for the same glance. The functionality is unchanged: Abort
+            # still sets exactly the same two flags it always did.
             $script:BtRec_AbortClicked = $false
-            $btAbortBtn = New-Object System.Windows.Forms.Button
-            $btAbortBtn.Text = "Abort"
-            $btAbortBtn.AutoSize = $true
-            $btAbortBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-            $btAbortBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
-            $btAbortBtn.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
-            $btAbortBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-            $btAbortBtn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(120, 120, 120)
-            $btAbortBtn.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
-            $btAbortBtn.ForeColor = [System.Drawing.Color]::FromArgb(180, 180, 180)
-            $btAbortBtn.Add_Click({ $script:BtRec_AbortClicked = $true; $script:BtRec_StopClicked = $true })
-            $btButtonRow.Controls.Add($btAbortBtn)
-            $btButtonRow.Controls.SetChildIndex($btAbortBtn, 1)
+
+            $btMoreMenu = New-Object System.Windows.Forms.ContextMenuStrip
+            $btMoreMenu.ShowImageMargin = $false
+            $btMoreAbort = $btMoreMenu.Items.Add("Abort - stop WITHOUT uploading")
+            $btMoreAbort.Add_Click({ $script:BtRec_AbortClicked = $true; $script:BtRec_StopClicked = $true })
+            $btMoreHelp = $btMoreMenu.Items.Add("What do these mean?")
+            $btMoreHelp.Add_Click({ script:Show-BtRecorderGlossary -Owner $null })
+            $btMoreDetails = $btMoreMenu.Items.Add("Technical details")
+            $btMoreDetails.Add_Click({ script:Switch-BtTechnicalDetails })
+
+            $btMoreBtn = New-Object System.Windows.Forms.Button
+            $btMoreBtn.Text = "More..."
+            $btMoreBtn.AutoSize = $true
+            $btMoreBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btMoreBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
+            $btMoreBtn.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
+            $btMoreBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btMoreBtn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(70, 70, 80)
+            $btMoreBtn.BackColor = [System.Drawing.Color]::FromArgb(38, 38, 46)
+            $btMoreBtn.ForeColor = [System.Drawing.Color]::FromArgb(180, 180, 190)
+            $btMoreBtn.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+            $btMoreBtn.ContextMenuStrip = $btMoreMenu
+            $btMoreBtn.Add_Click({ $this.ContextMenuStrip.Show($this, 0, $this.Height) })
+            $btButtonRow.Controls.Add($btMoreBtn)
 
             $btRecordStart = Get-Date
             $btPollJob     = $null
@@ -6409,6 +7291,10 @@ $buttonHandlers = @{
                     $btOpActionsLogged++
                     $opaDur = if ($opa.CompletedAt) { " (took $([int]($opa.CompletedAt - $opa.StartedAt).TotalSeconds)s)" } else { '' }
                     Write-BtLog "[~] Operator ran '$($opa.Tool)'$opaDur -- Bluetooth changes right after this are likely caused by it, not by NeurOptimal" -Level "WARN"
+                    # A repair tool the operator ran is a state transition with a
+                    # known cause, which is exactly what this list is for -- the
+                    # events just after it are attributable to the tool.
+                    script:Add-BtRecorderEvent -Text "Operator ran '$($opa.Tool)'" -Level 'WARN'
                 }
 
                 # Update elapsed label with current state summary.
@@ -6424,19 +7310,28 @@ $buttonHandlers = @{
                     # Scrolling up stops the log following new lines (see the
                     # sticky-bottom writer in Console.psm1). Say so, otherwise a
                     # log that has quietly stopped moving reads as a hang.
+                    # Only worth saying while the raw log is on screen. With the
+                    # technical details collapsed there is no log to have scrolled
+                    # away from, and the hint would be a claim about a control the
+                    # operator cannot see.
                     $btScrollHint = ''
                     try {
-                        if (-not (Test-WinConfigGuiBoxAtBottom -Box $btOutputBox)) {
+                        if ($btTechPanel.Visible -and -not (Test-WinConfigGuiBoxAtBottom -Box $btOutputBox)) {
                             $btScrollHint = '  |  scrolled up -- new events below'
                         }
                     } catch { }
-                    $newElapsedText = if ($btDeepProbeAvailable -and $btProbeWatch) {
-                        $devShort = Get-ProbeStateUserText -Kind device -State $btProbeWatch.DeviceState -Short
-                        $streamShort = Get-ProbeStateUserText -Kind stream -State $btProbeSession.StreamingState -Short
-                        "Recording  {0:mm\:ss}  |  {1}  |  {2}{3}" -f $elapsed, $devShort, $streamShort, $btScrollHint
-                    } else {
-                        "Recording  {0:mm\:ss}  -- click Stop and Upload when done{1}" -f $elapsed, $btScrollHint
-                    }
+                    # The clock alone in the header. The device/stream shorthand
+                    # that used to ride along here is now the diagram, and
+                    # repeating it in words beside it was the duplicate-state
+                    # problem this redesign is about.
+                    $newTimerText = "{0:mm\:ss}" -f $elapsed
+                    if ($btTimerLabel.Text -ne $newTimerText) { $btTimerLabel.Text = $newTimerText }
+                    # The bottom line carries ONLY what the header does not. With
+                    # the clock and the primary action moved up there, repeating
+                    # "Recording 12:47 -- click Stop and Upload when done" is the
+                    # duplicated state this redesign removes. The later phases
+                    # still write "Packaging..." and "Aborted." here.
+                    $newElapsedText = $btScrollHint.TrimStart(' ', '|')
                     if ($btElapsedLabel.Text -ne $newElapsedText) { $btElapsedLabel.Text = $newElapsedText }
                 }
 
@@ -6468,6 +7363,11 @@ $buttonHandlers = @{
                                 -TargetEverActive     ([bool]$btProbeSession.PortEverHeld)
                             [void]$btProbeSession.OperatorMarkers.Add($mk)
                             Write-BtLog "  $($now.ToString('HH:mm:ss'))  [MARK    ]  $(Format-ProbeStateMarker -Marker $mk)" -Level "ACTION"
+                            # The operator marker is the only labelling channel
+                            # this investigation has, so its acknowledgement has
+                            # to be visible on the default screen rather than in
+                            # a log the operator has to open.
+                            script:Add-BtRecorderEvent -Text $(if ($mkLabel) { "Marked: $mkLabel" } else { 'Operator marked this moment' }) -Level 'ACTION' -At $now
                             foreach ($cx in @($mk.Contradictions)) {
                                 Write-BtLog "             $cx" -Level "WARN"
                             }
@@ -6486,6 +7386,7 @@ $buttonHandlers = @{
                             }
                         } else {
                             Write-BtLog "  $($now.ToString('HH:mm:ss'))  [MARK    ]  Operator marked '$mkLabel' (limited monitoring -- no machine state captured with it)" -Level "ACTION"
+                            script:Add-BtRecorderEvent -Text "Marked: $mkLabel (no machine state)" -Level 'ACTION' -At $now
                         }
                         $btMarkBox.Text = 'NO code'
                         $btMarkBox.Tag  = 'placeholder'
@@ -6582,6 +7483,7 @@ $buttonHandlers = @{
                                     # scopes to the same device the watch does.
                                     $btProbeSession.TargetMacFrozen = $lateMac
                                     Write-BtLog "  Target acquired: $($lateDev.FriendlyName)  MAC: $lateMac" -Level "OK"
+                                    script:Add-BtRecorderEvent -Text "Target acquired: $($lateDev.FriendlyName)" -Level 'OK'
                                 }
                             }
                         }
@@ -6653,6 +7555,19 @@ $buttonHandlers = @{
                             $evtKind = switch ($evt.Kind) { 'device' { 'device' } 'comport' { 'comport' } 'BTLINK' { 'btlink' } 'STREAM' { 'stream' } default { '' } }
                             $evtStateText = if ($evtKind) { Get-ProbeStateUserText -Kind $evtKind -State $evt.State -Short } else { $evt.State }
                             Write-BtLog "  $ts  [$kindTag]  $evtStateText  --  $($evt.Reason)" -Level $evt.Level
+
+                            # ── Session events, the operator's short list ────
+                            # A RENDER-TIME filter over the SAME events that were
+                            # just persisted and logged in full. Anything dropped
+                            # here is still in events.jsonl and still in the raw
+                            # log above; what is removed is only the promotion to
+                            # the summary list. Filtering in the collector would
+                            # remove evidence from the capture, which is the one
+                            # thing this redesign must not do.
+                            if (Get-Command Get-BtRecorderEventText -ErrorAction SilentlyContinue) {
+                                $viewEvt = try { Get-BtRecorderEventText -Kind $evt.Kind -State $evt.State -Level $evt.Level } catch { $null }
+                                if ($viewEvt) { script:Add-BtRecorderEvent -Text $viewEvt.Text -Level $viewEvt.Level -At $evt.Timestamp }
+                            }
                             if ($evt.Annotation) {
                                 $annoLevel = if ($evt.Annotation.StartsWith('[!]')) { 'FAIL' } elseif ($evt.Annotation.StartsWith('[~]')) { 'WARN' } else { 'OK' }
                                 Write-BtLog "             $($evt.Annotation)" -Level $annoLevel
@@ -6867,8 +7782,12 @@ $buttonHandlers = @{
 
             if ($btPollJob) { Remove-Job $btPollJob -Force -ErrorAction SilentlyContinue }
 
+            # Both operator paths out of the recording are closed the instant the
+            # loop exits. The Abort item is disabled as well as the button --
+            # leaving a live-looking Abort in the overflow during packaging is a
+            # control that promises something it can no longer do.
             $btStopBtn.Enabled = $false
-            $btAbortBtn.Enabled = $false
+            $btMoreAbort.Enabled = $false
             $btAnomalyBar.Visible = $false
 
             if ($script:BtRec_AbortClicked) {
@@ -6878,6 +7797,15 @@ $buttonHandlers = @{
                 $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(220, 180, 80)
                 $btBannerLabel.Text      = "Aborted -- no data was uploaded. You may close this window."
                 $btElapsedLabel.Text     = "Aborted."
+                # The header clock must stop claiming a running recording. A timer
+                # left ticking on an aborted run is the window asserting a state
+                # the run contradicts.
+                $btTimerLabel.Text       = "Aborted"
+                $btTimerLabel.ForeColor  = [System.Drawing.Color]::FromArgb(220, 180, 80)
+                $btStopBtn.Visible       = $false
+                $btMarkBtn.Visible       = $false
+                $btMarkBox.Visible       = $false
+                $btMoreBtn.Visible       = $false
                 if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
                 return
             }
@@ -6886,12 +7814,17 @@ $buttonHandlers = @{
             $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 200, 100)
             $btBannerLabel.Text      = "Step 3 of 3 - Taking final snapshot, packaging and uploading..."
             $btElapsedLabel.Text     = "Packaging..."
+            $btTimerLabel.Text       = "Packaging"
+            $btTimerLabel.Font       = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+            $btTimerLabel.ForeColor  = [System.Drawing.Color]::FromArgb(255, 200, 100)
 
-            # Recording is over — free the bottom row for the saved-file path + Open Folder.
+            # Recording is over -- free the bottom row for the saved-file path +
+            # Open Folder. The overflow goes with them: its Abort item would be a
+            # live-looking control that can no longer do anything.
             $btStopBtn.Visible  = $false
-            $btAbortBtn.Visible = $false
             $btMarkBtn.Visible  = $false
             $btMarkBox.Visible  = $false
+            $btMoreBtn.Visible  = $false
 
             Write-BtLog ""
             Write-BtLog "Step 3 of 3: Stopping - taking final snapshot..." -Level "STEP"
