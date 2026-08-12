@@ -114,64 +114,82 @@ function Resolve-ComPortRole {
     return @{ Role = $null; Source = 'none'; Conflict = $false }
 }
 
-function Format-ComPortRoleSummary {
+function Get-ComPortRoleMap {
     <#
     .SYNOPSIS
-        Pure. Renders one operator-facing line saying which of the headset's COM
-        ports is the DATA channel and which is the COMMAND channel.
+        Pure. Reports which of the headset's COM ports is the DATA channel and
+        which is the COMMAND channel, as DATA rather than as a sentence.
     .DESCRIPTION
         Issue #68 item 2: the recorder window is the ONLY view of a live probe --
         no tick data reaches disk until the run ends -- so the port roles have to
-        be pinned in the window, not left in the closing report. The roles were
-        already resolved every tick by Resolve-ComPortRole and written to
+        be on screen for the whole run, not left in the closing report. The roles
+        were already resolved every tick by Resolve-ComPortRole and written to
         WatchState.ComPortMatches[].ChannelRole; nothing rendered them live.
 
-        Issue #68 item 4 governs every branch here: an absent measurement must
-        render as absent. "Not probed yet" and "no ports matched" are DIFFERENT
-        states and are worded differently, and neither may be shortened to a
-        bare 'unknown' -- which reads as a reading that was taken.
+        THIS RETURNS A MAP, NOT A LINE. It used to return one formatted string
+        for the header strip (Format-ComPortRoleSummary). The roles now belong
+        inside the COM Ports panel, where the question they answer -- which port
+        is this headset's, and is anyone using it -- is already being answered,
+        and a panel needs the pieces separately. Returning structure rather than
+        prose also means the one place that decides a role is still
+        Resolve-ComPortRole: nothing downstream re-derives it from a string.
+
+        Issue #68 item 4 governs every state here: an absent measurement must
+        render as absent. 'NotProbed' and 'NoMatches' are DIFFERENT states --
+        nothing looked, versus we looked and nothing matched -- and neither may
+        be collapsed into a bare 'unknown', which reads as a reading that was
+        taken. A caller that shortens them back into one word reintroduces the
+        defect this separation exists to prevent.
 
         A role conflict outranks everything: Resolve-ComPortRole returns a null
         role when the device's own channel name and the RFCOMM channel number
         disagree, and a tech sent to the wrong port with confidence is worse off
-        than one told the roles could not be established.
+        than one told the roles could not be established. In that state this
+        returns NO port roles at all rather than the half it still believes.
     .OUTPUTS
-        [string] Single line, ASCII, safe to put in a WinForms Label.
+        [hashtable] State ('NotProbed' | 'Conflict' | 'NoMatches' | 'Mapped')
+        and Ports, an array of @{ Port; Role } where Role is 'Data', 'Command'
+        or $null. A null Role is "not established", never a guess.
     #>
     [CmdletBinding()]
-    [OutputType([string])]
     param(
         [AllowNull()]
         [hashtable]$WatchState
     )
 
     if (-not $WatchState) {
-        return 'COM ports: not probed yet -- no reading has been taken'
+        return @{ State = 'NotProbed'; Ports = @() }
     }
-    if ($WatchState.ComPortRoleConflict) {
-        return '[!] COM port roles CONFLICT -- the channel name and the RFCOMM channel number disagree; roles NOT stated'
+    # ContainsKey rather than a bare property read: this module runs under
+    # Set-StrictMode, and a watch state built by an older caller need not carry
+    # every key this one reads.
+    if ($WatchState.ContainsKey('ComPortRoleConflict') -and $WatchState.ComPortRoleConflict) {
+        return @{ State = 'Conflict'; Ports = @() }
     }
 
-    $matchesList = @($WatchState.ComPortMatches)
+    $matchesList = @($(if ($WatchState.ContainsKey('ComPortMatches')) { $WatchState.ComPortMatches } else { @() }))
     if ($matchesList.Count -eq 0) {
-        # Deliberately distinct from the not-probed wording above. Both are
-        # "no roles on screen"; only one of them is a measurement.
-        return 'COM ports: none matched to this headset yet'
+        # Deliberately distinct from the not-probed state above. Both are "no
+        # roles to show"; only one of them is a measurement.
+        return @{ State = 'NoMatches'; Ports = @() }
     }
 
-    $parts = @()
+    $ports = @()
     foreach ($m in $matchesList) {
-        $portName = if ($m.PortName) { [string]$m.PortName } else { '(port name not reported)' }
-        $parts += switch ([string]$m.ChannelRole) {
-            'Data'    { "DATA $portName" }
-            'Command' { "COMMAND $portName" }
-            # Never guess. FI-012 records that the COM NUMBER moves between
-            # re-pairs while the channel does not, so a positional guess here
-            # would be wrong on exactly the machines this recorder exists for.
-            default   { "$portName (role not established)" }
+        # Never guess a role. FI-012 records that the COM NUMBER moves between
+        # re-pairs while the channel does not, so a positional guess here would
+        # be wrong on exactly the machines this recorder exists for.
+        $role = switch ([string]$m.ChannelRole) {
+            'Data'    { 'Data' }
+            'Command' { 'Command' }
+            default   { $null }
+        }
+        $ports += @{
+            Port = $(if ($m.PortName) { [string]$m.PortName } else { $null })
+            Role = $role
         }
     }
-    return "COM ports: $($parts -join ' | ')"
+    return @{ State = 'Mapped'; Ports = @($ports) }
 }
 
 function Get-TargetWatchStateValues {
@@ -1210,7 +1228,7 @@ Export-ModuleMember -Function @(
     'Find-TargetDeviceInPnpSnapshot',
     'Find-TargetBluetoothComPort',
     'Resolve-ComPortRole',
-    'Format-ComPortRoleSummary',
+    'Get-ComPortRoleMap',
     'Get-TargetDeviceProcessSnapshot',
     'Test-ProcessRunningInSnapshot',
     'New-TargetWatchState',

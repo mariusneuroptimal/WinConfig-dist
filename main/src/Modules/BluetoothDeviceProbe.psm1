@@ -1954,6 +1954,13 @@ function Get-BtDiagnosticChain {
         [System.Nullable[double]]$IoRecentOpsPerSecond,
         [System.Nullable[double]]$IoBaselineOpsPerSecond,
         [hashtable]$AdapterInfo,
+        # Get-ComPortRoleMap's output, passed through rather than re-derived.
+        # Resolve-ComPortRole is the one place that decides which port is DATA
+        # and which is COMMAND; this function carries that answer to the panel
+        # that shows it and adds nothing to it. Absent (an older caller) is a
+        # state of its own -- 'NotStated' -- and is NOT the same as a map that
+        # was taken and found nothing.
+        [hashtable]$ComPortRoleMap,
         [ValidateSet('Explicit', 'Unique', 'Inferred', 'Ambiguous', 'Unscoped', 'Unknown')]
         [string]$TargetBinding = 'Unknown',
         [string]$TargetLabelName,
@@ -1986,9 +1993,16 @@ function Get-BtDiagnosticChain {
     $adapterObs    = 'NotObserved'
     $adapterDetail = 'Not read'
     $adapterEv     = @()
+    # Carried as their own fields, not left for a renderer to recover from an
+    # evidence sentence. "Which Bluetooth hardware is this PC using" is the
+    # question the host panel answers, and parsing it back out of prose would be
+    # a second answerer to a question this branch has already answered.
+    $adapterNameOut   = $null
+    $adapterDriverOut = $null
     if ($AdapterInfo) {
         $adapterObs = 'Historical'
         $adapterName = if ($AdapterInfo.FriendlyName) { $AdapterInfo.FriendlyName } else { 'Bluetooth adapter' }
+        if ($AdapterInfo.FriendlyName) { $adapterNameOut = [string]$AdapterInfo.FriendlyName }
         if (-not $AdapterInfo.Present) {
             $adapterHealth = 'Failed'
             $adapterDetail = 'Not found'
@@ -2003,6 +2017,7 @@ function Get-BtDiagnosticChain {
             $adapterEv += (New-ChainEvidence 'Historical' "$adapterName reported status '$($AdapterInfo.Status)' when the recording started.")
         }
         if ($AdapterInfo.DriverInfo -and $AdapterInfo.DriverInfo.Version) {
+            $adapterDriverOut = [string]$AdapterInfo.DriverInfo.Version
             $adapterEv += (New-ChainEvidence 'Historical' "Driver $($AdapterInfo.DriverInfo.Version).")
         }
         $adapterEv += (New-ChainEvidence 'NotObserved' 'Read once at the start of the recording, not on every check. An adapter that failed mid-session is not reflected here.')
@@ -2012,6 +2027,7 @@ function Get-BtDiagnosticChain {
     [void]$nodes.Add(@{
         Id = 'Adapter'; Title = 'Bluetooth adapter'; EdgeLabel = $null; DependsOn = @()
         Health = $adapterHealth; Observation = $adapterObs; Detail = $adapterDetail; Evidence = $adapterEv
+        AdapterName = $adapterNameOut; DriverVersion = $adapterDriverOut
     })
 
     # ── 2. Pairing ────────────────────────────────────────────────────────────
@@ -2086,9 +2102,21 @@ function Get-BtDiagnosticChain {
     if ($comHealth -eq 'Healthy') {
         $comEv += (New-ChainEvidence 'Historical' 'A registered COM port is what a previous successful pairing left behind. It survives a flat battery, a headset in a drawer and a broken driver, so it does NOT show that anything is connected now.')
     }
+    # The port names and the DATA/COMMAND mapping travel ON the node, because
+    # the panel that shows this node is where an operator asks "which ports are
+    # this headset's, and is anyone using them". 'NotStated' is the caller not
+    # having a map to give, which is a different fact from a map that came back
+    # empty -- the same distinction the ComPorts health itself keeps.
+    $roleState = 'NotStated'
+    $rolePorts = @()
+    if ($ComPortRoleMap) {
+        if ($ComPortRoleMap.ContainsKey('State')) { $roleState = [string]$ComPortRoleMap.State }
+        if ($ComPortRoleMap.ContainsKey('Ports')) { $rolePorts = @($ComPortRoleMap.Ports) }
+    }
     [void]$nodes.Add(@{
         Id = 'ComPorts'; Title = 'COM ports registered'; EdgeLabel = 'Windows device enumeration -> virtual serial ports'; DependsOn = @('Pairing')
         Health = $comHealth; Observation = 'Historical'; Detail = $comDetail; Evidence = $comEv
+        Ports = $ports; RoleState = $roleState; Roles = $rolePorts
     })
 
     # ── 4. Radio link ─────────────────────────────────────────────────────────
@@ -2215,6 +2243,11 @@ function Get-BtDiagnosticChain {
         # called a consequence of either.
         Id = 'PortHold'; Title = 'COM port held'; EdgeLabel = 'live link + application -> owns the serial port'; DependsOn = @('ComPorts', 'RadioLink', 'App')
         Health = $holdHealth; Observation = $holdObs; Detail = $holdDetail; Evidence = $holdEv
+        # WHICH port is held, as a list rather than baked into Detail. The COM
+        # panel marks the held port inside the role mapping, and re-parsing
+        # "Held (COM3)" to find it would be a renderer inventing a second
+        # answerer for a fact this node was handed.
+        HeldPorts = $held
     })
 
     # ── 7. Data flow ──────────────────────────────────────────────────────────
@@ -2467,6 +2500,17 @@ function Get-BtDiagnosticChain {
             # reading an absent hashtable key THROWS rather than returning
             # $null, so "additive" has to be spelled out.
             Cause        = $(if ($_.ContainsKey('Cause')) { $_.Cause } else { $null })
+            # Node-specific identity fields, projected the same defensive way as
+            # Cause and for the same reason: they exist on ONE node each, and a
+            # bare property read under StrictMode would throw on every other.
+            # They are what the panels print; nothing here judges them, and
+            # chain.jsonl's node projection is unchanged.
+            AdapterName   = $(if ($_.ContainsKey('AdapterName'))   { $_.AdapterName }   else { $null })
+            DriverVersion = $(if ($_.ContainsKey('DriverVersion')) { $_.DriverVersion } else { $null })
+            Ports         = @($(if ($_.ContainsKey('Ports'))       { $_.Ports }         else { @() }))
+            RoleState     = $(if ($_.ContainsKey('RoleState'))     { $_.RoleState }     else { $null })
+            Roles         = @($(if ($_.ContainsKey('Roles'))       { $_.Roles }         else { @() }))
+            HeldPorts     = @($(if ($_.ContainsKey('HeldPorts'))   { $_.HeldPorts }     else { @() }))
             BlockedBy    = $_.BlockedBy
             IsRoot       = ($null -eq $_.BlockedBy -and $_.Health -ne 'Healthy')
             Evidence     = @($_.Evidence)
@@ -2498,6 +2542,13 @@ function Get-BtDiagnosticChain {
         TargetBinding     = $TargetBinding
         TargetConfirmed   = ($TargetBinding -in @('Explicit', 'Unique'))
         TargetLabel       = $targetLabel
+        # The two halves as well as the joined label. The Arc panel prints the
+        # device on one line and its MAC on another, and splitting "Name (MAC)"
+        # back apart in the renderer would be a parser standing in for a fact
+        # this function was given. TargetLabel is unchanged and stays the one
+        # string chain.jsonl records.
+        TargetName        = $(if ($TargetLabelName) { [string]$TargetLabelName } else { $null })
+        TargetMac         = $(if ($TargetLabelMac)  { [string]$TargetLabelMac }  else { $null })
         # Echoed, not re-derived. The window's scope line and chain.jsonl both
         # need "where did this identity come from", and Get-BtTargetBinding is
         # the one place that answers it.
@@ -2534,10 +2585,21 @@ function Get-BtRecorderView {
         looking at wins. What this function chooses is only which panel a node
         appears in, which short word to print, and which glyph to draw.
 
+        THE PANELS ALSO CARRY THE IDENTIFIERS. This System names the adapter and
+        its driver, NeurOptimal Arc names the headset and its MAC, and COM Ports
+        carries the DATA/COMMAND mapping. Those three facts used to be printed
+        in a header strip above the picture, which meant the screen stated the
+        target twice and the ports twice -- and two statements of one fact can
+        disagree. They are read off the chain here and rendered once, in the
+        panel whose question they answer.
+
         THE PICTURE IS NOT THE DEPENDENCY GRAPH, and the difference is
-        deliberate. The connection row is Host - Wireless - Arc. The supporting
-        signals -- NeurOptimal, COM, Data -- are drawn UNCONNECTED, side by
-        side, because they do not form a chain:
+        deliberate. The connection row is This System - Bluetooth Link -
+        NeurOptimal Arc. "Bluetooth Link" rather than "Bluetooth" because the
+        panel to its left already names the Bluetooth adapter, and one word for
+        both is how a healthy adapter gets read as a healthy connection. The
+        supporting signals -- NeurOptimal, COM Ports, Data Flow -- are drawn
+        UNCONNECTED, side by side, because they do not form a chain:
 
           * NeurOptimal has no Bluetooth dependency at all. Chaining it under
             the radio would report "NeurOptimal is closed" as a consequence of a
@@ -2609,7 +2671,8 @@ function Get-BtRecorderView {
     function New-ViewTile {
         param(
             [string]$Slot, [string]$Label, $Node, [string]$Caption,
-            [hashtable]$Face, [string]$Note, [string]$Caveat, [array]$NodeIds
+            [hashtable]$Face, [string]$Note, [string]$Caveat, [array]$NodeIds,
+            [array]$Details
         )
         $f = if ($Face) { $Face } else { Resolve-TileFace $Node.Health $Node.Observation }
         return [pscustomobject]@{
@@ -2620,6 +2683,14 @@ function Get-BtRecorderView {
             Glyph       = $f.Glyph
             Level       = $f.Level
             Caption     = $Caption
+            # IDENTIFIERS, not state. Adapter driver, headset MAC, DATA/COMMAND
+            # port numbers: the facts that used to be crammed into the header
+            # strip, moved to the panel whose question they answer. They are a
+            # SEPARATE field from Caption and Note because they are neither a
+            # reading nor context on one -- a renderer must be able to draw them
+            # in their own weight, and a reader must not mistake a COM number
+            # for a verdict.
+            Details     = @($(if ($Details) { $Details | Where-Object { $_ } } else { @() }))
             # A note is context on a reading that WAS taken ("checked at start").
             # A caveat is a warning that limits what the reading may be used for
             # ("target not confirmed"). They are rendered differently, so they
@@ -2639,19 +2710,45 @@ function Get-BtRecorderView {
         }
     }
 
-    # ── Host / System  <- Adapter ─────────────────────────────────────────────
+    # ── This System  <- Adapter ───────────────────────────────────────────────
     # Historical by construction: the adapter is read once, at recording start.
     # The note says so rather than letting a start-of-run reading pass as live.
+    #
+    # NAMED, not just graded. "Bluetooth ready" was true of every working box
+    # and told a reader nothing they could act on; WHICH radio and WHICH driver
+    # is the question this panel exists for, and the answer differs on every
+    # machine a capture arrives from. The green ring and the glyph still carry
+    # the state -- the caption stops repeating them.
+    #
+    # ONE identifier line, deliberately. This is not a hardware inventory: the
+    # full adapter record is already in the technical details and in the
+    # capture, and a panel that grows a line per fact is the header problem
+    # moved rather than fixed.
     $adapter = $byId['Adapter']
+    $adapterName = [string]$adapter.AdapterName
+    $hostDetails = @()
     $hostCaption = switch ($adapter.Health) {
-        'Healthy' { 'Bluetooth ready' }
+        'Healthy' { if ($adapterName) { $adapterName } else { 'Bluetooth ready' } }
         'Failed'  { $adapter.Detail }
         default   { 'Not read' }
     }
+    if ($adapter.Health -eq 'Healthy') {
+        if ($adapter.DriverVersion) { $hostDetails += "Driver $($adapter.DriverVersion)" }
+    } elseif ($adapterName) {
+        # A fault takes the caption, so the identity drops to the detail line --
+        # "Status Error" is not actionable without knowing which adapter it is
+        # about, and that is exactly the state where the name matters most.
+        $hostDetails += $adapterName
+    }
     $hostNote = if ($adapter.Observation -eq 'Historical') { 'read at start' } else { '' }
-    $tileHost = New-ViewTile -Slot 'Host' -Label 'Host / System' -Node $adapter -Caption $hostCaption -Note $hostNote
+    $tileHost = New-ViewTile -Slot 'Host' -Label 'This System' -Node $adapter -Caption $hostCaption -Note $hostNote -Details $hostDetails
 
-    # ── Wireless  <- RadioLink ────────────────────────────────────────────────
+    # ── Bluetooth Link  <- RadioLink ──────────────────────────────────────────
+    # NOT "Bluetooth". The panel to its left already names the Bluetooth
+    # ADAPTER, and one screen carrying "Bluetooth" twice for two different
+    # things -- the hardware in this PC and the live connection to the headset --
+    # is the ambiguity that makes an operator read a healthy adapter as a
+    # healthy connection.
     # Cause, not health, chooses the words. 'Failed' covers both a link that
     # dropped and a link that was never there while a port is held, and telling
     # an operator "connection lost" about the second is a claim the reading does
@@ -2672,17 +2769,50 @@ function Get-BtRecorderView {
     # Idle is a legitimately-negative reading, not a fault, and the note is
     # where that is said in the panel rather than in a paragraph below it.
     $wirelessNote = if ($link.Health -eq 'Idle') { 'normal between sessions' } else { '' }
-    $tileWireless = New-ViewTile -Slot 'Wireless' -Label 'Wireless' -Node $link -Caption $wirelessCaption -Note $wirelessNote
+    $tileWireless = New-ViewTile -Slot 'Wireless' -Label 'Bluetooth Link' -Node $link -Caption $wirelessCaption -Note $wirelessNote
 
-    # ── Arc  <- Pairing, gated by target identity ─────────────────────────────
+    # ── NeurOptimal Arc  <- Pairing, gated by target identity ─────────────────
+    # THE PANEL NAMES THE DEVICE. Capture 8E39860E4AF2 measured the wrong
+    # headset for 37 minutes, and the fix at the time was to pin the identity in
+    # the header strip. It is pinned here instead: the same fact, in the panel
+    # that is about that device, rather than repeated in two places where the
+    # two can disagree about which headset this recording is scoped to.
+    #
+    # "Identified" is gone as a caption wherever an identity is actually shown.
+    # A tick, a device number and a MAC already say it was identified; the word
+    # only survives for the case where the pairing reading is healthy and no
+    # identity reached this function -- where it is the honest answer.
     $pair = $byId['Pairing']
     $arcFace   = $null
     $arcCaveat = ''
+    $arcDetails = @()
+    $arcName = [string]$Chain.TargetName
+    $arcMac  = [string]$Chain.TargetMac
+    # The panel is already labelled "NeurOptimal Arc", so a device named
+    # "NeurOptimal Arc 000013" would print the product name twice and push the
+    # only distinguishing part -- the device number -- to the ellipsis. Trimmed
+    # by exact literal prefix, never by a pattern: renaming a device in a
+    # renderer is how a capture ends up describing a headset that was not there.
+    $arcIdentity = $arcName
+    foreach ($prefix in @('NeurOptimal Arc ', 'NeurOptimal ')) {
+        if ($arcIdentity -and $arcIdentity.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $arcIdentity = $arcIdentity.Substring($prefix.Length).Trim()
+            break
+        }
+    }
     $arcCaption = switch ($pair.Health) {
-        'Healthy'  { 'Identified' }
+        'Healthy'  {
+            if ($arcIdentity) { $arcIdentity }
+            elseif ($arcMac)  { $arcMac }
+            else              { 'Identified' }
+        }
         'Degraded' { 'More than one match' }
         default    { $pair.Detail }
     }
+    # The MAC stays on screen through a FAILED pairing reading too. "Windows is
+    # not seeing the Arc" is a claim about a particular headset, and a reader
+    # sent to check a headset needs to know which one.
+    if ($arcMac -and $arcCaption -ne $arcMac) { $arcDetails += $arcMac }
     if ($Chain.LocalizationScope -eq 'Suspended') {
         # The Pairing reading here is about a fallback candidate, so printing it
         # under a panel labelled "Arc" would name a device this recording never
@@ -2690,11 +2820,25 @@ function Get-BtRecorderView {
         # in the details -- but the panel stops claiming it describes the Arc.
         $arcFace    = @{ Marker = '[?]'; Glyph = 'Question'; Level = 'Unknown' }
         $arcCaption = 'Not confirmed'
+        # The identity lines are DROPPED here, not merely caveated. A MAC printed
+        # confidently under a panel that has just said the target is unconfirmed
+        # is the overconfident device conclusion this scope gate exists to
+        # prevent; the candidate travels as a caveat, which is drawn as a
+        # warning rather than as a fact.
+        $arcDetails = @()
         $arcCaveat  = if ($Chain.TargetLabel) { "Candidate: $($Chain.TargetLabel)" } else { 'No candidate named' }
     } elseif ($Chain.LocalizationScope -eq 'Provisional') {
         $arcCaveat = 'Target not confirmed'
+    } elseif ($Chain.LocalizationScope -eq 'Unstated') {
+        # A caller that told this recording nothing about its target. It is not
+        # Suspended -- nothing has claimed the target is unknown -- but it must
+        # not read as a confirmed one either. This used to be said only on a
+        # header line; with that line gone it has to be said here or a wiring
+        # break becomes silence, which is the failure mode this repo keeps
+        # finding: an absent measurement rendered as nothing at all.
+        $arcCaveat = 'Target not stated'
     }
-    $tileArc = New-ViewTile -Slot 'Arc' -Label 'Arc' -Node $pair -Caption $arcCaption -Face $arcFace -Caveat $arcCaveat
+    $tileArc = New-ViewTile -Slot 'Arc' -Label 'NeurOptimal Arc' -Node $pair -Caption $arcCaption -Face $arcFace -Caveat $arcCaveat -Details $arcDetails
 
     # ── NeurOptimal  <- App ───────────────────────────────────────────────────
     $app = $byId['App']
@@ -2706,7 +2850,7 @@ function Get-BtRecorderView {
     $appNote = if ($app.Health -eq 'Idle') { 'not a fault' } else { '' }
     $tileApp = New-ViewTile -Slot 'App' -Label 'NeurOptimal' -Node $app -Caption $appCaption -Note $appNote
 
-    # ── COM  <- ComPorts + PortHold, by the precedence in the header ──────────
+    # ── COM Ports  <- ComPorts + PortHold, by the precedence in the header ────
     $com  = $byId['ComPorts']
     $hold = $byId['PortHold']
     $comNode = $hold
@@ -2720,14 +2864,70 @@ function Get-BtRecorderView {
         # reading is the silence a reader fills in with "fine".
         $comCaption = $hold.Detail
     } elseif ($hold.Health -eq 'Healthy') {
-        # Deliberately NOT "held by NO.exe". The hold test opens a port and
-        # observes that it is refused; that proves SOME process owns it and
-        # nothing here binds the handle to NeurOptimal (issue #93).
-        $comCaption = $hold.Detail
-        $comNote    = 'in use by a process'
+        # Deliberately NOT "held by NO.exe", which is what the brief for this
+        # panel asked for. The hold test opens a port and observes that it is
+        # refused; that proves SOME process owns it, and nothing in this
+        # recording binds the handle to NeurOptimal (issue #93). Naming a
+        # process here would be the recorder asserting an owner it did not
+        # measure, on the one screen an operator uses to pick a remedy.
+        #
+        # The port numbers left this caption when they gained their own lines
+        # below, and the note that used to say "in use by a process" moved INTO
+        # the caption: two lines saying the same thing beside a mapping that
+        # says something new is the density this pass is removing.
+        $comCaption = 'Held by a process'
     } elseif ($hold.Health -eq 'Idle') {
         $comCaption = 'Registered, idle'
         $comNote    = 'nobody is using it'
+    }
+
+    # ── The DATA / COMMAND mapping, which used to live in the header strip ────
+    #
+    # Roles come from Resolve-ComPortRole via Get-ComPortRoleMap and are read
+    # here, never re-derived: FI-012 records that the COM NUMBER moves on every
+    # re-pair while the channel does not, so a positional guess ("the lower
+    # number is DATA") would be wrong on exactly the machines this recorder
+    # exists for. Where the roles are not established the ports are still shown
+    # -- WITHOUT role labels. A tech sent to the wrong port with confidence is
+    # worse off than one told the roles are not known.
+    $comPorts = @($com.Ports | Where-Object { $_ })
+    $comHeld  = @($hold.HeldPorts | Where-Object { $_ })
+    $comRoles = @($com.Roles | Where-Object { $_ })
+    # Marks the port a process is holding, inside the mapping rather than as a
+    # separate line. Which CHANNEL is held is diagnostic in itself -- a held
+    # command port with an idle data port is not the same situation as the
+    # reverse -- and that distinction had nowhere to appear before.
+    function Format-ComPortList {
+        param([array]$Ports, [array]$Held)
+        return (@($Ports | ForEach-Object {
+            if ($Held -contains $_) { "$_ (in use)" } else { "$_" }
+        }) -join ', ')
+    }
+    $comDetails = @()
+    $roleState = [string]$com.RoleState
+    if ($roleState -eq 'Conflict') {
+        # The FI-012 invariant failed on this box. Say nothing about which port
+        # is which -- this panel prints the ports and refuses the labels.
+        $comDetails += 'Roles CONFLICT -- not stated'
+        if ($comPorts.Count -gt 0) { $comDetails += "Ports: $(Format-ComPortList -Ports $comPorts -Held $comHeld)" }
+    } else {
+        # A resolved role whose PORT NAME Windows never returned still gets its
+        # line, saying so. Dropping it would delete a channel the recorder did
+        # resolve, and the panel would show one port where there are two.
+        $dataPorts = @($comRoles | Where-Object { $_.Role -eq 'Data' }    | ForEach-Object { if ($_.Port) { [string]$_.Port } else { '(port name not reported)' } })
+        $cmdPorts  = @($comRoles | Where-Object { $_.Role -eq 'Command' } | ForEach-Object { if ($_.Port) { [string]$_.Port } else { '(port name not reported)' } })
+        if ($dataPorts.Count -gt 0) { $comDetails += "Data: $(Format-ComPortList -Ports $dataPorts -Held $comHeld)" }
+        if ($cmdPorts.Count -gt 0)  { $comDetails += "Command: $(Format-ComPortList -Ports $cmdPorts -Held $comHeld)" }
+        # Degrade to the bare port list rather than to silence. This covers the
+        # older caller that passes no map at all, a map taken before any port
+        # matched, and a port whose channel could not be resolved from either
+        # source -- all of which have registered ports worth showing and no
+        # roles this panel is entitled to claim.
+        $unroled = @($comPorts | Where-Object { $_ -notin $dataPorts -and $_ -notin $cmdPorts })
+        if ($unroled.Count -gt 0) {
+            $label = if ($dataPorts.Count -gt 0 -or $cmdPorts.Count -gt 0) { 'Role not established' } else { 'Ports' }
+            $comDetails += "${label}: $(Format-ComPortList -Ports $unroled -Held $comHeld)"
+        }
     }
     # The HISTORICAL marker rides on the panel when registration is the only
     # positive fact left -- ports exist, and we LOOKED and nobody is holding
@@ -2738,14 +2938,19 @@ function Get-BtRecorderView {
     # that nothing was measured, and an H badge beside it would advertise a
     # historical POSITIVE that this recording is not entitled to lean on.
     $comHistorical = ($com.Observation -eq 'Historical' -and $com.Health -eq 'Healthy' -and $hold.Health -eq 'Idle')
-    $tileCom = New-ViewTile -Slot 'Com' -Label 'COM' -Node $comNode -Caption $comCaption -Note $comNote -NodeIds @('ComPorts', 'PortHold')
+    $tileCom = New-ViewTile -Slot 'Com' -Label 'COM Ports' -Node $comNode -Caption $comCaption -Note $comNote -NodeIds @('ComPorts', 'PortHold') -Details $comDetails
     # Assigned after construction: New-ViewTile derives Historical from ONE
     # node, and this panel's historical-ness is a fact about the pair.
     $tileCom.Historical = [bool]$comHistorical
 
-    # ── Data  <- DataFlow ─────────────────────────────────────────────────────
+    # ── Data Flow  <- DataFlow ────────────────────────────────────────────────
+    # "Data Flow", and the captions stay the chain's own words -- "Reads
+    # steady", not "Steady". This counts NeurOptimal's read OPERATIONS from
+    # outside the application; dropping the verb would let the panel read as a
+    # statement about the EEG data itself, which is the one claim the footnote
+    # under it exists to refuse.
     $data = $byId['DataFlow']
-    $tileData = New-ViewTile -Slot 'Data' -Label 'Data' -Node $data -Caption $data.Detail
+    $tileData = New-ViewTile -Slot 'Data' -Label 'Data Flow' -Node $data -Caption $data.Detail
 
     # ── The connecting edges ──────────────────────────────────────────────────
     # Both edges carry the WIRELESS state, because the wireless node IS the

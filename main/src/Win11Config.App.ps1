@@ -4583,8 +4583,20 @@ $buttonHandlers = @{
                 TileWSlack = [int](96  * $btS)
                 GapMin     = [int](22  * $btS)
                 GapMax     = [int](150 * $btS)
-                ConnH      = [int](116 * $btS)
-                SigH       = [int](104 * $btS)
+                # MEASURED against what a tile now has to carry, not picked to
+                # look right on the healthy screen. Both rows grew when the
+                # header strip's identifiers moved into the panels:
+                #   connection tile: badge 42 + label 19 + caption 15 +
+                #                    1 identifier 15 + note/caveat 15 + 4 = 110
+                #   signal tile:     the same, with TWO identifier lines
+                #                    (Data: / Command:) and a note = 133
+                # The signal row is the taller one for the first time, and that
+                # is correct: the COM panel is the one that gained a mapping.
+                # Anything shorter clips a line, and the line that clips first
+                # is the last one -- "nobody is using it", the half that says an
+                # idle port is not a fault.
+                ConnH      = [int](120 * $btS)
+                SigH       = [int](136 * $btS)
                 BadgeR     = [int](16  * $btS)
                 BadgeTop   = [int](10  * $btS)
                 HeadH      = [int](16  * $btS)
@@ -4644,11 +4656,21 @@ $buttonHandlers = @{
             }
             $script:BtViewInk       = [System.Drawing.Color]::FromArgb(226, 226, 232)
             $script:BtViewInkDim    = [System.Drawing.Color]::FromArgb(140, 140, 150)
+            # IDENTIFIERS sit between the caption and the note: brighter than a
+            # note, because a MAC or a COM number is read and transcribed off
+            # this screen, and dimmer than the caption, because it is not the
+            # state. Its own tone rather than a shared one so a reader can tell
+            # a fact about the device from a comment on the reading.
+            $script:BtViewInkDetail = [System.Drawing.Color]::FromArgb(176, 176, 188)
             $script:BtViewInkCaveat = [System.Drawing.Color]::FromArgb(228, 178,  60)
             $script:BtViewBack      = [System.Drawing.Color]::FromArgb(20, 20, 25)
             $script:BtViewFontLabel   = New-Object System.Drawing.Font("Segoe UI", 9.75, [System.Drawing.FontStyle]::Bold)
             $script:BtViewFontCaption = New-Object System.Drawing.Font("Segoe UI", 9)
             $script:BtViewFontNote    = New-Object System.Drawing.Font("Segoe UI", 7.5)
+            # Half a point above the note font. These lines carry COM numbers,
+            # a driver version and a MAC -- strings that get read back over the
+            # phone -- so they are not allowed to be the smallest text on screen.
+            $script:BtViewFontDetail  = New-Object System.Drawing.Font("Segoe UI", 8)
             $script:BtViewFontGlyph   = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
             $script:BtViewFontBadge   = New-Object System.Drawing.Font("Segoe UI", 6.75, [System.Drawing.FontStyle]::Bold)
             # Badge geometry lives in $script:BtViewM (above), in ONE place: the
@@ -4803,6 +4825,35 @@ $buttonHandlers = @{
                     $g.DrawString([string]$t.Note, $script:BtViewFontNote, $nb, (New-Object System.Drawing.RectangleF(2, ($bottom - $lineH), ($w - 4), $lineH)), $sf)
                     $nb.Dispose()
                     $bottom -= $lineH
+                }
+
+                # THE IDENTIFIER LINES, anchored bottom-up like the note and the
+                # caveat, and drawn LAST-FIRST so they read in the order the view
+                # supplied them. They sit between the caption and the note for
+                # the same reason those two are anchored at all: flowed from the
+                # top, a caption that happened to wrap would push "Command: COM5"
+                # off the bottom edge silently, and a mapping that is half
+                # present is worse than one that is absent -- a reader takes the
+                # single visible port for the only port.
+                #
+                # Two lines is the budget the tile height is measured for, so a
+                # third is dropped rather than drawn over the caption. The view
+                # builds at most two; this clamp is the guard, not the policy.
+                $detailLines = @($t.Details | Where-Object { $_ })
+                if ($detailLines.Count -gt 2) { $detailLines = @($detailLines[0], $detailLines[1]) }
+                if ($detailLines.Count -gt 0) {
+                    # A consequence recedes here too. The identifiers are still
+                    # true on a blocked panel -- the COM ports really are those
+                    # ports -- so they are dimmed with the rest of it rather than
+                    # left at full weight, which would make an explained panel
+                    # shout louder than the cause.
+                    $detailInk = $(if ($t.Blocked) { [System.Drawing.Color]::FromArgb(96, 96, 104) } else { $script:BtViewInkDetail })
+                    $db = New-Object System.Drawing.SolidBrush($detailInk)
+                    for ($di = $detailLines.Count - 1; $di -ge 0; $di--) {
+                        $g.DrawString([string]$detailLines[$di], $script:BtViewFontDetail, $db, (New-Object System.Drawing.RectangleF(2, ($bottom - $lineH), ($w - 4), $lineH)), $sf)
+                        $bottom -= $lineH
+                    }
+                    $db.Dispose()
                 }
 
                 # The caption is the state IN WORDS. Colour is decoration on top
@@ -4996,7 +5047,7 @@ $buttonHandlers = @{
                 # assignments every three seconds buys nothing at a display whose
                 # finest unit is one state transition.
                 $key = (@(@($View.Connection) + @($View.Signals)) | ForEach-Object {
-                    "$($_.Slot)=$($_.Level)/$($_.Caption)/$($_.Note)/$($_.Caveat)/$($_.Historical)/$($_.Blocked)"
+                    "$($_.Slot)=$($_.Level)/$($_.Caption)/$(@($_.Details) -join '|')/$($_.Note)/$($_.Caveat)/$($_.Historical)/$($_.Blocked)"
                 }) -join ';'
                 $key = "$key|$($View.EdgeState)|$($View.FocusSlot)|$(@($View.AttentionSlots) -join ',')|$($View.Verdict)|$($View.VerdictContext)|$($View.TargetState)|$($View.TargetLabel)"
                 if ($key -eq $script:BtView_LastKey) { return }
@@ -5012,6 +5063,11 @@ $buttonHandlers = @{
                         Slot       = $tv.Slot
                         Label      = $tv.Label
                         Caption    = $tv.Caption
+                        # The adapter/driver, the headset MAC and the
+                        # DATA/COMMAND mapping. Read off the view like
+                        # everything else here -- this renderer resolves no
+                        # ports and names no devices of its own.
+                        Details    = @($tv.Details)
                         Marker     = $tv.Marker
                         Glyph      = $tv.Glyph
                         Level      = $tv.Level
@@ -5031,6 +5087,12 @@ $buttonHandlers = @{
                     # tooltip is the one place a reader can get the state as WORDS
                     # without opening a dialog.
                     $tip = "$($tv.Marker)  $($tv.Label): $($tv.Caption)"
+                    # The identifiers go in the tooltip UNTRIMMED. On the panel a
+                    # long adapter name is ellipsised to keep the layout stable,
+                    # and the full string has to stay reachable without opening a
+                    # dialog -- these are exactly the values that get read back
+                    # over the phone.
+                    foreach ($d in @($tv.Details)) { if ($d) { $tip = "$tip`r`n$d" } }
                     if ($tv.Historical) { $tip = "$tip`r`nH = historical. This was true earlier and was NOT re-checked just now." }
                     if ($tv.Blocked)    { $tip = "$tip`r`nExplained by '$($tv.BlockedBy)'. A consequence, not a separate problem to chase." }
                     if ($tv.Caveat)     { $tip = "$tip`r`n$($tv.Caveat)" }
@@ -5056,18 +5118,15 @@ $buttonHandlers = @{
                 if ($script:BtView.Verdict.ForeColor -ne $vCol)    { $script:BtView.Verdict.ForeColor = $vCol }
                 if ($script:BtView.Context.Text -ne $View.VerdictContext) { $script:BtView.Context.Text = $View.VerdictContext }
 
-                # Target uncertainty, prominently and simply. Hidden entirely when
-                # the target IS confirmed, so the line appearing is itself the
-                # signal -- the full binding evidence stays on the scope line in
-                # the technical details.
-                $tsText = switch ($View.TargetState) {
-                    'Provisional' { "Target not confirmed  --  candidate: $(if ($View.TargetLabel) { $View.TargetLabel } else { 'not named' })" }
-                    'Suspended'   { "TARGET NOT CONFIRMED  --  $(if ($View.TargetLabel) { "candidate: $($View.TargetLabel)" } else { 'no candidate named' })" }
-                    'Unstated'    { 'Target not stated by this recording' }
-                    default       { '' }
-                }
-                if ($script:BtView.TargetState.Text -ne $tsText) { $script:BtView.TargetState.Text = $tsText }
-                if ($script:BtView.TargetState.Visible -ne [bool]$tsText) { $script:BtView.TargetState.Visible = [bool]$tsText }
+                # Target uncertainty is NOT re-rendered here any more. It used to
+                # get its own header line as well as the Arc panel's caveat, and
+                # the two were built from different fields of the same view --
+                # one more place for the screen to say two things about one fact.
+                # Every state it carried is on the Arc panel now: Suspended
+                # replaces the identity with "Not confirmed" and names the
+                # candidate, Provisional keeps the identity and marks it, and
+                # Unstated -- the wiring-break state -- carries "Target not
+                # stated" rather than passing as a confirmed device.
             }
 
             # Per-panel evidence, on click. Delegates to the SAME dialog the chain
@@ -5483,44 +5542,25 @@ $buttonHandlers = @{
             # show, and that is different from failing to read one.
             $script:BtRec_RunIdText = '(not assigned yet)'
 
-            # The OS title bar already names the recorder. Repeating that title
-            # here in tiny grey text consumed the highest-value line without
-            # adding state; the target is the first content the operator needs.
-            $btTargetLabel = New-Object System.Windows.Forms.Label
-            $btTargetLabel.Text = "Watching: (selecting headset...)"
-            $btTargetLabel.AutoSize = $true
-            $btTargetLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
-            $btTargetLabel.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
-            $btTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(235, 235, 235)
-            $btHeaderText.Controls.Add($btTargetLabel)
-
-            # Target uncertainty, simply and prominently, on its own line -- and
-            # hidden entirely when the target IS confirmed, so its presence is
-            # itself the signal. The full binding evidence stays in the technical
-            # details, on the scope line the chain feeds.
-            $btTargetStateLabel = New-Object System.Windows.Forms.Label
-            $btTargetStateLabel.Text = ""
-            $btTargetStateLabel.AutoSize = $true
-            $btTargetStateLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
-            $btTargetStateLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
-            $btTargetStateLabel.ForeColor = [System.Drawing.Color]::FromArgb(240, 175, 90)
-            $btTargetStateLabel.Visible = $false
-            $btHeaderText.Controls.Add($btTargetStateLabel)
-
-            # Run ID, and which COM port is the DATA channel and which is the
-            # COMMAND channel. Issue #68 item 2.
+            # THE HEADER CARRIES ONLY WHAT IS NOT IN THE PICTURE. It used to open
+            # with "Watching: NeurOptimal Arc - 000013  8C1F6471000D" and a line
+            # of DATA/COMMAND port roles. Both facts are now inside the panels
+            # they describe -- the Arc panel names the headset, the COM Ports
+            # panel carries the mapping -- and printing them twice was not merely
+            # redundant: the header answered "which headset" from
+            # $btProbeTargetMac while the picture answered it from the chain's
+            # target binding, which is two answerers for one field and the defect
+            # class this window keeps producing. What is left here is the run
+            # identity and the clock, which the diagram does not carry.
             #
-            # Both facts already existed and neither was on screen. The Run ID was
-            # written once, as log line 1 -- into the exact band #64 had covered,
-            # so it was unreachable for the rest of the run. The DATA/COMMAND
-            # roles were resolved on EVERY tick by Resolve-ComPortRole and stored
-            # in ComPortMatches[].ChannelRole, and rendered only in the closing
-            # report. With no tick data on disk until the run ends, a fact that is
-            # not in this panel is a fact neither the operator nor a remote
-            # assistant reading a screenshot can obtain.
+            # Issue #68 item 2 is preserved, not reverted: the Run ID and the
+            # port roles both stay pinned and visible for the whole run, because
+            # no tick data reaches disk until the run ends and a fact that is not
+            # on screen is a fact no screenshot can recover. They are simply
+            # pinned in the panels rather than in a strip above them.
             #
-            # Consolas because these are identifiers that get read back over the
-            # phone and transcribed into a case.
+            # Consolas because a Run ID gets read back over the phone and
+            # transcribed into a case.
             $btIdentityDetailLabel = New-Object System.Windows.Forms.Label
             $btIdentityDetailLabel.Text = "Run ID: (starting...)"
             $btIdentityDetailLabel.AutoSize = $true
@@ -5796,7 +5836,6 @@ $buttonHandlers = @{
                 EventsPanel   = $btEventsPanel
                 TechToggle    = $btTechToggleBtn
                 TechPanel     = $btTechPanel
-                TargetState   = $btTargetStateLabel
                 Tooltip       = $btViewTooltip
                 # Registered so the disclosure toggle can re-measure them; they
                 # are still rendered only by Update-BtChainPanel.
@@ -6185,6 +6224,19 @@ $buttonHandlers = @{
                     AdapterInfo         = $btProbeSession.AdapterInfo
                 }
 
+                # DATA/COMMAND roles for the COM Ports panel, from the SAME
+                # ComPortMatches the closing report reads -- not a second, simpler
+                # live estimate, for the same reason the coverage line reuses
+                # Get-ProbeObservationCoverage. Resolve-ComPortRole decides the
+                # role; this only carries it. Left absent when the function is
+                # missing from the build: the chain renders that as 'NotStated'
+                # and the panel falls back to the bare port list, which is a
+                # different thing from a mapping that came back empty.
+                if (Get-Command Get-ComPortRoleMap -ErrorAction SilentlyContinue) {
+                    $btRoleMap = try { Get-ComPortRoleMap -WatchState $btProbeWatch } catch { $null }
+                    if ($btRoleMap) { $chainArgs.ComPortRoleMap = $btRoleMap }
+                }
+
                 # ── Target binding: the PREREQUISITE for any device-scoped
                 # claim below. Computed here, at the one place the chain's
                 # inputs are assembled, for the same reason everything else in
@@ -6315,40 +6367,15 @@ $buttonHandlers = @{
                 if (-not $btIdentityPanel) { return }
                 if (-not $btIdentityPanel.Visible) { $btIdentityPanel.Visible = $true }
 
-                $tText = if ($btProbeTargetMac) {
-                    "Watching: $btTargetName   $btProbeTargetMac"
-                } else {
-                    "Watching: NO HEADSET SELECTED -- this recording is not scoped to a device"
-                }
-                if ($btTargetLabel.Text -ne $tText) { $btTargetLabel.Text = $tText }
-                $tCol = if ($btProbeTargetMac) {
-                    [System.Drawing.Color]::FromArgb(235, 235, 235)
-                } else {
-                    [System.Drawing.Color]::FromArgb(255, 140, 140)
-                }
-                if ($btTargetLabel.ForeColor -ne $tCol) { $btTargetLabel.ForeColor = $tCol }
-
-                # Run ID + DATA/COMMAND port roles (#68 item 2). The roles come
-                # from Format-ComPortRoleSummary over the SAME ComPortMatches the
-                # closing report reads -- not a second, simpler live estimate, for
-                # the same reason the coverage line below reuses
-                # Get-ProbeObservationCoverage.
-                $roleText = if (Get-Command Format-ComPortRoleSummary -ErrorAction SilentlyContinue) {
-                    try { Format-ComPortRoleSummary -WatchState $btProbeWatch }
-                    catch { 'COM ports: role check failed to run -- roles NOT established' }
-                } else {
-                    # Explicitly not a reading (#68 item 4). "unknown" here would
-                    # be indistinguishable from a probe that ran and found nothing.
-                    'COM ports: role check unavailable in this build -- not measured'
-                }
-                $dText = "Run ID: $script:BtRec_RunIdText    $roleText"
+                # The header is the RUN's identity now, and nothing else. Which
+                # headset this recording is watching, and which of its COM ports
+                # is DATA and which is COMMAND, are rendered once each -- in the
+                # Arc panel and the COM Ports panel -- from the chain, which is
+                # the one answerer for both. This function used to answer "which
+                # headset" a second time from $btProbeTargetMac and could
+                # disagree with the picture below it.
+                $dText = "Run ID: $script:BtRec_RunIdText"
                 if ($btIdentityDetailLabel.Text -ne $dText) { $btIdentityDetailLabel.Text = $dText }
-                $dCol = if ($roleText -match '^\[!\]') {
-                    [System.Drawing.Color]::FromArgb(255, 140, 140)
-                } else {
-                    [System.Drawing.Color]::FromArgb(190, 190, 190)
-                }
-                if ($btIdentityDetailLabel.ForeColor -ne $dCol) { $btIdentityDetailLabel.ForeColor = $dCol }
 
                 # How long NeurOptimal has been up. Not-yet-observed is the NORMAL
                 # state before a session starts, so it is only worth escalating
@@ -6564,7 +6591,7 @@ $buttonHandlers = @{
             $script:BtChain_LinesWritten    = 0
             $script:BtChain_LinesDropped    = 0
             $script:BtChain_LastBoundaryKey = $null
-            $btIdentityDetailLabel.Text = "Run ID: $btRunId    COM ports: not probed yet -- no reading has been taken"
+            $btIdentityDetailLabel.Text = "Run ID: $btRunId"
             if (-not $btIdentityPanel.Visible) { $btIdentityPanel.Visible = $true }
 
             Write-BtLog "Run ID: $btRunId" -Level "DIM"
@@ -7254,14 +7281,15 @@ $buttonHandlers = @{
                 Write-BtLog "" -Level "DIM"
                 Write-BtLog "  Watching for Bluetooth changes (every 3s) -- events appear below as they happen" -Level "DIM"
             } else {
-                # The pinned strip is now visible from the Run ID onwards, and in
-                # this mode Update-BtLiveCoverage never runs -- so without this the
-                # panel would sit on "(selecting headset...)" for the whole run,
-                # implying a selection that is not going to happen. #68 item 1:
-                # never assert a state the run contradicts.
-                $btTargetLabel.Text = "Watching: NO HEADSET SELECTED -- device tracking is unavailable, so this recording is not scoped to a device"
-                $btTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 140, 140)
-                $btCoverageLabel.Text = "Limited monitoring -- coverage is NOT being measured. Only Bluetooth connect/disconnect events are captured."
+                # In this mode neither Update-BtLiveCoverage nor Update-BtChain
+                # ever runs, so the six panels stay blank for the whole run and
+                # this line is the ONLY thing on screen that can say why. It
+                # therefore has to carry the scope fact as well as the coverage
+                # one: without it, a recording that is not scoped to any headset
+                # would look like a recording whose panels are merely still
+                # filling in. #68 item 1: never assert a state the run
+                # contradicts, and never leave one unstated either.
+                $btCoverageLabel.Text = "Limited monitoring -- NO HEADSET IS BEING TRACKED, so this recording is not scoped to a device, and coverage is NOT being measured. Only Bluetooth connect/disconnect events are captured."
                 $btCoverageLabel.ForeColor = [System.Drawing.Color]::FromArgb(240, 210, 110)
 
                 Write-BtLog "  Limited monitoring mode -- device tracking not available" -Level "WARN"
@@ -7374,7 +7402,13 @@ $buttonHandlers = @{
                     # that used to ride along here is now the diagram, and
                     # repeating it in words beside it was the duplicate-state
                     # problem this redesign is about.
-                    $newTimerText = "{0:mm\:ss}" -f $elapsed
+                    #
+                    # NAMED, because this label is also where "Packaging" and
+                    # "Complete" appear when the run ends. A bare "02:14" that
+                    # turns into a word is a control whose meaning the reader has
+                    # to infer; "Recording 02:14" makes the phase explicit and
+                    # the transition legible.
+                    $newTimerText = "Recording {0:mm\:ss}" -f $elapsed
                     if ($btTimerLabel.Text -ne $newTimerText) { $btTimerLabel.Text = $newTimerText }
                     # The bottom line carries ONLY what the header does not. With
                     # the clock and the primary action moved up there, repeating
@@ -7862,8 +7896,16 @@ $buttonHandlers = @{
             $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(60, 40, 10)
             $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 200, 100)
             $btBannerLabel.Text      = "Step 3 of 3 - Taking final snapshot, packaging and uploading..."
-            $btElapsedLabel.Text     = "Packaging..."
-            $btTimerLabel.Text       = "Packaging"
+            # THE IN-PROGRESS WORDING, and it must stay in progress until the
+            # outcome is known. The completion switch at the end of this function
+            # is the ONLY place allowed to retire it -- previously nothing did,
+            # so a finished run showed the header still saying "Packaging" beside
+            # a banner saying the results had been sent. Both were written by
+            # this file, three hundred lines apart, and neither was wrong on its
+            # own; together they said the upload was simultaneously running and
+            # done.
+            $btElapsedLabel.Text     = "Packaging results..."
+            $btTimerLabel.Text       = "Packaging..."
             $btTimerLabel.Font       = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
             $btTimerLabel.ForeColor  = [System.Drawing.Color]::FromArgb(255, 200, 100)
 
@@ -8980,22 +9022,47 @@ $buttonHandlers = @{
                 $btOutcomeMsg   = "Results captured and saved on this PC, but they could not be sent automatically. Click 'Open Folder' and send the file to support."
             }
 
+            # ── ONE OUTCOME, WRITTEN TO EVERY PLACE THAT SHOWS IT ─────────────
+            # Banner colour, banner text, the header phase and the status line
+            # are set together from the SAME $btOutcomeLevel, in one switch. They
+            # used to be set in three places: the header was left on "Packaging"
+            # from before the upload started, and the status line said "Complete."
+            # whatever happened -- so a failed upload could read as finished and a
+            # successful one could read as still running. A phase word and an
+            # outcome sentence that disagree is the same defect class as two
+            # panels disagreeing about a reading; the fix is the same, which is
+            # to have one answerer.
+            #
+            # Nothing about packaging or uploading itself changed here. This is
+            # the representation of an outcome that was already decided above.
             switch ($btOutcomeLevel) {
                 'warn' {
                     $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(70, 55, 10)
                     $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(250, 225, 150)
+                    # Complete, and NOT sent. The package exists, so the run did
+                    # finish -- but a header that said only "Complete" beside a
+                    # banner explaining the file is stranded on this PC would let
+                    # the reader take the good half.
+                    $btTimerLabel.Text       = "Not sent"
+                    $btTimerLabel.ForeColor  = [System.Drawing.Color]::FromArgb(250, 225, 150)
+                    $btElapsedLabel.Text     = "Finished - results were NOT sent to support."
                 }
                 'fail' {
                     $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(70, 20, 20)
                     $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(250, 170, 170)
+                    $btTimerLabel.Text       = "Failed"
+                    $btTimerLabel.ForeColor  = [System.Drawing.Color]::FromArgb(250, 170, 170)
+                    $btElapsedLabel.Text     = "Finished - the results could not be saved."
                 }
                 default {
                     $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(20, 65, 25)
                     $btBannerLabel.ForeColor = [System.Drawing.Color]::FromArgb(160, 240, 160)
+                    $btTimerLabel.Text       = "Complete"
+                    $btTimerLabel.ForeColor  = [System.Drawing.Color]::FromArgb(160, 240, 160)
+                    $btElapsedLabel.Text     = "Complete."
                 }
             }
             $btBannerLabel.Text  = $btOutcomeMsg
-            $btElapsedLabel.Text = "Complete."
 
             if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
 
