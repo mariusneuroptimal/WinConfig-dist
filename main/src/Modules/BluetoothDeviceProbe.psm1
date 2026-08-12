@@ -2724,7 +2724,7 @@ function Get-BtRecorderView {
         # observes that it is refused; that proves SOME process owns it and
         # nothing here binds the handle to NeurOptimal (issue #93).
         $comCaption = $hold.Detail
-        $comNote    = 'a process owns it'
+        $comNote    = 'in use by a process'
     } elseif ($hold.Health -eq 'Idle') {
         $comCaption = 'Registered, idle'
         $comNote    = 'nobody is using it'
@@ -2843,7 +2843,7 @@ function Get-BtRecorderView {
                 if ($boundary.Health -eq 'Failed') { 'The connection is present, but data activity has stopped.' }
                 elseif ($boundary.Health -eq 'Degraded') { 'The connection is present, but data activity is falling.' }
                 elseif ($boundary.Observation -eq 'NotObserved') { 'Data activity was not measured during this recording.' }
-                else { 'No data baseline has been established yet.' }
+                else { 'Establishing a data baseline -- keep recording.' }
             }
             default { "The recorder stopped at '$($boundary.Title)'." }
         }

@@ -5142,70 +5142,6 @@ $buttonHandlers = @{
                 }
             }
 
-            # The glossary. Reachable from the technical panel and from the
-            # overflow menu, and it now explains the DIAGRAM as well as the chips
-            # -- including the two readings this window has historically been
-            # misread on: a registered COM port, and a radio link that is
-            # legitimately off between sessions.
-            function script:Show-BtRecorderGlossary {
-                param($Owner)
-                $g = @(
-                    "THE PICTURE"
-                    "  Host / System --- Wireless --- Arc     is the connection path."
-                    "  NeurOptimal    COM    Data             are separate observations."
-                    ""
-                    "The supporting three are NOT a chain and are deliberately drawn"
-                    "without arrows between them. NeurOptimal runs perfectly well with no"
-                    "headset; COM registration survives a headset that is switched off;"
-                    "and data activity is a count of read operations, not proof of EEG."
-                    ""
-                    "WHAT THE MARKERS MEAN"
-                    "  [ok]            Checked and good."
-                    "  [!]             Checked and FAILING. This is a problem."
-                    "  [~]             Checked and getting worse."
-                    "  [idle]          Checked, and legitimately not active right now."
-                    "                  NOT a fault. A headset with no session running"
-                    "                  reads like this, and so does a closed NeurOptimal."
-                    "  [not observed]  NOTHING CHECKED THIS. It is not good and not bad;"
-                    "                  there is no reading. Do not read it as 'fine'."
-                    "  [n/a]           This tool cannot measure it at all."
-                    "  H               HISTORICAL. True earlier, not re-checked just now."
-                    ""
-                    "A panel drawn dimmed is EXPLAINED BY another one -- a consequence,"
-                    "not a separate problem to chase. Hover it to see which."
-                    ""
-                    "THE THREE THINGS THAT GET CONFUSED"
-                    "  Registered   COM ports exist. Left behind by an earlier successful"
-                    "               pairing. They survive a flat battery and a headset in"
-                    "               a drawer, so they prove nothing about right now. This"
-                    "               is what the H marker on the COM panel means."
-                    "  Radio link   The live wireless connection. It is NORMAL for this"
-                    "               to be off between sessions -- this headset holds no"
-                    "               Bluetooth profile open while idle. Dropping DURING a"
-                    "               session is the event we are hunting."
-                    "  Port held    Some process is holding the headset's COM port."
-                    "               This is NOT the same as data flowing, and the test"
-                    "               does not prove WHICH process holds it. NeurOptimal"
-                    "               keeps the port open whether or not the headset sends"
-                    "               a single sample."
-                    ""
-                    "WHAT GREEN DOES NOT PROVE"
-                    "Every panel going green does not prove the EEG signal is good. It"
-                    "proves the transport underneath it is. This tool cannot read EEG"
-                    "content -- the port belongs to NeurOptimal, and opening it to look"
-                    "would take it away from the application."
-                    ""
-                    "USB suspend  A Windows power-saving feature that can shut down the"
-                    "             Bluetooth radio mid-session."
-                    ""
-                    "Click any panel for the raw evidence behind it. 'Technical details'"
-                    "opens the full eight-step chain and the complete log."
-                ) -join "`r`n"
-                [void][System.Windows.Forms.MessageBox]::Show($Owner, $g, "How to read this window",
-                    [System.Windows.Forms.MessageBoxButtons]::OK,
-                    [System.Windows.Forms.MessageBoxIcon]::Information)
-            }
-
             # Bottom status bar. AutoSize + TopDown flow: the panel reserves
             # exactly the height its content needs, so on scaled/high-DPI displays
             # the labels and action buttons grow with the font instead of
@@ -5234,7 +5170,10 @@ $buttonHandlers = @{
             $btStatusPanel.Controls.Add($btElapsedLabel)
 
             $btUploadLabel = New-Object System.Windows.Forms.Label
-            $btUploadLabel.Text = "Upload: -"
+            # Empty while recording. "Upload: -" looked like a missing or failed
+            # reading even though upload does not begin until Stop and Upload is
+            # pressed. Real upload outcomes populate this line below.
+            $btUploadLabel.Text = ""
             $btUploadLabel.AutoSize = $true
             $btUploadLabel.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 1)
             $btUploadLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
@@ -5357,8 +5296,8 @@ $buttonHandlers = @{
             #
             # Everything the old window put on the main screen at once lives in
             # here: the eight-node chain with its per-node evidence, the target
-            # scope sentence, the engineer-facing boundary statement, the
-            # glossary and the full raw log.
+            # scope sentence, the engineer-facing boundary statement and the
+            # full raw log.
             #
             # HIDDEN, NOT DELETED, and nothing here is removed from the capture.
             # The window is still the only live view of a probe -- events.jsonl
@@ -5446,6 +5385,17 @@ $buttonHandlers = @{
             $btBoundaryLabel.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
             $btChainPanel.Controls.Add($btBoundaryLabel)
 
+            # Keep the one interpretation warning that is unsafe to lose when
+            # the long glossary is removed. It belongs beside the chain state it
+            # qualifies, not behind another button or in the event timeline.
+            $btObservationKeyLabel = New-Object System.Windows.Forms.Label
+            $btObservationKeyLabel.Text = "NOT OBSERVED means NOTHING CHECKED THIS. Do not read it as 'fine'."
+            $btObservationKeyLabel.AutoSize = $true
+            $btObservationKeyLabel.Margin = New-Object System.Windows.Forms.Padding(2, 1, 0, 1)
+            $btObservationKeyLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+            $btObservationKeyLabel.ForeColor = [System.Drawing.Color]::FromArgb(155, 155, 165)
+            $btChainPanel.Controls.Add($btObservationKeyLabel)
+
             # Node chips are created ONCE, on the first render, keyed by the node
             # ids the module hands back -- so the module owns the node set and
             # this file never carries a second copy of it. Rebuilding controls
@@ -5453,29 +5403,6 @@ $buttonHandlers = @{
             # window's bottleneck.
             $script:BtChain_NodeLabels = @{}
             $script:BtChain_LastBoundaryKey = $null
-
-            # Glossary, on demand. These are the terms operators misread --
-            # particularly "COM port held", which does NOT mean data is flowing,
-            # and a radio link that is legitimately off while idle. Kept next to
-            # the thing it explains rather than dumped into the timeline at
-            # startup where it scrolls away unread.
-            #
-            # The handler delegates to a script:-scoped function so the same text
-            # is reachable from the overflow menu on the main screen. An
-            # Add_Click scriptblock does not run inside the scope it was written
-            # in, which is why the target is script:-scoped and the owner comes
-            # from the event rather than from a captured variable.
-            $btGlossaryBtn = New-Object System.Windows.Forms.Button
-            $btGlossaryBtn.Text = "What do these mean?"
-            $btGlossaryBtn.AutoSize = $true
-            $btGlossaryBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-            $btGlossaryBtn.Margin = New-Object System.Windows.Forms.Padding(0, 4, 4, 2)
-            $btGlossaryBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-            $btGlossaryBtn.BackColor = [System.Drawing.Color]::FromArgb(45, 45, 52)
-            $btGlossaryBtn.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
-            $btGlossaryBtn.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-            $btGlossaryBtn.Add_Click({ script:Show-BtRecorderGlossary -Owner $this.FindForm() })
-            $btChainPanel.Controls.Add($btGlossaryBtn)
 
             # ── HEADER: "what am I watching, and am I seeing it?" ─────────────
             #
@@ -5556,14 +5483,9 @@ $buttonHandlers = @{
             # show, and that is different from failing to read one.
             $script:BtRec_RunIdText = '(not assigned yet)'
 
-            $btTitleLabel = New-Object System.Windows.Forms.Label
-            $btTitleLabel.Text = "Bluetooth Flight Recorder"
-            $btTitleLabel.AutoSize = $true
-            $btTitleLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 1)
-            $btTitleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-            $btTitleLabel.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 132)
-            $btHeaderText.Controls.Add($btTitleLabel)
-
+            # The OS title bar already names the recorder. Repeating that title
+            # here in tiny grey text consumed the highest-value line without
+            # adding state; the target is the first content the operator needs.
             $btTargetLabel = New-Object System.Windows.Forms.Label
             $btTargetLabel.Text = "Watching: (selecting headset...)"
             $btTargetLabel.AutoSize = $true
@@ -6790,36 +6712,38 @@ $buttonHandlers = @{
             $btButtonRow.Controls.SetChildIndex($btMarkBtn, 0)
             $btButtonRow.Controls.SetChildIndex($btMarkBox, 0)
 
-            # ── Overflow ──────────────────────────────────────────────────────
-            # Abort and the glossary move behind one control. Neither is used in
-            # the normal flow, and both were previously competing with Stop and
-            # Upload for the same glance. The functionality is unchanged: Abort
-            # still sets exactly the same two flags it always did.
+            # Abort remains visible. It is intentionally quieter than the red
+            # primary action, but it must not be hidden behind a disclosure: it
+            # is the only way to stop without packaging and sending the capture.
+            # Moving it from a two-click menu to a direct button adds an explicit
+            # confirmation so an accidental click cannot discard the upload.
             $script:BtRec_AbortClicked = $false
-
-            $btMoreMenu = New-Object System.Windows.Forms.ContextMenuStrip
-            $btMoreMenu.ShowImageMargin = $false
-            $btMoreAbort = $btMoreMenu.Items.Add("Abort - stop WITHOUT uploading")
-            $btMoreAbort.Add_Click({ $script:BtRec_AbortClicked = $true; $script:BtRec_StopClicked = $true })
-            $btMoreHelp = $btMoreMenu.Items.Add("What do these mean?")
-            $btMoreHelp.Add_Click({ script:Show-BtRecorderGlossary -Owner $null })
-            $btMoreDetails = $btMoreMenu.Items.Add("Technical details")
-            $btMoreDetails.Add_Click({ script:Switch-BtTechnicalDetails })
-
-            $btMoreBtn = New-Object System.Windows.Forms.Button
-            $btMoreBtn.Text = "More..."
-            $btMoreBtn.AutoSize = $true
-            $btMoreBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-            $btMoreBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
-            $btMoreBtn.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
-            $btMoreBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-            $btMoreBtn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(70, 70, 80)
-            $btMoreBtn.BackColor = [System.Drawing.Color]::FromArgb(38, 38, 46)
-            $btMoreBtn.ForeColor = [System.Drawing.Color]::FromArgb(180, 180, 190)
-            $btMoreBtn.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
-            $btMoreBtn.ContextMenuStrip = $btMoreMenu
-            $btMoreBtn.Add_Click({ $this.ContextMenuStrip.Show($this, 0, $this.Height) })
-            $btButtonRow.Controls.Add($btMoreBtn)
+            $btAbortBtn = New-Object System.Windows.Forms.Button
+            $btAbortBtn.Text = "Abort without uploading"
+            $btAbortBtn.AutoSize = $true
+            $btAbortBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btAbortBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
+            $btAbortBtn.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
+            $btAbortBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btAbortBtn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(130, 92, 72)
+            $btAbortBtn.BackColor = [System.Drawing.Color]::FromArgb(38, 38, 46)
+            $btAbortBtn.ForeColor = [System.Drawing.Color]::FromArgb(205, 172, 155)
+            $btAbortBtn.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+            $btAbortBtn.Add_Click({
+                $answer = [System.Windows.Forms.MessageBox]::Show(
+                    $this.FindForm(),
+                    "Stop this recording without uploading?`n`nThe diagnostic package will not be created or sent to support.",
+                    "Abort Bluetooth recording",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning,
+                    [System.Windows.Forms.MessageBoxDefaultButton]::Button2
+                )
+                if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) {
+                    $script:BtRec_AbortClicked = $true
+                    $script:BtRec_StopClicked = $true
+                }
+            })
+            $btButtonRow.Controls.Add($btAbortBtn)
 
             $btRecordStart = Get-Date
             $btPollJob     = $null
@@ -7311,13 +7235,9 @@ $buttonHandlers = @{
                 if ($btProbeSession.PowerPlan -and $btProbeSession.PowerPlan.IsPowerSaver) {
                     Write-BtLog "  Power plan    : $($btProbeSession.PowerPlan.ActivePlan) -- throttles USB/Bluetooth performance" -Level "WARN"
                 }
-                # The glossary used to be printed here, ten lines into the live
-                # timeline. It is reference material, not an event: by the time
-                # an operator actually wonders what "Port open" means -- twenty
-                # minutes into a session -- it has long scrolled away, while the
-                # events they needed to read were pushed down by it. It now sits
-                # behind the "What do these mean?" button next to the state
-                # strip, where it is available at the moment the question occurs.
+                # Reference prose does not belong in the live timeline: it pushes
+                # the transitions the operator needs below the fold. Panel clicks
+                # and Technical details carry the evidence on demand.
                 Write-BtLog "" -Level "DIM"
                 if ($noRunning) {
                     Write-BtLog "  NeurOptimal is already running. Run tests or reproduce the issue you have been seeing." -Level "INFO"
@@ -7913,11 +7833,10 @@ $buttonHandlers = @{
             if ($btPollJob) { Remove-Job $btPollJob -Force -ErrorAction SilentlyContinue }
 
             # Both operator paths out of the recording are closed the instant the
-            # loop exits. The Abort item is disabled as well as the button --
-            # leaving a live-looking Abort in the overflow during packaging is a
-            # control that promises something it can no longer do.
+            # loop exits. A live-looking Abort during packaging would promise an
+            # action that can no longer happen.
             $btStopBtn.Enabled = $false
-            $btMoreAbort.Enabled = $false
+            $btAbortBtn.Enabled = $false
             $btAnomalyBar.Visible = $false
 
             if ($script:BtRec_AbortClicked) {
@@ -7935,7 +7854,7 @@ $buttonHandlers = @{
                 $btStopBtn.Visible       = $false
                 $btMarkBtn.Visible       = $false
                 $btMarkBox.Visible       = $false
-                $btMoreBtn.Visible       = $false
+                $btAbortBtn.Visible      = $false
                 if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
                 return
             }
@@ -7949,12 +7868,12 @@ $buttonHandlers = @{
             $btTimerLabel.ForeColor  = [System.Drawing.Color]::FromArgb(255, 200, 100)
 
             # Recording is over -- free the bottom row for the saved-file path +
-            # Open Folder. The overflow goes with them: its Abort item would be a
-            # live-looking control that can no longer do anything.
+            # Open Folder. Abort goes with the marker controls because it can no
+            # longer do anything.
             $btStopBtn.Visible  = $false
             $btMarkBtn.Visible  = $false
             $btMarkBox.Visible  = $false
-            $btMoreBtn.Visible  = $false
+            $btAbortBtn.Visible = $false
 
             Write-BtLog ""
             Write-BtLog "Step 3 of 3: Stopping - taking final snapshot..." -Level "STEP"
