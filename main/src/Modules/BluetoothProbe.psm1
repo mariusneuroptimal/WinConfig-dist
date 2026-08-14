@@ -3985,6 +3985,257 @@ function Get-BluetoothSerialPortIntegrity {
     return $verdict
 }
 
+function Test-BluetoothRecorderSerialPreflight {
+    <#
+    .SYNOPSIS
+        Decides whether the Bluetooth Flight Recorder may start from a passive
+        serial-namespace integrity sample.
+    .DESCRIPTION
+        FI-012 can leave every paired-device and PnP signal green after Windows
+        wakes while SERIALCOMM contains duplicate owners or a COM symlink is
+        absent/stale. Starting NO in that state only rediscovers a known host
+        fault. This pure classifier turns Get-BluetoothSerialPortIntegrity into
+        an upfront gate without opening a serial port.
+
+        Healthy is not sufficient when the symlink layer was unreadable:
+        Test-BluetoothSerialPortIntegrity deliberately suppresses symlink faults
+        in that state to avoid a false positive. A readiness gate must therefore
+        call it Unverified rather than silently treating it as Ready.
+
+        No registrations is NotApplicable rather than Blocked. The recorder is
+        also used to diagnose discovery/pairing cases where no SPP endpoint has
+        been created yet.
+    .PARAMETER Integrity
+        Result from Get-/Test-BluetoothSerialPortIntegrity.
+    .PARAMETER CheckedAt
+        Sampling time carried into evidence. Injectable for deterministic tests.
+    .OUTPUTS
+        Ordered hashtable with CanStart, Status, Reason, Summary, Recommendation,
+        counts, and post-wake provenance.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object]$Integrity,
+        [datetime]$CheckedAt = (Get-Date)
+    )
+
+    $result = [ordered]@{
+        # Unverified is not proof of corruption. The recorder may continue in
+        # passive troubleshooting mode, but it must warn and must not represent
+        # the namespace as ready. Only Status=Blocked stops the run.
+        CanStart               = $true
+        PassiveCaptureAllowed = $true
+        ApplicationSessionReady = $false
+        Status                 = 'Unverified'
+        Reason                 = 'NoIntegritySample'
+        Summary                = 'Bluetooth serial readiness could not be verified before recording.'
+        Recommendation         = 'Continue passive troubleshooting, but do not treat the Bluetooth serial namespace as verified. Repair or update WinConfig and repeat this check before starting a new NO session.'
+        CheckedAt              = $CheckedAt
+        EntryCount             = $null
+        ComNameCount           = $null
+        CollisionCount         = $null
+        MissingSymlinkCount    = $null
+        DanglingSymlinkCount   = $null
+        SymlinksChecked        = $null
+        WakeContextAvailable   = $false
+        WakeObservedSinceBoot  = $null
+        ResumeCountSinceBoot   = $null
+        LastResumeTime         = $null
+        VerifiedAfterLastResume = $null
+        CorrelationAssessment  = $null
+    }
+
+    if ($null -eq $Integrity) { return $result }
+
+    $result.EntryCount           = $Integrity.EntryCount
+    $result.ComNameCount         = $Integrity.ComNameCount
+    $result.CollisionCount       = $Integrity.CollisionCount
+    $result.MissingSymlinkCount  = $Integrity.MissingSymlinkCount
+    $result.DanglingSymlinkCount = $Integrity.DanglingSymlinkCount
+    $result.SymlinksChecked      = [bool]$Integrity.SymlinksChecked
+    if ($Integrity.Correlation) {
+        $result.CorrelationAssessment = $Integrity.Correlation.Assessment
+    }
+
+    $power = $Integrity.PowerContext
+    if ($power -and $power.EventsRead) {
+        $result.WakeContextAvailable  = $true
+        $result.ResumeCountSinceBoot  = $power.ResumeCount
+        $result.WakeObservedSinceBoot = [bool]($null -ne $power.ResumeCount -and [int]$power.ResumeCount -gt 0)
+        $result.LastResumeTime        = $power.LastResumeTime
+        if ($result.WakeObservedSinceBoot -and $power.LastResumeTime) {
+            $result.VerifiedAfterLastResume = [bool]($CheckedAt -ge [datetime]$power.LastResumeTime)
+        }
+    }
+
+    # A known defect wins over collection limitations: collisions remain
+    # conclusive even when QueryDosDevice itself was unavailable.
+    if (-not [bool]$Integrity.Healthy) {
+        $result.CanStart       = $false
+        $result.PassiveCaptureAllowed = $false
+        $result.Status         = 'Blocked'
+        $result.Reason         = 'SerialNamespaceCorrupt'
+        $result.Summary        = "KNOWN Bluetooth serial fault detected: $($Integrity.Summary)"
+        $result.Recommendation = if ($Integrity.Recommendation) {
+            [string]$Integrity.Recommendation
+        } else {
+            'REBOOT - do not unpair. Run Bluetooth Diagnostics again after Windows starts.'
+        }
+        return $result
+    }
+
+    if ($Integrity.Error) {
+        $result.Reason         = 'IntegrityCollectorError'
+        $result.Summary        = "Bluetooth serial readiness could not be verified before recording: $($Integrity.Error)"
+        $result.Recommendation = 'Continue passive troubleshooting, but do not treat the Bluetooth serial namespace as verified. Repair or update WinConfig and repeat this check before starting a new NO session.'
+        return $result
+    }
+
+    if ([int]$Integrity.EntryCount -eq 0) {
+        $result.CanStart       = $true
+        $result.Status         = 'NotApplicable'
+        $result.Reason         = 'NoSerialRegistrations'
+        $result.Summary        = 'No Bluetooth serial registrations exist yet; the FI-012 preflight is not applicable to this recording.'
+        $result.Recommendation = $null
+        return $result
+    }
+
+    if (-not [bool]$Integrity.SymlinksChecked) {
+        $result.Reason         = 'SymlinkLayerUnreadable'
+        $result.Summary        = 'Bluetooth serial readiness could not be verified before recording because the COM symlink layer was unreadable.'
+        $result.Recommendation = 'Continue passive troubleshooting, but do not treat the Bluetooth serial namespace as verified. Repair or update WinConfig and repeat this check before starting a new NO session.'
+        return $result
+    }
+
+    $result.CanStart       = $true
+    $result.ApplicationSessionReady = $true
+    $result.Status         = 'Ready'
+    $result.Reason         = 'SerialNamespaceVerified'
+    $result.Recommendation = $null
+    if ($result.WakeObservedSinceBoot -and $result.LastResumeTime) {
+        $result.Summary = "Bluetooth serial readiness verified after the last Windows wake at $([datetime]$result.LastResumeTime): $($Integrity.Summary)"
+    } else {
+        $result.Summary = "Bluetooth serial readiness verified before recording: $($Integrity.Summary)"
+    }
+    return $result
+}
+
+function Get-BluetoothSerialTroubleshootingResponse {
+    <#
+    .SYNOPSIS
+        Builds state-aware user guidance from the passive serial-readiness gate.
+    .DESCRIPTION
+        Pure presentation policy. It never enumerates a process or opens a port;
+        callers supply whether NO and a recorder are already active. Confirmed
+        FI-012 corruption receives a proactive stop/reboot workflow. Unverified
+        collection receives a warning but remains available for passive capture.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object]$Readiness,
+        [bool]$NoExeRunning = $false,
+        [bool]$RecorderActive = $false
+    )
+
+    $status = if ($Readiness -and $Readiness.Status) { [string]$Readiness.Status } else { 'Unverified' }
+    $result = [ordered]@{
+        Status           = $status
+        NotifyUser       = ($status -in @('Blocked', 'Unverified'))
+        StopRecorderStart = ($status -eq 'Blocked')
+        ApplicationState = if ($RecorderActive) { 'RecorderActive' } elseif ($NoExeRunning) { 'NoExeRunning' } else { 'NoExeClosed' }
+        FaultStage       = $null
+        Title            = $null
+        LikelyCause      = $null
+        Impact           = $null
+        Steps            = @()
+        Summary          = if ($Readiness) { [string]$Readiness.Summary } else { 'Bluetooth serial readiness could not be verified.' }
+    }
+
+    if ($status -eq 'Blocked') {
+        $collisions = [int]$Readiness.CollisionCount
+        $missing    = [int]$Readiness.MissingSymlinkCount
+        $stale      = [int]$Readiness.DanglingSymlinkCount
+        if ($collisions -gt 0 -and $missing -eq 0 -and $stale -eq 0) {
+            # RETRACTED 2026-08-13. This branch used to be called
+            # DuplicateOwnersPreFailure and told the user "the ports may still
+            # open now ... the next application session is at risk". That was
+            # inferred, never measured, and it is false: captured live in this
+            # exact state on MMEVOLD_06, ALL EIGHT Bluetooth COM ports -- four
+            # Arc channels and four non-Arc SPP names with no headset behind
+            # them -- failed CreateFile with win32 433 in 0-2 ms. The surviving
+            # symlinks point at the dead generation; the new generation opens
+            # fine one layer down. The error understated severity, so the
+            # Blocked gate and its reboot steps were right for the wrong reason.
+            $result.FaultStage = 'DuplicateOwnersDeadTarget'
+            # NB: the phrasing deliberately avoids the retracted words ("may
+            # still open", "pre-failure", "at risk"), which a regression test
+            # greps for across this whole response. This is a present-tense
+            # outage, not a forecast, so no forecast vocabulary belongs here.
+            $result.Impact = 'Every Bluetooth COM port on this PC is expected to be unopenable right now. The COM names survive but point at abandoned RFCOMM device objects, so opens fail instantly (win32 433) even though Device Manager still reports every port healthy.'
+        } elseif ($missing -gt 0) {
+            $result.FaultStage = 'MissingComSymlinks'
+            $result.Impact = 'One or more COM names no longer exist in the Windows object namespace. Applications can report that the selected control/data port is invalid.'
+        } elseif ($stale -gt 0) {
+            $result.FaultStage = 'StaleComSymlinks'
+            $result.Impact = 'One or more COM names target an abandoned RFCOMM device object. Opens can time out even though Device Manager still reports the device as healthy.'
+        } else {
+            $result.FaultStage = 'SerialNamespaceCorrupt'
+            $result.Impact = 'The Windows Bluetooth serial namespace is corrupt and cannot be trusted for a new application session.'
+        }
+
+        $result.Title = 'Known Bluetooth Serial Fault Detected'
+        $correlation = $null
+        if ($Readiness -is [System.Collections.IDictionary] -and $Readiness.Contains('CorrelationAssessment')) {
+            $correlation = [string]$Readiness['CorrelationAssessment']
+        } elseif ($Readiness.PSObject.Properties.Name -contains 'CorrelationAssessment') {
+            $correlation = [string]$Readiness.CorrelationAssessment
+        }
+        $result.LikelyCause = switch ($correlation) {
+            'Consistent'  { 'Windows Bluetooth/RFCOMM registrations accumulated during this boot. The recorded sleep/wake count can account for the extra generations; Modern Standby is a reproduced trigger for this fault.' }
+            'Unexplained' { 'Windows Bluetooth/RFCOMM registrations accumulated during this boot. Sleep/wake is a known trigger, but the recorded wake count does not fully account for this machine, so the exact trigger remains unknown.' }
+            default       { 'Windows Bluetooth/RFCOMM registrations accumulated or became stale during this boot. Sleep/wake, including Modern Standby, is a known trigger, but this sample alone does not prove which event triggered it.' }
+        }
+
+        if ($RecorderActive) {
+            $result.Steps = @(
+                'Stop and save/upload the current Bluetooth recording before rebooting.',
+                'If NO has work in progress, finish or save it if possible, then close NO.',
+                'Reboot Windows without unpairing the Bluetooth device.',
+                'After sign-in, run Bluetooth Diagnostics again before starting NO; proceed only when serial readiness is Ready.',
+                'Do not unpair/re-pair, toggle the radio, reset COM numbers, or open extra serial ports for this signature.'
+            )
+        } elseif ($NoExeRunning) {
+            $result.Steps = @(
+                'Do not start another NO session or open additional Bluetooth serial ports.',
+                'If the current NO session has work in progress, finish or save it if possible, then close NO.',
+                'Reboot Windows without unpairing the Bluetooth device.',
+                'After sign-in, run Bluetooth Diagnostics again before starting NO; proceed only when serial readiness is Ready.',
+                'Do not unpair/re-pair, toggle the radio, or reset COM numbers for this signature.'
+            )
+        } else {
+            $result.Steps = @(
+                'Do not start NO or open a Bluetooth serial port in the current state.',
+                'Reboot Windows without unpairing the Bluetooth device.',
+                'After sign-in, run Bluetooth Diagnostics again before starting NO; proceed only when serial readiness is Ready.',
+                'Do not unpair/re-pair, toggle the radio, or reset COM numbers for this signature.'
+            )
+        }
+        return $result
+    }
+
+    if ($status -eq 'Unverified') {
+        $result.Title       = 'Bluetooth Serial Readiness Not Verified'
+        $result.LikelyCause = 'The passive collector could not prove whether SERIALCOMM and the COM symlink targets agree. This is not evidence that FI-012 is present.'
+        $result.Impact      = 'The probe can continue collecting passive troubleshooting evidence, but it must not describe the serial namespace as healthy.'
+        $result.Steps = @(
+            'Continue the diagnostic capture if troubleshooting is needed.',
+            'Do not use this result as an all-clear for a new NO session.',
+            'Repair or update WinConfig and repeat the passive serial-readiness check.'
+        )
+    }
+    return $result
+}
+
 function Test-BluetoothSerialPortIntegrity {
     <#
     .SYNOPSIS
@@ -4024,6 +4275,10 @@ function Test-BluetoothSerialPortIntegrity {
         CollisionCount       = 0
         MissingSymlinkCount  = 0
         DanglingSymlinkCount = 0
+        # Names where the staleness test CANNOT return a meaningful answer.
+        # Initialised here, not only on the path that sets it, so a StrictMode
+        # caller reading it on the zero-registration early return does not throw.
+        StaleUndecidableCount = 0
         ComNameCount         = 0
         EntryCount           = $Registrations.Count
         Entries              = @()
@@ -4065,9 +4320,23 @@ function Test-BluetoothSerialPortIntegrity {
             }).Count
         }
 
+        # THIS TEST GOES BLIND EXACTLY WHERE IT IS NEEDED MOST. It asks whether
+        # the symlink target is still REGISTERED, and on a collided name every
+        # generation is registered -- including the dead one the symlink points
+        # at. SERIALCOMM and the symlink are then two stale channels vouching
+        # for each other, so $targetRegistered comes back $true and the name
+        # scores 0 stale on a box where the port cannot be opened at all.
+        # Measured 2026-08-13 on MMEVOLD_06: 16 entries / 8 names, 0 dangling by
+        # this test, and all 8 ports failed CreateFile with win32 433 in 0-2 ms
+        # while \GLOBAL??\COMx pointed at the dead old generation and the new
+        # generation opened cleanly one layer down. Registration is not liveness.
+        # Do not report a reassuring zero here; report that it is undecidable.
+        $staleUndecidable = ($owners.Count -gt 1 -and $targetRegistered -eq $true)
+
         if ($owners.Count -gt 1)                 { $result.CollisionCount++ }
         if ($SymlinksValid -and -not $symlinkOk) { $result.MissingSymlinkCount++ }
         if ($targetRegistered -eq $false)        { $result.DanglingSymlinkCount++ }
+        if ($staleUndecidable)                   { $result.StaleUndecidableCount++ }
 
         $result.Entries += [PSCustomObject]@{
             ComName                 = $name
@@ -4077,6 +4346,7 @@ function Test-BluetoothSerialPortIntegrity {
             Symlink                 = $symlink
             SymlinkOk               = $symlinkOk
             SymlinkTargetRegistered = $targetRegistered
+            StaleTargetUndecidable  = $staleUndecidable
             Collision               = ($owners.Count -gt 1)
         }
     }
@@ -4093,12 +4363,22 @@ function Test-BluetoothSerialPortIntegrity {
         $result.Healthy = $false
         $result.Findings += "SYMLINK STALE: $($e.ComName) resolves to $($e.Symlink), which is NOT among the $($e.OwnerCount) device object(s) currently registered for it ($($e.DeviceObjects -join ', ')) - opens reach an abandoned device object and time out (ERROR_SEM_TIMEOUT), which looks exactly like a device that is not answering. It is not: the serial stack is stale and the fix is a reboot, NOT a radio toggle."
     }
+    foreach ($e in ($result.Entries | Where-Object { $_.StaleTargetUndecidable })) {
+        $result.Findings += "SYMLINK LIVENESS UNKNOWN: $($e.ComName) resolves to $($e.Symlink), which IS among the $($e.OwnerCount) device objects registered for it ($($e.DeviceObjects -join ', ')) - but a collided name registers every generation, including abandoned ones, so this check cannot tell a live target from a dead one. Measured on a box in this exact state, the symlink pointed at the DEAD generation and every open failed with win32 433 (ERROR_NO_SUCH_DEVICE) in under 2 ms. Do not read this as evidence the port works."
+    }
     if (-not $result.SymlinksChecked) {
         $result.Findings += "NOTE: symlink layer not readable - collision findings only"
     }
 
     if (-not $result.Healthy) {
-        $result.Summary = "$($result.EntryCount) SERIALCOMM entries for $($result.ComNameCount) COM name(s); $($result.CollisionCount) collided, $($result.MissingSymlinkCount) symlink(s) absent, $($result.DanglingSymlinkCount) symlink(s) stale"
+        # "0 symlink(s) stale" is a lie of omission on a collided box: the test
+        # is blind there, and a triager reads the zero as an all-clear.
+        $staleText = if ($result.StaleUndecidableCount -gt 0) {
+            "staleness undecidable on $($result.StaleUndecidableCount) collided name(s) - registration cannot prove liveness"
+        } else {
+            "$($result.DanglingSymlinkCount) symlink(s) stale"
+        }
+        $result.Summary = "$($result.EntryCount) SERIALCOMM entries for $($result.ComNameCount) COM name(s); $($result.CollisionCount) collided, $($result.MissingSymlinkCount) symlink(s) absent, $staleText"
         $result.Recommendation = "REBOOT - do not unpair. HKLM\HARDWARE is volatile and rebuilt at boot, which clears the duplicate registrations and restores the COM symlinks. Unpairing/re-pairing does not fix this and adds another colliding generation."
     } else {
         $result.Summary = "$($result.EntryCount) SERIALCOMM entries for $($result.ComNameCount) COM name(s); no collisions, all symlinks resolve to a registered device object"
@@ -4843,7 +5123,9 @@ function Get-BluetoothPowerCycleContext {
         unreadable (non-admin, cleared log, rolled over).
     .OUTPUTS
         [hashtable] Available, LastBootTime, UptimeHours, ResumeCount,
-        SleepCount, EventsRead, Error
+        SleepCount, LegacyResumeCount, LegacySleepCount,
+        ModernStandbyExitCount, ModernStandbyEntryCount, LastResumeTime,
+        LastSleepTime, EventsRead, Error
     #>
     [CmdletBinding()]
     param()
@@ -4854,6 +5136,12 @@ function Get-BluetoothPowerCycleContext {
         UptimeHours  = $null
         ResumeCount  = $null
         SleepCount   = $null
+        LegacyResumeCount       = $null
+        LegacySleepCount        = $null
+        ModernStandbyExitCount  = $null
+        ModernStandbyEntryCount = $null
+        LastResumeTime          = $null
+        LastSleepTime           = $null
         EventsRead   = $false
         Error        = $null
     }
@@ -4870,27 +5158,30 @@ function Get-BluetoothPowerCycleContext {
         return $ctx
     }
 
-    # Kernel-Power 107 = resume from sleep/hibernate, 42 = entering sleep. Scoped
-    # to the current boot because that is the window SERIALCOMM covers. A failure
-    # here leaves the counts $null (unknown), which is NOT the same as 0 and must
-    # not be reported as "no resumes" -- the correlation below treats them apart.
+    # Legacy sleep uses Kernel-Power 42/107. Modern Standby uses 506/507 and may
+    # never emit 42/107 at all. MMEVOLD_06 proved this gap on 2026-08-13: the old
+    # counter reported zero resumes beside a fresh 2-generation collision even
+    # though the same System log held nine Modern Standby exits since boot.
+    # Count both power models, scoped to the current boot because that is the
+    # window SERIALCOMM covers. A failure here leaves the counts $null (unknown),
+    # which is NOT the same as 0 and must not be reported as "no resumes".
     try {
         $filter = @{
             LogName      = 'System'
             ProviderName = 'Microsoft-Windows-Kernel-Power'
             StartTime    = $ctx.LastBootTime
+            Id           = @(42, 107, 506, 507)
         }
-        $events = @(Get-WinEvent -FilterHashtable $filter -ErrorAction Stop |
-                    Where-Object { $_.Id -in @(42, 107) })
-        $ctx.ResumeCount = @($events | Where-Object { $_.Id -eq 107 }).Count
-        $ctx.SleepCount  = @($events | Where-Object { $_.Id -eq 42  }).Count
+        $events = @(Get-WinEvent -FilterHashtable $filter -ErrorAction Stop)
+        $counts = Measure-BluetoothPowerCycleEvents -Event $events
+        foreach ($key in $counts.Keys) { $ctx[$key] = $counts[$key] }
         $ctx.EventsRead  = $true
     } catch {
         # No matching events is thrown as an error by Get-WinEvent, not returned
         # as an empty set. That case is a real zero, not an unknown.
         if ($_.Exception.Message -match 'No events were found') {
-            $ctx.ResumeCount = 0
-            $ctx.SleepCount  = 0
+            $counts = Measure-BluetoothPowerCycleEvents -Event @()
+            foreach ($key in $counts.Keys) { $ctx[$key] = $counts[$key] }
             $ctx.EventsRead  = $true
         } else {
             $ctx.Error = $_.Exception.Message
@@ -4898,6 +5189,46 @@ function Get-BluetoothPowerCycleContext {
     }
 
     return $ctx
+}
+
+function Measure-BluetoothPowerCycleEvents {
+    <#
+    .SYNOPSIS
+        Pure counter for legacy sleep and Modern Standby event records.
+    .DESCRIPTION
+        Kernel-Power 42/107 represent legacy sleep entry/resume. Modern Standby
+        machines instead use 506/507. Keeping the split counts makes it possible
+        to audit which power model supplied ResumeCount while preserving the one
+        total consumed by Get-SerialRegistrationCorrelation.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [object[]]$Event = @()
+    )
+
+    $legacySleep  = @($Event | Where-Object { $_.Id -eq 42 })
+    $legacyResume = @($Event | Where-Object { $_.Id -eq 107 })
+    $modernEntry  = @($Event | Where-Object { $_.Id -eq 506 })
+    $modernExit   = @($Event | Where-Object { $_.Id -eq 507 })
+    $sleepEvents  = @($legacySleep) + @($modernEntry)
+    $resumeEvents = @($legacyResume) + @($modernExit)
+
+    $lastSleep = @($sleepEvents | Where-Object { $null -ne $_.TimeCreated } |
+                   Sort-Object TimeCreated | Select-Object -Last 1)
+    $lastResume = @($resumeEvents | Where-Object { $null -ne $_.TimeCreated } |
+                    Sort-Object TimeCreated | Select-Object -Last 1)
+
+    return @{
+        ResumeCount             = $resumeEvents.Count
+        SleepCount              = $sleepEvents.Count
+        LegacyResumeCount       = $legacyResume.Count
+        LegacySleepCount        = $legacySleep.Count
+        ModernStandbyExitCount  = $modernExit.Count
+        ModernStandbyEntryCount = $modernEntry.Count
+        LastResumeTime          = if ($lastResume.Count -gt 0) { $lastResume[0].TimeCreated } else { $null }
+        LastSleepTime           = if ($lastSleep.Count -gt 0) { $lastSleep[0].TimeCreated } else { $null }
+    }
 }
 
 function Get-SerialRegistrationCorrelation {
@@ -4924,7 +5255,8 @@ function Get-SerialRegistrationCorrelation {
     .PARAMETER ComNameCount
         Distinct COM names among them.
     .PARAMETER ResumeCount
-        Kernel-Power 107 events since boot, or $null when unknown.
+        Combined legacy Kernel-Power 107 and Modern Standby 507 events since
+        boot, or $null when unknown.
     #>
     [CmdletBinding()]
     param(
@@ -5541,6 +5873,15 @@ function Get-SerialOpenClassification {
           5   ERROR_ACCESS_DENIED        -> InUse              (another process holds it)
           121 ERROR_SEM_TIMEOUT          -> DeviceNotResponding (fault 2)
 
+        A fourth was added 2026-08-13, measured rather than inferred:
+
+          433 ERROR_NO_SUCH_DEVICE       -> PortTargetDead     (fault 3, reboot)
+
+        433 is the SERIALCOMM-collision signature. The COM name still exists and
+        still resolves, so it is not fault 1; it fails in 0-2 ms, so it is not
+        fault 2 (which takes ~5.1 s to time out). The symlink simply points at a
+        generation the driver abandoned across a Modern Standby cycle.
+
         121 IS AMBIGUOUS ON A SINGLE ATTEMPT. A cold ACL link and a powered-off
         device both return it at ~5.1s. Measured 2026-08-06 on Arc 000019: cold
         link failed once at 5146ms and then opened (752ms, then 2745, 4011);
@@ -5576,6 +5917,9 @@ function Get-SerialOpenClassification {
         5   { return @{ Classification = 'InUse'
                         Meaning = 'ERROR_ACCESS_DENIED - the port exists and another process holds it'
                         Action  = 'Close the application holding the port (usually NO.exe) and retry.' } }
+        433 { return @{ Classification = 'PortTargetDead'
+                        Meaning = 'ERROR_NO_SUCH_DEVICE - the COM name resolves, but to an RFCOMM device object the driver has abandoned. Measured with duplicate SERIALCOMM owners after Modern Standby: every Bluetooth COM name on the PC fails this way in under 2 ms, including names with no device behind them, while the live generation opens normally one layer down.'
+                        Action  = 'Reboot without unpairing. This is not a headset fault and not a range/power problem - do not toggle the radio, re-pair, or reset COM numbers, and do not power-cycle the device chasing it.' } }
         121 {
             $persisted = if ($FirstWin32Error -eq 121) { ' on the first attempt and again on retry, so this is not a cold link' } else { '' }
             return @{ Classification = 'DeviceNotResponding'
@@ -7644,6 +7988,8 @@ Export-ModuleMember -Function @(
     # Bluetooth COM port detection (state accretion)
     'Get-BluetoothCOMPorts',
     'Get-BluetoothSerialPortIntegrity',
+    'Test-BluetoothRecorderSerialPreflight',
+    'Get-BluetoothSerialTroubleshootingResponse',
     'Test-BluetoothSerialPortIntegrity',
     # FI-014: pairing records left behind by a device removal, which mark the
     # no-node state and can accompany a failed re-pair. Only a fault when
@@ -7659,6 +8005,7 @@ Export-ModuleMember -Function @(
     'Test-BluetoothOrphanPairingRecord',
     'Initialize-RegistryKeyTimeApi',
     'Get-BluetoothPowerCycleContext',
+    'Measure-BluetoothPowerCycleEvents',
     'Get-SerialRegistrationCorrelation',
     'Get-BluetoothRadioState',
     'Get-BluetoothRadioPnpState',

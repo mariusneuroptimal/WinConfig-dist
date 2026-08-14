@@ -3933,10 +3933,10 @@ function New-DeviceProbeSession {
         AdapterInfo              = $null
         PowerPlan                = $null
         PendingConfirmation      = $null
-        # SERIALCOMM / COM-symlink integrity, captured at session start and end.
-        # Two samples rather than one because the interesting case is a box that
-        # was healthy when recording began and corrupt when it ended -- that
-        # pins the corruption to something that happened during the session.
+        # SERIALCOMM / COM-symlink integrity. Preflight is the passive hard gate
+        # evaluated before the recorder is constructed; start/end remain full
+        # samples because only their transition can pin corruption to the run.
+        SerialPortPreflight      = $null
         SerialPortIntegrity      = $null
         SerialPortIntegrityEnd   = $null
         # FI-012 fault 2 fingerprint (paired, ports clean, no link). Derived
@@ -4731,7 +4731,7 @@ function Get-DeviceProbeSessionSummary {
         if (-not $integ.Healthy -and $integ.MissingSymlinkCount -gt 0) {
             [void]$findings.Add("[!] Bluetooth COM ports are broken at the OS level: $($integ.EntryCount) SERIALCOMM registrations for $($integ.ComNameCount) COM name(s), $($integ.CollisionCount) collided, $($integ.MissingSymlinkCount) symlink(s) absent. No process can open ANY Bluetooth COM port in this state -- expect 'Control Port not valid' / 'Arc not detected'. FIX: reboot. Re-pairing also clears it but is more disruptive and adds another COM-name generation.")
         } elseif (-not $integ.Healthy -and $integ.CollisionCount -gt 0) {
-            [void]$findings.Add("[!] Bluetooth serial port registrations are colliding: $($integ.CollisionCount) COM name(s) claimed by more than one device object, but the symlinks still resolve. Ports work right now -- this is the state that precedes 'Control Port not valid'. A reboot clears it before it bites.")
+            [void]$findings.Add("[!] Bluetooth serial port registrations are colliding: $($integ.CollisionCount) COM name(s) claimed by more than one device object. The symlinks still resolve, but they resolve to the ABANDONED generation -- measured in this exact state, every Bluetooth COM port on the box failed to open with win32 433 in under 2 ms, including ports with no device behind them. Treat this as broken now, not as an early warning. FIX: reboot without unpairing.")
         } elseif ($integ.Healthy) {
             [void]$findings.Add("[ok] Bluetooth serial port registrations are consistent ($($integ.EntryCount) entries for $($integ.ComNameCount) COM name(s), all symlinks resolve)")
         }

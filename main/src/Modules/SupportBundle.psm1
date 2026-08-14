@@ -49,7 +49,14 @@ Set-StrictMode -Off
 #   the live runtime root's mtime in ZEN-WEBVIEW2-001 (FI-015 — a maintenancetool
 #   that cannot initialize, where "is the binary damaged?" was unanswerable from
 #   the bundle and the gutted WebView2 tree was undatable).
-$script:SupportBundleProbeVersion = '1.4.0'
+# 1.5.0 (2026-08-11): ZEN-INSTALLLOG-001 gains lastWriteTime (FI-018 — QtIFW
+#   does not flush a run's operations until it ends, so a WEDGED installer looks
+#   like a clean one: MCAJOLAIS_05 sat 12 minutes with maintenancetool alive and
+#   no rule could see it, because nothing recorded how old the log was);
+#   RedactInstallationLog also redacts the mysql client's attached '-p<value>'
+#   argv (FI-017 — same secret as FI-007 through a syntax the key=value pattern
+#   cannot see, shipped in the clear on adjacent lines of one bundle).
+$script:SupportBundleProbeVersion = '1.5.0'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -325,11 +332,25 @@ function Add-WinConfigSupportBundleFile {
     # code 2) makes QtIFW log the full child argv — including the customer's
     # /LICENSECODE= value. Same value-only strategy: the command line and the
     # /S flag after it stay readable.
+    # FI-017: the SAME MySQL root password also reaches this log through a
+    # SECOND syntax the key=value pattern above cannot see — the mysql/mysqldump
+    # client's attached '-p<value>' argv form, emitted by the backup and restore
+    # Execute operations on com.zengar.no.mysql.server. MCAJOLAIS_05 2026-08-11
+    # shipped 'passwd=<redacted>' and '-p<cleartext>' on adjacent lines of one
+    # bundle. FI-007's residual-risk note reserved exactly this case ("add to the
+    # pattern if one ever is [observed]"); one now has been.
+    # Anchored on a mysql* token within the same line so a bare '-p' in some
+    # other tool's argv is never touched, and value-only so the '-u root' and
+    # '--all-databases' context a reader needs stays intact. The space-separated
+    # form ('-p secret') is deliberately NOT matched: to the mysql clients that
+    # spelling means "prompt me", so the following token is an argument, not a
+    # secret, and eating it would corrupt the line for no gain.
     $lines = $null
     if ($Transform -eq 'RedactInstallationLog') {
         $lines = @(Get-Content -LiteralPath $SourcePath -ErrorAction Stop) -replace `
             '(?i)((?:passwd|password)\s*=\s*)(?:"[^"]*"|''[^'']*''|[^;\s"'']+)', '$1<redacted>' -replace `
-            '(?i)(licensecode\s*=\s*)(?:"[^"]*"|''[^'']*''|[^;\s"'']+)', '$1<redacted>'
+            '(?i)(licensecode\s*=\s*)(?:"[^"]*"|''[^'']*''|[^;\s"'']+)', '$1<redacted>' -replace `
+            '(?i)((?:mysql|mysqldump|mysqladmin)(?:\.exe)?\b[^\r\n]{0,400}?[\s,]-p)(?:"[^"]*"|''[^'']*''|[^\s,;"'']+)', '$1<redacted>'
     }
 
     if ($TailLines -gt 0) {
@@ -813,11 +834,20 @@ function Get-WinConfigSupportCollectors {
                 }
                 $lineCount = 0
                 try { $lineCount = @(Get-Content -LiteralPath $logPath).Count } catch { }
+                # FI-018: how OLD the log is, not just how long it is. QtIFW does
+                # not flush a run's operations until that run ends, so on a box
+                # where the installer is WEDGED the newest line can be many
+                # minutes older than collection time -- the only in-bundle signal
+                # that an install is stuck rather than working. Explicit $null
+                # when unreadable: an unmeasured age must read as unmeasured, never
+                # as a timestamp a reader would difference against.
+                $lastWrite = $null
+                try { $lastWrite = (Get-Item -LiteralPath $logPath -ErrorAction Stop).LastWriteTime.ToString('o') } catch { }
                 @{
                     # transform is a fact, not a verdict: it tells the engineer the
                     # shipped file is post-redaction (FI-007), so a '<redacted>'
                     # token in it is our doing, not the installer's.
-                    Facts = @{ present = $true; totalLines = $lineCount; tailCap = $Context.Caps.InstallLogTailLines; transform = 'RedactInstallationLog' }
+                    Facts = @{ present = $true; totalLines = $lineCount; lastWriteTime = $lastWrite; tailCap = $Context.Caps.InstallLogTailLines; transform = 'RedactInstallationLog' }
                     Files = @(@{ SourcePath = $logPath; TargetName = 'InstallationLog.txt'; TailLines = $Context.Caps.InstallLogTailLines; Transform = 'RedactInstallationLog' })
                 }
             }

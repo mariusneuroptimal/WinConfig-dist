@@ -4489,10 +4489,136 @@ $buttonHandlers = @{
                 return
             }
 
-            # One recorder at a time. The recording loop pumps DoEvents, which keeps
-            # the whole main window clickable -- without this guard a second click on
-            # this button would nest a second recording loop over the same shared
-            # script-scoped state ($script:BtRec_StopClicked etc.).
+            # FI-012 state-aware preflight. It is safe whether NO is closed or
+            # already running: registry + QueryDosDevice + process enumeration
+            # only, never a COM open. A CONFIRMED namespace fault stops a new
+            # recording after preserving a small evidence package. An UNVERIFIED
+            # collector warns but continues in passive troubleshooting mode --
+            # inability to prove health is not proof of corruption.
+            $btSerialPreflight = $null
+            $btSerialPreflightError = $null
+            $btPreflightIntegrity = $null
+            $btNoProcesses = @(Get-Process -Name 'NO' -ErrorAction SilentlyContinue)
+            $btNoProcessState = @($btNoProcesses | ForEach-Object {
+                [ordered]@{
+                    Id              = $_.Id
+                    ProcessName     = $_.ProcessName
+                    StartTime       = $(try { $_.StartTime } catch { $null })
+                    MainWindowTitle = $(try { $_.MainWindowTitle } catch { $null })
+                }
+            })
+            try {
+                if (-not (Get-Command Get-BluetoothSerialPortIntegrity -ErrorAction SilentlyContinue) -or
+                    -not (Get-Command Test-BluetoothRecorderSerialPreflight -ErrorAction SilentlyContinue)) {
+                    throw 'The installed Bluetooth probe does not include the serial-readiness preflight.'
+                }
+                $btPreflightIntegrity = Get-BluetoothSerialPortIntegrity
+                $btSerialPreflight = Test-BluetoothRecorderSerialPreflight -Integrity $btPreflightIntegrity
+            } catch {
+                $btSerialPreflightError = $_.Exception.Message
+            }
+
+            if (-not $btSerialPreflight) {
+                $btSerialPreflight = [ordered]@{
+                    CanStart = $true; Status = 'Unverified'; Reason = 'PreflightUnavailable'
+                    PassiveCaptureAllowed = $true; ApplicationSessionReady = $false
+                    Summary = "Bluetooth serial readiness could not be verified: $btSerialPreflightError"
+                    CheckedAt = Get-Date; CollisionCount = $null; MissingSymlinkCount = $null
+                    DanglingSymlinkCount = $null; ResumeCountSinceBoot = $null
+                    VerifiedAfterLastResume = $null
+                }
+            }
+
+            $btPfResponse = if (Get-Command Get-BluetoothSerialTroubleshootingResponse -ErrorAction SilentlyContinue) {
+                Get-BluetoothSerialTroubleshootingResponse -Readiness $btSerialPreflight `
+                    -NoExeRunning ($btNoProcesses.Count -gt 0) -RecorderActive ([bool]$script:BtRecordingActive)
+            } else {
+                [ordered]@{
+                    Status = 'Unverified'; NotifyUser = $true; StopRecorderStart = $false
+                    ApplicationState = if ($btNoProcesses.Count -gt 0) { 'NoExeRunning' } else { 'NoExeClosed' }
+                    FaultStage = $null; Title = 'Bluetooth Serial Readiness Not Verified'
+                    Summary = "Bluetooth serial readiness could not be verified: $btSerialPreflightError"
+                    LikelyCause = 'The installed passive collector could not verify SERIALCOMM and COM symlink agreement. This is not proof that FI-012 is present.'
+                    Impact = 'The probe can continue collecting passive evidence, but this result is not an all-clear for a new NO session.'
+                    Steps = @('Continue the diagnostic capture if troubleshooting is needed.', 'Repair or update WinConfig and repeat the passive serial-readiness check.')
+                }
+            }
+
+            if ($btPfResponse.NotifyUser) {
+                $btPfEvidencePath = $null
+
+                # A known fault must survive beyond the modal that reports it.
+                # Preserve the complete registration/symlink table, power
+                # correlation, and whether NO was already running. Do not upload
+                # automatically; the operator owns that external action.
+                if ($btPfResponse.StopRecorderStart -and
+                    (Get-Command New-WinConfigDiagnosticRun -ErrorAction SilentlyContinue) -and
+                    (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue) -and
+                    (Get-Command Compress-WinConfigDiagnosticRun -ErrorAction SilentlyContinue)) {
+                    try {
+                        $btPfRun = New-WinConfigDiagnosticRun -ToolId 'bluetooth-serial-readiness'
+                        Add-WinConfigDiagnosticArtifact -RunFolder $btPfRun.RunFolder -Name 'serialcomm-integrity.json' -Depth 8 -Data ([ordered]@{
+                            Fault             = 'FI-012'
+                            Reference         = 'docs/FIELD-ISSUES.md'
+                            AtPreflight       = $btSerialPreflight
+                            Integrity         = $btPreflightIntegrity
+                            Troubleshooting   = $btPfResponse
+                            ApplicationState  = [ordered]@{
+                                ObservedAt     = Get-Date
+                                NoExeRunning   = ($btNoProcesses.Count -gt 0)
+                                NoProcesses    = $btNoProcessState
+                                RecorderActive = [bool]$script:BtRecordingActive
+                            }
+                            Safety            = [ordered]@{
+                                SerialPortOpened = $false
+                                ProcessStopped   = $false
+                                PairingChanged   = $false
+                            }
+                        })
+                        Add-WinConfigDiagnosticArtifact -RunFolder $btPfRun.RunFolder -Name 'manifest.json' -Depth 6 -Data ([ordered]@{
+                            RunId                              = $btPfRun.RunId
+                            ToolId                             = $btPfRun.ToolId
+                            StartedAtUtc                       = $btPfRun.StartedAtUtc
+                            MachineName                        = $env:COMPUTERNAME
+                            SerialPortPreflightStatus          = $btPfResponse.Status
+                            SerialPortPreflightFaultStage      = $btPfResponse.FaultStage
+                            SerialPortCollisionCount           = $btSerialPreflight.CollisionCount
+                            SerialPortMissingSymlinkCount      = $btSerialPreflight.MissingSymlinkCount
+                            SerialPortDanglingSymlinkCount     = $btSerialPreflight.DanglingSymlinkCount
+                            SerialResumeCountSinceBoot         = $btSerialPreflight.ResumeCountSinceBoot
+                            NoExeRunning                       = ($btNoProcesses.Count -gt 0)
+                            RecorderStartPrevented             = $true
+                            PassiveCheckOpenedSerialPort       = $false
+                        })
+                        $btPfHost = ($env:COMPUTERNAME -replace '[^A-Za-z0-9]', '').ToUpper()
+                        $btPfPkg = Compress-WinConfigDiagnosticRun -RunFolder $btPfRun.RunFolder `
+                            -ExportsRoot $btPfRun.ExportsRoot -Label "serial-fault_${btPfHost}" -Prefix 'bt-preflight'
+                        $btPfEvidencePath = $btPfPkg.ZipPath
+                    } catch {
+                        $btPfEvidencePath = $null
+                    }
+                }
+
+                $btPfSteps = @($btPfResponse.Steps)
+                $btPfStepText = if ($btPfSteps.Count -gt 0) {
+                    ((0..($btPfSteps.Count - 1) | ForEach-Object { "$($_ + 1). $($btPfSteps[$_])" }) -join "`n")
+                } else { '' }
+                $btPfAppText = if ($btNoProcesses.Count -gt 0) { 'NO.exe is currently running.' } else { 'NO.exe is currently closed.' }
+                $btPfEvidenceText = if ($btPfEvidencePath) { "`n`nEvidence saved locally:`n$btPfEvidencePath" } else { '' }
+                [System.Windows.Forms.MessageBox]::Show(
+                    "$($btPfResponse.Summary)`n`nLikely cause:`n$($btPfResponse.LikelyCause)`n`nImpact:`n$($btPfResponse.Impact)`n`nCurrent application state:`n$btPfAppText`n`nWhat to do:`n$btPfStepText`n`nThis passive check opened no serial port and changed no pairing or process state.$btPfEvidenceText",
+                    $btPfResponse.Title,
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning
+                ) | Out-Null
+
+                if ($btPfResponse.StopRecorderStart) { return }
+            }
+
+            # One recorder at a time. This guard follows the passive preflight
+            # deliberately: clicking the tool while a recorder is active is still
+            # an opportunity to surface a newly visible known namespace fault.
+            # If readiness is clean, retain the original one-recorder behavior.
             if ($script:BtRecordingActive) {
                 [System.Windows.Forms.MessageBox]::Show(
                     "A Bluetooth Flight Recorder session is already running.`n`nUse the existing recorder window - click 'Stop and Upload' (or Abort) there before starting a new recording.",
@@ -6791,6 +6917,12 @@ $buttonHandlers = @{
                 $btWin32Ok = Initialize-BtWin32Api
                 $btProbeSession = New-DeviceProbeSession
                 $btProbeSession.BtWin32Available = $btWin32Ok
+                # Proof that the passive FI-012 gate ran before this recorder was
+                # constructed. The full start/end tables below remain separate.
+                $btProbeSession.SerialPortPreflight = $btSerialPreflight
+                if ($btSerialPreflight.Status -eq 'Unverified') {
+                    Write-BtLog "  [~] $($btSerialPreflight.Summary) Passive troubleshooting will continue, but this is not a serial-readiness all-clear." -Level "WARN"
+                }
                 $btProbeSession.NoExeVersion = try { Get-NoExeVersion } catch { $null }
                 # The recording window opens HERE, on the same $btRecordStart the
                 # operator markers and the on-screen "Recording mm:ss" label
@@ -8337,6 +8469,7 @@ $buttonHandlers = @{
                             Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'serialcomm-integrity.json' -Depth 8 -Data @{
                                 Fault          = 'FI-012'
                                 Reference      = 'docs/FIELD-ISSUES.md'
+                                AtPreflight    = $btProbeSession.SerialPortPreflight
                                 AtSessionStart = $siStart
                                 AtSessionEnd   = $siEnd
                                 DegradedInRun  = [bool]($siStart -and $siEnd -and $siStart.Healthy -and -not $siEnd.Healthy)
@@ -8689,6 +8822,22 @@ $buttonHandlers = @{
                                                           $btProbeSession.SerialPortIntegrity.Healthy -and -not $btProbeSession.SerialPortIntegrityEnd.Healthy)
                         SerialPortDanglingSymlinkCount = if ($btProbeSession -and $btProbeSession.SerialPortIntegrity) {
                             $(if ($btProbeSession.SerialPortIntegrityEnd) { $btProbeSession.SerialPortIntegrityEnd } else { $btProbeSession.SerialPortIntegrity }).DanglingSymlinkCount
+                        } else { $null }
+                        # Passive gate evaluated before the recorder window was
+                        # constructed. These fields prove that a package started
+                        # from a verified namespace and, when power events were
+                        # readable, that the verification followed the last wake.
+                        SerialPortPreflightStatus = if ($btProbeSession -and $btProbeSession.SerialPortPreflight) {
+                            $btProbeSession.SerialPortPreflight.Status
+                        } else { $null }
+                        SerialPortPreflightCheckedAt = if ($btProbeSession -and $btProbeSession.SerialPortPreflight) {
+                            $btProbeSession.SerialPortPreflight.CheckedAt
+                        } else { $null }
+                        SerialPortPreflightWakeObserved = if ($btProbeSession -and $btProbeSession.SerialPortPreflight) {
+                            $btProbeSession.SerialPortPreflight.WakeObservedSinceBoot
+                        } else { $null }
+                        SerialPortPreflightVerifiedAfterLastResume = if ($btProbeSession -and $btProbeSession.SerialPortPreflight) {
+                            $btProbeSession.SerialPortPreflight.VerifiedAfterLastResume
                         } else { $null }
                         # Which FI-012 fault, and how strongly. 'DeviceNotLinked'
                         # is Suspected by construction -- confirming it needs an
