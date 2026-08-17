@@ -990,20 +990,95 @@ function Get-ComPortHoldState {
     param([string]$PortName)
 
     if ([string]::IsNullOrWhiteSpace($PortName)) { return 'Unknown' }
+    return (Get-ComPortOpenObservation -PortName $PortName).CoarseState
+}
+
+function Get-ComPortOpenObservation {
+    <#
+    .SYNOPSIS
+        One open attempt against one port, returning the RAW win32 code beside
+        the coarse state. This is what Get-ComPortHoldState now runs on.
+    .DESCRIPTION
+        WHY THE OPEN MECHANISM CHANGED. The recorder took two blocking opens per
+        tick and threw the only diagnostic part away: System.IO.Ports.SerialPort
+        raises IOException whose HResult is the generic COR_E_IO (0x80131620),
+        so 2 (reboot), 121 (device not answering), 433 (dead RFCOMM target,
+        reboot without unpairing) and 1231 all collapsed into the single string
+        'Unavailable'. A field capture with four Unavailable observations could
+        not say which of those it saw, and they need different fixes.
+
+        This makes ONE attempt through the shared primitive
+        Invoke-SerialRawOpenAttempt -- the same call the operator-driven probe
+        uses -- and keeps the raw code. It REPLACES the existing open. It does
+        not add one, and unlike the operator path it never retries and never
+        sleeps: the recorder runs during real client sessions.
+
+        FALLBACK IS RECORDED, NOT SILENT. If the CreateFile P/Invoke cannot be
+        loaded, the old SerialPort path still answers the coarse question, so a
+        clinic capture is never degraded by this change. The observation then
+        carries Contract = 'SerialPortLegacy/v1' and a null Win32Error, because
+        that path genuinely cannot know the code. A reader must be able to tell
+        "no raw code was recorded" from "the raw code was 0".
+
+        THE TWO CONTRACTS MUST NOT BE POOLED. A SerialPort call configures
+        DCB/baud and a CreateFile call does not, so their timings measure
+        different work. The Contract field is what keeps them separable, and the
+        timing accumulators are fed separately on it.
+    .OUTPUTS
+        [pscustomobject] WinConfig.Serial.OpenAttempt
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PortName,
+        [string]$Role,
+        [string]$Phase = 'Tick'
+    )
+
+    if (Get-Command Invoke-SerialRawOpenAttempt -ErrorAction SilentlyContinue) {
+        $raw = Invoke-SerialRawOpenAttempt -PortName $PortName -Role $Role -Phase $Phase
+        # PRESENCE OF THE FUNCTION IS NOT SUCCESS OF THE API. When
+        # Initialize-SerialOpenApi cannot Add-Type, the primitive still returns
+        # -- with Attempted = $false and no code. Returning that here would have
+        # meant NO open was made at all and the coarse state read 'Unknown',
+        # which is a silently degraded capture: exactly what the fallback exists
+        # to prevent, and what this branch previously did.
+        if ($raw -and $raw.Attempted) { return $raw }
+    }
+
+    # --- Legacy path: coarse state only, and it says so. ---
+    $attemptedAt = (Get-Date).ToUniversalTime()
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $state = 'Unknown'
     $sp = $null
     try {
         $sp = New-Object System.IO.Ports.SerialPort $PortName
         $sp.Open()
         $sp.Close()
-        return 'Free'
+        $state = 'Free'
     } catch [System.UnauthorizedAccessException] {
-        return 'Held'
+        $state = 'Held'
     } catch [System.IO.IOException] {
-        return 'Unavailable'
+        $state = 'Unavailable'
     } catch {
-        return 'Unknown'
+        $state = 'Unknown'
     } finally {
         if ($sp) { try { $sp.Dispose() } catch { } }
+    }
+    $sw.Stop()
+
+    return [pscustomobject]@{
+        PSTypeName     = 'WinConfig.Serial.OpenAttempt'
+        PortName       = $PortName
+        Role           = $Role
+        Phase          = $Phase
+        TimestampIso   = $attemptedAt.ToString('o')
+        Attempted      = $true
+        Win32Error     = $null
+        ElapsedMs      = [math]::Round($sw.Elapsed.TotalMilliseconds, 1)
+        HandleAcquired = ($state -eq 'Free')
+        CoarseState    = $state
+        Contract       = 'SerialPortLegacy/v1'
+        Unavailable    = 'Raw win32 code not observable through System.IO.Ports'
     }
 }
 
@@ -1036,6 +1111,13 @@ function Get-StreamingState {
         The probe session, read ONLY for the locked ActivePortOpenProbeEnabled
         setting. Omitted => enabled, which is the shipped default and what every
         pre-toggle caller and test mock means.
+    .PARAMETER Phase
+        Which part of the recording these opens belong to. This function serves
+        BOTH the tick loop and the arrival snapshot, and the arrival opens are
+        the COLD ones -- the slowest, and the first chance in a session to see
+        433. Hardcoding 'Tick' filed them under the wrong phase, which is the
+        same downward bias #83 was filed to remove, so the caller states it.
+        Defaults to 'Tick' for every pre-existing caller and test mock.
     .OUTPUTS
         [hashtable] State ('Active'/'Stopped'/'Unknown'/'DisabledBySetting'),
         ActivePort, HeldPorts, UnavailablePorts.
@@ -1043,7 +1125,9 @@ function Get-StreamingState {
     [CmdletBinding()]
     param(
         [hashtable]$WatchState,
-        $Session
+        $Session,
+        [ValidateSet('Selection', 'Startup', 'Tick', 'Anomaly')]
+        [string]$Phase = 'Tick'
     )
 
     # ── The gate, FIRST ──────────────────────────────────────────────────
@@ -1068,6 +1152,10 @@ function Get-StreamingState {
             # zero milliseconds is a true statement about what was done; an
             # empty held-port list would be a false statement about what is.
             PortOpenDurations    = @()
+            # Same reasoning for the raw-code channel: zero attempts is a true
+            # statement about what this function did, and an empty list keeps a
+            # reader from inferring that attempts were made and all succeeded.
+            PortOpenObservations = @()
         }
     }
 
@@ -1106,12 +1194,25 @@ function Get-StreamingState {
     # Timed at the CALL SITE deliberately: Get-ComPortHoldState keeps its string
     # return and its signature, so every existing caller and every test mock of it
     # is untouched.
-    $durations = @()
+    # ONE attempt per port, exactly as before -- the mechanism changed, the
+    # number of opens did not. The attempt now times itself and returns the raw
+    # win32 code, so there is no second call and no stopwatch wrapped around a
+    # call that already measured itself.
+    $durations    = @()
+    $observations = @()
     foreach ($p in $ports) {
-        $holdSw = [System.Diagnostics.Stopwatch]::StartNew()
-        $holdState = Get-ComPortHoldState -PortName $p
-        $holdSw.Stop()
-        $durations += @{ Port = $p; State = $holdState; DurationMs = $holdSw.Elapsed.TotalMilliseconds }
+        $obs = Get-ComPortOpenObservation -PortName $p -Phase $Phase
+        $holdState = $obs.CoarseState
+        $observations += $obs
+        $durations += @{
+            Port       = $p
+            State      = $holdState
+            # 0 only when no attempt was made, in which case State is 'Unknown'
+            # and the timing folder counts nothing for it.
+            DurationMs = $(if ($null -ne $obs.ElapsedMs) { [double]$obs.ElapsedMs } else { [double]0 })
+            Win32Error = $obs.Win32Error
+            Contract   = $obs.Contract
+        }
         switch ($holdState) {
             'Held'        { $activePorts += $p }
             'Unavailable' { $deadPorts   += $p }
@@ -1121,19 +1222,21 @@ function Get-StreamingState {
 
     if ($activePorts.Count -gt 0) {
         return @{
-            State             = 'Active'
-            ActivePort        = ($activePorts -join ', ')
-            HeldPorts         = @($activePorts)
-            UnavailablePorts  = @($deadPorts)
-            OpenedPorts       = @($openedPorts)
-            ProbedPorts       = @($ports)
-            PortOpenDurations = @($durations)
+            State                = 'Active'
+            ActivePort           = ($activePorts -join ', ')
+            HeldPorts            = @($activePorts)
+            UnavailablePorts     = @($deadPorts)
+            OpenedPorts          = @($openedPorts)
+            ProbedPorts          = @($ports)
+            PortOpenDurations    = @($durations)
+            PortOpenObservations = @($observations)
         }
     }
     return @{
         State = 'Stopped'; ActivePort = $null; HeldPorts = @()
         UnavailablePorts = @($deadPorts); OpenedPorts = @($openedPorts); ProbedPorts = @($ports)
         PortOpenDurations = @($durations)
+        PortOpenObservations = @($observations)
     }
 }
 
@@ -1256,6 +1359,15 @@ function Add-PortOpenTimingSamples {
         if ([string]::IsNullOrWhiteSpace($port)) { continue }
         $state = try { [string]$d.State } catch { 'Unknown' }
         $ms    = try { [double]$d.DurationMs } catch { [double]0 }
+        # CONTRACT SEGREGATION. This accumulator's Basis string describes a
+        # System.IO.Ports call. A CreateFile attempt measures different work
+        # (no DCB/baud configuration), so folding one into the other would
+        # produce a number that matches neither and is labelled as the wrong
+        # one. Raw-contract samples belong to Get-SerialOpenAttemptReport;
+        # entries with no Contract are legacy by definition, which is what
+        # every pre-existing caller supplies.
+        $contract = try { [string]$d.Contract } catch { '' }
+        if (-not [string]::IsNullOrWhiteSpace($contract) -and $contract -ne 'SerialPortLegacy/v1') { continue }
         Add-PortOpenTimingSample -Timing $Timing -PortName $port -State $state -DurationMs $ms -Phase $Phase
         $n++
     }
@@ -1429,6 +1541,590 @@ function Get-PortOpenTimingReport {
         # defect this field exists to make visible rather than plausible.
         Phases                               = @($phases)
         Basis                                = 'Full Get-ComPortHoldState call: SerialPort construct + RFCOMM bring-up + Open + Close + Dispose. UPPER BOUND on the exclusive-ownership interval, not a measurement of it.'
+    }
+}
+
+# THE evidence schema version. ONE constant, one owner. Every artifact that
+# needs to state which shape it was written in reads this; a second literal
+# somewhere else is how two halves of an archive come to claim different
+# versions. Bump when a capture's evidence SHAPE changes in a way a reader
+# must branch on -- not for additive fields a reader can ignore.
+$script:BtEvidenceSchemaVersion = '1.0.0'
+
+function Get-BtEvidenceProvenance {
+    <#
+    .SYNOPSIS
+        Answers "which build produced this capture, and how were its port opens
+        measured" -- so an archive is attributable without asking the operator.
+    .DESCRIPTION
+        Every field capture so far has been unattributable: nothing in the
+        manifest carried a build id, so a package could not be tied to the code
+        that wrote it. That is fine until two builds disagree, at which point
+        the corpus cannot be split and every conclusion drawn across it is
+        suspect.
+
+        NEVER THROWS, NEVER BLOCKS A RECORDING. Provenance is metadata about the
+        evidence; failing to read it must not cost the evidence. Missing or
+        malformed input renders as a NULL value with an explicit read status,
+        which is a different fact from a commit that was read cleanly.
+
+        THE OPEN CONTRACT IS DERIVED, NOT DECLARED. Hardcoding
+        CreateFileRawWin32/v1 would be a claim rather than an observation, and
+        it would be WRONG for a legitimate fallback capture that ran on
+        SerialPortLegacy/v1. A run with the probe disabled, or one that never
+        reached a port, observed no contract at all and says so.
+    .PARAMETER SerialOpenRecord
+        The session's raw-open accumulator. Omitted or empty => the contract
+        renders as NotObserved.
+    .PARAMETER SourceCommitRawValue
+        Override for the raw commit text, for tests. When bound -- INCLUDING as
+        an empty string -- the environment is not consulted at all, so a test
+        can exercise the missing case without mutating the process environment.
+    .OUTPUTS
+        [pscustomobject] WinConfig.Evidence.Provenance
+    #>
+    [CmdletBinding()]
+    param(
+        $SerialOpenRecord,
+        [AllowNull()][AllowEmptyString()][string]$SourceCommitRawValue
+    )
+
+    $raw = if ($PSBoundParameters.ContainsKey('SourceCommitRawValue')) {
+        $SourceCommitRawValue
+    } else {
+        # Bootstrap sets this, and explicitly sets it to $null on its own error
+        # path, so absent is a REAL case rather than a theoretical one.
+        $env:WINCONFIG_SOURCE_COMMIT
+    }
+
+    $commit = $null
+    $status = 'Missing'
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        $status = 'Missing'
+    } elseif ($raw -match '^[0-9a-fA-F]{7,40}$') {
+        $commit = $raw.ToLowerInvariant()
+        $status = 'Explicit'
+    } else {
+        # Kept as raw text, not coerced. A value that is present but not a
+        # commit is evidence about the build pipeline, and silently nulling it
+        # would hide that.
+        $status = 'Malformed'
+    }
+
+    $contracts = @()
+    if ($SerialOpenRecord -is [hashtable]) {
+        $rawCount    = try { [int]$SerialOpenRecord.AttemptCount } catch { 0 }
+        $legacyCount = try { [int]$SerialOpenRecord.LegacyContractCount } catch { 0 }
+        if ($rawCount -gt 0)    { $contracts += [string]$SerialOpenRecord.Contract }
+        if ($legacyCount -gt 0) { $contracts += 'SerialPortLegacy/v1' }
+    }
+    $contracts = @($contracts | Where-Object { $_ } | Select-Object -Unique)
+
+    # Mixed is a real outcome, not an error: the P/Invoke can be available for
+    # part of a run and not another. It renders as Mixed with both listed
+    # rather than as whichever happened to be counted first.
+    $contractStatus = switch ($contracts.Count) {
+        0       { 'NotObserved' }
+        1       { 'Single' }
+        default { 'Mixed' }
+    }
+
+    return [pscustomobject]@{
+        PSTypeName                  = 'WinConfig.Evidence.Provenance'
+        EvidenceSchemaVersion       = $script:BtEvidenceSchemaVersion
+        SourceCommit                = $commit
+        SourceCommitReadStatus      = $status
+        SourceCommitRawValue        = $(if ([string]::IsNullOrWhiteSpace($raw)) { $null } else { [string]$raw })
+        SerialOpenContract          = $(if ($contracts.Count -eq 1) { $contracts[0] } else { $null })
+        SerialOpenContractStatus    = $contractStatus
+        SerialOpenContractsObserved = @($contracts)
+    }
+}
+
+function New-BluetoothEventEvidenceRecord {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [datetime]$WindowStart = (Get-Date).AddMinutes(-10),
+        [int]$MaxEvents = 2500
+    )
+
+    return @{
+        Contract            = 'WinConfig.BluetoothEventEvidence/v1'
+        WindowStart         = $WindowStart
+        MaxEvents           = [Math]::Max(1, $MaxEvents)
+        Events              = @()
+        EventKeys           = @()
+        Seen                = @{}
+        Queries             = @()
+        Failures            = @()
+        PollCount           = 0
+        DuplicateCount      = 0
+        DroppedEventCount   = 0
+        DroppedQueryCount   = 0
+        DroppedFailureCount = 0
+        FinalDrainStatus    = 'NotAttempted'
+        FinalDrainReason    = $null
+        FinalDrainAt        = $null
+        LastCollectorAt     = $null
+    }
+}
+
+function Add-BluetoothEventEvidenceBatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Record,
+        [AllowNull()]$Batch,
+        [AllowNull()][string]$CollectorError
+    )
+
+    if ($Record -isnot [hashtable]) {
+        return [pscustomobject]@{ AcceptedCount = 0; AcceptedEvents = @(); NextSince = $null }
+    }
+
+    $Record.PollCount++
+    $capturedAt = Get-Date
+    if ($null -ne $Batch -and @($Batch.PSObject.Properties.Name) -contains 'CapturedAt' -and $Batch.CapturedAt) {
+        $capturedAt = [datetime]$Batch.CapturedAt
+    }
+    $Record.LastCollectorAt = $capturedAt
+
+    if (-not [string]::IsNullOrWhiteSpace($CollectorError)) {
+        $Record.Failures += [pscustomobject]@{
+            At       = $capturedAt
+            LogName  = '(collector)'
+            Provider = $null
+            Reason   = $CollectorError
+        }
+    }
+
+    $batchProperties = if ($null -eq $Batch) {
+        @()
+    } elseif ($Batch -is [System.Collections.IDictionary]) {
+        @($Batch.Keys)
+    } else {
+        @($Batch.PSObject.Properties.Name)
+    }
+    if ($batchProperties -contains 'Failures') {
+        foreach ($failure in @($Batch.Failures)) {
+            $Record.Failures += [pscustomobject]@{
+                At       = $capturedAt
+                LogName  = if ($failure.Log) { [string]$failure.Log } else { $null }
+                Provider = if ($failure.Provider) { [string]$failure.Provider } else { $null }
+                Reason   = [string]$failure.Reason
+            }
+        }
+    }
+    if ($batchProperties -contains 'Queries') {
+        $Record.Queries += @($Batch.Queries)
+    }
+    while ($Record.Failures.Count -gt $Record.MaxEvents) {
+        $Record.Failures = @($Record.Failures | Select-Object -Skip 1)
+        $Record.DroppedFailureCount++
+    }
+    while ($Record.Queries.Count -gt ($Record.MaxEvents * 4)) {
+        $Record.Queries = @($Record.Queries | Select-Object -Skip 1)
+        $Record.DroppedQueryCount++
+    }
+
+    $accepted = 0
+    $acceptedEvents = @()
+    if ($batchProperties -contains 'Events') {
+        foreach ($eventRow in @($Batch.Events)) {
+            if ($null -eq $eventRow) { continue }
+            $names = if ($eventRow -is [System.Collections.IDictionary]) { @($eventRow.Keys) } else { @($eventRow.PSObject.Properties.Name) }
+            $logName = if ($names -contains 'LogName') { [string]$eventRow.LogName } else { '' }
+            $recordId = if ($names -contains 'RecordId' -and $null -ne $eventRow.RecordId) { [string]$eventRow.RecordId } else { '' }
+            if (-not [string]::IsNullOrWhiteSpace($recordId)) {
+                $key = 'record|{0}|{1}' -f $logName.ToLowerInvariant(), $recordId
+            } else {
+                $provider = if ($names -contains 'ProviderName') { [string]$eventRow.ProviderName } else { '' }
+                $id = if ($names -contains 'Id') { [string]$eventRow.Id } else { '' }
+                $time = if ($names -contains 'TimeCreated' -and $eventRow.TimeCreated) { ([datetime]$eventRow.TimeCreated).ToUniversalTime().Ticks } else { 0 }
+                $body = if ($names -contains 'Xml' -and $eventRow.Xml) { [string]$eventRow.Xml } elseif ($names -contains 'Message') { [string]$eventRow.Message } else { '' }
+                $key = 'fallback|{0}|{1}|{2}|{3}|{4}' -f $logName.ToLowerInvariant(), $provider.ToLowerInvariant(), $id, $time, $body
+            }
+            if ($Record.Seen.ContainsKey($key)) {
+                $Record.DuplicateCount++
+                continue
+            }
+            $Record.Seen[$key] = $true
+            $Record.Events += $eventRow
+            $Record.EventKeys += $key
+            $accepted++
+            $acceptedEvents += $eventRow
+            while ($Record.Events.Count -gt $Record.MaxEvents) {
+                $droppedKey = $Record.EventKeys[0]
+                $Record.Events = @($Record.Events | Select-Object -Skip 1)
+                $Record.EventKeys = @($Record.EventKeys | Select-Object -Skip 1)
+                [void]$Record.Seen.Remove($droppedKey)
+                $Record.DroppedEventCount++
+            }
+        }
+    }
+
+    # Event-log commits can trail the event timestamp. Re-query a generous
+    # overlap and rely on LogName+RecordId deduplication; advancing to the exact
+    # capture time can permanently miss a late-arriving authentication row.
+    $nextSince = $capturedAt.AddSeconds(-30)
+    return [pscustomobject]@{ AcceptedCount = $accepted; AcceptedEvents = @($acceptedEvents); NextSince = $nextSince }
+}
+
+function Set-BluetoothEventEvidenceFinalDrain {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Record,
+        [Parameter(Mandatory)][ValidateSet('Collected', 'Failed', 'TimedOut')][string]$Status,
+        [AllowNull()][string]$Reason
+    )
+    if ($Record -isnot [hashtable]) { return $false }
+    $Record.FinalDrainStatus = $Status
+    $Record.FinalDrainReason = $Reason
+    $Record.FinalDrainAt = Get-Date
+    return $true
+}
+
+function Get-BluetoothEventEvidenceReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Record,
+        [AllowNull()][string]$TargetMac
+    )
+
+    if ($Record -isnot [hashtable]) { return $null }
+    $normalizedTarget = if ($TargetMac) { ($TargetMac -replace '[^0-9A-Fa-f]', '').ToUpperInvariant() } else { '' }
+    $structuredMatches = 0
+    $messageOnlyMatches = 0
+    if ($normalizedTarget) {
+        foreach ($eventRow in @($Record.Events)) {
+            $eventNames = if ($eventRow -is [System.Collections.IDictionary]) { @($eventRow.Keys) } else { @($eventRow.PSObject.Properties.Name) }
+            $eventDataValues = if ($eventNames -contains 'EventData') { @($eventRow.EventData | ForEach-Object { [string]$_.Value }) } else { @() }
+            # Do not search the rendered Message (which may also appear under
+            # RenderingInfo in XML) as structured evidence. Only event payload
+            # values can establish a target match; localized text stays context.
+            $structuredText = $eventDataValues -join ' '
+            $structuredNormalized = ($structuredText -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+            if ($structuredNormalized -like "*$normalizedTarget*") {
+                $structuredMatches++
+            } else {
+                $messageValue = if ($eventNames -contains 'Message') { [string]$eventRow.Message } else { '' }
+                $messageNormalized = ($messageValue -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+                if ($messageNormalized -like "*$normalizedTarget*") { $messageOnlyMatches++ }
+            }
+        }
+    }
+
+    $queryFailures = @($Record.Queries | Where-Object { $_.Status -eq 'Failed' }).Count
+    $queryTruncations = @($Record.Queries | Where-Object { $_.HitLimit }).Count
+    return [pscustomobject]@{
+        PSTypeName                 = 'WinConfig.BluetoothEventEvidence.Report'
+        Contract                   = $Record.Contract
+        WindowStart                = $Record.WindowStart
+        LastCollectorAt            = $Record.LastCollectorAt
+        EventCount                 = @($Record.Events).Count
+        Events                     = @($Record.Events | Sort-Object TimeCreated, LogName, RecordId)
+        PollCount                  = [int]$Record.PollCount
+        DuplicateCount             = [int]$Record.DuplicateCount
+        DroppedEventCount          = [int]$Record.DroppedEventCount
+        MaxEvents                  = [int]$Record.MaxEvents
+        QueryCount                 = @($Record.Queries).Count
+        QueryFailureCount          = $queryFailures
+        QueryHitLimitCount         = $queryTruncations
+        DroppedQueryCount          = [int]$Record.DroppedQueryCount
+        Queries                    = @($Record.Queries)
+        FailureCount               = @($Record.Failures).Count
+        DroppedFailureCount        = [int]$Record.DroppedFailureCount
+        Failures                   = @($Record.Failures)
+        FinalDrainStatus           = $Record.FinalDrainStatus
+        FinalDrainReason           = $Record.FinalDrainReason
+        FinalDrainAt               = $Record.FinalDrainAt
+        TargetMac                  = if ($normalizedTarget) { $normalizedTarget } else { $null }
+        StructuredTargetMatchCount = $structuredMatches
+        MessageOnlyTargetMatchCount = $messageOnlyMatches
+        MessageDiagnosticUse       = 'ContextOnlyLocalized'
+    }
+}
+
+function Complete-SerialOpenTopologyRequest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Record,
+        [AllowNull()]$Snapshot,
+        [AllowNull()][string]$FailureReason
+    )
+
+    if ($Record -isnot [hashtable] -or $null -eq $Record.TopologyRequest) { return $false }
+    $request = $Record.TopologyRequest
+    if ($request.Status -ne 'Pending') { return $false }
+    $request['CollectedAt'] = (Get-Date).ToString('o')
+    if (-not [string]::IsNullOrWhiteSpace($FailureReason) -or $null -eq $Snapshot) {
+        $request.Status = 'Failed'
+        $request.Snapshot = $null
+        $request['FailureReason'] = if ($FailureReason) { $FailureReason } else { 'Topology collector returned no snapshot.' }
+    } else {
+        $request.Status = 'Collected'
+        $request.Snapshot = $Snapshot
+        $request['FailureReason'] = $null
+    }
+    return $true
+}
+
+function New-SerialOpenAttemptRecord {
+    <#
+    .SYNOPSIS
+        Creates the session accumulator for raw open attempts.
+    .DESCRIPTION
+        AGGREGATE, NEVER A ROW PER TICK. A 524-tick recording over four ports is
+        ~2000 attempts; storing each one would bloat every archive to describe a
+        session whose answer is usually "the same code, over and over". What a
+        reader actually needs is: which codes did this port produce, how often,
+        how long did each take, when was each first and last seen, and WHEN DID
+        THE CODE CHANGE. Transitions are the expensive-to-reconstruct part, so
+        they are kept explicitly and everything else is folded.
+    .OUTPUTS
+        [hashtable]
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([int]$MaxTransitions = 200)
+
+    return @{
+        Contract               = 'CreateFileRawWin32/v1'
+        Ports                  = @{}
+        AttemptCount           = 0
+        NotAttemptedCount      = 0
+        LegacyContractCount    = 0
+        Transitions            = @()
+        MaxTransitions         = $MaxTransitions
+        DroppedTransitionCount = 0
+        TopologyRequest        = $null
+    }
+}
+
+function Add-SerialOpenAttempt {
+    <#
+    .SYNOPSIS
+        Folds ONE open observation into the session record, in place.
+    .DESCRIPTION
+        Tolerant by design: this runs inside the recording loop, and a malformed
+        observation must not take the tick down.
+
+        Also raises the TOPOLOGY REQUEST. The first time a port produces a code
+        that indicates a dead or missing target (2 or 433), this sets a pending
+        request so a background collector can capture the serial topology ONCE.
+        It does no topology work itself -- nothing here may touch the tick
+        thread beyond folding numbers.
+    .PARAMETER Record
+        Accumulator from New-SerialOpenAttemptRecord.
+    .PARAMETER Observation
+        A WinConfig.Serial.OpenAttempt from Get-ComPortOpenObservation.
+    .OUTPUTS
+        [bool] whether the observation was accepted.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]$Record,
+        [Parameter(Mandatory)][AllowNull()]$Observation
+    )
+
+    if ($Record -isnot [hashtable]) { return $false }
+    if ($null -eq $Observation)     { return $false }
+
+    $names = @($Observation.PSObject.Properties.Name)
+    $port  = if ($names -contains 'PortName') { [string]$Observation.PortName } else { '' }
+    if ([string]::IsNullOrWhiteSpace($port)) { return $false }
+
+    $contract = if ($names -contains 'Contract') { [string]$Observation.Contract } else { '' }
+    if ($contract -ne $Record.Contract) {
+        # A legacy SerialPort observation carries no win32 code. Count it so the
+        # archive can say the raw-code channel was NOT available, rather than
+        # letting a reader infer from an empty code table that nothing failed.
+        $Record.LegacyContractCount++
+        return $false
+    }
+
+    $attempted = if ($names -contains 'Attempted') { [bool]$Observation.Attempted } else { $false }
+    if (-not $attempted) {
+        $Record.NotAttemptedCount++
+        return $false
+    }
+
+    $code = if ($names -contains 'Win32Error' -and $null -ne $Observation.Win32Error) { [int]$Observation.Win32Error } else { $null }
+    if ($null -eq $code) { $Record.NotAttemptedCount++; return $false }
+
+    $ms   = if ($names -contains 'ElapsedMs' -and $null -ne $Observation.ElapsedMs) { [double]$Observation.ElapsedMs } else { [double]0 }
+    $iso  = if ($names -contains 'TimestampIso') { [string]$Observation.TimestampIso } else { '' }
+    $ph   = if ($names -contains 'Phase' -and -not [string]::IsNullOrWhiteSpace([string]$Observation.Phase)) { [string]$Observation.Phase } else { 'Unknown' }
+    $role = if ($names -contains 'Role') { [string]$Observation.Role } else { '' }
+
+    if (-not $Record.Ports.ContainsKey($port)) {
+        $Record.Ports[$port] = @{
+            Role     = $role
+            Codes    = @{}
+            LastCode = $null
+            Phases   = @{}
+        }
+    }
+    $pe = $Record.Ports[$port]
+    if ([string]::IsNullOrWhiteSpace($pe.Role) -and -not [string]::IsNullOrWhiteSpace($role)) { $pe.Role = $role }
+
+    $key = [string]$code
+    if (-not $pe.Codes.ContainsKey($key)) {
+        $pe.Codes[$key] = @{
+            Code      = $code
+            Count     = 0
+            FirstIso  = $iso
+            LastIso   = $iso
+            TotalMs   = [double]0
+            MinMs     = $ms
+            MaxMs     = $ms
+        }
+    }
+    $ce = $pe.Codes[$key]
+    $ce.Count++
+    $ce.LastIso = $iso
+    $ce.TotalMs += $ms
+    if ($ms -lt $ce.MinMs) { $ce.MinMs = $ms }
+    if ($ms -gt $ce.MaxMs) { $ce.MaxMs = $ms }
+
+    if (-not $pe.Phases.ContainsKey($ph)) { $pe.Phases[$ph] = 0 }
+    $pe.Phases[$ph]++
+
+    # Code CHANGE, not code presence. This is the sequence a reader cannot
+    # rebuild from counts alone: healthy -> 433 at a known instant is the Modern
+    # Standby signature; 433 from the first tick is a box that arrived broken.
+    if ($null -ne $pe.LastCode -and $pe.LastCode -ne $code) {
+        if ($Record.Transitions.Count -lt $Record.MaxTransitions) {
+            $Record.Transitions += @{ Port = $port; FromCode = $pe.LastCode; ToCode = $code; AtIso = $iso; Phase = $ph }
+        } else {
+            # Bounded, and the drop is COUNTED. A silently truncated list reads
+            # as a session that stopped flapping.
+            $Record.DroppedTransitionCount++
+        }
+    }
+    $pe.LastCode = $code
+    $Record.AttemptCount++
+
+    # Single-flight: first interesting code only, and never overwritten.
+    if ($null -eq $Record.TopologyRequest -and ($code -eq 433 -or $code -eq 2)) {
+        $Record.TopologyRequest = @{
+            Reason      = "FirstWin32Code:$code"
+            Port        = $port
+            Phase       = $ph
+            RequestedAt = $iso
+            Status      = 'Pending'
+            Snapshot    = $null
+        }
+    }
+
+    return $true
+}
+
+function Get-SerialOpenAttemptReport {
+    <#
+    .SYNOPSIS
+        Renders the session's raw open-attempt evidence.
+    .DESCRIPTION
+        Supersedes PortOpenTiming for captures taken through the CreateFile
+        primitive, and carries the invasiveness accounting (#83) that the legacy
+        key carried, so nothing is lost by the switch.
+
+        THE TWO KEYS MUST NEVER BE POOLED. PortOpenTiming measured a
+        System.IO.Ports call, which configures DCB/baud; this measures a bare
+        CreateFile, which does not. Same units, different work. Contract is
+        emitted so a reader cannot merge them by accident, and a capture that
+        used the legacy path emits the legacy key instead of this one.
+    .PARAMETER Record
+        Accumulator from New-SerialOpenAttemptRecord.
+    .PARAMETER RecordingSeconds
+        Total recording length, for the observer-effect percentage. Omit and the
+        percentage renders as absent rather than as 0.
+    .OUTPUTS
+        [pscustomobject] or $null when nothing was observed.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Record,
+        [double]$RecordingSeconds = 0
+    )
+
+    if ($Record -isnot [hashtable]) { return $null }
+    if ($Record.AttemptCount -le 0 -and $Record.LegacyContractCount -le 0 -and $Record.NotAttemptedCount -le 0) { return $null }
+
+    $ports       = @()
+    $openMs      = [double]0
+    $openCount   = 0
+    $codeTotals  = @{}
+
+    foreach ($portName in @($Record.Ports.Keys | Sort-Object)) {
+        $pe = $Record.Ports[$portName]
+        $codes = @()
+        foreach ($k in @($pe.Codes.Keys | Sort-Object { [int]$_ })) {
+            $ce = $pe.Codes[$k]
+            $codes += [pscustomobject]@{
+                Win32Error = $ce.Code
+                Count      = [int]$ce.Count
+                FirstIso   = $ce.FirstIso
+                LastIso    = $ce.LastIso
+                TotalMs    = [math]::Round([double]$ce.TotalMs, 1)
+                MeanMs     = [math]::Round(([double]$ce.TotalMs / [Math]::Max(1, $ce.Count)), 1)
+                MinMs      = [math]::Round([double]$ce.MinMs, 1)
+                MaxMs      = [math]::Round([double]$ce.MaxMs, 1)
+            }
+            if (-not $codeTotals.ContainsKey($k)) { $codeTotals[$k] = 0 }
+            $codeTotals[$k] += [int]$ce.Count
+            if ([int]$ce.Code -eq 0) {
+                $openCount += [int]$ce.Count
+                $openMs    += [double]$ce.TotalMs
+            }
+        }
+        $ports += [pscustomobject]@{
+            PortName = $portName
+            Role     = $pe.Role
+            LastCode = $pe.LastCode
+            Codes    = @($codes)
+            Phases   = @($pe.Phases.Keys | Sort-Object | ForEach-Object { [pscustomobject]@{ Phase = $_; Count = [int]$pe.Phases[$_] } })
+        }
+    }
+
+    $pct = if ($RecordingSeconds -gt 0) { [math]::Round((($openMs / 1000.0) / $RecordingSeconds) * 100, 2) } else { $null }
+
+    $topology = if ($null -eq $Record.TopologyRequest) {
+        $null
+    } else {
+        $tr = $Record.TopologyRequest
+        # A request that nothing serviced must say so. Rendering it as absent
+        # would let a reader conclude no topology defect was present, when in
+        # fact the question was asked and never answered.
+        $status = if ($tr.Status -eq 'Pending') { 'RequestedButNotCollected' } else { $tr.Status }
+        [pscustomobject]@{
+            Reason      = $tr.Reason
+            Port        = $tr.Port
+            Phase       = $tr.Phase
+            RequestedAt = $tr.RequestedAt
+            Status      = $status
+            Snapshot    = $tr.Snapshot
+            CollectedAt  = if ($tr.ContainsKey('CollectedAt')) { $tr.CollectedAt } else { $null }
+            FailureReason = if ($tr.ContainsKey('FailureReason')) { $tr.FailureReason } else { $null }
+        }
+    }
+
+    return [pscustomobject]@{
+        PSTypeName                           = 'WinConfig.Serial.OpenAttemptReport'
+        Contract                             = $Record.Contract
+        Ports                                = @($ports)
+        AttemptCount                         = [int]$Record.AttemptCount
+        NotAttemptedCount                    = [int]$Record.NotAttemptedCount
+        LegacyContractCount                  = [int]$Record.LegacyContractCount
+        CodeTotals                           = @($codeTotals.Keys | Sort-Object { [int]$_ } | ForEach-Object { [pscustomobject]@{ Win32Error = [int]$_; Count = [int]$codeTotals[$_] } })
+        Transitions                          = @($Record.Transitions)
+        DroppedTransitionCount               = [int]$Record.DroppedTransitionCount
+        HandleAcquiredCount                  = $openCount
+        SuccessfulOpenCallMs                 = [math]::Round($openMs, 1)
+        SuccessfulOpenCallPercentOfRecording = $pct
+        TopologyRequest                      = $topology
+        Basis                                = 'One CreateFile open attempt per port per phase: CreateFile + (on success) CloseHandle. No DCB/baud configuration, no retry, no sleep. UPPER BOUND on the exclusive-ownership interval, not a measurement of it.'
     }
 }
 
@@ -3960,6 +4656,10 @@ function New-DeviceProbeSession {
         # Add-PortOpenTimingSamples. See Get-PortOpenTimingReport on why the
         # headline is an upper bound rather than a measurement.
         PortOpenTiming           = @{}
+        # Raw win32 evidence for the same opens, under its own versioned
+        # contract. Separate from PortOpenTiming on purpose: the two measure
+        # different work and must never be pooled.
+        SerialOpenAttempts       = (New-SerialOpenAttemptRecord)
         # Cross-field contradictions present in the arrival snapshot, before any
         # transition could fire. Populated by the caller at startup.
         StartupConsistency       = @()
@@ -4245,6 +4945,15 @@ function Invoke-DeviceProbeTick {
         if ($streamResult.ContainsKey('PortOpenDurations')) {
             $null = Add-PortOpenTimingSamples -Timing $Session.PortOpenTiming `
                 -Durations $streamResult.PortOpenDurations -Phase 'Tick'
+        }
+        # Raw codes for the SAME attempts -- no extra open. Absent on an older
+        # caller or a test mock of Get-StreamingState, in which case the record
+        # stays empty and the archive reports no raw evidence rather than
+        # implying every attempt succeeded.
+        if ($streamResult.ContainsKey('PortOpenObservations') -and $Session.SerialOpenAttempts) {
+            foreach ($obs in @($streamResult.PortOpenObservations)) {
+                $null = Add-SerialOpenAttempt -Record $Session.SerialOpenAttempts -Observation $obs
+            }
         }
     }
 
@@ -5429,9 +6138,28 @@ function Invoke-AnomalyDiagnosticSnapshot {
     }
     $ports = @($ports | Select-Object -Unique)
     if ($ports.Count -gt 0 -and $activeProbe) {
-        $snapshot.ComPortStatus = @($ports | ForEach-Object {
-            @{ PortName = $_; InUse = (Test-ComPortInUse -PortName $_) }
+        # ONE detailed observation per port, not a bool over a discarded one.
+        # This path spends a real open at the most diagnostic moment in the
+        # recording -- the operator has just confirmed something went wrong --
+        # and it previously kept only InUse, throwing the win32 code away. The
+        # same observation feeds the snapshot AND the session accumulator, so
+        # nothing here opens the port twice.
+        $anomalyObs = @($ports | ForEach-Object { Get-ComPortOpenObservation -PortName $_ -Phase 'Anomaly' })
+        $snapshot.ComPortStatus = @($anomalyObs | ForEach-Object {
+            @{
+                PortName   = $_.PortName
+                InUse      = ($_.CoarseState -eq 'Held')
+                State      = $_.CoarseState
+                Win32Error = $_.Win32Error
+                ElapsedMs  = $_.ElapsedMs
+                Contract   = $_.Contract
+            }
         })
+        if ($Session -and $Session.SerialOpenAttempts) {
+            foreach ($ao in $anomalyObs) {
+                $null = Add-SerialOpenAttempt -Record $Session.SerialOpenAttempts -Observation $ao
+            }
+        }
     } elseif ($ports.Count -gt 0) {
         # Named as NOT COLLECTED with a reason, rather than omitted or emitted
         # with InUse = $false. An omitted key reads as "there were no ports";
@@ -6664,6 +7392,90 @@ function Get-NextProbeTickDeadline {
     }
 }
 
+function Get-BluetoothGhostPortPlan {
+    <#
+    .SYNOPSIS
+        Pure. THE answer to "which Bluetooth COM port devices would a cleanup
+        remove", for both the Dry Run preview and the live removal.
+    .DESCRIPTION
+        This exists because the preview and the execution had DIFFERENT answers.
+        Live selection took the all-zero LOCALMFG local-service registration OR
+        any BTHENUM port whose device is no longer present; the Dry Run planner
+        took only the all-zero set. The preview therefore under-reported a
+        DESTRUCTIVE scope -- an operator who approved "1 port" could have three
+        removed. Both sides now call this function, so there is one answerer.
+
+        Scope note, deliberately narrow: a ghost here means a port node that is
+        not present, or the all-zero local-service placeholder. It does NOT
+        cover the FI-012 fault-3 state, where every affected node stays
+        `Present = $true` and reads healthy while its symlink points at an
+        abandoned RFCOMM generation. Nothing in this plan detects that, and
+        removing nodes does not repair it -- the fix there is a reboot without
+        unpairing. Do not grow this predicate to try to catch it.
+    .PARAMETER PortDevices
+        Raw `Get-PnpDevice -Class Ports` output. The BTHENUM filter is applied
+        HERE rather than at the call sites, so callers cannot narrow the input
+        and reintroduce the divergence this function removes.
+    .OUTPUTS
+        Hashtable: Targets (array), TargetCount, AllZeroCount, NotPresentCount.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [object[]]$PortDevices
+    )
+
+    $targets = @()
+    $allZero = 0
+    $notPresent = 0
+
+    foreach ($dev in @($PortDevices)) {
+        if (-not $dev) { continue }
+
+        # StrictMode-safe property reads: Get-PnpDevice objects always carry
+        # these, but the tests feed synthetic rows and an absent key must not
+        # throw (see project-powershell-test-gotchas).
+        $names = @($dev.PSObject.Properties.Name)
+        $instanceId = if ($names -contains 'InstanceId') { [string]$dev.InstanceId } else { '' }
+        if ([string]::IsNullOrWhiteSpace($instanceId)) { continue }
+        if ($instanceId -notmatch 'BTHENUM') { continue }
+
+        $reasons = @()
+        if ($instanceId -match 'LOCALMFG' -and $instanceId -match '000000000000') {
+            $reasons += 'AllZeroLocalService'
+        }
+        # Absent/null Present is NOT treated as absent hardware. Only an
+        # explicit $false marks a node gone: guessing from a missing property
+        # would make the plan destructive on incomplete input.
+        if ($names -contains 'Present' -and $dev.Present -eq $false) {
+            $reasons += 'NotPresent'
+        }
+        if ($reasons.Count -eq 0) { continue }
+
+        if ($reasons -contains 'AllZeroLocalService') { $allZero++ }
+        if ($reasons -contains 'NotPresent') { $notPresent++ }
+
+        $targets += @{
+            InstanceId   = $instanceId
+            FriendlyName = if ($names -contains 'FriendlyName') { [string]$dev.FriendlyName } else { '' }
+            Status       = if ($names -contains 'Status') { [string]$dev.Status } else { '' }
+            Present      = if ($names -contains 'Present') { $dev.Present } else { $null }
+            Reasons      = $reasons
+            Reason       = ($reasons -join ', ')
+        }
+    }
+
+    return @{
+        Targets         = $targets
+        TargetCount     = $targets.Count
+        AllZeroCount    = $allZero
+        NotPresentCount = $notPresent
+    }
+}
+
 Export-ModuleMember -Function @(
     'Initialize-BtWin32Api',
     'Get-NextProbeTickDeadline',
@@ -6685,6 +7497,29 @@ Export-ModuleMember -Function @(
     'Get-BtConnectionState',
     'Test-ComPortInUse',
     'Get-ComPortHoldState',
+    # Raw open evidence. Get-ComPortHoldState keeps its string contract and is
+    # now a thin coarse view over this; the detailed form is what carries the
+    # win32 code the recorder used to discard. Aggregation is exported for the
+    # same reason the chain is: the window, the archive and the tests must read
+    # ONE computation, not three.
+    'Get-ComPortOpenObservation',
+    # Capture provenance. Exported so the manifest, the archive and the tests
+    # read ONE answer to "which build wrote this, and how were its opens
+    # measured" -- and so the open contract is DERIVED from the evidence rather
+    # than asserted a second time at the render site.
+    'Get-BtEvidenceProvenance',
+    'New-BluetoothEventEvidenceRecord',
+    'Add-BluetoothEventEvidenceBatch',
+    'Set-BluetoothEventEvidenceFinalDrain',
+    'Get-BluetoothEventEvidenceReport',
+    'Complete-SerialOpenTopologyRequest',
+    'New-SerialOpenAttemptRecord',
+    'Add-SerialOpenAttempt',
+    'Get-SerialOpenAttemptReport',
+    # Ghost-port removal target plan. Exported because the Dry Run preview and
+    # the live removal MUST read one computation of "what would be deleted" --
+    # they previously read two, and the preview reported the smaller scope.
+    'Get-BluetoothGhostPortPlan',
     'Get-StreamingState',
     'Get-ActivePortOpenProbeSetting',
     'Test-ActivePortOpenProbeEnabled',

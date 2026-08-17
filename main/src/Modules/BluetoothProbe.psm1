@@ -5860,6 +5860,130 @@ public static class WinConfigSerialOpen {
     }
 }
 
+function Invoke-SerialRawOpenAttempt {
+    <#
+    .SYNOPSIS
+        THE one-shot raw open. Exactly one native CreateFile attempt, no retry
+        and no sleep, returning the raw win32 code with its timing.
+    .DESCRIPTION
+        Shared deliberately by the Flight Recorder tick and the operator-driven
+        Test-BluetoothSerialPortOpen, so there is one implementation of "what
+        does opening this port do right now" and one contract describing it.
+        Copying the P/Invoke or the coarse mapping into the recorder would give
+        the two paths separate answers to the same question, which is the
+        channel-mismatch class this repo keeps re-filing.
+
+        RETRY POLICY LIVES IN THE CALLER, NOT HERE. The standalone probe retries
+        win32 121 because a single 121 cannot separate a cold ACL link from an
+        unreachable device. The recorder must NOT: it runs during real client
+        sessions, and a retry plus its settle delay would multiply the time the
+        probe owns a port NO.exe is trying to open. One attempt in, one
+        observation out.
+
+        THIS IS NOT A HOLD TEST. A successful attempt takes a handle and closes
+        it immediately; it does not configure DCB/baud the way System.IO.Ports
+        does, so it disturbs the device slightly less than the SerialPort path
+        it replaces. It still establishes an RFCOMM link -- it is an active
+        probe, and every caller must be behind the active-probe gate.
+    .PARAMETER PortName
+        COM port to attempt, e.g. 'COM6'.
+    .PARAMETER Role
+        Channel role for the port when known (Data / Command). Presentation
+        only; the COM number is not an identity and moves on every re-pair.
+    .PARAMETER Phase
+        Which part of the recording this attempt came from: Selection, Startup,
+        Tick or Anomaly. Recorded because a report built from ticks alone drops
+        the COLD opens, which are the slowest on a Bluetooth SPP port.
+    .OUTPUTS
+        [pscustomobject] WinConfig.Serial.OpenAttempt
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PortName,
+        [string]$Role,
+        [string]$Phase = 'Tick'
+    )
+
+    $attemptedAt = (Get-Date).ToUniversalTime()
+
+    if (-not (Initialize-SerialOpenApi)) {
+        # ABSENT, not healthy. There is no win32 code because no attempt was
+        # made, and Win32Error must not default to 0 -- 0 means "opened".
+        return [pscustomobject]@{
+            PSTypeName     = 'WinConfig.Serial.OpenAttempt'
+            PortName       = $PortName
+            Role           = $Role
+            Phase          = $Phase
+            TimestampIso   = $attemptedAt.ToString('o')
+            Attempted      = $false
+            Win32Error     = $null
+            ElapsedMs      = $null
+            HandleAcquired = $false
+            CoarseState    = 'Unknown'
+            Contract       = 'CreateFileRawWin32/v1'
+            Unavailable    = 'CreateFile P/Invoke unavailable'
+        }
+    }
+
+    $sw  = [Diagnostics.Stopwatch]::StartNew()
+    $err = [WinConfigSerialOpen]::TryOpen($PortName)
+    $sw.Stop()
+
+    return [pscustomobject]@{
+        PSTypeName     = 'WinConfig.Serial.OpenAttempt'
+        PortName       = $PortName
+        Role           = $Role
+        Phase          = $Phase
+        TimestampIso   = $attemptedAt.ToString('o')
+        Attempted      = $true
+        Win32Error     = [int]$err
+        ElapsedMs      = [math]::Round($sw.Elapsed.TotalMilliseconds, 1)
+        HandleAcquired = ($err -eq 0)
+        CoarseState    = (Get-SerialOpenCoarseState -Win32Error $err)
+        Contract       = 'CreateFileRawWin32/v1'
+        Unavailable    = $null
+    }
+}
+
+function Get-SerialOpenCoarseState {
+    <#
+    .SYNOPSIS
+        Pure. Maps a raw win32 open result onto the recorder's existing coarse
+        vocabulary: Free / Held / Unavailable / Unknown.
+    .DESCRIPTION
+        Exists so the raw-code swap is BACKWARD COMPATIBLE at the coarse layer.
+        Get-ComPortHoldState previously derived these strings from which .NET
+        exception SerialPort threw:
+
+            UnauthorizedAccessException -> Held          (win32 5)
+            IOException                 -> Unavailable   (win32 2 / 121 / 433 / ...)
+            anything else               -> Unknown
+
+        The mapping below reproduces that exactly from the code itself, so every
+        existing caller, capture field and test mock of the coarse string keeps
+        working while the raw code becomes available alongside it.
+
+        DELIBERATELY COARSE. This does not diagnose. 433 is a strong dead-target
+        SIGNATURE but only becomes a Modern Standby verdict with topology and
+        resume corroboration; a lone 121 stays ambiguous; 1231 is raw evidence
+        pending target-matched BTHUSB authentication events. Those judgements
+        live in Get-SerialOpenClassification and above, never here.
+    .OUTPUTS
+        [string] Free / Held / Unavailable / Unknown
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][AllowNull()][object]$Win32Error)
+
+    if ($null -eq $Win32Error) { return 'Unknown' }
+    $code = [int]$Win32Error
+    switch ($code) {
+        0   { return 'Free' }
+        5   { return 'Held' }
+        default { return 'Unavailable' }
+    }
+}
+
 function Get-SerialOpenClassification {
     <#
     .SYNOPSIS
@@ -5917,12 +6041,32 @@ function Get-SerialOpenClassification {
         5   { return @{ Classification = 'InUse'
                         Meaning = 'ERROR_ACCESS_DENIED - the port exists and another process holds it'
                         Action  = 'Close the application holding the port (usually NO.exe) and retry.' } }
+        1231 {
+            # ERROR_NETWORK_UNREACHABLE. Observed on MMEVOLD_06 alongside a
+            # target-matched BTHUSB Event 16, and the CONJUNCTION is what
+            # established mutual-authentication failure there. Microsoft defines
+            # 1231 only as "network unreachable" -- on its own it does not prove
+            # a stale or mismatched bond, and it must not be reported as one.
+            # Raw evidence, pending the event correlation.
+            return @{ Classification = 'LinkUnreachable'
+                      Meaning = 'ERROR_NETWORK_UNREACHABLE - the RFCOMM link could not be established. On its own this does NOT establish a stale or mismatched pairing; that reading requires target-matched BTHUSB authentication events from the same window.'
+                      Action  = 'Collect the Bluetooth event evidence for this device before acting. Do NOT re-pair on this code alone - it is also consistent with the device being out of range or the radio being in a bad state.' }
+        }
         433 { return @{ Classification = 'PortTargetDead'
                         Meaning = 'ERROR_NO_SUCH_DEVICE - the COM name resolves, but to an RFCOMM device object the driver has abandoned. Measured with duplicate SERIALCOMM owners after Modern Standby: every Bluetooth COM name on the PC fails this way in under 2 ms, including names with no device behind them, while the live generation opens normally one layer down.'
                         Action  = 'Reboot without unpairing. This is not a headset fault and not a range/power problem - do not toggle the radio, re-pair, or reset COM numbers, and do not power-cycle the device chasing it.' } }
         121 {
-            $persisted = if ($FirstWin32Error -eq 121) { ' on the first attempt and again on retry, so this is not a cold link' } else { '' }
+            # A SINGLE 121 does not settle anything, and the returned text now
+            # says so. Retry evidence is what separates a cold ACL link from an
+            # unreachable device; with RetryCount 0 there is none, and the old
+            # wording read identically to the retried case.
+            $persisted = if ($FirstWin32Error -eq 121) {
+                ' on the first attempt and again on retry, so this is not a cold link'
+            } elseif ($FirstWin32Error -lt 0) {
+                ' on a SINGLE attempt, which cannot separate a cold ACL link from an unreachable device - this reading is UNRESOLVED until a retry is made'
+            } else { '' }
             return @{ Classification = 'DeviceNotResponding'
+                      Resolved = ($FirstWin32Error -ge 0)
                       Meaning = "ERROR_SEM_TIMEOUT - the port is healthy; the device did not answer the RFCOMM connect$persisted"
                       Action  = 'Check the headset is powered ON and in range FIRST. A powered-off device fails exactly this way on every retry while every static signal - PnP nodes, SERIALCOMM, port integrity - still reads healthy. Only once it is confirmed on does a Bluetooth radio toggle (>=10s off) apply.' }
         }
@@ -6115,12 +6259,14 @@ function Test-BluetoothSerialPortOpen {
 
     $result.Ran = $true
     foreach ($port in $PortName) {
-        $sw  = [Diagnostics.Stopwatch]::StartNew()
-        $err = [WinConfigSerialOpen]::TryOpen($port)
-        $sw.Stop()
+        # Same one-shot primitive the recorder uses. The RETRY below is what
+        # separates this path from the recorder's, and it stays here in the
+        # caller rather than moving into the primitive.
+        $obs = Invoke-SerialRawOpenAttempt -PortName $port -Role $roles[$port] -Phase 'Operator'
+        $err = $obs.Win32Error
 
         $first    = $err
-        $firstMs  = $sw.ElapsedMilliseconds
+        $firstMs  = $obs.ElapsedMs
         $retryMs  = $null
         $attempts = 1
 
@@ -6130,10 +6276,9 @@ function Test-BluetoothSerialPortOpen {
         # would only burn the operator's time.
         while ($err -eq 121 -and $attempts -le $RetryCount) {
             if ($RetryDelayMs -gt 0) { Start-Sleep -Milliseconds $RetryDelayMs }
-            $sw2 = [Diagnostics.Stopwatch]::StartNew()
-            $err = [WinConfigSerialOpen]::TryOpen($port)
-            $sw2.Stop()
-            $retryMs = $sw2.ElapsedMilliseconds
+            $retryObs = Invoke-SerialRawOpenAttempt -PortName $port -Role $roles[$port] -Phase 'Operator'
+            $err     = $retryObs.Win32Error
+            $retryMs = $retryObs.ElapsedMs
             $attempts++
         }
 
@@ -7395,6 +7540,68 @@ function Get-BluetoothEventLogInventory {
     }
 }
 
+function ConvertTo-BluetoothEventEvidenceRow {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Event
+    )
+
+    $message = $null
+    try { $message = [string]$Event.Message } catch { $message = $null }
+    if ($message -and $message.Length -gt 500) {
+        $message = $message.Substring(0, 500) + '...'
+    }
+
+    $xmlText = $null
+    $eventData = @()
+    $xmlReadStatus = 'Missing'
+    $xmlReadError = $null
+    try {
+        $xmlText = [string]$Event.ToXml()
+        if ($xmlText) {
+            $xmlReadStatus = 'Success'
+            $xmlDocument = [xml]$xmlText
+            $eventDataNodes = @($xmlDocument.SelectNodes("//*[local-name()='EventData']/*[local-name()='Data']"))
+            $eventData = @($eventDataNodes | ForEach-Object {
+                [pscustomobject]@{
+                    Name  = if ($_.Attributes['Name']) { [string]$_.Attributes['Name'].Value } else { $null }
+                    Value = [string]$_.InnerText
+                }
+            })
+        }
+    } catch {
+        $xmlText = $null
+        $eventData = @()
+        $xmlReadStatus = 'Failed'
+        $xmlReadError = $_.Exception.Message
+    }
+
+    [pscustomobject]@{
+        TimeCreated          = $Event.TimeCreated
+        LogName              = $Event.LogName
+        ProviderName         = $Event.ProviderName
+        Id                   = $Event.Id
+        RecordId             = $Event.RecordId
+        Version              = $Event.Version
+        Level                = $Event.LevelDisplayName
+        Task                 = $Event.Task
+        Opcode               = $Event.Opcode
+        ActivityId           = $Event.ActivityId
+        RelatedActivityId    = $Event.RelatedActivityId
+        ProcessId            = $Event.ProcessId
+        ThreadId             = $Event.ThreadId
+        MachineName          = $Event.MachineName
+        StableClass          = Get-BluetoothEventClass -Event $Event
+        EventData            = $eventData
+        Xml                  = $xmlText
+        XmlReadStatus        = $xmlReadStatus
+        XmlReadError         = $xmlReadError
+        Message              = $message
+        MessageDiagnosticUse = 'ContextOnlyLocalized'
+    }
+}
+
 function Get-BluetoothRecentEvents {
     <#
     .SYNOPSIS
@@ -7408,7 +7615,8 @@ function Get-BluetoothRecentEvents {
     .PARAMETER Since
         Earliest event time to include. Defaults to one hour ago.
     .PARAMETER MaxEventsPerLog
-        Cap on events pulled from each log to bound output size. Default 500.
+        Cap on events pulled from each operational log or System provider to
+        bound output size. Default 500.
     .OUTPUTS
         PSCustomObject with CapturedAt + Since + Events + Failures.
     #>
@@ -7421,6 +7629,7 @@ function Get-BluetoothRecentEvents {
     $now = Get-Date
     $events = @()
     $failures = @()
+    $queries = @()
 
     # Bluetooth operational channels (whichever are enabled on this build).
     $btChannels = @()
@@ -7432,56 +7641,83 @@ function Get-BluetoothRecentEvents {
 
     foreach ($ch in $btChannels) {
         try {
-            $rows = Get-WinEvent -FilterHashtable @{
+            $rows = @(Get-WinEvent -FilterHashtable @{
                 LogName   = $ch
                 StartTime = $Since
-            } -MaxEvents $MaxEventsPerLog -ErrorAction Stop
+            } -MaxEvents $MaxEventsPerLog -ErrorAction Stop)
 
             foreach ($r in $rows) {
-                $msg = $r.Message
-                if ($msg -and $msg.Length -gt 500) { $msg = $msg.Substring(0, 500) + '...' }
-                $events += [pscustomobject]@{
-                    TimeCreated  = $r.TimeCreated
-                    LogName      = $r.LogName
-                    ProviderName = $r.ProviderName
-                    Id           = $r.Id
-                    Level        = $r.LevelDisplayName
-                    StableClass  = Get-BluetoothEventClass -Event $r
-                    Message      = $msg
-                }
+                $events += ConvertTo-BluetoothEventEvidenceRow -Event $r
+            }
+            $queries += [pscustomobject]@{
+                LogName = $ch; ProviderName = $null
+                Status = if ($rows.Count -gt 0) { 'Success' } else { 'Empty' }
+                ReturnedCount = $rows.Count
+                HitLimit = ($rows.Count -ge $MaxEventsPerLog)
+                Reason = $null
             }
         } catch {
             # FilterHashtable throws "no events matched" as an error — treat as empty, not failure.
-            if ($_.Exception.Message -notmatch 'No events were found') {
+            if ($_.Exception.Message -match 'No events were found') {
+                $queries += [pscustomobject]@{
+                    LogName = $ch; ProviderName = $null; Status = 'Empty'
+                    ReturnedCount = 0; HitLimit = $false; Reason = $null
+                }
+            } else {
                 $failures += [pscustomobject]@{ Log = $ch; Reason = $_.Exception.Message }
+                $queries += [pscustomobject]@{
+                    LogName = $ch; ProviderName = $null; Status = 'Failed'
+                    ReturnedCount = 0; HitLimit = $false; Reason = $_.Exception.Message
+                }
             }
         }
     }
 
-    # System log filtered to Bluetooth/Audio providers.
-    try {
-        $sysRows = Get-WinEvent -FilterHashtable @{
-            LogName      = 'System'
-            StartTime    = $Since
-            ProviderName = @('BTHUSB', 'BTHPORT', 'Microsoft-Windows-Bluetooth-BthUSB', 'Microsoft-Windows-Audio', 'Microsoft-Windows-Bluetooth-Bthmini')
-        } -MaxEvents $MaxEventsPerLog -ErrorAction Stop
+    # Query System providers independently. Get-WinEvent rejects an entire
+    # multi-provider FilterHashtable when even one named provider is absent on
+    # the current Windows build; that previously hid valid BTHUSB rows.
+    $systemProviders = @(
+        'BTHUSB',
+        'BTHPORT',
+        'Microsoft-Windows-Bluetooth-BthUSB',
+        'Microsoft-Windows-Audio',
+        'Microsoft-Windows-Bluetooth-Bthmini'
+    )
+    foreach ($provider in $systemProviders) {
+        try {
+            $sysRows = @(Get-WinEvent -FilterHashtable @{
+                LogName      = 'System'
+                StartTime    = $Since
+                ProviderName = $provider
+            } -MaxEvents $MaxEventsPerLog -ErrorAction Stop)
 
-        foreach ($r in $sysRows) {
-            $msg = $r.Message
-            if ($msg -and $msg.Length -gt 500) { $msg = $msg.Substring(0, 500) + '...' }
-            $events += [pscustomobject]@{
-                TimeCreated  = $r.TimeCreated
-                LogName      = $r.LogName
-                ProviderName = $r.ProviderName
-                Id           = $r.Id
-                Level        = $r.LevelDisplayName
-                StableClass  = Get-BluetoothEventClass -Event $r
-                Message      = $msg
+            foreach ($r in $sysRows) {
+                $events += ConvertTo-BluetoothEventEvidenceRow -Event $r
             }
-        }
-    } catch {
-        if ($_.Exception.Message -notmatch 'No events were found') {
-            $failures += [pscustomobject]@{ Log = 'System (BT/Audio filter)'; Reason = $_.Exception.Message }
+            $queries += [pscustomobject]@{
+                LogName = 'System'; ProviderName = $provider
+                Status = if ($sysRows.Count -gt 0) { 'Success' } else { 'Empty' }
+                ReturnedCount = $sysRows.Count
+                HitLimit = ($sysRows.Count -ge $MaxEventsPerLog)
+                Reason = $null
+            }
+        } catch {
+            if ($_.Exception.Message -match 'No events were found') {
+                $queries += [pscustomobject]@{
+                    LogName = 'System'; ProviderName = $provider; Status = 'Empty'
+                    ReturnedCount = 0; HitLimit = $false; Reason = $null
+                }
+            } else {
+                $failures += [pscustomobject]@{
+                    Log      = 'System'
+                    Provider = $provider
+                    Reason   = $_.Exception.Message
+                }
+                $queries += [pscustomobject]@{
+                    LogName = 'System'; ProviderName = $provider; Status = 'Failed'
+                    ReturnedCount = 0; HitLimit = $false; Reason = $_.Exception.Message
+                }
+            }
         }
     }
 
@@ -7489,11 +7725,16 @@ function Get-BluetoothRecentEvents {
 
     return [pscustomobject]@{
         PSTypeName = 'WinConfig.FlightRecorder.RecentEvents'
+        Contract   = 'WinConfig.BluetoothRecentEvents/v2'
         CapturedAt = $now
         Since      = $Since
+        MaxEventsPerLog = $MaxEventsPerLog
         Count      = $events.Count
         Events     = $events
         Failures   = $failures
+        FailureCount = $failures.Count
+        Queries    = $queries
+        Truncated  = [bool](@($queries | Where-Object HitLimit).Count -gt 0)
     }
 }
 
@@ -8029,6 +8270,12 @@ Export-ModuleMember -Function @(
     'Get-BluetoothDeviceReachability',
     'Initialize-SerialSymlinkApi',
     'Initialize-SerialOpenApi',
+    # The one-shot raw open and its coarse mapping. Exported because the Flight
+    # Recorder calls the SAME primitive rather than carrying its own copy of the
+    # P/Invoke -- two implementations of "what does opening this port do" would
+    # be two answers to one question.
+    'Invoke-SerialRawOpenAttempt',
+    'Get-SerialOpenCoarseState',
     'Invoke-RevealHiddenBluetoothDevices',
     'Invoke-BluetoothGhostCOMCleanup',
     # Audit critical-fix helpers (exported for unit tests + downstream tooling)

@@ -1160,6 +1160,39 @@ $buttonClickHandler = {
 }
 
 # =============================================================================
+# BLUETOOTH GHOST-PORT TARGET PLAN
+# =============================================================================
+# Get-BluetoothGhostPortPlan lives in BluetoothDeviceProbe.psm1, which is an
+# OPTIONAL module loaded lazily when the recorder panel opens. The repair
+# buttons can be pressed without ever opening that panel, so resolve it here.
+#
+# This FAILS CLOSED. There is deliberately no local copy of the ghost predicate
+# to fall back on: a fallback would be a second answerer for "what gets
+# deleted", which is the exact divergence this function was extracted to end.
+
+function Get-BtGhostPortPlanOrThrow {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+
+    if (-not (Get-Command Get-BluetoothGhostPortPlan -ErrorAction SilentlyContinue)) {
+        # $PSScriptRoot can be empty when this runs outside a script file. Guard
+        # the path build: an unguarded Join-Path fails with a parameter-binding
+        # error, which still fails closed but hides the reason from the tech.
+        $bdpPath = if ($PSScriptRoot) { Join-Path $PSScriptRoot "Modules\BluetoothDeviceProbe.psm1" } else { $null }
+        if ($bdpPath -and (Test-Path $bdpPath)) {
+            try { Import-Module $bdpPath -Force -DisableNameChecking -ErrorAction Stop } catch { }
+        }
+    }
+    if (-not (Get-Command Get-BluetoothGhostPortPlan -ErrorAction SilentlyContinue)) {
+        throw "Cannot determine which Bluetooth ports would be removed: BluetoothDeviceProbe.psm1 did not provide Get-BluetoothGhostPortPlan. Refusing to remove anything on a guess."
+    }
+
+    $devices = @(Get-PnpDevice -Class Ports -ErrorAction Stop)
+    return (Get-BluetoothGhostPortPlan -PortDevices $devices)
+}
+
+# =============================================================================
 # SESSION LEDGER INSTRUMENTATION HELPER
 # =============================================================================
 # Wrapper function that ensures operations are recorded BEFORE execution.
@@ -6900,10 +6933,97 @@ $buttonHandlers = @{
 
             $btRecordStart = Get-Date
             $btPollJob     = $null
-            $btPollSince   = $btRecordStart
+            # A bounded pre-roll is persisted on every run. Authentication and
+            # BTHUSB failures often precede the operator clicking Record; starting
+            # at the click made the most useful causal evidence disappear.
+            $btPollSince   = $btRecordStart.AddMinutes(-10)
             $btNextPoll    = $btRecordStart.AddSeconds(6)
             $btSvcStates   = $null
             $btFirstPoll   = $true
+            $btEventReport = $null
+            $btDeviceProbeModPath = Join-Path $PSScriptRoot "Modules\BluetoothDeviceProbe.psm1"
+            $btEventEvidence = if (Get-Command New-BluetoothEventEvidenceRecord -ErrorAction SilentlyContinue) {
+                New-BluetoothEventEvidenceRecord -WindowStart $btPollSince
+            } else { $null }
+
+            # One collector and one consumer for live polls and the final drain.
+            # The topology snapshot is conditional work in this background job,
+            # never on the three-second tick/UI thread.
+            $btPollJobScript = {
+                param($probeModulePath, $deviceProbeModulePath, $since, [bool]$collectTopology)
+                Import-Module $probeModulePath -Force -DisableNameChecking -ErrorAction SilentlyContinue
+                Import-Module $deviceProbeModulePath -Force -DisableNameChecking -ErrorAction SilentlyContinue
+                $eventError = $null
+                $events = try { Get-BluetoothRecentEvents -Since $since -MaxEventsPerLog 100 } catch {
+                    $eventError = $_.Exception.Message
+                    $null
+                }
+                $services = try { Get-BluetoothServiceStates } catch { @{} }
+                $topology = $null
+                $topologyError = $null
+                if ($collectTopology) {
+                    $topology = try { Get-BluetoothSerialPortIntegrity } catch {
+                        $topologyError = $_.Exception.Message
+                        $null
+                    }
+                }
+                [pscustomobject]@{
+                    Events              = $events
+                    EventCollectorError = $eventError
+                    Services            = $services
+                    TopologyRequested   = $collectTopology
+                    Topology            = $topology
+                    TopologyError       = $topologyError
+                }
+            }
+
+            $mergeBtPollData = {
+                param($pollData, [bool]$renderLive)
+                if ($pollData -is [array]) { $pollData = @($pollData)[-1] }
+                if ($null -eq $pollData) {
+                    if ($btEventEvidence -and (Get-Command Add-BluetoothEventEvidenceBatch -ErrorAction SilentlyContinue)) {
+                        Add-BluetoothEventEvidenceBatch -Record $btEventEvidence -Batch $null -CollectorError 'Background collector returned no result.' | Out-Null
+                    }
+                } else {
+                    $mergeResult = $null
+                    if ($btEventEvidence -and (Get-Command Add-BluetoothEventEvidenceBatch -ErrorAction SilentlyContinue)) {
+                        $mergeResult = Add-BluetoothEventEvidenceBatch -Record $btEventEvidence -Batch $pollData.Events -CollectorError $pollData.EventCollectorError
+                        if ($mergeResult.NextSince) { $btPollSince = $mergeResult.NextSince }
+                    }
+
+                    if ($pollData.Services) {
+                        if (-not $btSvcStates) {
+                            $btSvcStates = $pollData.Services
+                        } else {
+                            foreach ($k in @($pollData.Services.Keys)) {
+                                $prev = $btSvcStates[$k]; $curr = $pollData.Services[$k]
+                                if ($prev -and $curr -and $prev.Status -ne $curr.Status -and $renderLive) {
+                                    $lvl = if ($curr.Running) { 'OK' } else { 'WARN' }
+                                    Write-BtLog "  Service: $($curr.DisplayName)  $($prev.Status) -> $($curr.Status)" -Level $lvl
+                                }
+                            }
+                            $btSvcStates = $pollData.Services
+                        }
+                    }
+
+                    if ($renderLive -and $mergeResult) {
+                        $newEvts = @($mergeResult.AcceptedEvents | Where-Object { $_ -and $_.TimeCreated -ge $btRecordStart })
+                        $connEvts  = @($newEvts | Where-Object { $_.StableClass -eq 'Connected' })
+                        $discEvts  = @($newEvts | Where-Object { $_.StableClass -eq 'Disconnected' })
+                        $otherEvts = @($newEvts | Where-Object { $_.StableClass -eq 'Unknown' })
+                        foreach ($ev in $connEvts) { Write-BtLog "  $($ev.TimeCreated.ToString('HH:mm:ss'))  Connected  ($($ev.ProviderName))" -Level 'OK' }
+                        foreach ($ev in $discEvts) { Write-BtLog "  $($ev.TimeCreated.ToString('HH:mm:ss'))  Disconnected  ($($ev.ProviderName))" -Level 'WARN' }
+                        if ($otherEvts.Count -gt 0) { Write-BtLog "  $($otherEvts.Count) Bluetooth event(s) captured" -Level 'DIM' }
+                        if ($newEvts.Count -eq 0 -and $btFirstPoll) { Write-BtLog '  (no Bluetooth activity yet)' -Level 'DIM' }
+                    }
+
+                    if ($pollData.TopologyRequested -and $btProbeSession -and
+                        (Get-Command Complete-SerialOpenTopologyRequest -ErrorAction SilentlyContinue)) {
+                        Complete-SerialOpenTopologyRequest -Record $btProbeSession.SerialOpenAttempts -Snapshot $pollData.Topology -FailureReason $pollData.TopologyError | Out-Null
+                    }
+                    $btFirstPoll = $false
+                }
+            }
 
             # Deep probe session state (used across recording + summary)
             $btProbeSession  = $null
@@ -7073,17 +7193,24 @@ $buttonHandlers = @{
                         # emptying it would not merely lose the tie-breaker, it
                         # would feed the selector a fabricated observation.
                         $cdHeld = $(if ($btSelectActiveProbe) { ,@() } else { $null })
-                        if ($btSelectActiveProbe -and (Get-Command Get-ComPortHoldState -ErrorAction SilentlyContinue)) {
+                        if ($btSelectActiveProbe -and (Get-Command Get-ComPortOpenObservation -ErrorAction SilentlyContinue)) {
                             foreach ($cdP in $cdPorts) {
-                                $cdSw = [System.Diagnostics.Stopwatch]::StartNew()
-                                $cdState = try { Get-ComPortHoldState -PortName $cdP } catch { $null }
-                                $cdSw.Stop()
-                                if (Get-Command Add-PortOpenTimingSamples -ErrorAction SilentlyContinue) {
+                                # ONE attempt, which times itself and returns the raw
+                                # win32 code. Selection opens are the COLD ones and the
+                                # first chance in a session to see 433, so they must
+                                # carry the code too -- a tick-only raw channel would
+                                # miss the most diagnostic opens of the run.
+                                $cdObs = try { Get-ComPortOpenObservation -PortName $cdP -Phase 'Selection' } catch { $null }
+                                $cdState = if ($cdObs) { $cdObs.CoarseState } else { $null }
+                                if ($cdObs -and (Get-Command Add-PortOpenTimingSamples -ErrorAction SilentlyContinue)) {
                                     try {
                                         $null = Add-PortOpenTimingSamples -Timing $btProbeSession.PortOpenTiming -Phase 'Selection' -Durations @(
-                                            @{ Port = $cdP; State = ([string]$cdState); DurationMs = $cdSw.Elapsed.TotalMilliseconds }
+                                            @{ Port = $cdP; State = ([string]$cdState); DurationMs = $cdObs.ElapsedMs; Contract = $cdObs.Contract }
                                         )
                                     } catch { }
+                                }
+                                if ($cdObs -and $btProbeSession -and $btProbeSession.SerialOpenAttempts -and (Get-Command Add-SerialOpenAttempt -ErrorAction SilentlyContinue)) {
+                                    try { $null = Add-SerialOpenAttempt -Record $btProbeSession.SerialOpenAttempts -Observation $cdObs } catch { }
                                 }
                                 if ($cdState -eq 'Held') { $cdHeld += $cdP }
                             }
@@ -7258,7 +7385,7 @@ $buttonHandlers = @{
                 # ActivePortOpenProbeEnabled and returns 'DisabledBySetting'
                 # without touching a port. This is the SECOND of the three active
                 # -open paths; passing the session here is not optional plumbing.
-                $initStream = Get-StreamingState -WatchState $btProbeWatch -Session $btProbeSession
+                $initStream = Get-StreamingState -WatchState $btProbeWatch -Session $btProbeSession -Phase 'Startup'
                 # This call opens the same ports the tick loop does, and it too
                 # sits inside the recording window ($btRecordStart, above). It
                 # already emits PortOpenDurations -- the first cut of #83 threw
@@ -7267,6 +7394,16 @@ $buttonHandlers = @{
                     try {
                         $null = Add-PortOpenTimingSamples -Timing $btProbeSession.PortOpenTiming `
                             -Durations $initStream.PortOpenDurations -Phase 'Startup'
+                    } catch { }
+                }
+                # Raw codes for those same arrival opens. Startup is where a box
+                # that ARRIVED broken shows 433 on the very first attempt, which
+                # is what separates it from one that degraded mid-session.
+                if ($btProbeSession.SerialOpenAttempts -and (Get-Command Add-SerialOpenAttempt -ErrorAction SilentlyContinue)) {
+                    try {
+                        foreach ($obs in @($initStream.PortOpenObservations)) {
+                            $null = Add-SerialOpenAttempt -Record $btProbeSession.SerialOpenAttempts -Observation $obs
+                        }
                     } catch { }
                 }
                 $btProbeSession.StreamingState = $initStream.State
@@ -7948,55 +8085,15 @@ $buttonHandlers = @{
                     Remove-Job $btPollJob -Force -ErrorAction SilentlyContinue
                     $btPollJob = $null
 
-                    if ($pollData) {
-                        if (-not $btSvcStates) {
-                            $btSvcStates = $pollData.Services
-                        } else {
-                            foreach ($k in @($pollData.Services.Keys)) {
-                                $prev = $btSvcStates[$k]; $curr = $pollData.Services[$k]
-                                if ($prev -and $curr -and $prev.Status -ne $curr.Status) {
-                                    $lvl = if ($curr.Running) { 'OK' } else { 'WARN' }
-                                    Write-BtLog "  Service: $($curr.DisplayName)  $($prev.Status) -> $($curr.Status)" -Level $lvl
-                                }
-                            }
-                            $btSvcStates = $pollData.Services
-                        }
-
-                        if (-not $btDeepProbeAvailable) {
-                            $newEvts = @($pollData.Events.Events | Where-Object { $_ -and $_.TimeCreated -gt $btPollSince })
-                            if ($newEvts.Count -gt 0) {
-                                $btPollSince = ($newEvts | Sort-Object TimeCreated | Select-Object -Last 1).TimeCreated
-                                $connEvts  = @($newEvts | Where-Object { $_.StableClass -eq 'Connected' })
-                                $discEvts  = @($newEvts | Where-Object { $_.StableClass -eq 'Disconnected' })
-                                $otherEvts = @($newEvts | Where-Object { $_.StableClass -eq 'Unknown' })
-                                foreach ($ev in $connEvts) {
-                                    Write-BtLog "  $($ev.TimeCreated.ToString('HH:mm:ss'))  Connected  ($($ev.ProviderName))" -Level "OK"
-                                }
-                                foreach ($ev in $discEvts) {
-                                    Write-BtLog "  $($ev.TimeCreated.ToString('HH:mm:ss'))  Disconnected  ($($ev.ProviderName))" -Level "WARN"
-                                }
-                                if ($otherEvts.Count -gt 0) {
-                                    Write-BtLog "  $($otherEvts.Count) Bluetooth event(s) captured" -Level "DIM"
-                                }
-                            } elseif ($btFirstPoll) {
-                                Write-BtLog "  (no Bluetooth activity yet)" -Level "DIM"
-                            }
-                        }
-                        $btFirstPoll = $false
-                    }
+                    . $mergeBtPollData $pollData $true
 
                     $btNextPoll = (Get-Date).AddSeconds(8)
                 }
 
                 if (-not $btPollJob -and $now -ge $btNextPoll) {
-                    $pollSince = $btPollSince; $pollMod = $btModPath
-                    $btPollJob = Start-Job -ScriptBlock {
-                        param($mp, $since)
-                        Import-Module $mp -Force -ErrorAction SilentlyContinue
-                        $evts = try { Get-BluetoothRecentEvents -Since $since -MaxEventsPerLog 100 } catch { $null }
-                        $svcs = try { Get-BluetoothServiceStates } catch { @{} }
-                        return @{ Events = $evts; Services = $svcs }
-                    } -ArgumentList $pollMod, $pollSince
+                    $collectTopology = [bool]($btProbeSession -and $btProbeSession.SerialOpenAttempts.TopologyRequest -and
+                        $btProbeSession.SerialOpenAttempts.TopologyRequest.Status -eq 'Pending')
+                    $btPollJob = Start-Job -ScriptBlock $btPollJobScript -ArgumentList $btModPath, $btDeviceProbeModPath, $btPollSince, $collectTopology
                 }
 
                 Wait-BtPump -Milliseconds 200 -BreakOnOperatorAction
@@ -8008,8 +8105,6 @@ $buttonHandlers = @{
             # recorded duration.
             if ($btProbeSession) { $btProbeSession.RecordingStoppedAt = Get-Date }
 
-            if ($btPollJob) { Remove-Job $btPollJob -Force -ErrorAction SilentlyContinue }
-
             # Both operator paths out of the recording are closed the instant the
             # loop exits. A live-looking Abort during packaging would promise an
             # action that can no longer happen.
@@ -8018,6 +8113,11 @@ $buttonHandlers = @{
             $btAnomalyBar.Visible = $false
 
             if ($script:BtRec_AbortClicked) {
+                if ($btPollJob) {
+                    Stop-Job $btPollJob -ErrorAction SilentlyContinue
+                    Remove-Job $btPollJob -Force -ErrorAction SilentlyContinue
+                    $btPollJob = $null
+                }
                 Write-BtLog ""
                 Write-BtLog "ABORTED -- recording stopped without uploading." -Level "WARN"
                 $btBanner.BackColor      = [System.Drawing.Color]::FromArgb(60, 50, 10)
@@ -8060,6 +8160,88 @@ $buttonHandlers = @{
             $btMarkBtn.Visible  = $false
             $btMarkBox.Visible  = $false
             $btAbortBtn.Visible = $false
+
+            # Consume the in-flight poll instead of discarding its result, then
+            # perform one bounded final drain. This closes both prior gaps: the
+            # last BTHUSB rows survive Stop, and a 2/433 raised on the final tick
+            # still receives its one background topology snapshot.
+            if ($btPollJob) {
+                $pollDeadline = (Get-Date).AddSeconds(30)
+                while ($btPollJob.State -in @('Running', 'NotStarted') -and (Get-Date) -lt $pollDeadline) {
+                    Wait-BtPump -Milliseconds 200
+                }
+                if ($btPollJob.State -notin @('Running', 'NotStarted')) {
+                    $pollData = $null
+                    try { $pollData = Receive-Job $btPollJob -ErrorAction SilentlyContinue } catch { }
+                    . $mergeBtPollData $pollData $false
+                } elseif ($btEventEvidence) {
+                    Add-BluetoothEventEvidenceBatch -Record $btEventEvidence -Batch $null -CollectorError 'In-flight event poll timed out during stop.' | Out-Null
+                }
+                Stop-Job $btPollJob -ErrorAction SilentlyContinue
+                Remove-Job $btPollJob -Force -ErrorAction SilentlyContinue
+                $btPollJob = $null
+            }
+
+            $finalDrainCollected = $false
+            $finalDrainReason = $null
+            try {
+                $collectTopology = [bool]($btProbeSession -and $btProbeSession.SerialOpenAttempts.TopologyRequest -and
+                    $btProbeSession.SerialOpenAttempts.TopologyRequest.Status -eq 'Pending')
+                $btPollJob = Start-Job -ScriptBlock $btPollJobScript -ArgumentList $btModPath, $btDeviceProbeModPath, $btPollSince, $collectTopology
+                $drainDeadline = (Get-Date).AddSeconds(30)
+                while ($btPollJob.State -in @('Running', 'NotStarted') -and (Get-Date) -lt $drainDeadline) {
+                    Wait-BtPump -Milliseconds 200
+                }
+                if ($btPollJob.State -notin @('Running', 'NotStarted')) {
+                    $pollData = $null
+                    try { $pollData = Receive-Job $btPollJob -ErrorAction Stop } catch { $finalDrainReason = $_.Exception.Message }
+                    . $mergeBtPollData $pollData $false
+                    $finalDrainCollected = ($null -ne $pollData)
+                } else {
+                    $finalDrainReason = 'Final Bluetooth event drain timed out after 30 seconds.'
+                }
+            } catch {
+                $finalDrainReason = $_.Exception.Message
+            } finally {
+                if ($btPollJob) {
+                    Stop-Job $btPollJob -ErrorAction SilentlyContinue
+                    Remove-Job $btPollJob -Force -ErrorAction SilentlyContinue
+                    $btPollJob = $null
+                }
+            }
+            if ($btEventEvidence -and (Get-Command Set-BluetoothEventEvidenceFinalDrain -ErrorAction SilentlyContinue)) {
+                if ($finalDrainCollected) {
+                    Set-BluetoothEventEvidenceFinalDrain -Record $btEventEvidence -Status Collected | Out-Null
+                } else {
+                    if ([string]::IsNullOrWhiteSpace($finalDrainReason)) { $finalDrainReason = 'Final Bluetooth event drain returned no result.' }
+                    Add-BluetoothEventEvidenceBatch -Record $btEventEvidence -Batch $null -CollectorError $finalDrainReason | Out-Null
+                    Set-BluetoothEventEvidenceFinalDrain -Record $btEventEvidence -Status Failed -Reason $finalDrainReason | Out-Null
+                    if ($btProbeSession -and (Get-Command Complete-SerialOpenTopologyRequest -ErrorAction SilentlyContinue)) {
+                        Complete-SerialOpenTopologyRequest -Record $btProbeSession.SerialOpenAttempts -Snapshot $null -FailureReason $finalDrainReason | Out-Null
+                    }
+                }
+            }
+
+            # Persist immediately after the drain, before any later summary or
+            # packaging work can fail. An empty result and a collection failure
+            # are both evidence and therefore both produce this artifact.
+            if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
+                try {
+                    $btEventReport = if ($btEventEvidence -and (Get-Command Get-BluetoothEventEvidenceReport -ErrorAction SilentlyContinue)) {
+                        Get-BluetoothEventEvidenceReport -Record $btEventEvidence -TargetMac $btProbeTargetMac
+                    } else {
+                        [pscustomobject]@{
+                            Contract = 'WinConfig.BluetoothEventEvidence/v1'
+                            EventCount = 0
+                            Events = @()
+                            FailureCount = 1
+                            Failures = @([pscustomobject]@{ Reason = 'Bluetooth event evidence accumulator was unavailable.' })
+                            FinalDrainStatus = 'Failed'
+                        }
+                    }
+                    Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'bluetooth-events.json' -Depth 12 -Data $btEventReport
+                } catch { }
+            }
 
             Write-BtLog ""
             Write-BtLog "Step 3 of 3: Stopping - taking final snapshot..." -Level "STEP"
@@ -8637,6 +8819,15 @@ $buttonHandlers = @{
                         FinalVerdict         = if ($finalResult)    { $finalResult.VerdictStatus    } else { $null }
                         FinalFindingCount    = if ($finalResult)    { $finalResult.FindingCount     } else { $null }
                         FinalStatus          = if ($finalResult)    { $finalResult.Status           } else { $null }
+                        BluetoothEventEvidence = if ($btEventReport) {
+                            [ordered]@{
+                                Artifact         = 'bluetooth-events.json'
+                                Contract         = $btEventReport.Contract
+                                EventCount       = $btEventReport.EventCount
+                                FailureCount     = $btEventReport.FailureCount
+                                FinalDrainStatus = $btEventReport.FinalDrainStatus
+                            }
+                        } else { $null }
                         ProbeObservationCount  = if ($btProbeSummary) { $btProbeSummary.ObservationCount } else { $null }
                         ProbeFindingCount      = if ($btProbeSummary) { $btProbeSummary.Findings.Count   } else { $null }
                         ProbeReconnectCount    = if ($btProbeSession) { $btProbeSession.ReconnectTimes.Count } else { $null }
@@ -8746,13 +8937,26 @@ $buttonHandlers = @{
                         # every ~3s. Recorded so this is answered from a capture
                         # rather than argued -- and so a decision to back the
                         # interval off rests on a measured number.
+                        # ── Provenance: which build wrote this capture ───────
+                        # Every capture before this one was unattributable --
+                        # nothing in the manifest carried a build id, so a
+                        # package could not be tied to the code that produced
+                        # it. Derived, never asserted: the open contract comes
+                        # from what was actually observed, so a fallback capture
+                        # reports SerialPortLegacy/v1 honestly and a run that
+                        # never reached a port reports NotObserved.
+                        # A failed read renders as null with a status; it never
+                        # costs the recording.
+                        BtEvidenceProvenance = if ($btProbeSession -and (Get-Command Get-BtEvidenceProvenance -ErrorAction SilentlyContinue)) {
+                            try { Get-BtEvidenceProvenance -SerialOpenRecord $btProbeSession.SerialOpenAttempts } catch { $null }
+                        } else { $null }
                         # ── The treatment this capture ran under ─────────────
                         # ABSENT on a pre-toggle build, and that is NOT the same
                         # as $true -- a reader who finds no key here is looking
                         # at a package from a build that had no toggle, which is
                         # a different fact from a build that had one and left it
-                        # on. Nothing in the manifest carries a build id, so the
-                        # key's PRESENCE is the only discriminator available
+                        # on. The key's PRESENCE remains the discriminator for
+                        # packages written BEFORE BtEvidenceProvenance existed
                         # (same reasoning as the #86 ops-per-second rename).
                         ActivePortOpenProbeEnabled = if ($btProbeSession -and $btProbeSession.ContainsKey('ActivePortOpenProbeEnabled')) {
                             [bool]$btProbeSession.ActivePortOpenProbeEnabled
@@ -8806,6 +9010,16 @@ $buttonHandlers = @{
                                         @{ PortName = $_.PortName; Role = $_.ChannelRole }
                                     })
                                 } else { @() })
+                        } else { $null }
+                        # Raw win32 evidence for the same opens, under its own
+                        # versioned contract. SEPARATE KEY, never merged into
+                        # PortOpenTiming: that one measured a System.IO.Ports
+                        # call which configures DCB/baud, this measures a bare
+                        # CreateFile. Same units, different work. A capture
+                        # normally carries one or the other, not both.
+                        PortOpenAttemptTiming = if ($btProbeSession -and $btProbeSession.SerialOpenAttempts -and (Get-Command Get-SerialOpenAttemptReport -ErrorAction SilentlyContinue)) {
+                            Get-SerialOpenAttemptReport -Record $btProbeSession.SerialOpenAttempts `
+                                -RecordingSeconds $(if ($btWindow) { $btWindow.DurationSeconds } else { 0 })
                         } else { $null }
                         # Read rate on BOTH scopes (#84). The read-rate channel
                         # used to be gated on the invasive port-hold test, so a
@@ -9096,7 +9310,7 @@ $buttonHandlers = @{
                             @(@($btProbeSession.OperatorMarkers) | Where-Object { @($_.Contradictions).Count -gt 0 }).Count
                         } else { $null }
                     }
-                    Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'manifest.json' -Data $manifest
+                    Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'manifest.json' -Depth 10 -Data $manifest
                 } catch { }
             }
 
@@ -9291,7 +9505,15 @@ $buttonHandlers = @{
                     Register-WinConfigSessionAction -Action "BT COM Port Reset" -Detail "ComDB cleared and verified absent; backup at $backupPath" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "PASS" -Tier 2 -Summary "COM arbiter reset"
                 }
                 if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
-                [System.Windows.Forms.MessageBox]::Show("COM Name Arbiter has been reset.`n`nNext Bluetooth pairing will use low COM port numbers (COM3, COM4).`n`nBackup saved to:`n$backupPath", "Success", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+                # NO CAUSAL PROMISE HERE. This previously predicted the specific
+                # low COM numbers the next pairing would be assigned -- never
+                # measured, and not guaranteed by the change: ComDB is an
+                # allocation BITMAP of reserved names, and clearing it does not
+                # decide what the next pairing receives. Say what was changed,
+                # not what is predicted to follow. The retracted sentence is
+                # quoted only in tests/BluetoothGhostPortPlan.Tests.ps1, so the
+                # regression guard there can stay a plain literal scan.
+                [System.Windows.Forms.MessageBox]::Show("COM Name Arbiter has been reset.`n`nThe global COM-name reservation bitmap was cleared. This frees the reserved names; it does NOT choose which COM number the next pairing receives, and it does not repair COM symlinks, existing port assignments, or pairing state.`n`nBackup saved to:`n$backupPath", "Success", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
             } catch {
                 if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
                     Register-WinConfigSessionAction -Action "BT COM Port Reset" -Detail "Reset failed: $($_.Exception.Message)" -Category "AdminChange" -ToolCategory "Bluetooth" -Result "FAIL" -Tier 3 -Summary "COM arbiter reset failed"
@@ -9307,15 +9529,10 @@ $buttonHandlers = @{
                 return
             }
 
+            # ONE answerer for the removal set, shared with the Dry Run planner.
             $ghostPorts = @()
             try {
-                $allBtPorts = @(Get-PnpDevice -Class Ports -ErrorAction SilentlyContinue |
-                    Where-Object { $_.InstanceId -match 'BTHENUM' })
-                # A ghost is either the all-zero LOCALMFG local-service registration, OR any
-                # BTHENUM port whose device is no longer present (stale, safe to remove).
-                $ghostPorts = @($allBtPorts | Where-Object {
-                    ($_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000') -or ($_.Present -eq $false)
-                })
+                $ghostPorts = @((Get-BtGhostPortPlanOrThrow).Targets)
             } catch {
                 [System.Windows.Forms.MessageBox]::Show("Failed to enumerate Bluetooth ports: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
                 return
@@ -9331,8 +9548,16 @@ $buttonHandlers = @{
                 return
             }
 
+            # The confirm dialog IS the operator's preview on the live path, so it
+            # states the same scope the Dry Run plan does -- including WHY each
+            # node is a target. A bare count let an operator approve "1 port" and
+            # get three removed.
+            $ghostBreakdown = @($ghostPorts | ForEach-Object { "  - $($_.InstanceId) [$($_.Reason)]" }) -join "`n"
+            $comDbLine = if ($hasComDb) {
+                "`n`nIt will ALSO clear the global COM-name reservation bitmap (ComDB). That bitmap is not Bluetooth-specific: it covers every serial device on this PC, including non-Bluetooth hardware."
+            } else { '' }
             $confirm = [System.Windows.Forms.MessageBox]::Show(
-                "This will remove $($ghostPorts.Count) ghost Bluetooth port(s) and reset COM port assignments.`n`nDevices may need to be re-paired after this operation.`n`nContinue?",
+                "This will remove $($ghostPorts.Count) Bluetooth port device node(s):`n`n$ghostBreakdown$comDbLine`n`nRemoving a port node is not the same as unpairing, and Windows may need a reboot to finish. This does NOT repair a headset whose port nodes are still present and healthy.`n`nContinue?",
                 "Confirm Bluetooth Port Cleanup",
                 [System.Windows.Forms.MessageBoxButtons]::YesNo,
                 [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -9369,14 +9594,25 @@ $buttonHandlers = @{
                     try { $comDbAfter = (Get-ItemProperty -Path $arbiterPath -Name 'ComDB' -ErrorAction Stop).ComDB } catch {}
                     if ($comDbAfter) { $verifyNotes += "ComDB still present" }
                 }
+                # Post-check reads the SAME plan the removal did: a narrower
+                # re-query here would report success for nodes still present.
+                #
+                # A FAILED re-enumeration is not zero remaining ghosts. Swallowing
+                # it left $ghostsAfter empty, which added no verify note, which
+                # made the result PASS -- reporting a verified cleanup when the
+                # verification never ran. An absent measurement renders as absent.
                 $ghostsAfter = @()
+                $ghostVerifyError = $null
                 try {
-                    $ghostsAfter = @(Get-PnpDevice -Class Ports -ErrorAction SilentlyContinue |
-                        Where-Object { $_.InstanceId -match 'BTHENUM' -and (
-                            ($_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000') -or ($_.Present -eq $false)
-                        ) })
-                } catch {}
-                if ($ghostsAfter.Count -gt 0) { $verifyNotes += "$($ghostsAfter.Count) ghost port(s) still present (a reboot may be required)" }
+                    $ghostsAfter = @((Get-BtGhostPortPlanOrThrow).Targets)
+                } catch {
+                    $ghostVerifyError = $_.Exception.Message
+                }
+                if ($ghostVerifyError) {
+                    $verifyNotes += "remaining ghost ports NOT checked (re-enumeration failed: $ghostVerifyError)"
+                } elseif ($ghostsAfter.Count -gt 0) {
+                    $verifyNotes += "$($ghostsAfter.Count) ghost port(s) still present (a reboot may be required)"
+                }
 
                 $summary = "$removed ghost port(s) removed"
                 if ($failed -gt 0) { $summary += ", $failed failed" }
@@ -9466,10 +9702,7 @@ $buttonHandlers = @{
                 # Ghost-port and ComDB removal: capture errors rather than swallowing them,
                 # so a silent no-op can't be reported as a clean reset.
                 try {
-                    $ghostPorts = @(Get-PnpDevice -Class Ports -ErrorAction Stop |
-                        Where-Object { $_.InstanceId -match 'BTHENUM' -and (
-                            ($_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000') -or ($_.Present -eq $false)
-                        ) })
+                    $ghostPorts = @((Get-BtGhostPortPlanOrThrow).Targets)
                     foreach ($ghost in $ghostPorts) {
                         & pnputil /remove-device $ghost.InstanceId 2>&1 | Out-Null
                         if ($LASTEXITCODE -eq 0) { $ghostsRemoved++ } else { $stackNotes += "ghost removal returned exit $LASTEXITCODE" }
@@ -11597,15 +11830,34 @@ foreach ($tabPage in $tabControl.TabPages) {
                             }
                     }
 
+                    # Same plan the live handler removes from. This previously
+                    # matched only the all-zero set while the live path also
+                    # removed non-present nodes, so the preview under-reported
+                    # a destructive scope.
+                    #
+                    # A planning failure must NOT fall through as an empty target
+                    # list: "0 ghost ports found" and "could not determine the
+                    # ghost ports" are different facts that rendered identically,
+                    # and the empty one reads to an operator as nothing to clean.
                     $ghostPorts = @()
                     try {
-                        $allBtPorts = Get-PnpDevice -Class Ports -ErrorAction Stop |
-                            Where-Object { $_.InstanceId -match 'BTHENUM' }
-                        $ghostPorts = @($allBtPorts | Where-Object {
-                            $_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000'
-                        })
+                        $ghostPorts = @((Get-BtGhostPortPlanOrThrow).Targets)
                     } catch {
-                        # Get-PnpDevice may fail on older systems
+                        return New-DryRunPlan `
+                            -ToolId "bt-clean-ports" `
+                            -ToolName "Clean Bluetooth Ports" `
+                            -Steps @("PLAN FAILED: cannot determine which ports would be removed") `
+                            -AffectedResources @("Unknown - planning aborted") `
+                            -RequiresAdmin $true `
+                            -Reversible $false `
+                            -EstimatedImpact "Unknown" `
+                            -Preconditions @("Admin: $isAdmin") `
+                            -Evidence @{
+                                PlanFailed    = $true
+                                FailureReason = "Ghost-port enumeration failed: $($_.Exception.Message)"
+                                Preconditions = @{ IsAdmin = $isAdmin }
+                                Findings      = @{}
+                            }
                     }
 
                     $arbiterPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\COM Name Arbiter'
@@ -11643,7 +11895,9 @@ foreach ($tabPage in $tabControl.TabPages) {
                     $affected = @()
                     $actions += (New-DryRunStep -Verb WOULD_CREATE -Target "registry backup" -Detail "COM Name Arbiter .reg export").Summary
                     foreach ($ghost in $ghostPorts) {
-                        $actions += (New-DryRunStep -Verb WOULD_DELETE -Target "ghost PnP device" -Detail "$($ghost.InstanceId)").Summary
+                        # Reason is shown, not just the count: "3 ghost ports" hides
+                        # that two of them are being removed for being absent.
+                        $actions += (New-DryRunStep -Verb WOULD_DELETE -Target "ghost PnP device" -Detail "$($ghost.InstanceId) [$($ghost.Reason)]").Summary
                         $affected += $ghost.InstanceId
                     }
                     if ($allocatedPorts.Count -gt 0) {
@@ -11653,7 +11907,7 @@ foreach ($tabPage in $tabControl.TabPages) {
 
                     $ghostInfo = @()
                     foreach ($g in $ghostPorts) {
-                        $ghostInfo += @{ InstanceId = $g.InstanceId; Status = "$($g.Status)"; FriendlyName = $g.FriendlyName }
+                        $ghostInfo += @{ InstanceId = $g.InstanceId; Status = "$($g.Status)"; FriendlyName = $g.FriendlyName; Reason = $g.Reason }
                     }
 
                     New-DryRunPlan `
@@ -11721,14 +11975,30 @@ foreach ($tabPage in $tabControl.TabPages) {
                         }
                     }
 
+                    # Shared plan: the stack reset removes the same ghost set as
+                    # Clean Ports, so its preview must not compute a smaller one.
+                    # As above, a planning failure is reported as a failure rather
+                    # than silently becoming an empty removal list.
                     $ghostPorts = @()
                     try {
-                        $allBtPorts = Get-PnpDevice -Class Ports -ErrorAction Stop |
-                            Where-Object { $_.InstanceId -match 'BTHENUM' }
-                        $ghostPorts = @($allBtPorts | Where-Object {
-                            $_.InstanceId -match 'LOCALMFG' -and $_.InstanceId -match '000000000000'
-                        })
-                    } catch {}
+                        $ghostPorts = @((Get-BtGhostPortPlanOrThrow).Targets)
+                    } catch {
+                        return New-DryRunPlan `
+                            -ToolId "bt-stack-reset" `
+                            -ToolName "Full Bluetooth Stack Reset" `
+                            -Steps @("PLAN FAILED: cannot determine which ports would be removed") `
+                            -AffectedResources @("Unknown - planning aborted") `
+                            -RequiresAdmin $true `
+                            -Reversible $false `
+                            -EstimatedImpact "Unknown" `
+                            -Preconditions @("Admin: $isAdmin") `
+                            -Evidence @{
+                                PlanFailed    = $true
+                                FailureReason = "Ghost-port enumeration failed: $($_.Exception.Message)"
+                                Preconditions = @{ IsAdmin = $isAdmin }
+                                Findings      = @{}
+                            }
+                    }
 
                     $allocatedPorts = @()
                     try {
@@ -11760,7 +12030,9 @@ foreach ($tabPage in $tabControl.TabPages) {
                     }
 
                     foreach ($ghost in $ghostPorts) {
-                        $actions += (New-DryRunStep -Verb WOULD_DELETE -Target "ghost PnP device" -Detail "$($ghost.InstanceId)").Summary
+                        # Reason is shown, not just the count: "3 ghost ports" hides
+                        # that two of them are being removed for being absent.
+                        $actions += (New-DryRunStep -Verb WOULD_DELETE -Target "ghost PnP device" -Detail "$($ghost.InstanceId) [$($ghost.Reason)]").Summary
                         $affected += $ghost.InstanceId
                     }
 
