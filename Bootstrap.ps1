@@ -426,14 +426,29 @@ function Get-RawGitHubContent {
 
     $ProgressPreference = 'SilentlyContinue'
 
-    # Helper to fetch from raw CDN (with 1 retry on transient failure)
+    # Helper to fetch from raw CDN.  A production launch fetches every runtime
+    # artifact separately, so a brief GitHub secondary throttle or edge outage
+    # must not invalidate an otherwise healthy build.  The old two attempts,
+    # 500 ms apart, both landed inside the same 429/503 window in production
+    # (2026-08-17) and made Bootstrap refuse to load after 26/31 valid files.
+    #
+    # Retry only failures that can reasonably clear without changing the URL:
+    # request timeout, Too Early, rate limiting, selected gateway/server errors,
+    # and transport failures with no HTTP response.  A 404 or authorization
+    # failure still fails immediately.  Backoff is bounded so a real outage
+    # remains a clear failure rather than an indefinite hang.
     $fetchFromCdn = {
-        param([int]$MaxRetries = 1)
+        param(
+            [int]$MaxAttempts = 5,
+            [int]$BaseDelayMilliseconds = 1000,
+            [int]$MaxDelayMilliseconds = 15000
+        )
         $cdnUrl = "https://raw.githubusercontent.com/$Owner/$Repo/$Branch/$Path"
         $attempt = 0
         $lastError = $null
 
-        while ($attempt -le $MaxRetries) {
+        while ($attempt -lt $MaxAttempts) {
+            $attempt++
             try {
                 $response = Invoke-WebRequest -Uri $cdnUrl -UseBasicParsing -ErrorAction Stop -Headers @{
                     "User-Agent" = "WinConfig-Bootstrap"
@@ -442,10 +457,34 @@ function Get-RawGitHubContent {
                 return $response.Content
             } catch {
                 $lastError = $_
-                $attempt++
-                if ($attempt -le $MaxRetries) {
-                    Start-Sleep -Milliseconds 500
+                $statusCode = $null
+                if ($_.Exception.Response) {
+                    try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
                 }
+
+                $transientStatusCodes = @(408, 425, 429, 500, 502, 503, 504)
+                $isTransient = ($null -eq $statusCode -or $transientStatusCodes -contains $statusCode)
+                if (-not $isTransient -or $attempt -ge $MaxAttempts) {
+                    break
+                }
+
+                # Exponential 1s/2s/4s/8s backoff by default.  Honor an integer
+                # Retry-After response when present, but cap it so Bootstrap
+                # cannot disappear into an unbounded provider-requested wait.
+                $backoffMs = [int][Math]::Min(
+                    $MaxDelayMilliseconds,
+                    $BaseDelayMilliseconds * [Math]::Pow(2, $attempt - 1)
+                )
+                $retryAfterMs = 0
+                try {
+                    $retryAfter = $_.Exception.Response.Headers['Retry-After']
+                    if ($retryAfter -and [int]::TryParse([string]$retryAfter, [ref]$retryAfterMs)) {
+                        $retryAfterMs = [int][Math]::Min($MaxDelayMilliseconds, $retryAfterMs * 1000)
+                    }
+                } catch { $retryAfterMs = 0 }
+
+                $delayMs = [int][Math]::Max($backoffMs, $retryAfterMs)
+                Start-Sleep -Milliseconds $delayMs
             }
         }
         throw $lastError
