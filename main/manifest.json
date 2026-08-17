@@ -1,8 +1,4 @@
 {
-  "source_ref": "d8bd994ee42102263c2b4a3b06f866a8f7cf94af",
-  "schema_version": "2.0",
-  "timestamp": "2026-08-17T15:43:29.4044955Z",
-  "build_id": "32043150192-1",
   "artifacts": [
     {
       "size": 2001,
@@ -160,6 +156,10 @@
       "sha256": "8d689fa4f75db1cb0f0b41b8e47ad5cc09ba0577ff120d9130440d2a8d586471"
     }
   ],
+  "timestamp": "2026-08-17T16:04:44.6909212Z",
   "event": "push",
-  "branch": "main"
+  "branch": "main",
+  "source_ref": "b1c002566fc83665d21f55caad1c0209f7dcc8ab",
+  "schema_version": "2.0",
+  "build_id": "32044260994-1"
 }

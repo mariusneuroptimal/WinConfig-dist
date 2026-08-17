@@ -608,6 +608,116 @@ function Get-RawGitHubContent {
     }
 }
 
+function Get-DistArchiveContent {
+    <#
+    .SYNOPSIS
+        Downloads the public dist repository once and returns the requested
+        environment artifacts as UTF-8 strings.
+    .DESCRIPTION
+        The manifest and SOURCE_COMMIT remain fresh control-plane reads through
+        the Contents API.  This is only the hash-verified data plane.  Replacing
+        31 raw-file requests with one codeload archive prevents GitHub edge
+        throttling from turning a valid production build into a partial stage.
+
+        Nothing is extracted by path.  Requested entries are read directly from
+        ZipArchive by exact name, so an archive entry cannot escape TempRoot.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter(Mandatory)][string]$Environment,
+        [Parameter(Mandatory)][string[]]$FilePaths,
+        [Parameter(Mandatory)][string]$TempRoot,
+        [int]$MaxAttempts = 3
+    )
+
+    $archiveUrl = "https://codeload.github.com/$Owner/$Repo/zip/refs/heads/main"
+    $archivePath = Join-Path $TempRoot 'dist-main.zip'
+    $lastError = $null
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $client = $null
+        try {
+            $client = New-Object System.Net.WebClient
+            $client.Headers['User-Agent'] = 'WinConfig-Bootstrap'
+            $client.DownloadFile($archiveUrl, $archivePath)
+            if (-not (Test-Path -LiteralPath $archivePath) -or
+                (Get-Item -LiteralPath $archivePath).Length -le 0) {
+                throw 'GitHub returned an empty distribution archive.'
+            }
+            $lastError = $null
+            break
+        } catch {
+            $lastError = $_
+            $statusCode = $null
+            if ($_.Exception.Response) {
+                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+            }
+            $transientStatusCodes = @(408, 425, 429, 500, 502, 503, 504)
+            $isTransient = ($null -eq $statusCode -or $transientStatusCodes -contains $statusCode)
+            if (-not $isTransient -or $attempt -ge $MaxAttempts) { break }
+            Start-Sleep -Seconds ([int][Math]::Pow(2, $attempt - 1))
+        } finally {
+            if ($client) { $client.Dispose() }
+        }
+    }
+
+    if ($lastError) { throw $lastError }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
+    try {
+        $manifestSuffix = "/$Environment/manifest.json"
+        $manifestEntries = @($archive.Entries | Where-Object {
+            $_.FullName.EndsWith($manifestSuffix, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+        if ($manifestEntries.Count -ne 1) {
+            throw "Distribution archive has $($manifestEntries.Count) '$Environment/manifest.json' entries; expected exactly one."
+        }
+
+        $rootPrefix = $manifestEntries[0].FullName.Substring(
+            0,
+            $manifestEntries[0].FullName.Length - ($Environment.Length + 'manifest.json'.Length + 1)
+        )
+        $contentByPath = @{}
+
+        foreach ($filePath in $FilePaths) {
+            $normalizedPath = $filePath -replace '\\', '/'
+            $entryName = "$rootPrefix$Environment/$normalizedPath"
+            $entry = $archive.GetEntry($entryName)
+            if (-not $entry) {
+                throw "Distribution archive is missing '$entryName'."
+            }
+
+            $entryStream = $entry.Open()
+            $memory = New-Object System.IO.MemoryStream
+            try {
+                $entryStream.CopyTo($memory)
+                $bytes = $memory.ToArray()
+            } finally {
+                $memory.Dispose()
+                $entryStream.Dispose()
+            }
+
+            $offset = 0
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and
+                $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+                $offset = 3
+            }
+            $contentByPath[$filePath] = [System.Text.Encoding]::UTF8.GetString(
+                $bytes,
+                $offset,
+                $bytes.Length - $offset
+            )
+        }
+
+        return $contentByPath
+    } finally {
+        $archive.Dispose()
+    }
+}
+
 function Get-DistManifest {
     <#
     .SYNOPSIS
@@ -801,6 +911,23 @@ $filesFailed = 0
 Write-BufferedLog ""
 Write-Status "Downloading and verifying $($FileManifest.Count) files..." "INFO"
 
+# The manifest and source pin above are the freshness authority.  Bulk content
+# is now fetched in one archive request and every requested entry is still
+# checked against that manifest below.  If codeload itself is unavailable, keep
+# the existing per-file path as a compatibility fallback rather than weakening
+# the integrity gate.
+$archiveContentByPath = $null
+try {
+    Write-Status "Fetching distribution artifact archive..." "INFO"
+    $archiveContentByPath = Get-DistArchiveContent `
+        -Owner $GitHubOwner -Repo $DistRepoName -Environment $Branch `
+        -FilePaths @($FileManifest.Keys) -TempRoot $stagingRoot
+    Write-Status "Artifact archive loaded ($($archiveContentByPath.Count) files)." "OK"
+} catch {
+    Write-Status "Artifact archive unavailable; falling back to individual verified downloads. $($_.Exception.Message)" "WARN"
+    $archiveContentByPath = $null
+}
+
 foreach ($filePath in $FileManifest.Keys) {
     $expectedHash = $FileManifest[$filePath]
     $shortHash = $expectedHash.Substring(0, 12)
@@ -808,10 +935,15 @@ foreach ($filePath in $FileManifest.Keys) {
     Write-BufferedLog "  $filePath ... " -Color "Gray" -NoNewline
 
     try {
-        # Download file content from distribution repo
-        # Dist repo structure: main branch with environment directories (main/, develop/)
-        # Use CDN for bulk downloads (no rate limit) - hash verification ensures integrity
-        $content = Get-RawGitHubContent -Owner $GitHubOwner -Repo $DistRepoName -Branch "main" -Path "$Branch/$filePath" -PreferCdn
+        if ($archiveContentByPath -and $archiveContentByPath.ContainsKey($filePath)) {
+            $content = $archiveContentByPath[$filePath]
+            $script:LastFetchSource = 'Archive'
+        } else {
+            # Compatibility fallback. Dist repo structure: main branch with
+            # environment directories (main/, develop/). Hash verification
+            # below remains mandatory whichever transport supplied the bytes.
+            $content = Get-RawGitHubContent -Owner $GitHubOwner -Repo $DistRepoName -Branch "main" -Path "$Branch/$filePath" -PreferCdn
+        }
 
         if ([string]::IsNullOrWhiteSpace($content)) {
             Write-BufferedLog "EMPTY" -Color "Red"
