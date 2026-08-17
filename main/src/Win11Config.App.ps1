@@ -7280,7 +7280,14 @@ $buttonHandlers = @{
                     $btProbeSession.HeldPorts = @($initStream.HeldPorts)
                 }
                 if ($initStream.ContainsKey('UnavailablePorts')) {
-                    $btProbeSession.UnavailablePorts = @($initStream.UnavailablePorts)
+                    $arrivalDead = @($initStream.UnavailablePorts | Where-Object { $_ })
+                    $btProbeSession.UnavailablePorts        = @($arrivalDead)
+                    $btProbeSession.UnavailablePortsCurrent = @($arrivalDead)
+                    $btProbeSession.UnavailablePortsEver    = @($arrivalDead)
+                    # Arrival has no earlier tick.  Even if another port is held
+                    # in the same snapshot, simultaneity cannot support the
+                    # sentence "worked, then stopped opening" (#81).
+                    $btProbeSession.UnavailableAfterHeldPortsCurrent = @()
                 }
                 # A port ALREADY held when recording starts is a real observation,
                 # for the same reason as the link seeding above -- and here it is
@@ -7298,7 +7305,11 @@ $buttonHandlers = @{
                 # asserting "no process ever held the port" on a run where it
                 # never looked.
                 if ($initStream.ContainsKey('HeldPorts') -and
-                    @($initStream.HeldPorts | Where-Object { $_ }).Count -gt 0) { $btProbeSession.PortEverHeld = $true }
+                    @($initStream.HeldPorts | Where-Object { $_ }).Count -gt 0) {
+                    $arrivalHeld = @($initStream.HeldPorts | Where-Object { $_ })
+                    $btProbeSession.PortEverHeld = $true
+                    $btProbeSession.HeldPortsEver = @($arrivalHeld)
+                }
                 if ($initStream.State -eq 'Active') { $btProbeSession.StateEnteredAt['streaming_Active_at'] = Get-Date }
 
                 # Show the diagnostic chain and the initial state. Rendered from
@@ -7567,7 +7578,8 @@ $buttonHandlers = @{
                                 -BtLinkState  $btProbeSession.BtLinkState `
                                 -StreamState  $btProbeSession.StreamingState `
                                 -HeldPorts    @($btProbeSession.HeldPorts | Where-Object { $_ }) `
-                                -UnavailablePorts @($btProbeSession.UnavailablePorts | Where-Object { $_ }) `
+                                -UnavailablePorts @($btProbeSession.UnavailablePortsCurrent | Where-Object { $_ }) `
+                                -UnavailableAfterHeldPorts @($btProbeSession.UnavailableAfterHeldPortsCurrent | Where-Object { $_ }) `
                                 -PortHoldObserved ([bool]$btProbeSession.ActivePortOpenProbeEnabled) `
                                 -AppRunning   ($btProbeWatch.AppProcessState -eq 'Running') `
                                 -NoExeVersion $btProbeSession.NoExeVersion `
@@ -8427,6 +8439,7 @@ $buttonHandlers = @{
                                 StreamState      = $_.StreamState
                                 HeldPorts        = @($_.HeldPorts)
                                 UnavailablePorts = @($_.UnavailablePorts)
+                                UnavailableAfterHeldPorts = @($_.UnavailableAfterHeldPorts)
                                 AppRunning       = $_.AppRunning
                                 IoVerdict            = $_.IoVerdict
                                 IoBaselineOpsPerSecond = $_.IoBaselineOpsPerSecond
@@ -8689,6 +8702,9 @@ $buttonHandlers = @{
                         } else { $null }
                         AppHangDetected        = if ($btProbeSession) { [bool]$btProbeSession.AppHangReported } else { $null }
                         BtLinkEverConnected    = if ($btProbeSession) { [bool]$btProbeSession.BtLinkEverConnected } else { $null }
+                        BtLinkPreSessionFlapCount = if ($btProbeSession) { [int]$btProbeSession.BtLinkPreSessionFlapCount } else { $null }
+                        BtLinkActiveSessionDropCount = if ($btProbeSession) { [int]$btProbeSession.BtLinkActiveSessionDropCount } else { $null }
+                        StartupSppChannelCount = if ($btProbeSession) { [int]$btProbeSession.StartupSppChannelCount } else { $null }
                         # Raw count, NOT the [!]-vs-[ok] judgement. Whether a
                         # reassignment matters depends on the NO build (>= 4.0
                         # re-resolves from the MAC, so it invalidates nothing),
@@ -9010,6 +9026,8 @@ $buttonHandlers = @{
                         HeldPortsEver         = if ($btProbeSession) { @($btProbeSession.HeldPortsEver | Where-Object { $_ }) } else { @() }
                         UnavailablePortsCurrent = if ($btProbeSession) { @($btProbeSession.UnavailablePortsCurrent | Where-Object { $_ }) } else { @() }
                         UnavailablePortsEver    = if ($btProbeSession) { @($btProbeSession.UnavailablePortsEver | Where-Object { $_ }) } else { @() }
+                        UnavailableAfterHeldPortsCurrent = if ($btProbeSession) { @($btProbeSession.UnavailableAfterHeldPortsCurrent | Where-Object { $_ }) } else { @() }
+                        UnavailableAfterHeldPorts = if ($btProbeSession) { @($btProbeSession.UnavailableAfterHeldPorts | Where-Object { $_ }) } else { @() }
                         SecondsToReadBaseline = if ($btCoverage) { $btCoverage.SecondsToReadBaseline } else { $null }
                         PostBaselineObservationSeconds = if ($btCoverage) { $btCoverage.PostBaselineSeconds } else { $null }
                         # When the recorder told the operator a read baseline
@@ -9037,6 +9055,10 @@ $buttonHandlers = @{
                         # Ports registered in SERIALCOMM that would not open. The
                         # old bool port test folded these in with "free".
                         UnopenablePortCount = if ($btProbeSession) { @($btProbeSession.UnavailablePorts | Where-Object { $_ }).Count } else { $null }
+                        # The ordered subset that can actually support "worked,
+                        # then stopped opening" (#81).  UnopenablePortCount is
+                        # retained as the lossless ever-observed count.
+                        UnavailableAfterHeldPortCount = if ($btProbeSession) { @($btProbeSession.UnavailableAfterHeldPorts | Where-Object { $_ }).Count } else { $null }
                         # Contradictions present before recording started -- the
                         # transition-driven alarms are blind to these by design.
                         ArrivalContradictionCount = if ($btProbeSession) { @($btProbeSession.StartupConsistency).Count } else { $null }

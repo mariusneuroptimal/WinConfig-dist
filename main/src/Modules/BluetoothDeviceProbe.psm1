@@ -1489,11 +1489,18 @@ function Get-ProbeStateConsistency {
         [string]$StreamState,
         [AllowEmptyCollection()][array]$HeldPorts = @(),
         [AllowEmptyCollection()][array]$UnavailablePorts = @(),
+        # Ordered subset of UnavailablePorts: each named port was observed held
+        # on an earlier tick and unavailable on a later one.  This is the only
+        # evidence that can support "reachable earlier, then stopped opening".
+        [AllowEmptyCollection()][array]$UnavailableAfterHeldPorts = @(),
         [System.Nullable[bool]]$AppRunning,
         [bool]$CpuStalled = $false,
         [bool]$IoStalled = $false,
         [bool]$IoDegrading = $false,
         [bool]$SerialIntegrityFault = $false,
+        # Retained for callers/bundles from the pre-#81 API.  Ever-active is a
+        # coverage fact, not ordering evidence, and must not corroborate the
+        # unavailable-port rule.
         [bool]$TargetEverActive = $false,
         # Whether the port-hold channel was observed at all. $false only when the
         # active port-open probe is disabled by setting.
@@ -1510,6 +1517,9 @@ function Get-ProbeStateConsistency {
     $out = @()
     $held     = @($HeldPorts | Where-Object { $_ })
     $dead     = @($UnavailablePorts | Where-Object { $_ })
+    $afterHeld = @($UnavailableAfterHeldPorts | Where-Object {
+        $_ -and $_ -in $dead
+    } | Select-Object -Unique)
     $heldStr  = if ($held.Count -gt 0) { $held -join ', ' } else { 'a COM port' }
     # The Arc exposes two SPP channels, so a held-port list is routinely plural.
     # These findings are read by clinic techs; "COM3, COM6 is held open" reads as
@@ -1537,26 +1547,36 @@ function Get-ProbeStateConsistency {
     # named first -- the same hedge Get-SerialFaultFingerprint already applies to
     # NoActiveLink, and for exactly the same reason.
     if ($dead.Count -gt 0) {
-        $corroborated = ($SerialIntegrityFault -or $TargetEverActive)
-        if ($corroborated) {
+        # Integrity corruption corroborates every currently unavailable port.
+        # Otherwise only the per-port ordered subset can support the temporal
+        # claim.  `TargetEverActive` used to make the opposite ordering
+        # (unavailable first, held later) read as a failure (#81).
+        # Wrap the conditional itself: PowerShell otherwise unwraps a one-item
+        # branch to a scalar under StrictMode, where `.Count` is unavailable.
+        $failedDead = @(if ($SerialIntegrityFault) { $dead } else { $afterHeld })
+        $uncorroboratedDead = @($dead | Where-Object { $_ -notin $failedDead })
+
+        if ($failedDead.Count -gt 0) {
             $why = if ($SerialIntegrityFault) {
                 'The serial port integrity check independently reports an OS-level fault, so this is not simply a device that is switched off.'
             } else {
-                'This headset was reachable earlier in the same recording and then stopped opening, which being switched off does not explain.'
+                'Each named port was held earlier in this recording and became unavailable on a later tick, which being switched off before the session does not explain.'
             }
             $out += @{
                 Level = 'FAIL'
-                Text  = "[!] $($dead -join ', ') is registered as a Bluetooth serial port but will not open. $why NO.exe cannot receive EEG through a port in this state -- expect 'Control Port not valid' or 'Arc not detected'. The probe deliberately does not guess the cause here: an absent symlink and a stale one give different win32 errors and need different fixes. Run the serial port integrity check (operator-initiated, with NO.exe closed) to split them."
+                Text  = "[!] $($failedDead -join ', ') is registered as a Bluetooth serial port but will not open. $why NO.exe cannot receive EEG through a port in this state -- expect 'Control Port not valid' or 'Arc not detected'. The probe deliberately does not guess the cause here: an absent symlink and a stale one give different win32 errors and need different fixes. Run the serial port integrity check (operator-initiated, with NO.exe closed) to split them."
             }
-        } elseif ($BtLinkState -ne 'Connected') {
+        }
+
+        if ($uncorroboratedDead.Count -gt 0 -and $BtLinkState -ne 'Connected') {
             $out += @{
                 Level = 'INFO'
-                Text  = "[i] $($dead -join ', ') is registered as a Bluetooth serial port and did not open, and the radio reports no link to this headset. The most likely reason by far is that the headset is switched off or out of range -- a port with nothing on the other end times out exactly like a broken one, and FI-012 records that the two are indistinguishable from the error alone. This is NOT evidence of a fault. To turn it into one: power the headset on, confirm it connects, then run the serial port integrity check with NO.exe closed."
+                Text  = "[i] $($uncorroboratedDead -join ', ') is registered as a Bluetooth serial port and did not open, and the radio reports no link to this headset. The most likely reason by far is that the headset is switched off or out of range -- a port with nothing on the other end times out exactly like a broken one, and FI-012 records that the two are indistinguishable from the error alone. This is NOT evidence of a fault. To turn it into one: power the headset on, confirm it connects, then run the serial port integrity check with NO.exe closed."
             }
-        } else {
+        } elseif ($uncorroboratedDead.Count -gt 0) {
             $out += @{
                 Level = 'WARN'
-                Text  = "[~] $($dead -join ', ') is registered as a Bluetooth serial port but will not open, even though the radio reports an active link to this headset. A linked device whose port refuses to open is worth capturing. The probe deliberately does not guess the cause here: an absent symlink and a stale one give different win32 errors and need different fixes. Run the serial port integrity check with NO.exe closed to classify it."
+                Text  = "[~] $($uncorroboratedDead -join ', ') is registered as a Bluetooth serial port but will not open, even though the radio reports an active link to this headset. A linked device whose port refuses to open is worth capturing. The probe deliberately does not guess the cause here: an absent symlink and a stale one give different win32 errors and need different fixes. Run the serial port integrity check with NO.exe closed to classify it."
             }
         }
     }
@@ -3214,6 +3234,7 @@ function New-ProbeStateMarker {
         [string]$StreamState,
         [AllowEmptyCollection()][array]$HeldPorts = @(),
         [AllowEmptyCollection()][array]$UnavailablePorts = @(),
+        [AllowEmptyCollection()][array]$UnavailableAfterHeldPorts = @(),
         [System.Nullable[bool]]$AppRunning,
         [string]$NoExeVersion,
         [string]$IoVerdict,
@@ -3255,6 +3276,7 @@ function New-ProbeStateMarker {
         -DeviceState $DeviceState -ComPortState $ComPortState `
         -BtLinkState $BtLinkState -StreamState $StreamState `
         -HeldPorts $HeldPorts -UnavailablePorts $UnavailablePorts `
+        -UnavailableAfterHeldPorts $UnavailableAfterHeldPorts `
         -AppRunning $AppRunning -IoStalled ($IoVerdict -eq 'Collapsed') `
         -IoDegrading ($IoVerdict -eq 'Degrading') `
         -SerialIntegrityFault $SerialIntegrityFault -TargetEverActive $TargetEverActive `
@@ -3287,6 +3309,7 @@ function New-ProbeStateMarker {
         # the exact distinction these two lines exist to make.
         HeldPorts        = $(if ($PortHoldObserved) { ,@($HeldPorts | Where-Object { $_ }) } else { $null })
         UnavailablePorts = $(if ($PortHoldObserved) { ,@($UnavailablePorts | Where-Object { $_ }) } else { $null })
+        UnavailableAfterHeldPorts = $(if ($PortHoldObserved) { ,@($UnavailableAfterHeldPorts | Where-Object { $_ }) } else { $null })
         # Stated as its own field so no reader has to know that $null above is
         # meaningful, and so a marker from a pre-toggle build (field absent) is
         # not confused with one that recorded a genuine observation.
@@ -3585,6 +3608,17 @@ function New-DeviceProbeSession {
         BtLinkState              = 'Unknown'
         BtLinkEnteredAt          = $null
         BtLinkFlapCount          = 0
+        # A Connected -> NotConnected transition before any target port has
+        # ever been held is setup/connection negotiation, not evidence that an
+        # established application session dropped.  Keep it in the record, but
+        # separately, so the closing verdict cannot turn a pre-session radio
+        # transition into session instability (CDE30CD6BF8C).
+        BtLinkPreSessionFlapCount = 0
+        # Link drops while a target port is actually held are the temporal
+        # session fault.  The legacy total above remains for compatibility and
+        # fleet counting; this field is the ordering-aware answer used by the
+        # verdict.
+        BtLinkActiveSessionDropCount = 0
         BtLinkEverConnected      = $false
         # Cross-evidence context findings are latched for the run. A scope
         # mismatch can disappear from the live inputs when NeurOptimal exits;
@@ -3689,6 +3723,13 @@ function New-DeviceProbeSession {
         HeldPortsEver            = $(if ($apop.Enabled) { ,@() } else { $null })
         UnavailablePortsCurrent  = $(if ($apop.Enabled) { ,@() } else { $null })
         UnavailablePortsEver     = $(if ($apop.Enabled) { ,@() } else { $null })
+        # Per-port temporal join for #81.  A port belongs here only when an
+        # unavailable observation happened on a LATER tick than a held
+        # observation for that same port.  `UnavailablePortsEver` deliberately
+        # remains the lossless union; consumers that make the sentence
+        # "worked, then stopped opening" must use this ordered subset.
+        UnavailableAfterHeldPorts        = $(if ($apop.Enabled) { ,@() } else { $null })
+        UnavailableAfterHeldPortsCurrent = $(if ($apop.Enabled) { ,@() } else { $null })
         StreamPeakCpuS           = 0.0
         StreamPeakWorkingSetMB   = 0
         # Data-flow corroboration. The probe cannot read the EEG bytes -- the port
@@ -4032,6 +4073,10 @@ function Invoke-DeviceProbeTick {
     $activeProbe  = Test-ActivePortOpenProbeEnabled -Session $Session
     $streamResult = Get-StreamingState -WatchState $WatchState -Session $Session
     $newStreamState = $streamResult.State
+    # Snapshot BEFORE this tick's observations are folded into the ever-union.
+    # Ordering is the evidence: unavailable on this tick counts as "after held"
+    # only if the SAME port was held on an earlier tick (or at arrival).
+    $heldBeforeTick = @($Session.HeldPortsEver | Where-Object { $_ })
     # Tolerate a result without the port lists: Get-StreamingState is mocked in
     # tests and may be replaced by an older caller, and a missing list must not
     # take the whole tick down.
@@ -4061,6 +4106,14 @@ function Invoke-DeviceProbeTick {
     # noticing the mismatch is how #81's false "port will not open" was produced.
     if ($activeProbe) {
         $Session.UnavailablePortsCurrent = @($newDeadPorts | Where-Object { $_ })
+        $afterHeldNow = @($Session.UnavailablePortsCurrent | Where-Object {
+            $_ -in $heldBeforeTick
+        } | Select-Object -Unique)
+        $Session.UnavailableAfterHeldPortsCurrent = @($afterHeldNow)
+        $Session.UnavailableAfterHeldPorts = @(
+            @($Session.UnavailableAfterHeldPorts) + $afterHeldNow |
+                Where-Object { $_ } | Select-Object -Unique
+        )
         # Union across the session: a port that failed to open at any point stays
         # in the record even if it opens later.
         $Session.UnavailablePorts = @(@($Session.UnavailablePorts) + $newDeadPorts | Where-Object { $_ } | Select-Object -Unique)
@@ -4340,10 +4393,15 @@ function Invoke-DeviceProbeTick {
         } elseif ($newBtLink -eq 'NotConnected') {
             $fromStr = if ($prevBtLink -eq 'Connected') { " after ${linkElapsed}s connected" } else { '' }
             if ($Session.StreamingState -eq 'Active') {
+                $Session.BtLinkFlapCount++
+                $Session.BtLinkActiveSessionDropCount++
                 $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "Radio link dropped during active EEG stream$fromStr"; Annotation = "[!] Radio link lost while streaming -- this is the mid-session disconnect event"; Level = 'FAIL'; Timestamp = $now }
             } elseif ($WatchState.DeviceState -eq 'PairedCandidate') {
                 $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "Radio link dropped, device still paired$fromStr"; Annotation = "[~] Device paired but radio link down"; Level = 'WARN'; Timestamp = $now }
                 $Session.BtLinkFlapCount++
+                if (-not [bool]$Session.PortEverHeld) {
+                    $Session.BtLinkPreSessionFlapCount++
+                }
             } else {
                 $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "Radio link down$fromStr"; Annotation = $null; Level = 'DIM'; Timestamp = $now }
             }
@@ -5059,23 +5117,45 @@ function Get-DeviceProbeSessionSummary {
     # Same narrowing as the arrival cross-check, and for the same reason: a
     # switched-off headset produces this exact symptom, and calling it a fault
     # is how capture 8E39860E4AF2 failed a session that had gone perfectly.
-    # FAIL survives only with corroboration -- an OS-level integrity fault, or a
-    # target that WAS working in this recording and then went unavailable.
-    $deadPorts = @($Session.UnavailablePorts | Where-Object { $_ })
+    # FAIL survives only with corroboration -- an OS-level integrity fault, or
+    # the same port held on an earlier tick and unavailable on a later one.
+    $deadPorts = @(
+        @($Session.UnavailablePortsEver) + @($Session.UnavailablePorts) |
+            Where-Object { $_ } | Select-Object -Unique
+    )
+    # Ordered evidence, per port.  `UnavailablePortsEver` is intentionally a
+    # lossless union and cannot say which observation came first.  Joining it
+    # to PortEverHeld produced #81: an offline-at-arrival port that worked later
+    # was rendered as "worked, then failed".  Only this subset supports that
+    # temporal sentence.
+    $deadAfterHeld = @($Session.UnavailableAfterHeldPorts | Where-Object {
+        $_ -and $_ -in $deadPorts
+    } | Select-Object -Unique)
+    $heldEver = @($Session.HeldPortsEver | Where-Object { $_ })
+    $resolvedStartupDead = @($deadPorts | Where-Object {
+        $_ -in $heldEver -and $_ -notin $deadAfterHeld
+    })
+    $uncorroboratedDead = @($deadPorts | Where-Object {
+        $_ -notin $resolvedStartupDead -and $_ -notin $deadAfterHeld
+    })
+
     if ($deadPorts.Count -gt 0) {
         $integForDead = if ($Session.SerialPortIntegrityEnd) { $Session.SerialPortIntegrityEnd } else { $Session.SerialPortIntegrity }
         $integBad     = [bool]($integForDead -and -not $integForDead.Healthy)
-        if ($integBad -or $Session.PortEverHeld) {
-            $why = if ($integBad) {
-                'The serial port integrity check independently reports an OS-level fault, so this is not simply a device that was switched off.'
-            } else {
-                'This headset was reachable earlier in the same recording and then stopped opening, which being switched off does not explain.'
-            }
-            [void]$findings.Add("[!] $($deadPorts -join ', ') registered as a Bluetooth serial port but would not open during this session. $why No process can reach the headset through it. Cause not classified here (an absent symlink and a stale one need different fixes) -- run the serial port integrity check with NO.exe closed.")
-        } elseif (-not $Session.BtLinkEverConnected) {
-            [void]$findings.Add("[i] $($deadPorts -join ', ') registered as a Bluetooth serial port and never opened during this session, and the headset never linked to the radio either. The likeliest explanation by far is that it was switched off or out of range for the whole recording -- a port with nothing behind it times out exactly like a broken one, and FI-012 records that the two cannot be told apart from the error alone. This is NOT evidence of a fault. Power the headset on, confirm it connects, then run the serial port integrity check with NO.exe closed if you want it classified.")
+        if ($integBad) {
+            [void]$findings.Add("[!] $($deadPorts -join ', ') registered as a Bluetooth serial port but would not open during this session. The serial port integrity check independently reports an OS-level fault, so this is not simply a device that was switched off. No process can reach the headset through it. Cause not classified here (an absent symlink and a stale one need different fixes) -- run the serial port integrity check with NO.exe closed.")
         } else {
-            [void]$findings.Add("[~] $($deadPorts -join ', ') registered as a Bluetooth serial port but would not open during this session, although the headset did link to the radio at some point. Worth capturing, but not classified: the probe cannot tell an absent symlink from a stale one. Run the serial port integrity check with NO.exe closed.")
+            if ($deadAfterHeld.Count -gt 0) {
+                [void]$findings.Add("[!] $($deadAfterHeld -join ', ') was held successfully earlier in this recording and became unavailable on a later tick. That ordering is a real in-run loss, not a headset that was merely off before the session. Cause not classified here (an absent symlink and a stale one need different fixes) -- run the serial port integrity check with NO.exe closed.")
+            }
+            if ($resolvedStartupDead.Count -gt 0) {
+                [void]$findings.Add("[i] $($resolvedStartupDead -join ', ') did not open before the application session, then was held successfully later. The ordered evidence shows a resolved startup/offline condition rather than a later port-opening failure.")
+            }
+            if ($uncorroboratedDead.Count -gt 0 -and -not $Session.BtLinkEverConnected) {
+                [void]$findings.Add("[i] $($uncorroboratedDead -join ', ') registered as a Bluetooth serial port and never opened during this session, and the headset never linked to the radio either. The likeliest explanation by far is that it was switched off or out of range for the whole recording -- a port with nothing behind it times out exactly like a broken one, and FI-012 records that the two cannot be told apart from the error alone. This is NOT evidence of a fault. Power the headset on, confirm it connects, then run the serial port integrity check with NO.exe closed if you want it classified.")
+            } elseif ($uncorroboratedDead.Count -gt 0) {
+                [void]$findings.Add("[~] $($uncorroboratedDead -join ', ') registered as a Bluetooth serial port but would not open during this session, although the headset did link to the radio at some point. Worth capturing, but not classified: the probe cannot tell an absent symlink from a stale one. Run the serial port integrity check with NO.exe closed.")
+            }
         }
     }
 
@@ -5170,17 +5250,25 @@ function Get-DeviceProbeSessionSummary {
     # so claiming [ok] stable would mislead the operator (field bug 2026-07-08:
     # session showed Radio: Disconnected end-to-end yet reported [ok] stable).
     if ($Session.BtWin32Available) {
-        if ($Session.BtLinkFlapCount -ge 3) {
-            [void]$findings.Add("[!] Radio link instability: $($Session.BtLinkFlapCount) link drop(s) detected while device stayed paired")
-        } elseif ($Session.BtLinkFlapCount -gt 0) {
-            [void]$findings.Add("[~] BT link flap: $($Session.BtLinkFlapCount) link drop(s) while device stayed paired")
+        $preSessionFlaps = [int]$Session.BtLinkPreSessionFlapCount
+        $activeDrops     = [int]$Session.BtLinkActiveSessionDropCount
+        $sessionFlaps    = [math]::Max(0, [int]$Session.BtLinkFlapCount - $preSessionFlaps)
+        if ($preSessionFlaps -gt 0) {
+            [void]$findings.Add("[i] BT link setup transition: $preSessionFlaps link drop(s) occurred before any target COM port was held. Recorded, but not classified as an application-session failure.")
+        }
+        if ($activeDrops -gt 0) {
+            [void]$findings.Add("[!] Radio link instability: $activeDrops link drop(s) occurred while a target COM port was actively held")
+        } elseif ($sessionFlaps -ge 3) {
+            [void]$findings.Add("[!] Radio link instability: $sessionFlaps link drop(s) detected after the application session first held a target port")
+        } elseif ($sessionFlaps -gt 0) {
+            [void]$findings.Add("[~] BT link flap: $sessionFlaps link drop(s) after the application session first held a target port")
         } elseif (-not $Session.BtLinkEverConnected) {
             if ($Session.BtLinkState -eq 'Unknown') {
                 [void]$findings.Add("[info] BT radio link state could not be read this session (no readings -- likely no MAC available)")
             } else {
                 [void]$findings.Add("[~] BT radio link never connected during this session (radio stayed disconnected) -- link stability could not be assessed")
             }
-        } else {
+        } elseif ($preSessionFlaps -eq 0) {
             [void]$findings.Add("[ok] BT radio link stable throughout session (no drops observed)")
         }
         [void]$findings.Add("[info] Final BT link state: $($Session.BtLinkState)")
@@ -5190,7 +5278,25 @@ function Get-DeviceProbeSessionSummary {
 
     # SPP server channel accumulation
     if ($Session.StartupSppChannelCount -ge 4) {
-        [void]$findings.Add("[~] SPP server channel accumulation: $($Session.StartupSppChannelCount) LOCALMFG entries at startup")
+        # A raw LOCALMFG count is not itself corruption.  CDE30CD6BF8C had four
+        # entries with two paired Arcs while the independently measured serial
+        # namespace was clean 8/8 at both ends.  Keep the count, but warn only
+        # when the namespace cannot corroborate that those registrations are
+        # unique and resolvable.
+        $sppIntegrity = if ($Session.SerialPortIntegrityEnd) {
+            $Session.SerialPortIntegrityEnd
+        } else { $Session.SerialPortIntegrity }
+        $sppVerifiedHealthy = [bool](
+            $sppIntegrity -and $sppIntegrity.Healthy -and
+            $sppIntegrity.SymlinksChecked -and
+            [int]$sppIntegrity.EntryCount -gt 0 -and
+            [int]$sppIntegrity.EntryCount -eq [int]$sppIntegrity.ComNameCount
+        )
+        if ($sppVerifiedHealthy) {
+            [void]$findings.Add("[info] SPP server channels at startup: $($Session.StartupSppChannelCount) LOCALMFG entries; serial namespace independently verified healthy ($($sppIntegrity.EntryCount)/$($sppIntegrity.ComNameCount)), so the count alone is not a fault")
+        } else {
+            [void]$findings.Add("[~] SPP server channel accumulation: $($Session.StartupSppChannelCount) LOCALMFG entries at startup; serial namespace was not independently verified healthy")
+        }
     } elseif ($Session.StartupSppChannelCount -gt 0) {
         [void]$findings.Add("[ok] SPP server channels at startup: $($Session.StartupSppChannelCount) (normal)")
     } else {
@@ -5241,7 +5347,10 @@ function Get-DeviceProbeSessionSummary {
         ComPortHistory  = @($Session.ComPortHistory)
         ReconnectStats  = $reconnectStats
         BtLinkFlapCount = $Session.BtLinkFlapCount
+        BtLinkPreSessionFlapCount = $Session.BtLinkPreSessionFlapCount
+        BtLinkActiveSessionDropCount = $Session.BtLinkActiveSessionDropCount
         BtLinkEverConnected = $Session.BtLinkEverConnected
+        UnavailableAfterHeldPorts = @($Session.UnavailableAfterHeldPorts | Where-Object { $_ })
         ObservationCount = $WatchState.Observations.Count
         OperatorMarkers = @($Session.OperatorMarkers)
     }
