@@ -370,6 +370,29 @@ function Write-GuiDiagnostic {
         throw "Invalid diagnostic level: $Level. Valid levels: $($script:ValidLevels -join ', ')"
     }
 
+    # Lifecycle guard -- deliberately AFTER the level check, not before it.
+    #
+    # An invalid level is a PROGRAMMING error and must fail closed whatever the
+    # box happens to be doing, so that check keeps both its position and its
+    # throw. A disposed box is a different kind of event: a teardown RACE. The
+    # recorder writes diagnostics from click handlers and from its own stop
+    # path, so a message can legitimately arrive after the form has gone.
+    #
+    # Measured 2026-08-17 on MMEVOLD_06: the operator clicked a button, this
+    # function ran against the disposed log box, and the unhandled
+    # ObjectDisposedException killed the process ON THE PACKAGING PATH. The
+    # capture's provider evidence had already drained (FinalDrainStatus =
+    # Collected) but no archive was ever written, and the run artifacts had to
+    # be rescued by hand out of the TEMP staging tree. Dropping a shutdown
+    # message is correct; losing the archive is not.
+    #
+    # The throw came from `$Box.SelectionStart = $Box.TextLength` below:
+    # TextLength on a disposed control reaches get_Handle() -> CreateHandle().
+    # Note Test-GuiBoxAtBottom is ALREADY guarded and returns $true for a
+    # disposed box, which walked the old code straight into that unguarded
+    # write -- the guard existed one function away and was not applied here.
+    if ($Box.IsDisposed -or $Box.Disposing) { return }
+
     $color = [System.Drawing.ColorTranslator]::FromHtml($script:GuiColors[$Level])
 
     # Format output with or without prefix
@@ -379,34 +402,43 @@ function Write-GuiDiagnostic {
         "[{0}] {1}`r`n" -f $Level.PadRight(6), $Message
     }
 
-    # Sticky-bottom autoscroll: follow new output only when the reader was
-    # already at the end. Measured BEFORE appending -- afterwards the box is
-    # always at the bottom, because AppendText moves the caret there itself.
-    $wasAtBottom = Test-GuiBoxAtBottom -Box $Box
-    $firstVisible = if ($wasAtBottom) { -1 } else {
-        try { $Box.GetCharIndexFromPosition((New-Object System.Drawing.Point(1, 1))) } catch { -1 }
-    }
-
-    # Append with color
-    $Box.SelectionStart = $Box.TextLength
-    $Box.SelectionLength = 0
-    $Box.SelectionColor = $color
-    $Box.AppendText($output)
-    $Box.SelectionColor = $Box.ForeColor
-
-    if ($wasAtBottom -or $firstVisible -lt 0) {
-        $Box.ScrollToCaret()
-    } else {
-        # Put the reader's top line back. ScrollToCaret scrolls the minimum
-        # distance needed to reveal the caret, and the caret is now above the
-        # viewport, so the target character lands back on the top row.
-        try {
-            $Box.SelectionStart = $firstVisible
-            $Box.SelectionLength = 0
-            $Box.ScrollToCaret()
-        } catch {
-            $Box.ScrollToCaret()
+    # The guard above closes the common case. This closes the RACE: the box can
+    # be disposed between that check and these writes, because disposal happens
+    # on the UI thread while this runs from a handler on it. Only a disposal is
+    # swallowed -- the box is re-tested in the catch and anything else rethrows,
+    # so a genuine defect in here still surfaces instead of being hidden.
+    try {
+        # Sticky-bottom autoscroll: follow new output only when the reader was
+        # already at the end. Measured BEFORE appending -- afterwards the box is
+        # always at the bottom, because AppendText moves the caret there itself.
+        $wasAtBottom = Test-GuiBoxAtBottom -Box $Box
+        $firstVisible = if ($wasAtBottom) { -1 } else {
+            try { $Box.GetCharIndexFromPosition((New-Object System.Drawing.Point(1, 1))) } catch { -1 }
         }
+
+        # Append with color
+        $Box.SelectionStart = $Box.TextLength
+        $Box.SelectionLength = 0
+        $Box.SelectionColor = $color
+        $Box.AppendText($output)
+        $Box.SelectionColor = $Box.ForeColor
+
+        if ($wasAtBottom -or $firstVisible -lt 0) {
+            $Box.ScrollToCaret()
+        } else {
+            # Put the reader's top line back. ScrollToCaret scrolls the minimum
+            # distance needed to reveal the caret, and the caret is now above the
+            # viewport, so the target character lands back on the top row.
+            try {
+                $Box.SelectionStart = $firstVisible
+                $Box.SelectionLength = 0
+                $Box.ScrollToCaret()
+            } catch {
+                $Box.ScrollToCaret()
+            }
+        }
+    } catch {
+        if (-not ($Box.IsDisposed -or $Box.Disposing)) { throw }
     }
 }
 

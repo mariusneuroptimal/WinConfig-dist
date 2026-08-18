@@ -5440,6 +5440,17 @@ $buttonHandlers = @{
             $btOpenFolderBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
             $btOpenFolderBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
             $btOpenFolderBtn.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
+            # EXPLICIT colours are mandatory on this row. BackColor is an AMBIENT
+            # property, so a button with none inherits $btStatusPanel's near-black
+            # (28,28,34) while ForeColor falls back to SystemColors.ControlText,
+            # which is BLACK -- the button renders black-on-black and is invisible.
+            # Reported from the field 2026-08-18 ("Open Folder is hidden, black
+            # against black"). Every other button on this row sets all four; this
+            # one was the only omission.
+            $btOpenFolderBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btOpenFolderBtn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(120, 120, 120)
+            $btOpenFolderBtn.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+            $btOpenFolderBtn.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
             $btOpenFolderBtn.Visible = $false
             $btOpenFolderBtn.Add_Click({
                 $folder = $this.Tag
