@@ -4562,6 +4562,19 @@ $buttonHandlers = @{
                 }
             }
 
+            # D3 (2026-08-19): a confirmed serial fault no longer stops the
+            # recording -- it forces it passive-only. Read the permission field
+            # defensively so an older module (no ActiveProbePermitted key)
+            # keeps today's behaviour.
+            $btPfForcePassiveOnly = $false
+            if ($btSerialPreflight -is [System.Collections.IDictionary]) {
+                if ($btSerialPreflight.Contains('ActiveProbePermitted')) {
+                    $btPfForcePassiveOnly = -not [bool]$btSerialPreflight['ActiveProbePermitted']
+                }
+            } elseif ($btSerialPreflight -and $btSerialPreflight.PSObject.Properties['ActiveProbePermitted']) {
+                $btPfForcePassiveOnly = -not [bool]$btSerialPreflight.ActiveProbePermitted
+            }
+
             $btPfResponse = if (Get-Command Get-BluetoothSerialTroubleshootingResponse -ErrorAction SilentlyContinue) {
                 Get-BluetoothSerialTroubleshootingResponse -Readiness $btSerialPreflight `
                     -NoExeRunning ($btNoProcesses.Count -gt 0) -RecorderActive ([bool]$script:BtRecordingActive)
@@ -7046,7 +7059,16 @@ $buttonHandlers = @{
             if ($btDeepProbeAvailable) {
                 # ── Initialize deep probe ────────────────────────────────────
                 $btWin32Ok = Initialize-BtWin32Api
-                $btProbeSession = New-DeviceProbeSession
+                # D3: a confirmed serial fault forces the whole run passive-only
+                # at construction, before the first instant any code could open
+                # a target port. The force and its reason ride on the session so
+                # the capture can distinguish "off because the machine state
+                # forbade opens" from "off by operator setting".
+                $btProbeSession = if ($btPfForcePassiveOnly) {
+                    New-DeviceProbeSession -ForcePassiveOnly -ForcePassiveOnlyReason ([string]$btSerialPreflight.Summary)
+                } else {
+                    New-DeviceProbeSession
+                }
                 $btProbeSession.BtWin32Available = $btWin32Ok
                 # Proof that the passive FI-012 gate ran before this recorder was
                 # constructed. The full start/end tables below remain separate.
@@ -7054,7 +7076,21 @@ $buttonHandlers = @{
                 if ($btSerialPreflight.Status -eq 'Unverified') {
                     Write-BtLog "  [~] $($btSerialPreflight.Summary) Passive troubleshooting will continue, but this is not a serial-readiness all-clear." -Level "WARN"
                 }
+                if ($btPfForcePassiveOnly) {
+                    Write-BtLog "  [!] KNOWN serial fault present -- recording in PASSIVE-ONLY mode. The active port-open probe is disabled for this entire run; no serial port will be opened by the recorder." -Level "WARN"
+                    Write-BtLog "      $($btSerialPreflight.Summary)" -Level "WARN"
+                }
                 $btProbeSession.NoExeVersion = try { Get-NoExeVersion } catch { $null }
+                # NO's own device table, read-only, at the recording's start.
+                # The end snapshot at teardown makes record-staleness (alias ->
+                # COM -> MAC disagreeing with the live namespace) provable from
+                # a capture instead of from an operator screenshot.
+                if (Get-Command Get-NoDeviceManagerConfigSnapshot -ErrorAction SilentlyContinue) {
+                    $btProbeSession.NoDeviceConfigStart = try { Get-NoDeviceManagerConfigSnapshot } catch { $null }
+                    if ($btProbeSession.NoDeviceConfigStart -and $btProbeSession.NoDeviceConfigStart.Exists) {
+                        Write-BtLog "  NO device table: $(@($btProbeSession.NoDeviceConfigStart.ComPorts) -join ', ')  (config written $($btProbeSession.NoDeviceConfigStart.LastWriteTimeUtc))" -Level 'DIM'
+                    }
+                }
                 # The recording window opens HERE, on the same $btRecordStart the
                 # operator markers and the on-screen "Recording mm:ss" label
                 # already count from -- not at the first probe tick, which is at
@@ -7111,6 +7147,8 @@ $buttonHandlers = @{
                             ActivePortOpenProbeReadStatus = [string]$btProbeSession.ActivePortOpenProbeReadStatus
                             ActivePortOpenProbeSource     = [string]$btProbeSession.ActivePortOpenProbeSource
                             ActivePortOpenProbeRawValue   = $btProbeSession.ActivePortOpenProbeRawValue
+                            ActivePortOpenProbeForcedOff  = if ($btProbeSession.ContainsKey('ActivePortOpenProbeForcedOff')) { [bool]$btProbeSession.ActivePortOpenProbeForcedOff } else { $false }
+                            ActivePortOpenProbeForcedOffReason = if ($btProbeSession.ContainsKey('ActivePortOpenProbeForcedOffReason')) { $btProbeSession.ActivePortOpenProbeForcedOffReason } else { $null }
                             PortObservationSources        = @($btProbeSession.PortObservationSources)
                             ActiveSensorState             = [string]$btProbeSession.ActiveSensorState
                             RunId      = $btRunId
@@ -7950,6 +7988,36 @@ $buttonHandlers = @{
                             }
                         }
 
+                        # NO's message store, sampled every tick (a 99-byte read).
+                        # The store was measured EMPTY during a live 12006, so
+                        # this watch is the measurement of whether the channel
+                        # ever carries NO's error codes: every change is a
+                        # timeline line; a store that never changes renders as a
+                        # counted absence in no-application-evidence.json.
+                        if (Get-Command Update-NoMessageStoreWatch -ErrorAction SilentlyContinue) {
+                            $noMsgChange = try { Update-NoMessageStoreWatch -Session $btProbeSession } catch { $null }
+                            if ($noMsgChange) {
+                                if ($btDiagRun) {
+                                    $wrote = Add-WinConfigDiagnosticJsonLine -RunFolder $btDiagRun.RunFolder -Name 'events.jsonl' -Data ([ordered]@{
+                                        AtUtc            = $noMsgChange.AtUtc
+                                        Kind             = 'NO_MESSAGES'
+                                        State            = $noMsgChange.ChangeType
+                                        Level            = 'INFO'
+                                        Reason           = "NO_messages.xml $($noMsgChange.ChangeType): $($noMsgChange.Length) bytes, MessageCount=$($noMsgChange.MessageCount)"
+                                        MessageCount     = $noMsgChange.MessageCount
+                                        LastWriteTimeUtc = $noMsgChange.LastWriteTimeUtc
+                                        Sha256           = $noMsgChange.Sha256
+                                        Content          = $noMsgChange.Content
+                                        ContentTruncated = $noMsgChange.ContentTruncated
+                                        TickIndex        = [int]$btProbeSession.TickCount
+                                    })
+                                    if (-not $wrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
+                                    else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
+                                }
+                                Write-BtLog "  $((Get-Date).ToString('HH:mm:ss'))  [NO-MSG ]  NO's message store $($noMsgChange.ChangeType.ToLower()): $($noMsgChange.Length) bytes, MessageCount=$($noMsgChange.MessageCount)" -Level 'WARN'
+                            }
+                        }
+
                         # Diagnostic chain: compute, persist on change, render.
                         # This replaced five independent indicators that showed a
                         # single root cause as four separate problems.
@@ -8280,8 +8348,17 @@ $buttonHandlers = @{
                         # Explicit-enabled and ended DefaultedMissing-enabled has
                         # the same behaviour and a different provenance, and the
                         # provenance is what an arm is scored on.
+                        # Compare against the SETTING as read at the start, not
+                        # the effective value: a session the D3 preflight forced
+                        # passive-only would otherwise report drift on every run
+                        # even though the environment never changed.
+                        $apopStartSettingEnabled = if ($btProbeSession.ContainsKey('ActivePortOpenProbeSettingEnabled')) {
+                            [bool]$btProbeSession.ActivePortOpenProbeSettingEnabled
+                        } else {
+                            [bool]$btProbeSession.ActivePortOpenProbeEnabled
+                        }
                         $btProbeSession.ActivePortOpenProbeDrift = (
-                            ([bool]$apopEnd.Enabled -ne [bool]$btProbeSession.ActivePortOpenProbeEnabled) -or
+                            ([bool]$apopEnd.Enabled -ne $apopStartSettingEnabled) -or
                             ([string]$apopEnd.SettingReadStatus -ne [string]$btProbeSession.ActivePortOpenProbeReadStatus)
                         )
                         if ($btProbeSession.ActivePortOpenProbeDrift) {
@@ -8689,6 +8766,80 @@ $buttonHandlers = @{
                     } catch { }
                 }
 
+                # HOST EVIDENCE -- the two facts that make every other artifact
+                # comparable ACROSS machines, neither of which was collected
+                # before 2026-08-18.
+                #
+                # 1. Sleep capability. The FI-012 trigger is Modern Standby, so
+                #    an absent Kernel-Power 42/107 count is ambiguous between
+                #    "did not sleep" and "CANNOT sleep that way" -- MMEVOLD_06's
+                #    firmware supports no S3 at all. Without this field a clean
+                #    capture from an S3-only host reads as a negative result
+                #    when it is actually an untested configuration.
+                #
+                # 2. Port identity. Roles move on re-pair and COM numbers are
+                #    reassigned, so "COM6 = Data" cannot be audited later. A
+                #    port with no device behind it reads Status OK, resolves its
+                #    symlink, and opens in under 3 ms -- indistinguishable from a
+                #    working port in every static view we captured until now.
+                if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
+                    try {
+                        $hostSleepCap = if (Get-Command Get-HostSleepCapability -ErrorAction SilentlyContinue) {
+                            Get-HostSleepCapability
+                        } else { $null }
+                        $hostPortIdent = if (Get-Command Get-BluetoothSerialPortIdentity -ErrorAction SilentlyContinue) {
+                            Get-BluetoothSerialPortIdentity
+                        } else { $null }
+                        Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'host-evidence.json' -Depth 8 -Data @{
+                            Reference       = 'docs/FIELD-ISSUES.md'
+                            CollectedAtUtc  = (Get-Date).ToUniversalTime().ToString('o')
+                            LastBootTimeUtc = $(try {
+                                ((Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime).ToUniversalTime().ToString('o')
+                            } catch { $null })
+                            SleepCapability = $hostSleepCap
+                            PortIdentity    = $hostPortIdent
+                        }
+                    } catch { }
+                }
+
+                # NO APPLICATION EVIDENCE -- what NO itself said and cached,
+                # collected read-only. The message-store section is primarily a
+                # MEASUREMENT of the channel: EverNonEmpty=$false with a nonzero
+                # SampleCount is the counted absence that retires the channel;
+                # a single change record with content is NO's error codes
+                # arriving in a capture for the first time.
+                if ($btDiagRun -and $btProbeSession -and (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue)) {
+                    try {
+                        if ((Get-Command Get-NoDeviceManagerConfigSnapshot -ErrorAction SilentlyContinue) -and
+                            $btProbeSession.ContainsKey('NoDeviceConfigEnd')) {
+                            $btProbeSession.NoDeviceConfigEnd = try { Get-NoDeviceManagerConfigSnapshot } catch { $null }
+                        }
+                        $noMsgState = if ($btProbeSession.ContainsKey('NoMessageStore')) { $btProbeSession.NoMessageStore } else { $null }
+                        $noDevStart = if ($btProbeSession.ContainsKey('NoDeviceConfigStart')) { $btProbeSession.NoDeviceConfigStart } else { $null }
+                        $noDevEnd   = if ($btProbeSession.ContainsKey('NoDeviceConfigEnd'))   { $btProbeSession.NoDeviceConfigEnd }   else { $null }
+                        if ($noMsgState -or $noDevStart -or $noDevEnd) {
+                            Add-WinConfigDiagnosticArtifact -RunFolder $btDiagRun.RunFolder -Name 'no-application-evidence.json' -Depth 8 -Data @{
+                                Reference    = 'docs/FIELD-ISSUES.md'
+                                CollectedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+                                MessageStore = $(if ($noMsgState) { [ordered]@{
+                                    SampleCount        = [int]$noMsgState.SampleCount
+                                    ChangeCount        = [int]$noMsgState.ChangeCount
+                                    DroppedChangeCount = [int]$noMsgState.DroppedChangeCount
+                                    ReadErrorCount     = [int]$noMsgState.ReadErrorCount
+                                    EverNonEmpty       = [bool]$noMsgState.EverNonEmpty
+                                    FirstSnapshot      = $noMsgState.FirstSnapshot
+                                    LastSnapshot       = $noMsgState.LastSnapshot
+                                    Changes            = @($noMsgState.Changes)
+                                } } else { $null })
+                                DeviceManagerConfig = [ordered]@{
+                                    AtSessionStart = $noDevStart
+                                    AtSessionEnd   = $noDevEnd
+                                }
+                            }
+                        }
+                    } catch { }
+                }
+
                 # FI-014 structured evidence, kept as its own artifact rather
                 # than folded into the Bluetooth blob -- same reasoning as
                 # serialcomm-integrity.json above. A reader triaging "the
@@ -8978,6 +9129,15 @@ $buttonHandlers = @{
                         ActivePortOpenProbeReadStatus = if ($btProbeSession) { $btProbeSession.ActivePortOpenProbeReadStatus } else { $null }
                         ActivePortOpenProbeSource     = if ($btProbeSession) { $btProbeSession.ActivePortOpenProbeSource } else { $null }
                         ActivePortOpenProbeRawValue   = if ($btProbeSession) { $btProbeSession.ActivePortOpenProbeRawValue } else { $null }
+                        # D3: disabled-by-preflight is a different fact from
+                        # disabled-by-setting. A capture with ForcedOff=$true is
+                        # a fault-state recording, never an experimental arm.
+                        ActivePortOpenProbeForcedOff = if ($btProbeSession -and $btProbeSession.ContainsKey('ActivePortOpenProbeForcedOff')) {
+                            [bool]$btProbeSession.ActivePortOpenProbeForcedOff
+                        } else { $null }
+                        ActivePortOpenProbeForcedOffReason = if ($btProbeSession -and $btProbeSession.ContainsKey('ActivePortOpenProbeForcedOffReason')) {
+                            $btProbeSession.ActivePortOpenProbeForcedOffReason
+                        } else { $null }
                         # Verified at BOTH ends, automatically. Drift means the
                         # capture is not scoreable as an arm even though the
                         # recorder's own behaviour never changed.

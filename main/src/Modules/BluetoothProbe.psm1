@@ -3888,6 +3888,212 @@ public static class WinConfigSerialSymlink {
     }
 }
 
+function Get-HostSleepCapability {
+    <#
+    .SYNOPSIS
+        Which sleep states this machine can actually enter, from powercfg /a.
+    .DESCRIPTION
+        THE FI-012 TRIGGER IS MODERN STANDBY. A host whose firmware cannot enter
+        S3 can never produce Kernel-Power 42/107, and a host with no Modern
+        Standby can never reproduce the namespace corruption at all. So a "clean"
+        capture is UNINTERPRETABLE without knowing which states the host
+        supports: absent 42/107 might mean "did not sleep" or "cannot sleep that
+        way", and those are different facts.
+
+        Measured 2026-08-18 on MMEVOLD_06: S1/S2/S3 all report "The system
+        firmware does not support this standby state", so its zero 42/107 count
+        carries no information about sleep activity.
+
+        Read-only. Keeps the raw text, because the wording is localised and
+        version-dependent and a later reader must be able to re-parse rather
+        than trust this classification.
+    .PARAMETER PowercfgOutput
+        Injectable powercfg /a output, for deterministic tests.
+    .OUTPUTS
+        Ordered hashtable. Availability fields are $null when undetermined -
+        never $false, which would read as "measured absent".
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][string[]]$PowercfgOutput)
+
+    $result = [ordered]@{
+        Collected               = $false
+        Error                   = $null
+        RawText                 = $null
+        S0LowPowerIdleAvailable = $null
+        S3Available             = $null
+        HibernateAvailable      = $null
+        AvailableStates         = @()
+        UnavailableStates       = @()
+        ModernStandbyOnly       = $null
+        Note                    = $null
+    }
+
+    $lines = $PowercfgOutput
+    if ($null -eq $lines) {
+        try { $lines = @(& powercfg /a 2>&1) }
+        catch {
+            $result.Error = "powercfg /a failed: $($_.Exception.Message)"
+            return $result
+        }
+    }
+    if (-not $lines -or @($lines).Count -eq 0) {
+        $result.Error = 'powercfg /a returned no output'
+        return $result
+    }
+
+    $result.Collected = $true
+    $result.RawText   = (@($lines) -join "`n")
+
+    # Parse BY SECTION. powercfg /a prints an "available" block and a "not
+    # available" block, and the second block repeats the state names - matching
+    # a state name anywhere in the text reads unavailable states as available.
+    $section = 'unknown'
+    foreach ($raw in @($lines)) {
+        $line = [string]$raw
+        if ($line -match 'following sleep states are available')     { $section = 'available';   continue }
+        if ($line -match 'following sleep states are not available') { $section = 'unavailable'; continue }
+        $t = $line.Trim()
+        if (-not $t) { continue }
+        # Deeply indented lines under a state are its REASON, not a state name.
+        if ($line -match '^\s{8,}' -or $t -match '^(The|This|Hibernation)\b') { continue }
+        if ($section -eq 'available')   { $result.AvailableStates   += $t }
+        if ($section -eq 'unavailable') { $result.UnavailableStates += $t }
+    }
+
+    if ($section -eq 'unknown') {
+        $result.Note = 'powercfg /a output did not contain the expected section headers; read RawText instead of trusting the fields above.'
+        return $result
+    }
+
+    $avail = (@($result.AvailableStates)   -join ' ')
+    $unav  = (@($result.UnavailableStates) -join ' ')
+    $result.S0LowPowerIdleAvailable = [bool]($avail -match 'S0 Low Power Idle')
+    if     ($avail -match 'Standby \(S3\)') { $result.S3Available = $true }
+    elseif ($unav  -match 'Standby \(S3\)') { $result.S3Available = $false }
+    if     ($avail -match 'Hibernate')      { $result.HibernateAvailable = $true }
+    elseif ($unav  -match 'Hibernate')      { $result.HibernateAvailable = $false }
+
+    if ($result.S0LowPowerIdleAvailable -and $result.S3Available -eq $false) {
+        $result.ModernStandbyOnly = $true
+        $result.Note = 'Modern Standby only: S3 is unavailable, so Kernel-Power 42/107 CANNOT appear on this host. Their absence says nothing about sleep activity.'
+    } elseif ($result.S0LowPowerIdleAvailable -eq $false -and $result.S3Available) {
+        $result.ModernStandbyOnly = $false
+        $result.Note = 'Classic S3 only: no Modern Standby, so this host cannot reproduce the FI-012 trigger observed on MMEVOLD_06.'
+    } elseif ($null -ne $result.S3Available) {
+        $result.ModernStandbyOnly = $false
+    }
+
+    return $result
+}
+
+function Get-BluetoothSerialPortIdentity {
+    <#
+    .SYNOPSIS
+        Per-port IDENTITY for every Bluetooth SPP devnode: remote address,
+        service channel, role, and the raw PnP fields behind them.
+    .DESCRIPTION
+        RECORD THE IDENTIFIER, NOT THE LABEL. A capture holding only "COM6 =
+        Data" cannot be audited later: COM numbers get reassigned, roles move
+        across a re-pair, and a port with no device behind it looks identical to
+        a working one in every static view. Measured 2026-08-18 on MMEVOLD_06:
+        4 of 8 ports carried an all-zero remote address, and all 8 resolved
+        their symlink and reported Status OK.
+
+        Three DESCRIPTIVE states, deliberately not diagnostic:
+          Device      - non-zero remote Bluetooth address
+          ZeroAddress - all-zero remote address, structurally different devnode
+                        (LOCALMFG, service suffix with no C prefix). What these
+                        ARE is not established: possibly stale leftovers,
+                        possibly locally defined endpoints. NOT called "orphan"
+                        - the structure is measured, the staleness is not.
+          Unparsed    - InstanceId matched neither shape. Kept visible rather
+                        than bucketed into one of the above.
+
+        Read-only. Opens no port.
+    .PARAMETER PnpPort
+        Injectable port objects, for deterministic tests.
+    .OUTPUTS
+        Ordered hashtable: Collected, Error, Ports, counts by state.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][object[]]$PnpPort)
+
+    $result = [ordered]@{
+        Collected        = $false
+        Error            = $null
+        Ports            = @()
+        TotalCount       = 0
+        DeviceCount      = 0
+        ZeroAddressCount = 0
+        UnparsedCount    = 0
+        DistinctAddress  = @()
+    }
+
+    $devices = $PnpPort
+    if ($null -eq $devices) {
+        try {
+            $devices = @(Get-PnpDevice -Class Ports -ErrorAction Stop |
+                Where-Object { Test-BluetoothTransportInstanceId -InstanceId $_.InstanceId })
+        } catch {
+            $result.Error = "Get-PnpDevice failed: $($_.Exception.Message)"
+            return $result
+        }
+    }
+
+    $result.Collected = $true
+    $ports = @()
+    foreach ($d in @($devices)) {
+        $friendly = [string]$d.FriendlyName
+        $instance = [string]$d.InstanceId
+        $com   = ([regex]::Match($friendly, '\((COM\d+)\)')).Groups[1].Value
+        $addrM = [regex]::Match($instance, '&([0-9A-Fa-f]{12})_')
+        $svc   = ([regex]::Match($instance, '_(C?[0-9A-Fa-f]{8})$')).Groups[1].Value
+
+        $state = if (-not $addrM.Success) { 'Unparsed' }
+                 elseif ($addrM.Groups[1].Value -eq '000000000000') { 'ZeroAddress' }
+                 else { 'Device' }
+
+        # Role comes from the SERVICE CHANNEL, which survives a re-pair. The COM
+        # number does not: 2026-08-18 kept COM4/COM6 but swapped Data/Command
+        # between them, so a cached COM number opens fine and addresses the
+        # wrong channel - a failure with no error code at all.
+        $role = switch ($svc) {
+            'C00000000' { 'Data' }
+            'C00000001' { 'Command' }
+            default     { $null }
+        }
+
+        $busDesc = $null
+        if ($instance) {
+            try {
+                $busDesc = (Get-PnpDeviceProperty -InstanceId $instance -KeyName '{540b947e-8b40-45bc-a8a2-6a0b894cbda2} 4' -ErrorAction SilentlyContinue).Data
+            } catch { }
+        }
+
+        $ports += [ordered]@{
+            ComName         = $(if ($com) { $com } else { $null })
+            State           = $state
+            RemoteAddress   = $(if ($addrM.Success) { $addrM.Groups[1].Value.ToUpperInvariant() } else { $null })
+            ServiceChannel  = $(if ($svc) { $svc } else { $null })
+            Role            = $role
+            BusReportedDesc = $busDesc
+            Status          = [string]$d.Status
+            Present         = $(if ($null -ne $d.Present) { [bool]$d.Present } else { $null })
+            FriendlyName    = $friendly
+            InstanceId      = $instance
+        }
+    }
+
+    $result.Ports            = $ports
+    $result.TotalCount       = @($ports).Count
+    $result.DeviceCount      = @($ports | Where-Object { $_.State -eq 'Device' }).Count
+    $result.ZeroAddressCount = @($ports | Where-Object { $_.State -eq 'ZeroAddress' }).Count
+    $result.UnparsedCount    = @($ports | Where-Object { $_.State -eq 'Unparsed' }).Count
+    $result.DistinctAddress  = @($ports | Where-Object { $_.State -eq 'Device' } | ForEach-Object { $_.RemoteAddress } | Sort-Object -Unique)
+    return $result
+}
+
 function Get-BluetoothSerialPortIntegrity {
     <#
     .SYNOPSIS
@@ -4022,9 +4228,16 @@ function Test-BluetoothRecorderSerialPreflight {
     $result = [ordered]@{
         # Unverified is not proof of corruption. The recorder may continue in
         # passive troubleshooting mode, but it must warn and must not represent
-        # the namespace as ready. Only Status=Blocked stops the run.
+        # the namespace as ready. Since 2026-08-19 no state produced here stops
+        # the run: passive capture opens no serial port, so even a confirmed
+        # fault is recorded (Status=PassiveOnly) rather than refused. The
+        # response layer still honours Status=Blocked from older builds.
         CanStart               = $true
         PassiveCaptureAllowed = $true
+        # $false forces the recorder's active port-open probe OFF for the whole
+        # run. Distinct from PassiveCaptureAllowed: passive capture is now
+        # always allowed; what a corrupt namespace forbids is OPENING ports.
+        ActiveProbePermitted   = $true
         ApplicationSessionReady = $false
         Status                 = 'Unverified'
         Reason                 = 'NoIntegritySample'
@@ -4070,10 +4283,23 @@ function Test-BluetoothRecorderSerialPreflight {
 
     # A known defect wins over collection limitations: collisions remain
     # conclusive even when QueryDosDevice itself was unavailable.
+    #
+    # CONTRACT CHANGED 2026-08-19 (defect D3). This branch used to return
+    # Status='Blocked' with CanStart and PassiveCaptureAllowed both $false,
+    # which stopped the Flight Recorder outright. That made the field corpus
+    # STRUCTURALLY unable to contain a recording of FI-012's end state: the one
+    # machine state this recorder exists to document was the one state it
+    # refused to record. Passive capture opens no serial port and changes no
+    # pairing or process state, so there is nothing for it to make worse. The
+    # recording now proceeds passive-only: ActiveProbePermitted=$false forces
+    # the active port-open probe off for the whole run, and the namespace stays
+    # NOT ready for an application session.
     if (-not [bool]$Integrity.Healthy) {
-        $result.CanStart       = $false
-        $result.PassiveCaptureAllowed = $false
-        $result.Status         = 'Blocked'
+        $result.CanStart       = $true
+        $result.PassiveCaptureAllowed = $true
+        $result.ActiveProbePermitted  = $false
+        $result.ApplicationSessionReady = $false
+        $result.Status         = 'PassiveOnly'
         $result.Reason         = 'SerialNamespaceCorrupt'
         $result.Summary        = "KNOWN Bluetooth serial fault detected: $($Integrity.Summary)"
         $result.Recommendation = if ($Integrity.Recommendation) {
@@ -4127,8 +4353,11 @@ function Get-BluetoothSerialTroubleshootingResponse {
     .DESCRIPTION
         Pure presentation policy. It never enumerates a process or opens a port;
         callers supply whether NO and a recorder are already active. Confirmed
-        FI-012 corruption receives a proactive stop/reboot workflow. Unverified
-        collection receives a warning but remains available for passive capture.
+        FI-012 corruption (Status=PassiveOnly since 2026-08-19) receives the
+        stop/reboot workflow for the APPLICATION session while the recording
+        itself continues passive-only; Status=Blocked from an older classifier
+        still stops the recorder start. Unverified collection receives a warning
+        but remains available for passive capture.
     #>
     [CmdletBinding()]
     param(
@@ -4140,7 +4369,10 @@ function Get-BluetoothSerialTroubleshootingResponse {
     $status = if ($Readiness -and $Readiness.Status) { [string]$Readiness.Status } else { 'Unverified' }
     $result = [ordered]@{
         Status           = $status
-        NotifyUser       = ($status -in @('Blocked', 'Unverified'))
+        NotifyUser       = ($status -in @('Blocked', 'PassiveOnly', 'Unverified'))
+        # Only the legacy Blocked status stops a recorder start. The current
+        # classifier reports a confirmed fault as PassiveOnly, and that
+        # recording must happen -- it is the artifact of the fault (D3).
         StopRecorderStart = ($status -eq 'Blocked')
         ApplicationState = if ($RecorderActive) { 'RecorderActive' } elseif ($NoExeRunning) { 'NoExeRunning' } else { 'NoExeClosed' }
         FaultStage       = $null
@@ -4151,7 +4383,7 @@ function Get-BluetoothSerialTroubleshootingResponse {
         Summary          = if ($Readiness) { [string]$Readiness.Summary } else { 'Bluetooth serial readiness could not be verified.' }
     }
 
-    if ($status -eq 'Blocked') {
+    if ($status -in @('Blocked', 'PassiveOnly')) {
         $collisions = [int]$Readiness.CollisionCount
         $missing    = [int]$Readiness.MissingSymlinkCount
         $stale      = [int]$Readiness.DanglingSymlinkCount
@@ -4206,6 +4438,7 @@ function Get-BluetoothSerialTroubleshootingResponse {
             )
         } elseif ($NoExeRunning) {
             $result.Steps = @(
+                $(if ($status -eq 'PassiveOnly') { 'The Bluetooth recording will continue in PASSIVE-ONLY mode: this recorder will not open any serial port while the fault is present.' }),
                 'Do not start another NO session or open additional Bluetooth serial ports.',
                 'If the current NO session has work in progress, finish or save it if possible, then close NO.',
                 'Reboot Windows without unpairing the Bluetooth device.',
@@ -4214,12 +4447,16 @@ function Get-BluetoothSerialTroubleshootingResponse {
             )
         } else {
             $result.Steps = @(
+                $(if ($status -eq 'PassiveOnly') { 'The Bluetooth recording will continue in PASSIVE-ONLY mode: this recorder will not open any serial port while the fault is present.' }),
                 'Do not start NO or open a Bluetooth serial port in the current state.',
                 'Reboot Windows without unpairing the Bluetooth device.',
                 'After sign-in, run Bluetooth Diagnostics again before starting NO; proceed only when serial readiness is Ready.',
                 'Do not unpair/re-pair, toggle the radio, or reset COM numbers for this signature.'
             )
         }
+        # The array-subexpression steps above contribute $null when the branch
+        # is inactive; strip them so Steps stays a clean ordered list.
+        $result.Steps = @($result.Steps | Where-Object { $_ })
         return $result
     }
 
@@ -6076,6 +6313,52 @@ function Get-SerialOpenClassification {
     }
 }
 
+function Get-SerialPortDeviceAddress {
+    <#
+    .SYNOPSIS
+        Pure. Extracts the 12-hex Bluetooth device address from an SPP devnode
+        instance path, or $null when the path carries none.
+    .DESCRIPTION
+        The address is the IDENTIFIER. Role labels ("NEUROPTIMAL COMMAND") and
+        COM numbers are not: roles move on every re-pair and the label is
+        vendor text. An all-zero address marks an ORPHAN devnode - a port with
+        no device behind it.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()][string]$InstanceId)
+
+    if ([string]::IsNullOrWhiteSpace($InstanceId)) { return $null }
+    # BTHENUM\{guid}_...\7&34D00A70&0&8C1F64710013_C00000000
+    if ($InstanceId -match '([0-9A-Fa-f]{12})_C[0-9A-Fa-f]{8}') { return $Matches[1].ToUpperInvariant() }
+    if ($InstanceId -match 'BTHENUM\.*\.*?([0-9A-Fa-f]{12})')  { return $Matches[1].ToUpperInvariant() }
+    return $null
+}
+
+function Test-SerialOpenResultIsOrphan {
+    <#
+    .SYNOPSIS
+        Pure. True when an open-attempt result belongs to an ORPHAN port (null
+        Bluetooth address). UNKNOWN provenance returns $false, never $true.
+    .DESCRIPTION
+        Absent is not orphan. A result whose IsOrphan/DeviceAddress could not be
+        determined (older callers, a port named that enumeration never saw) is
+        treated as a real device port, which is the conservative direction: it
+        preserves the pre-existing verdict rather than silently inventing an
+        orphan and weakening a real control.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([AllowNull()][object]$Result)
+
+    if ($null -eq $Result) { return $false }
+    $flag = $Result.PSObject.Properties['IsOrphan']
+    if ($flag -and $null -ne $flag.Value) { return [bool]$flag.Value }
+    $addr = $Result.PSObject.Properties['DeviceAddress']
+    if ($addr -and $addr.Value) { return ([string]$addr.Value -eq '000000000000') }
+    return $false
+}
+
 function Get-SerialOpenIsolation {
     <#
     .SYNOPSIS
@@ -6087,6 +6370,12 @@ function Get-SerialOpenIsolation {
         serial stack all work on this box, so the fault is specific to that
         device or its channels. The converse - every port failing - points back
         at the stack itself.
+
+        AN ORPHAN PORT IS NOT A CONTROL. A port whose devnode carries an
+        all-zero Bluetooth address has no device behind it; opening it
+        establishes no RFCOMM link. Orphan opens are therefore excluded from the
+        "other ports opened, so it is device-specific" inference and reported
+        separately as AllDevicePortsFailed.
 
         THAT CONVERSE IS ONLY VALID WHEN EVERY PORT WAS TESTED. Observed
         2026-08-06: called with -PortName COM6 alone, the old code returned
@@ -6118,8 +6407,21 @@ function Get-SerialOpenIsolation {
                 elseif ($missed.Count -eq 0) { 'Full' }
                 else { 'Subset' }
 
+    # An ORPHAN port (all-zero Bluetooth address) has no device behind it. Its
+    # open succeeds against a local device object WITHOUT establishing an RFCOMM
+    # link, so it proves CreateFile, the symlinks and the serial driver and
+    # proves NOTHING about radio reachability. Measured 2026-08-18 on
+    # MMEVOLD_06: 4 orphans opened in 0.4-2.6 ms while all 4 real device
+    # channels failed, and the verdict read "the other 4 opened normally, so
+    # ... the fault is specific to this device" - reassurance computed entirely
+    # from ports with no device. An orphan must never be the control that makes
+    # a failure device-specific.
     $bad  = @($Results | Where-Object { -not $_.Opened })
     $good = @($Results | Where-Object { $_.Opened })
+
+    $devicePorts = @($Results | Where-Object { -not (Test-SerialOpenResultIsOrphan $_) })
+    $deviceGood  = @($devicePorts | Where-Object { $_.Opened })
+    $orphanGood  = @($good | Where-Object { Test-SerialOpenResultIsOrphan $_ })
 
     if ($bad.Count -eq 0) {
         return @{ Isolation = 'AllOpened'
@@ -6129,10 +6431,19 @@ function Get-SerialOpenIsolation {
 
     $base = "$($bad.Count) of $($Results.Count) port(s) failed to open: $(($bad | ForEach-Object { "$($_.PortName)=$($_.Classification)" }) -join ', ')"
 
-    if ($good.Count -gt 0) {
+    if ($deviceGood.Count -gt 0) {
+        $orphanNote = if ($orphanGood.Count -gt 0) {
+            " ($($orphanGood.Count) orphan port(s) with no device behind them also opened and are excluded from this reasoning.)"
+        } else { '' }
         return @{ Isolation = 'DeviceSpecific'
                   Coverage  = $coverage
-                  Summary   = "$base. The other $($good.Count) Bluetooth COM port(s) opened normally, so CreateFile, the COM symlinks and the serial stack are all working - the fault is specific to this device or its channels, not system-wide." }
+                  Summary   = "$base. Another $($deviceGood.Count) Bluetooth COM port(s) WITH A DEVICE BEHIND THEM opened normally, so CreateFile, the COM symlinks and the serial stack are all working - the fault is specific to this device or its channels, not system-wide.$orphanNote" }
+    }
+
+    if ($orphanGood.Count -gt 0) {
+        return @{ Isolation = 'AllDevicePortsFailed'
+                  Coverage  = $coverage
+                  Summary   = "$base. EVERY Bluetooth COM port with a device behind it failed. The only $($orphanGood.Count) port(s) that opened are ORPHANS with an all-zero Bluetooth address: they open against a local device object without establishing an RFCOMM link, so they show CreateFile, the COM symlinks and the serial driver are working and say NOTHING about radio reachability. This CANNOT be isolated to one device - confirm the devices are powered ON and in range, and check the radio, before treating it as a device fault." }
     }
 
     if ($coverage -eq 'Full') {
@@ -6239,11 +6550,15 @@ function Test-BluetoothSerialPortOpen {
     # "Standard Serial over Bluetooth link (COMx)" on every SPP channel.
     $knownPorts = @()
     $roles      = @{}
+    $addresses  = @{}
     try {
         foreach ($p in (Get-BluetoothCOMPorts).COMPorts) {
             if ($p.COMPort) {
                 $knownPorts += $p.COMPort
                 $roles[$p.COMPort] = $p.BusReportedDeviceDesc
+                # The IDENTIFIER, captured alongside the label. The isolation
+                # verdict needs it to tell a real device port from an orphan.
+                $addresses[$p.COMPort] = Get-SerialPortDeviceAddress -InstanceId $p.InstanceId
             }
         }
     } catch { }
@@ -6283,9 +6598,15 @@ function Test-BluetoothSerialPortOpen {
         }
 
         $c = Get-SerialOpenClassification -Win32Error $err -FirstWin32Error $first
+        # $null address = provenance UNKNOWN (a port enumeration never saw), which
+        # is NOT the same as "not an orphan" and must not serialize as $false.
+        $addr     = if ($addresses.ContainsKey($port)) { $addresses[$port] } else { $null }
+        $isOrphan = if ($null -eq $addr) { $null } else { ($addr -eq '000000000000') }
         $result.Results += [PSCustomObject]@{
             PortName        = $port
             Role            = $roles[$port]
+            DeviceAddress   = $addr
+            IsOrphan        = $isOrphan
             Opened          = ($err -eq 0)
             Win32Error      = $err
             FirstWin32Error = $first
@@ -8262,7 +8583,11 @@ Export-ModuleMember -Function @(
     'Get-BluetoothInquiryScan',
     'Test-BluetoothSerialPortOpen',
     'Get-SerialOpenClassification',
+    'Get-HostSleepCapability',
+    'Get-BluetoothSerialPortIdentity',
     'Get-SerialOpenIsolation',
+    'Get-SerialPortDeviceAddress',
+    'Test-SerialOpenResultIsOrphan',
     # "Was the headset actually on when this was captured?" - the question no
     # static signal answers, because a powered-off Arc reads green on all of
     # them. INTRUSIVE (opens a port); operator-initiated, never the recorder.

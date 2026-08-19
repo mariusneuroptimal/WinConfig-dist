@@ -1096,6 +1096,101 @@ function Test-ComPortInUse {
     return ((Get-ComPortHoldState -PortName $PortName) -eq 'Held')
 }
 
+function Get-ActiveOpenDecision {
+    <#
+    .SYNOPSIS
+        Pure. Decides whether THIS tick may take an exclusive handle on the
+        target's COM ports, and says why.
+    .DESCRIPTION
+        WHY THIS EXISTS. Measured 2026-08-19, from our own captures and from an
+        independent sampler outside the process:
+
+          * The probe owns at least one of the Arc's serial ports for **12-23 %
+            of every window in which no other process holds them** -- 23.3 % over
+            the 79 s pre-streaming window of capture 026B63C26C4D, 15.6 % over
+            the device-present span of E470A928F98C. The shipped headline said
+            4.6 % / 11.8 % because it divided by the whole recording, including
+            the streaming ticks where the open is refused at ~0 ms and no handle
+            is ever taken.
+          * A held port **fails a NO session start outright** -- instantly, with
+            no retry, reporting 12005 "No valid Headset at port COMn" (P11,
+            2026-08-19, against a control that started normally seconds later).
+          * A handle held across a device REMOVAL strands the registration
+            permanently. Reproduced end to end the same afternoon, with NO itself
+            as the holder: both of the Arc's channels stranded, both names reused
+            by the next pairing, both symlinks resolving to the corpses.
+
+        Together those make the tick loop's unconditional open a genuine hazard
+        rather than an academic one: a diagnostic that can manufacture the fault
+        it was sent to observe. This function is the throttle.
+
+        THE RULES, in order, and each one is a separate decision:
+
+          1. Non-tick phases (Selection / Startup / Anomaly) ALWAYS probe. They
+             are one-shot, they are the cold opens that carry the most diagnostic
+             value, and backing them off would trade the whole point of the
+             snapshot for nothing.
+          2. TEARDOWN INTERLOCK. If the target device is not currently resolvable
+             -- device Missing, or no COM port matched -- do not open. That is
+             the removal window, the only window in which an open can strand a
+             registration, and there is nothing to learn from an open that is
+             about to fail anyway.
+          3. ANY CHANGE RESETS THE STREAK. A different port set, a change in
+             whether the application is running, or a change in radio link state
+             all mean the world moved and the next observation is worth its cost.
+          4. Otherwise back off once the answer has been the same for
+             StreakBeforeBackoff ticks: probe one tick in BackoffCadence.
+
+        WHAT THE BACKOFF COSTS, stated rather than hidden: a transition from free
+        to held can be observed up to (BackoffCadence - 1) ticks late, so a
+        session start may be stamped up to ~12 s after it happened. The read-rate
+        baseline is scoped to port-held windows and takes ~99 s to establish, so
+        a 12 s clip at the head is tolerable. Rule 3 exists to keep that cost
+        bounded to genuinely quiet stretches -- the moment anything moves, the
+        cadence returns to every tick.
+
+        A DENIED open is free (~0 ms, no handle) and a SUCCESSFUL one is not.
+        The backoff therefore only ever suppresses the expensive, hazardous case,
+        which is why the streak counts consecutive ticks where we ACQUIRED.
+    .PARAMETER Session
+        Read for the streak state and the last-seen world. Mutated only by
+        Set-ActiveOpenStreak, never here -- this function is pure so it can be
+        tested without a session at all.
+    .PARAMETER Phase
+        'Selection' | 'Startup' | 'Tick' | 'Anomaly'.
+    .OUTPUTS
+        [pscustomobject] Probe (bool), Reason (string), Rule (string).
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateSet('Selection', 'Startup', 'Tick', 'Anomaly')]
+        [string]$Phase = 'Tick',
+        [int]$TickCount = 0,
+        [int]$AcquiredStreak = 0,
+        [bool]$WorldChanged = $false,
+        [bool]$TargetResolvable = $true,
+        [int]$StreakBeforeBackoff = 3,
+        [int]$BackoffCadence = 5
+    )
+
+    if ($Phase -ne 'Tick') {
+        return [pscustomobject]@{ Probe = $true; Rule = 'NonTickPhase'; Reason = "Phase '$Phase' is a one-shot snapshot; it always probes." }
+    }
+    if (-not $TargetResolvable) {
+        return [pscustomobject]@{ Probe = $false; Rule = 'TeardownInterlock'; Reason = 'The target device is not currently resolvable (removed, or no COM port matched). An open here cannot succeed and is the one condition under which a handle can strand a registration.' }
+    }
+    if ($WorldChanged) {
+        return [pscustomobject]@{ Probe = $true; Rule = 'WorldChanged'; Reason = 'The port set, the application process state, or the radio link state changed since the last tick; the next observation is worth taking.' }
+    }
+    if ($AcquiredStreak -lt $StreakBeforeBackoff) {
+        return [pscustomobject]@{ Probe = $true; Rule = 'WarmUp'; Reason = "Only $AcquiredStreak consecutive ticks have acquired the handle (backoff begins at $StreakBeforeBackoff)." }
+    }
+    if ($BackoffCadence -le 1 -or ($TickCount % $BackoffCadence) -eq 0) {
+        return [pscustomobject]@{ Probe = $true; Rule = 'BackoffCadence'; Reason = "Backoff is active and this is the 1-in-$BackoffCadence tick that still probes." }
+    }
+    return [pscustomobject]@{ Probe = $false; Rule = 'BackoffSkip'; Reason = "Nothing has held these ports for $AcquiredStreak consecutive ticks and nothing changed; skipping the open rather than taking a handle that would tell us what we already know." }
+}
+
 function Get-StreamingState {
     <#
     .SYNOPSIS
@@ -1173,6 +1268,88 @@ function Get-StreamingState {
     $ports = @($ports | Where-Object { $_ } | Select-Object -Unique)
     if ($ports.Count -eq 0) { return @{ State = 'Unknown'; ActivePort = $null; HeldPorts = @(); UnavailablePorts = @() } }
 
+    # ── The throttle ─────────────────────────────────────────────────────
+    # Placed AFTER port resolution (which opens nothing) and BEFORE the first
+    # open, so a skipped tick costs one registry read rather than two RFCOMM
+    # channel setups over the air. See Get-ActiveOpenDecision for the measured
+    # basis: 12-23 % occupancy of the uncontended window, a held port failing a
+    # NO session start outright, and a handle held across a removal stranding a
+    # registration permanently.
+    #
+    # Sessions that predate this (older callers, test mocks, $null) have none of
+    # the state keys, so $sessionHas is false throughout and every tick probes --
+    # exactly the pre-existing behaviour. The throttle can only ever REDUCE opens
+    # on a session that opted in by carrying the fields.
+    $sessionHas = ($Session -is [hashtable]) -and $Session.ContainsKey('ActiveOpenAcquiredStreak')
+    if ($sessionHas) {
+        # The "world" is the set of facts that, if any of them moved, make the
+        # next observation worth its cost. Deliberately NOT the held set itself:
+        # that is the thing being measured, and keying the decision to measure on
+        # the measurement is how a detector goes blind.
+        # StrictMode makes an absent hashtable key THROW, and WatchState is
+        # hand-built by several callers and by every test mock -- a missing
+        # DeviceState must degrade to "unknown", never take the tick down.
+        $wsGet = {
+            param($Key)
+            if ($null -eq $WatchState) { return '' }
+            if ($WatchState -is [hashtable]) {
+                if ($WatchState.ContainsKey($Key)) { return [string]$WatchState[$Key] } else { return '' }
+            }
+            $prop = $WatchState.PSObject.Properties[$Key]
+            if ($prop) { return [string]$prop.Value } else { return '' }
+        }
+        $wsAppState    = & $wsGet 'AppProcessState'
+        $wsDeviceState = & $wsGet 'DeviceState'
+        $worldNow = @(
+            ($ports -join ',')
+            $wsAppState
+            $wsDeviceState
+            $(if ($Session.ContainsKey('BtLinkState')) { [string]$Session.BtLinkState } else { '' })
+        ) -join '|'
+        $worldChanged = ($Session.ActiveOpenLastWorld -ne $worldNow)
+
+        $decision = Get-ActiveOpenDecision -Phase $Phase `
+            -TickCount ([int]$Session.TickCount) `
+            -AcquiredStreak ([int]$Session.ActiveOpenAcquiredStreak) `
+            -WorldChanged $worldChanged `
+            -TargetResolvable ($wsDeviceState -ne 'Missing') `
+            -StreakBeforeBackoff ([int]$Session.ActiveOpenStreakBeforeBackoff) `
+            -BackoffCadence ([int]$Session.ActiveOpenBackoffCadence)
+
+        $Session.ActiveOpenLastWorld = $worldNow
+
+        if (-not $decision.Probe) {
+            $Session.ActiveOpenSkippedTicks++
+            # CARRY FORWARD, do not invent. Returning 'Stopped' would manufacture
+            # the measurement "the probe opened every port and found none held"
+            # out of a decision not to look -- the same error the
+            # DisabledBySetting branch above exists to avoid. The backoff's whole
+            # premise is that nothing changed, so the previous answer is the
+            # honest one to repeat, and it is stamped as CARRIED so no reader can
+            # mistake it for a fresh observation.
+            #
+            # PortOpenDurations and PortOpenObservations are present and EMPTY:
+            # zero opens over zero milliseconds is a true statement about what
+            # this tick did, and it keeps the timing accumulators and the
+            # attempt counters from counting a tick that never opened anything.
+            $carriedHeld = @($(if ($Session.ContainsKey('HeldPorts')) { $Session.HeldPorts } else { @() }) | Where-Object { $_ })
+            return @{
+                State                = $(if ($carriedHeld.Count -gt 0) { 'Active' } else { 'Stopped' })
+                ActivePort           = $(if ($carriedHeld.Count -gt 0) { ($carriedHeld -join ', ') } else { $null })
+                HeldPorts            = $carriedHeld
+                UnavailablePorts     = @($(if ($Session.ContainsKey('UnavailablePortsCurrent')) { $Session.UnavailablePortsCurrent } else { @() }) | Where-Object { $_ })
+                OpenedPorts          = @()
+                ProbedPorts          = @()
+                PortOpenDurations    = @()
+                PortOpenObservations = @()
+                ActiveOpenCarried    = $true
+                ActiveOpenSkipRule   = $decision.Rule
+                ActiveOpenSkipReason = $decision.Reason
+            }
+        }
+        $Session.ActiveOpenProbedTicks++
+    }
+
     $activePorts = @()
     $deadPorts   = @()
     # Ports we actually OPENED and closed on this tick. This is the number the
@@ -1217,6 +1394,19 @@ function Get-StreamingState {
             'Held'        { $activePorts += $p }
             'Unavailable' { $deadPorts   += $p }
             'Free'        { $openedPorts += $p }
+        }
+    }
+
+    # Streak bookkeeping for the throttle. Counts consecutive ticks on which we
+    # ACQUIRED every port and nothing was held or unavailable -- the only shape
+    # that is both expensive (a real handle, an RFCOMM setup over the air) and
+    # uninformative (the same answer as last time). A held or unavailable port
+    # resets it, because those are the transitions worth catching promptly.
+    if ($sessionHas) {
+        if ($activePorts.Count -eq 0 -and $deadPorts.Count -eq 0 -and $openedPorts.Count -eq $ports.Count) {
+            $Session.ActiveOpenAcquiredStreak++
+        } else {
+            $Session.ActiveOpenAcquiredStreak = 0
         }
     }
 
@@ -2090,6 +2280,44 @@ function Get-SerialOpenAttemptReport {
 
     $pct = if ($RecordingSeconds -gt 0) { [math]::Round((($openMs / 1000.0) / $RecordingSeconds) * 100, 2) } else { $null }
 
+    # ── The denominator that the invasiveness question actually turns on ──
+    # PercentOfRecording divides by the WHOLE recording, which includes every
+    # tick where another process held the port and our open was refused at ~0 ms
+    # with no handle taken. Those ticks cost nothing and cannot collide with
+    # anything, so including them understates the probe's real occupancy.
+    #
+    # The events that matter -- a user pressing Start, or unpairing and
+    # re-pairing -- happen ONLY when nobody else holds the port. The probability
+    # that one of them lands on a tick where WE hold the handle is therefore
+    # openMs over the UNCONTENDED window, not over the recording.
+    #
+    # Measured 2026-08-19 on two captures already collected:
+    #   026B63C26C4D  18,471 ms over a 79 s uncontended window  = 23.3 %  (headline said 4.6 %)
+    #   E470A928F98C  31,694 ms over a 203 s device-present span = 15.6 %  (headline said 11.8 %)
+    # so the shipped headline understated occupancy ~5x for the window in which
+    # a collision is possible at all. P11 (2026-08-19) then established that a
+    # held port fails a NO session start outright, which is what makes this
+    # number a safety figure rather than a curiosity.
+    #
+    # ESTIMATOR, and its assumption stated: attempts are evenly spaced by the
+    # tick loop, so the fraction of attempts NOT refused estimates the fraction
+    # of wall clock in which acquisition was possible. Against 026B63C26C4D that
+    # gives 77 s where the true window was 79 s. It is an estimate and the field
+    # name does not pretend otherwise.
+    # Keyed by whatever type the per-port Codes table used, which is not
+    # guaranteed to be [int] -- ContainsKey(5) against string keys silently
+    # returns 0 refusals and hands back the whole recording as the "uncontended"
+    # window, i.e. exactly the overstatement this field exists to remove.
+    $refusedCount = 0
+    foreach ($ck in $codeTotals.Keys) { if ([int]$ck -eq 5) { $refusedCount += [int]$codeTotals[$ck] } }
+    $totalAttempts = [int]$Record.AttemptCount
+    $uncontendedSeconds = if ($RecordingSeconds -gt 0 -and $totalAttempts -gt 0) {
+        [math]::Round($RecordingSeconds * (($totalAttempts - $refusedCount) / [double]$totalAttempts), 1)
+    } else { $null }
+    $uncontendedPct = if ($uncontendedSeconds -gt 0) {
+        [math]::Round((($openMs / 1000.0) / $uncontendedSeconds) * 100, 2)
+    } else { $null }
+
     $topology = if ($null -eq $Record.TopologyRequest) {
         $null
     } else {
@@ -2123,8 +2351,10 @@ function Get-SerialOpenAttemptReport {
         HandleAcquiredCount                  = $openCount
         SuccessfulOpenCallMs                 = [math]::Round($openMs, 1)
         SuccessfulOpenCallPercentOfRecording = $pct
+        UncontendedWindowSeconds             = $uncontendedSeconds
+        SuccessfulOpenCallPercentOfUncontendedWindow = $uncontendedPct
         TopologyRequest                      = $topology
-        Basis                                = 'One CreateFile open attempt per port per phase: CreateFile + (on success) CloseHandle. No DCB/baud configuration, no retry, no sleep. UPPER BOUND on the exclusive-ownership interval, not a measurement of it.'
+        Basis                                = 'One CreateFile open attempt per port per phase: CreateFile + (on success) CloseHandle. No DCB/baud configuration, no retry, no sleep. UPPER BOUND on the exclusive-ownership interval, not a measurement of it. PercentOfRecording divides by the whole recording; PercentOfUncontendedWindow divides by the estimated wall clock in which no other process held the port, which is the only window in which a session start or a re-pair can collide with this probe. Read the second one for exposure.'
     }
 }
 
@@ -4260,15 +4490,34 @@ function New-DeviceProbeSession {
         recorder could open a target port. Every gate downstream reads the value
         off the session, so the treatment is fixed for the whole run and cannot
         be hot-switched by editing the environment mid-recording.
+    .PARAMETER ForcePassiveOnly
+        Forces the active port-open probe OFF for this session regardless of
+        the environment setting. Introduced 2026-08-19 for the FI-012 serial
+        preflight (defect D3): a corrupt namespace is now RECORDED passively
+        instead of refusing to record at all, and recording it must not open
+        ports into the fault. The underlying setting read is preserved
+        separately (ActivePortOpenProbeSettingEnabled) so the end-of-run drift
+        check still compares like with like.
+    .PARAMETER ForcePassiveOnlyReason
+        Human-readable provenance for the force, carried into the capture.
     #>
     [CmdletBinding()]
-    param($ActivePortOpenProbeSetting)
+    param(
+        $ActivePortOpenProbeSetting,
+        [switch]$ForcePassiveOnly,
+        [string]$ForcePassiveOnlyReason
+    )
 
     $apop = if ($null -ne $ActivePortOpenProbeSetting) {
         $ActivePortOpenProbeSetting
     } else {
         Get-ActivePortOpenProbeSetting
     }
+
+    # The EFFECTIVE treatment: the setting, overridden to off when the caller
+    # proved the namespace corrupt before construction. All downstream gates
+    # read ActivePortOpenProbeEnabled, so one computed value here is the lock.
+    $apopEffective = [bool]$apop.Enabled -and -not $ForcePassiveOnly
 
     return @{
         # ── The active port-open probe treatment, LOCKED at construction ────
@@ -4277,7 +4526,17 @@ function New-DeviceProbeSession {
         # experiment introduced; the READ STATUS beside it is what lets an
         # experimental arm be invalidated for the same condition (section
         # 3.4(2)). One boolean could not carry both, so there are two fields.
-        ActivePortOpenProbeEnabled    = [bool]$apop.Enabled
+        ActivePortOpenProbeEnabled    = $apopEffective
+        # The SETTING as read, before any force. The end-of-run drift check
+        # re-reads the environment and must compare against this, not against
+        # the effective value -- a preflight-forced session would otherwise
+        # false-flag drift on every run.
+        ActivePortOpenProbeSettingEnabled = [bool]$apop.Enabled
+        ActivePortOpenProbeForcedOff  = [bool]$ForcePassiveOnly
+        ActivePortOpenProbeForcedOffReason = $(if ($ForcePassiveOnly) {
+            if ($ForcePassiveOnlyReason) { [string]$ForcePassiveOnlyReason }
+            else { 'Forced passive-only by the caller; no reason supplied.' }
+        } else { $null })
         ActivePortOpenProbeReadStatus = [string]$apop.SettingReadStatus
         ActivePortOpenProbeSource     = [string]$apop.Source
         ActivePortOpenProbeRawValue   = $apop.RawValue
@@ -4294,8 +4553,33 @@ function New-DeviceProbeSession {
         # tell "no sensor looked" from "a sensor looked and saw nothing", and no
         # field may be populated by whichever sensor happened to be available
         # (the channel-mismatch class, nine instances filed).
-        PortObservationSources        = @(if ($apop.Enabled) { 'ActiveOpenProbe' })
-        ActiveSensorState             = $(if ($apop.Enabled) { 'Observing' } else { 'DisabledBySetting' })
+        PortObservationSources        = @(if ($apopEffective) { 'ActiveOpenProbe' })
+        # 'ForcedPassiveByPreflight' is deliberately distinct from
+        # 'DisabledBySetting': the first says the machine state forbade opens,
+        # the second says the operator's configuration did. A scorer must be
+        # able to tell an experimental arm from a fault-state capture.
+        ActiveSensorState             = $(if ($apopEffective) { 'Observing' }
+                                          elseif ($ForcePassiveOnly) { 'ForcedPassiveByPreflight' }
+                                          else { 'DisabledBySetting' })
+        # ── NO application evidence (read-only; see the collector section) ──
+        # The message-store watch is opt-in by THIS seed's presence: an older
+        # caller or test mock without it makes Update-NoMessageStoreWatch a
+        # no-op. The change list is capped and the cap is counted -- never a
+        # silent truncation.
+        NoMessageStore = @{
+            SampleCount        = 0
+            ReadErrorCount     = 0
+            ChangeCount        = 0
+            DroppedChangeCount = 0
+            EverNonEmpty       = $false
+            FirstSnapshot      = $null
+            LastSnapshot       = $null
+            MaxChanges         = 50
+            Changes            = [System.Collections.ArrayList]::new()
+        }
+        # Start/end snapshots of NO's own device table, set by the recorder.
+        NoDeviceConfigStart = $null
+        NoDeviceConfigEnd   = $null
         StateEnteredAt           = @{}
         LastComPortNames         = @()
         SustainedComAnomaly      = $false
@@ -4328,7 +4612,12 @@ function New-DeviceProbeSession {
         # every tick will return is what stops arm B manufacturing a spurious
         # STREAM transition on tick one and an episode boundary out of a config
         # flag.
-        StreamingState           = $(if ($apop.Enabled) { 'Stopped' } else { 'DisabledBySetting' })
+        # A preflight-forced session also seeds 'DisabledBySetting': that is
+        # the value Get-StreamingState returns for ANY effectively-disabled
+        # session, and the seed must equal the per-tick value or tick one
+        # manufactures a spurious STREAM transition. The forced/by-setting
+        # distinction is carried by ActiveSensorState and the ForcedOff fields.
+        StreamingState           = $(if ($apopEffective) { 'Stopped' } else { 'DisabledBySetting' })
         # Ever-held, as opposed to held-on-the-last-tick. Drives observation
         # coverage; see Get-ProbeObservationCoverage.
         #
@@ -4351,7 +4640,7 @@ function New-DeviceProbeSession {
         # basis. This is the shape #67 shipped once already, with a latch that
         # could not fire; the difference now is that the sensor is off ON
         # PURPOSE, which makes an unobserved $false even easier to believe.
-        PortEverHeld             = $(if ($apop.Enabled) { $false } else { $null })
+        PortEverHeld             = $(if ($apopEffective) { $false } else { $null })
         # Recomputed from the live held set on EVERY tick since #85, and left
         # $null while more than one port is held rather than naming one of them:
         # the read counter is process-wide, so picking a single port out of a set
@@ -4410,24 +4699,55 @@ function New-DeviceProbeSession {
         # the comma the ENABLED branch silently produces exactly the $null the
         # disabled branch is supposed to be the only source of, which would
         # make every ordinary clinic capture claim its port hold was unobserved.
-        HeldPorts                = $(if ($apop.Enabled) { ,@() } else { $null })
-        UnavailablePorts         = $(if ($apop.Enabled) { ,@() } else { $null })
+        HeldPorts                = $(if ($apopEffective) { ,@() } else { $null })
+        UnavailablePorts         = $(if ($apopEffective) { ,@() } else { $null })
         # Explicit current/ever pairs (#88). The two above are kept because the
         # module reads them everywhere, but a CONSUMER must never have to know
         # that one is last-tick and the other a session union -- that asymmetry,
         # joined without noticing, is #81.
-        HeldPortsEver            = $(if ($apop.Enabled) { ,@() } else { $null })
-        UnavailablePortsCurrent  = $(if ($apop.Enabled) { ,@() } else { $null })
-        UnavailablePortsEver     = $(if ($apop.Enabled) { ,@() } else { $null })
+        HeldPortsEver            = $(if ($apopEffective) { ,@() } else { $null })
+        UnavailablePortsCurrent  = $(if ($apopEffective) { ,@() } else { $null })
+        UnavailablePortsEver     = $(if ($apopEffective) { ,@() } else { $null })
         # Per-port temporal join for #81.  A port belongs here only when an
         # unavailable observation happened on a LATER tick than a held
         # observation for that same port.  `UnavailablePortsEver` deliberately
         # remains the lossless union; consumers that make the sentence
         # "worked, then stopped opening" must use this ordered subset.
-        UnavailableAfterHeldPorts        = $(if ($apop.Enabled) { ,@() } else { $null })
-        UnavailableAfterHeldPortsCurrent = $(if ($apop.Enabled) { ,@() } else { $null })
+        UnavailableAfterHeldPorts        = $(if ($apopEffective) { ,@() } else { $null })
+        UnavailableAfterHeldPortsCurrent = $(if ($apopEffective) { ,@() } else { $null })
+        # ── Active-open throttle state (see Get-ActiveOpenDecision) ──────
+        # The probe owns a target port for 12-23 % of every window in which
+        # nobody else holds it (measured 2026-08-19 from captures 026B63C26C4D
+        # and E470A928F98C). A held port fails a NO session start outright, and
+        # a handle held across a device removal strands a registration
+        # permanently. These fields exist so a quiet stretch stops costing an
+        # RFCOMM setup every three seconds on both channels.
+        #
+        # Their PRESENCE is what opts a session in: Get-StreamingState checks
+        # ContainsKey, so any older caller or test mock without them probes every
+        # tick exactly as before.
+        ActiveOpenAcquiredStreak      = 0
+        ActiveOpenLastWorld           = $null
+        ActiveOpenSkippedTicks        = 0
+        ActiveOpenProbedTicks         = 0
+        # Tunables, on the session rather than as constants, so an experimental
+        # arm can set them and the capture records what was in force. 3 and 5
+        # give: probe every tick until the answer has been identical three times,
+        # then one tick in five (~15 s), with any change in the port set, the
+        # application's process state, the device state or the radio link state
+        # returning immediately to every tick.
+        ActiveOpenStreakBeforeBackoff = 3
+        ActiveOpenBackoffCadence      = 5
         StreamPeakCpuS           = 0.0
         StreamPeakWorkingSetMB   = 0
+        # Was the monitored application EVER observed running during this
+        # recording? Guards every sentence that makes a process-lifecycle claim
+        # ("NO.exe exited") from a PORT observation. Without it the probe asserted
+        # an exit for a process it had never once seen -- capture E470A928F98C,
+        # 2026-08-19, four times in 27 seconds while NO.exe was not running.
+        # Latching (never cleared) is deliberate: "exited" is a statement about
+        # the whole run, not about the current tick.
+        AppEverRunning           = $false
         # Data-flow corroboration. The probe cannot read the EEG bytes -- the port
         # is held by NO.exe, and opening it to look would steal it. NO.exe's own
         # CPU is the honest proxy available from outside: a live stream keeps
@@ -4764,6 +5084,13 @@ function Invoke-DeviceProbeTick {
     if (-not $Session.FirstTickAt) { $Session.FirstTickAt = $now }
     $Session.LastTickAt = $now
 
+    # Latch BEFORE anything can render a process-lifecycle sentence this tick.
+    # ContainsKey-guarded so a session built by an older caller or a test mock
+    # that predates the field cannot throw under StrictMode.
+    if ($Session.ContainsKey('AppEverRunning') -and $WatchState.AppProcessState -eq 'Running') {
+        $Session.AppEverRunning = $true
+    }
+
     # ── Port-hold detection (NOT a data-flow measurement) ────────────────
     # The Session is passed for exactly one reason: Get-StreamingState reads the
     # locked ActivePortOpenProbeEnabled off it and refuses to open anything when
@@ -5039,7 +5366,32 @@ function Invoke-DeviceProbeTick {
             # Deliberately does not say "EEG data streaming" -- this event fires on
             # a handle being taken, which NO.exe does at connect whether or not the
             # headset ever delivers a sample.
-            $evt = @{ Kind = 'STREAM'; State = 'Active'; Reason = "NO.exe has the COM port open$portInfo (data flow not verified -- the probe cannot read the port while it is held)"; Annotation = $null; Level = 'OK'; Timestamp = $now }
+            # WHO holds the port is a DIFFERENT question from WHETHER it is held,
+            # and only one of them was measured. The open attempt returns
+            # ERROR_ACCESS_DENIED, which says "some process owns this handle" and
+            # names nobody. Naming NO.exe from that alone is a one-field/one-answerer
+            # violation, and it fired in the field: capture E470A928F98C logged
+            # 'NO.exe has the COM port open on COM6' four times on 2026-08-19 while
+            # NO.exe was NOT RUNNING -- the holder was our own sampler. A technician
+            # reading that capture would conclude a session started and stopped four
+            # times in 27 seconds. Nothing of the sort happened.
+            #
+            # So the name is now conditioned on the one piece of evidence we do
+            # have: whether the process is running at all. That is still not proof
+            # of ownership -- it is a necessary condition, not a sufficient one --
+            # and the wording says "the port is held" rather than "NO.exe is
+            # streaming" in both branches.
+            $holderKnownRunning = ($WatchState.AppProcessState -eq 'Running')
+            $holderPhrase = if ($holderKnownRunning) {
+                "NO.exe is running and the COM port is held$portInfo"
+            } else {
+                "the COM port is held by another process$portInfo -- NO.exe is NOT running, so this hold is NOT a NO session"
+            }
+            $evt = @{ Kind = 'STREAM'; State = 'Active'; Reason = "$holderPhrase (holder not identified: an open refusal names no process. Data flow not verified -- the probe cannot read the port while it is held)"; Annotation = $null; Level = 'OK'; Timestamp = $now }
+            if (-not $holderKnownRunning) {
+                $evt.Annotation = "[!] A port was taken while NO.exe was not running. Some other program on this PC is opening the headset's serial ports -- including, possibly, this diagnostic itself."
+                $evt.Level = 'WARN'
+            }
             if ($WatchState.DeviceState -ne 'PairedCandidate') {
                 $evt.Annotation = "[!] Streaming started but device state is '$($WatchState.DeviceState)' -- unexpected"
                 $evt.Level = 'FAIL'
@@ -5068,7 +5420,22 @@ function Invoke-DeviceProbeTick {
             if (-not $deviceOk) {
                 $events += @{ Kind = 'STREAM'; State = "Stopped$durationStr"; Reason = "device disconnected mid-stream$peakInfo"; Annotation = "[!] Stream interrupted by Bluetooth disconnect"; Level = 'FAIL'; Timestamp = $now }
             } elseif (-not $appOk) {
-                $events += @{ Kind = 'STREAM'; State = "Stopped$durationStr"; Reason = "NO.exe exited$peakInfo"; Annotation = "[~] NO.exe closed while device still paired"; Level = 'WARN'; Timestamp = $now }
+                # 'NO.exe exited' is a PROCESS-LIFECYCLE claim, and this branch is
+                # reached by a PORT being released. Those coincide only if NO.exe
+                # was ever running in the first place. On 2026-08-19 this asserted
+                # 'NO.exe exited' four times in a capture where NO.exe never ran at
+                # any point -- a claim about a process the probe had not observed.
+                # AppEverRunning is the guard: it is set on any tick where the
+                # process was seen, so 'exited' can only be said of something that
+                # was once there.
+                # Missing key => a session from an older caller or a test mock that
+                # predates this guard. Fall back to the previous wording rather
+                # than asserting the new one on evidence that was never collected.
+                if (-not $Session.ContainsKey('AppEverRunning') -or $Session.AppEverRunning) {
+                    $events += @{ Kind = 'STREAM'; State = "Stopped$durationStr"; Reason = "NO.exe exited$peakInfo"; Annotation = "[~] NO.exe closed while device still paired"; Level = 'WARN'; Timestamp = $now }
+                } else {
+                    $events += @{ Kind = 'STREAM'; State = "Stopped$durationStr"; Reason = "the COM port was released$peakInfo"; Annotation = "[~] A port was held and released while NO.exe was never running during this recording. The holder was some other program on this PC; this was not a NO session."; Level = 'WARN'; Timestamp = $now }
+                }
             } else {
                 $events += @{ Kind = 'STREAM'; State = "Stopped$durationStr"; Reason = "COM port released, device + NO.exe still active$peakInfo"; Annotation = "[~] Could not determine cause -- was this a manual stop or unexpected?"; Level = 'WARN'; Timestamp = $now }
                 $Session.PendingConfirmation = @{
@@ -7476,7 +7843,220 @@ function Get-BluetoothGhostPortPlan {
     }
 }
 
+# =============================================================================
+# NO APPLICATION EVIDENCE (read-only; FI-012 "fold NO's own channel in")
+# =============================================================================
+#
+# NO's error dialogs are a reliable readout of its handle state (verified 4x on
+# 2026-08-19: 12005 <=> holds no port, 12006 <=> holds both), and both stores
+# below are readable with ZERO intrusion. These collectors READ ONLY, from two
+# named files under C:\ProgramData\NeurOptimal -- deliberately NOT the clinical
+# data trees (C:\zengar\sessions, C:\zengar\BLT_data are on the hard deny-list
+# and are never touched), and deliberately not VAULT/NOTATE or any other
+# NeurOptimal store that could carry client information.
+#
+#  1. NO_messages.xml -- a LabVIEW-flattened message array. Measured EMPTY
+#     during a live 12006 on 2026-08-10 (written seven minutes before the
+#     event) and empty again after a full day of 12005s on 2026-08-19, so it
+#     behaves as a queue that is cleared, not a log. The per-tick watcher
+#     exists to MEASURE whether this channel ever carries the codes: every
+#     content change is recorded with a timestamp, and a store that stays
+#     empty through a failure renders as a counted absence, never as silence.
+#
+#  2. NO Device Manager.config -- NO's own device table. The LabVIEW blob
+#     carries recoverable plain text: device aliases, COM port assignments and
+#     MAC addresses (confirmed on MMEVOLD_06 2026-08-19: alias 000013 ->
+#     COM4/COM6 -> 8C:1F:64:71:00:0D, plus the current alias). A start/end
+#     snapshot lets a capture prove "NO's record is stale" against the live
+#     namespace -- previously only observable by operator screenshot, which is
+#     banned.
+
+$script:NoMessageStorePath        = 'C:\ProgramData\NeurOptimal\NO_Messages\NO_messages.xml'
+$script:NoDeviceManagerConfigPath = 'C:\ProgramData\NeurOptimal\NO Device Manager\NO Device Manager.config'
+
+function Get-NoMessageStoreSnapshot {
+    <#
+    .SYNOPSIS
+        Reads NO's message store once: existence, timestamps, hash, content.
+    .DESCRIPTION
+        Read-only. Absolute path by default ([IO.File] ignores the provider
+        working directory, so a relative override is the caller's own risk).
+        MessageCount is parsed from the LabVIEW <Dimsize> element: 0 means the
+        array is present and EMPTY, which is a real observation, distinct from
+        $null (store missing or unparseable).
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Path = $script:NoMessageStorePath,
+        [int]$MaxContentBytes = 65536
+    )
+    $r = [ordered]@{
+        Path             = $Path
+        SampledAtUtc     = (Get-Date).ToUniversalTime().ToString('o')
+        Exists           = $false
+        Length           = $null
+        LastWriteTimeUtc = $null
+        Sha256           = $null
+        Content          = $null
+        ContentTruncated = $false
+        MessageCount     = $null
+        ReadStatus       = 'Missing'
+        Error            = $null
+    }
+    try {
+        $fi = [System.IO.FileInfo]::new($Path)
+        if (-not $fi.Exists) { return [pscustomobject]$r }
+        $r.Exists           = $true
+        $r.Length           = [long]$fi.Length
+        $r.LastWriteTimeUtc = $fi.LastWriteTimeUtc.ToString('o')
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $r.Sha256 = ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '') }
+        finally { $sha.Dispose() }
+        $take = [Math]::Min($bytes.Length, [Math]::Max(0, $MaxContentBytes))
+        $r.ContentTruncated = ($bytes.Length -gt $take)
+        $r.Content = [System.Text.Encoding]::UTF8.GetString($bytes, 0, $take)
+        if ($r.Content -match '<Dimsize>(\d+)</Dimsize>') { $r.MessageCount = [int]$Matches[1] }
+        $r.ReadStatus = 'Read'
+    } catch {
+        $r.ReadStatus = 'Error'
+        $r.Error      = $_.Exception.Message
+    }
+    return [pscustomobject]$r
+}
+
+function Update-NoMessageStoreWatch {
+    <#
+    .SYNOPSIS
+        Folds one message-store snapshot into the session; returns the change
+        record when the store changed, else $null.
+    .DESCRIPTION
+        Opt-in by session-field presence (the throttle pattern): a session
+        without the NoMessageStore seed -- every older caller and test mock --
+        is a silent no-op, never a throw.
+
+        The FIRST sample is the baseline and is never reported as a change.
+        Change detection is on existence + content hash, not on LastWriteTime
+        alone (a rewrite of identical bytes is not evidence of a message).
+        The per-session change list is capped, and the cap is COUNTED
+        (DroppedChangeCount) -- a capped list that reads as complete is the
+        silent-truncation lie. A dropped change is still RETURNED, so the
+        caller's timeline line survives even when the session list is full.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Session,
+        $Snapshot,
+        [datetime]$Now = (Get-Date)
+    )
+    if ($Session -isnot [hashtable] -or -not $Session.ContainsKey('NoMessageStore')) { return $null }
+    $st = $Session['NoMessageStore']
+    if ($null -eq $st) { return $null }
+    if ($null -eq $Snapshot) { $Snapshot = Get-NoMessageStoreSnapshot }
+
+    $st.SampleCount = [int]$st.SampleCount + 1
+    if ($Snapshot.ReadStatus -eq 'Error') { $st.ReadErrorCount = [int]$st.ReadErrorCount + 1 }
+    if ($null -ne $Snapshot.MessageCount -and [int]$Snapshot.MessageCount -gt 0) { $st.EverNonEmpty = $true }
+
+    if ($null -eq $st.FirstSnapshot) {
+        $st.FirstSnapshot = $Snapshot
+        $st.LastSnapshot  = $Snapshot
+        return $null
+    }
+
+    $prev = $st.LastSnapshot
+    $st.LastSnapshot = $Snapshot
+    $changed = ([bool]$Snapshot.Exists -ne [bool]$prev.Exists) -or
+               ([string]$Snapshot.Sha256 -ne [string]$prev.Sha256)
+    if (-not $changed) { return $null }
+
+    $st.ChangeCount = [int]$st.ChangeCount + 1
+    $rec = [ordered]@{
+        AtUtc            = $Now.ToUniversalTime().ToString('o')
+        ChangeType       = $(if (-not $Snapshot.Exists) { 'Removed' }
+                            elseif (-not $prev.Exists)  { 'Appeared' }
+                            else { 'Modified' })
+        Length           = $Snapshot.Length
+        LastWriteTimeUtc = $Snapshot.LastWriteTimeUtc
+        MessageCount     = $Snapshot.MessageCount
+        Sha256           = $Snapshot.Sha256
+        Content          = $Snapshot.Content
+        ContentTruncated = [bool]$Snapshot.ContentTruncated
+        ReadStatus       = $Snapshot.ReadStatus
+        Error            = $Snapshot.Error
+    }
+    if ($st.Changes.Count -ge [int]$st.MaxChanges) {
+        $st.DroppedChangeCount = [int]$st.DroppedChangeCount + 1
+    } else {
+        [void]$st.Changes.Add($rec)
+    }
+    return [pscustomobject]$rec
+}
+
+function Get-NoDeviceManagerConfigSnapshot {
+    <#
+    .SYNOPSIS
+        Reads NO's Device Manager config once and extracts its device table.
+    .DESCRIPTION
+        Read-only. The file is a LabVIEW-flattened blob whose device table
+        survives as plain text; the extraction is a printable-string regex
+        pass, never a claim to parse the LabVIEW format. RawBase64 preserves
+        the whole file (size-capped, and the cap is stated when hit) so a
+        later, better parser can re-read exactly what was captured.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Path = $script:NoDeviceManagerConfigPath,
+        [int]$MaxRawBytes = 262144
+    )
+    $r = [ordered]@{
+        Path             = $Path
+        SampledAtUtc     = (Get-Date).ToUniversalTime().ToString('o')
+        Exists           = $false
+        Length           = $null
+        LastWriteTimeUtc = $null
+        Sha256           = $null
+        ComPorts         = $null
+        MacAddresses     = $null
+        DeviceLabels     = $null
+        RawBase64        = $null
+        RawOmittedReason = $null
+        ReadStatus       = 'Missing'
+        Error            = $null
+    }
+    try {
+        $fi = [System.IO.FileInfo]::new($Path)
+        if (-not $fi.Exists) { return [pscustomobject]$r }
+        $r.Exists           = $true
+        $r.Length           = [long]$fi.Length
+        $r.LastWriteTimeUtc = $fi.LastWriteTimeUtc.ToString('o')
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $r.Sha256 = ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '') }
+        finally { $sha.Dispose() }
+        # Latin-1: a 1:1 byte-to-char decode, so the regex pass sees every
+        # printable run regardless of what binary surrounds it.
+        $text = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
+        $r.ComPorts     = @([regex]::Matches($text, 'COM\d{1,3}') | ForEach-Object { $_.Value } | Select-Object -Unique)
+        $r.MacAddresses = @([regex]::Matches($text, '(?i)\b(?:[0-9A-F]{2}:){5}[0-9A-F]{2}\b') | ForEach-Object { $_.Value.ToUpper() } | Select-Object -Unique)
+        $r.DeviceLabels = @([regex]::Matches($text, 'NeurOptimal Arc - \d{6}') | ForEach-Object { $_.Value } | Select-Object -Unique)
+        if ($bytes.Length -le $MaxRawBytes) {
+            $r.RawBase64 = [System.Convert]::ToBase64String($bytes)
+        } else {
+            $r.RawOmittedReason = "File is $($bytes.Length) bytes, over the $MaxRawBytes-byte raw-capture cap; string extraction above still covers the full file."
+        }
+        $r.ReadStatus = 'Read'
+    } catch {
+        $r.ReadStatus = 'Error'
+        $r.Error      = $_.Exception.Message
+    }
+    return [pscustomobject]$r
+}
+
 Export-ModuleMember -Function @(
+    'Get-NoMessageStoreSnapshot',
+    'Update-NoMessageStoreWatch',
+    'Get-NoDeviceManagerConfigSnapshot',
     'Initialize-BtWin32Api',
     'Get-NextProbeTickDeadline',
     # Session-long read-rate record. Exported because the bundle summary must be
@@ -7522,6 +8102,9 @@ Export-ModuleMember -Function @(
     'Get-BluetoothGhostPortPlan',
     'Get-StreamingState',
     'Get-ActivePortOpenProbeSetting',
+    # Pure decision function for the active-open throttle. Exported so the
+    # rule table can be tested directly rather than inferred from tick behaviour.
+    'Get-ActiveOpenDecision',
     'Test-ActivePortOpenProbeEnabled',
     'Get-ProbeStateConsistency',
     # The failure-boundary chain. Exported because the window, the persisted
