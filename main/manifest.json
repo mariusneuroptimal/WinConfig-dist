@@ -1,9 +1,8 @@
 {
-    "event":  "manual",
-    "build_id":  "manual-repair-202608201027",
-    "timestamp":  "2026-08-20T14:27:23.3000445Z",
-    "schema_version":  "2.0",
+    "timestamp":  "2026-08-20T15:30:52.8798924Z",
     "branch":  "main",
+    "schema_version":  "2.0",
+    "source_ref":  "c220def0d7d4c4849be1d8c2a2ca4349c763a317",
     "artifacts":  [
                       {
                           "path":  "Win11Config.ps1",
@@ -161,5 +160,6 @@
                           "size":  471271
                       }
                   ],
-    "source_ref":  "cadb2c6faa6f4c0156d5d63775525e19aee9ec5b"
+    "build_id":  "manual-20260820113052",
+    "event":  "manual"
 }
