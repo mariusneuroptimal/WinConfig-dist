@@ -5449,29 +5449,73 @@ namespace WinConfigDiag {
             # taken, suppressed by throttle/cap, or failed -- because a shot
             # that silently didn't happen reads as "nothing was on screen".
             # Gated on the LOCKED opt-in copy, never the checkbox.
+            # The recorder's own reading of the machine at the shot instant --
+            # MEASUREMENT, not a claim. Attaching it to a shot makes each
+            # auto-shot a self-describing evidence point (held ports, stream and
+            # link state, IoVerdict, serial health), so the operator no longer
+            # has to press Mark just to record the state a drop happened in. It
+            # is deliberately NOT folded into $Session.OperatorMarkers: an
+            # auto-shot is not an operator claim, and the #111/#117 boundary
+            # keeps declarations and measurements apart. The typed NO code is
+            # the one thing a shot cannot supply, so manual marking still exists
+            # for that.
+            function script:Get-BtShotStateSnapshot {
+                param($Session, $Watch)
+                if (-not $Session) { return $null }
+                [ordered]@{
+                    StreamState            = [string]$Session.StreamingState
+                    BtLinkState            = [string]$Session.BtLinkState
+                    DeviceState            = if ($Watch) { [string]$Watch.DeviceState } else { $null }
+                    ComPortState           = if ($Watch) { [string]$Watch.ComPortState } else { $null }
+                    AppRunning             = if ($Watch) { [bool]($Watch.AppProcessState -eq 'Running') } else { $null }
+                    HeldPorts              = @($Session.HeldPorts | Where-Object { $_ })
+                    UnavailablePorts       = @($Session.UnavailablePortsCurrent | Where-Object { $_ })
+                    IoVerdict              = [string]$Session.IoVerdict
+                    EpisodeId              = [string]$Session.IoEpisodeId
+                    IoBaselineOpsPerSecond = [double]$Session.IoBaselineOpsPerSecond
+                    IoRecentOpsPerSecond   = [double]$Session.IoRecentOpsPerSecond
+                    PortHoldObserved       = [bool]$Session.ActivePortOpenProbeEnabled
+                    SerialIntegrityHealthy = if ($Session.SerialPortIntegrity) { [bool]$Session.SerialPortIntegrity.Healthy } else { $null }
+                }
+            }
+
             function script:Invoke-BtEventScreenshot {
                 param(
                     [string]$RunFolder,
                     [string]$Trigger,
                     $At,
-                    [switch]$OperatorRequested
+                    [switch]$OperatorRequested,
+                    # High-value triggers (NO_messages, in-session collapse,
+                    # anomaly, operator mark) are the rare events the feature
+                    # exists to catch. They are EXEMPT from the tuning cap and
+                    # the cooldown -- only the runaway backstop below applies --
+                    # so idle-drop noise can never crowd out the real thing.
+                    [switch]$HighValue,
+                    $StateSnapshot
                 )
-                if (-not $script:BtRec_ScreenshotEnabled) { return }
-                if (-not $RunFolder) { return }
+                if (-not $script:BtRec_ScreenshotEnabled) { return $false }
+                if (-not $RunFolder) { return $false }
                 $when = $(if ($At) { [datetime]$At } else { Get-Date })
-                # Hard per-run cap: an idle link sawtooth emits a WARN pair
-                # every ~30 s and would otherwise fill the package.
-                if ($script:BtRec_ScreenshotsTaken -ge 12) {
+                # Runaway backstop -- applies to EVERYTHING, high-value included.
+                # Not the tuning cap; a safety net so no fault storm can fill the
+                # disk. Well above any real run's shot count.
+                if ($script:BtRec_ScreenshotsTaken -ge 50) {
                     $script:BtRec_ScreenshotsSuppressed = [int]$script:BtRec_ScreenshotsSuppressed + 1
-                    return
+                    return $false
                 }
-                # Cooldown between automatic shots. An operator mark bypasses
-                # it: a human pressed the button because something is on screen
-                # RIGHT NOW, which is the whole point of the feature.
-                if (-not $OperatorRequested -and $script:BtRec_LastScreenshotAt -and
-                    (($when - [datetime]$script:BtRec_LastScreenshotAt).TotalSeconds -lt 15)) {
-                    $script:BtRec_ScreenshotsSuppressed = [int]$script:BtRec_ScreenshotsSuppressed + 1
-                    return
+                if (-not $HighValue) {
+                    # Tuning cap and cooldown apply to establishing / low-value
+                    # shots only. An idle link sawtooth emits a WARN pair every
+                    # ~30 s and would otherwise fill the package.
+                    if ($script:BtRec_ScreenshotsTaken -ge 12) {
+                        $script:BtRec_ScreenshotsSuppressed = [int]$script:BtRec_ScreenshotsSuppressed + 1
+                        return $false
+                    }
+                    if (-not $OperatorRequested -and $script:BtRec_LastScreenshotAt -and
+                        (($when - [datetime]$script:BtRec_LastScreenshotAt).TotalSeconds -lt 15)) {
+                        $script:BtRec_ScreenshotsSuppressed = [int]$script:BtRec_ScreenshotsSuppressed + 1
+                        return $false
+                    }
                 }
                 # The backend is compiled C# (see Initialize-BtScreenCapture):
                 # the native-PowerShell screen-grab idiom is an Empire signature
@@ -5479,7 +5523,7 @@ namespace WinConfigDiag {
                 # initialize, count a failure and leave -- never throw.
                 if (-not (script:Initialize-BtScreenCapture)) {
                     $script:BtRec_ScreenshotFailures = [int]$script:BtRec_ScreenshotFailures + 1
-                    return
+                    return $false
                 }
                 try {
                     $shotDir = Join-Path $RunFolder 'screenshots'
@@ -5496,6 +5540,7 @@ namespace WinConfigDiag {
                     # token pattern out of the PowerShell layer AMSI scans.
                     [WinConfigDiag.ScreenGrab]::CaptureVirtualScreenJpeg($shotPath, [long]85)
                     $script:BtRec_ScreenshotsTaken  = [int]$script:BtRec_ScreenshotsTaken + 1
+                    if ($HighValue) { $script:BtRec_ScreenshotsHighValue = [int]$script:BtRec_ScreenshotsHighValue + 1 }
                     $script:BtRec_LastScreenshotAt  = $when
                     if (Get-Command Add-WinConfigDiagnosticJsonLine -ErrorAction SilentlyContinue) {
                         $shotWrote = Add-WinConfigDiagnosticJsonLine -RunFolder $RunFolder -Name 'events.jsonl' -Data ([ordered]@{
@@ -5507,6 +5552,14 @@ namespace WinConfigDiag {
                             Trigger           = $Trigger
                             File              = "screenshots/$shotName"
                             OperatorRequested = [bool]$OperatorRequested
+                            # Which tier fired this: HighValue (NO_messages,
+                            # collapse, anomaly, mark -- uncapped) vs Establishing
+                            # (the one-per-session idle-drop corroboration shot).
+                            Class             = $(if ($HighValue) { 'HighValue' } else { 'Establishing' })
+                            # The recorder's own reading at the shot instant, so a
+                            # shot is a marker with visual proof, not bare pixels.
+                            # MEASUREMENT, never fused into a verdict.
+                            MachineState      = $StateSnapshot
                         })
                         if (-not $shotWrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
                         else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
@@ -5514,6 +5567,7 @@ namespace WinConfigDiag {
                     if (Get-Command Write-BtLog -ErrorAction SilentlyContinue) {
                         Write-BtLog "  $($when.ToString('HH:mm:ss'))  [SHOT    ]  Screen captured ($Trigger) -> screenshots\$shotName" -Level 'DIM'
                     }
+                    return $true
                 } catch {
                     # The compiled method disposes its own Bitmap/Graphics via
                     # using-blocks, so there is nothing to release here.
@@ -5521,6 +5575,7 @@ namespace WinConfigDiag {
                     if (Get-Command Write-BtLog -ErrorAction SilentlyContinue) {
                         Write-BtLog "  Screenshot failed ($Trigger): $_" -Level 'WARN'
                     }
+                    return $false
                 }
             }
 
@@ -5718,7 +5773,17 @@ namespace WinConfigDiag {
             $script:BtRec_ScreenshotsTaken       = 0
             $script:BtRec_ScreenshotsSuppressed  = 0
             $script:BtRec_ScreenshotFailures     = 0
+            $script:BtRec_ScreenshotsHighValue   = 0        # of Taken, how many were high-value (uncapped) triggers
             $script:BtRec_LastScreenshotAt       = $null
+            # ONE establishing shot per session (re-armed on STREAM Active, like
+            # the idle-sawtooth notice): idle/transport link drops are the noise
+            # the recorder already coalesces, and shooting each one burns the
+            # budget on identical desktops and can exhaust the cap BEFORE a real
+            # NO error dialog appears (run B3F8859A297C: 5 of 6 shots were idle
+            # link drops, 0 on anything NO surfaced). One establishing shot
+            # corroborates what is on screen; the rest of the budget is reserved
+            # for high-value triggers (NO_messages, collapse, anomaly, marks).
+            $script:BtRec_EstablishingShotTaken  = $false
             $script:BtRec_ShotConfirmGuard       = $false   # reentrancy guard: reverting .Checked refires CheckedChanged
 
             # EXPLICIT colours: the $btButtonRow class guard auto-covers
@@ -7101,7 +7166,9 @@ namespace WinConfigDiag {
             $script:BtRec_ScreenshotsTaken      = 0
             $script:BtRec_ScreenshotsSuppressed = 0
             $script:BtRec_ScreenshotFailures    = 0
+            $script:BtRec_ScreenshotsHighValue  = 0
             $script:BtRec_LastScreenshotAt      = $null
+            $script:BtRec_EstablishingShotTaken = $false
             # The one-time idle-sawtooth notice, re-armed per run for the same
             # reason as the counters: a second recording must explain the parked
             # link once for ITS operator, not inherit "already said it".
@@ -8186,9 +8253,12 @@ namespace WinConfigDiag {
                         $mkLabel = if ($btMarkBox.Tag -eq 'placeholder') { '' } else { $btMarkBox.Text }
                         # An operator mark means a human is looking at a dialog
                         # RIGHT NOW -- the single most valuable moment to shoot.
-                        # Bypasses the automatic cooldown (not the per-run cap).
+                        # HIGH-VALUE: uncapped and no cooldown, with the machine
+                        # state attached so the shot carries the same context the
+                        # marker below records.
                         if ($btDiagRun) {
-                            script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger 'OperatorMark' -At $now -OperatorRequested
+                            $shotSnap = script:Get-BtShotStateSnapshot -Session $btProbeSession -Watch $btProbeWatch
+                            [void](script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger 'OperatorMark' -At $now -OperatorRequested -HighValue -StateSnapshot $shotSnap)
                         }
                         if ($btDeepProbeAvailable -and $btProbeWatch -and (Get-Command New-ProbeStateMarker -ErrorAction SilentlyContinue)) {
                             $mk = New-ProbeStateMarker -Label $mkLabel -At $now `
@@ -8388,13 +8458,32 @@ namespace WinConfigDiag {
                                 # as an unmeasured zero rendered as 0.
                                 if (-not $wrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
                                 else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
-                                # Screenshot on drops/errors: any WARN/FAIL
-                                # timeline event (link drop, unexpected stream
-                                # stop, anomaly). Persist-first order holds --
-                                # the event line is already on disk. No-op
-                                # unless the operator double-confirmed opt-in.
+                                # Screenshot on drops/errors, TIERED so idle
+                                # link-park noise cannot crowd out a real NO
+                                # dialog. Persist-first order holds -- the event
+                                # line is already on disk. No-op unless the
+                                # operator double-confirmed opt-in.
                                 if ($evt.Level -eq 'WARN' -or $evt.Level -eq 'FAIL') {
-                                    script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger "$($evt.Kind)/$($evt.State)" -At $evt.Timestamp
+                                    $shotSnap = script:Get-BtShotStateSnapshot -Session $btProbeSession -Watch $btProbeWatch
+                                    # HIGH-VALUE = a real fault: an ANOMALY, any
+                                    # FAIL-level event, or a drop while the read
+                                    # rate was actually collapsing/degrading.
+                                    # These are uncapped -- the events the
+                                    # feature exists to catch. Everything else at
+                                    # WARN (the idle BTLINK sawtooth, a Get-details
+                                    # 6 s hold/release) is ESTABLISHING: worth ONE
+                                    # corroborating shot per session, then silent.
+                                    $shotHighValue = ($evt.Kind -eq 'ANOMALY') -or ($evt.Level -eq 'FAIL') -or ($btProbeSession.IoVerdict -in @('Collapsed','Degrading'))
+                                    if ($shotHighValue) {
+                                        [void](script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger "$($evt.Kind)/$($evt.State)" -At $evt.Timestamp -HighValue -StateSnapshot $shotSnap)
+                                    } elseif (-not $script:BtRec_EstablishingShotTaken) {
+                                        $shotTook = script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger "$($evt.Kind)/$($evt.State)" -At $evt.Timestamp -StateSnapshot $shotSnap
+                                        # Disarm only on a real capture, so a
+                                        # shot suppressed by the cap/cooldown does
+                                        # not silently spend the session's single
+                                        # establishing slot.
+                                        if ($shotTook) { $script:BtRec_EstablishingShotTaken = $true }
+                                    }
                                 }
                             }
                             $ts = $evt.Timestamp.ToString('HH:mm:ss')
@@ -8429,7 +8518,14 @@ namespace WinConfigDiag {
                                 # A session starting re-arms the one-time idle
                                 # notice, so the first parked-link cycle after
                                 # each session explains itself again.
-                                if ($evt.Kind -eq 'STREAM' -and $evt.State -eq 'Active') { $script:BtRec_IdleLinkNoticeShown = $false }
+                                if ($evt.Kind -eq 'STREAM' -and $evt.State -eq 'Active') {
+                                    $script:BtRec_IdleLinkNoticeShown = $false
+                                    # Same re-arm for the establishing screenshot:
+                                    # each new session (hold episode) earns one
+                                    # fresh idle-drop corroboration shot, because
+                                    # the screen may have changed since the last.
+                                    $script:BtRec_EstablishingShotTaken = $false
+                                }
                                 $viewEvt = try { Get-BtRecorderEventText -Kind $evt.Kind -State $evt.State -Level $evt.Level -SessionIdle $evtSessionIdle -IdleNoticeAlreadyShown ([bool]$script:BtRec_IdleLinkNoticeShown) } catch { $null }
                                 if ($viewEvt) {
                                     if ($viewEvt.IdleNotice) { $script:BtRec_IdleLinkNoticeShown = $true }
@@ -8471,9 +8567,11 @@ namespace WinConfigDiag {
                                 Write-BtLog "  $((Get-Date).ToString('HH:mm:ss'))  [NO-MSG ]  NO's message store $($noMsgChange.ChangeType.ToLower()): $($noMsgChange.Length) bytes, MessageCount=$($noMsgChange.MessageCount)" -Level 'WARN'
                                 # NO's message store changing is the closest
                                 # thing to "NO just surfaced something" this
-                                # instrument has -- capture the screen with it.
+                                # instrument has -- HIGH-VALUE, uncapped, always
+                                # shot, with the machine state attached.
                                 if ($btDiagRun) {
-                                    script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger "NO_MESSAGES/$($noMsgChange.ChangeType)"
+                                    $shotSnap = script:Get-BtShotStateSnapshot -Session $btProbeSession -Watch $btProbeWatch
+                                    [void](script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger "NO_MESSAGES/$($noMsgChange.ChangeType)" -HighValue -StateSnapshot $shotSnap)
                                 }
                             }
                         }
@@ -9945,6 +10043,12 @@ namespace WinConfigDiag {
                         # the throttle or a capture error was the reason.
                         ScreenshotCaptureEnabled = $script:BtRec_ScreenshotEnabled
                         ScreenshotsTaken         = [int]$script:BtRec_ScreenshotsTaken
+                        # Of those taken, how many were HIGH-VALUE triggers
+                        # (NO_messages / collapse / anomaly / mark, uncapped) vs
+                        # the one-per-session establishing idle-drop shot. A
+                        # package that is all-establishing means nothing NO
+                        # surfaced was captured; the split says which.
+                        ScreenshotsHighValue     = [int]$script:BtRec_ScreenshotsHighValue
                         ScreenshotsSuppressed    = [int]$script:BtRec_ScreenshotsSuppressed
                         ScreenshotFailures       = [int]$script:BtRec_ScreenshotFailures
                         # Operator-labelled moments. The NO codes let triage group
