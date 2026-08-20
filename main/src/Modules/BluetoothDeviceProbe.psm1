@@ -4087,19 +4087,51 @@ function Get-BtRecorderEventText {
         collection time is deliberate: a filter in the collector would remove
         evidence from the record, which is the one thing this redesign must not
         do.
+
+        THE IDLE SAWTOOTH IS NOT A TRANSITION WORTH A LINE PER CYCLE. With no
+        session holding a port, the recorder's own port check raises the link
+        and the headset parks it again 12-23 s later, forever (run
+        74569A4C46AE's list alternated connected/disconnected every ~15 s).
+        Rendered one line per cycle, that list is indistinguishable from a
+        failing radio to anyone who does not already know the rhythm. So while
+        the session is idle, BTLINK transitions collapse into ONE explanatory
+        line -- emitted on the first cycle, then silence until a session
+        starts. In-session link transitions keep their per-line treatment: a
+        drop while a port is held is exactly the event the list exists for.
+    .PARAMETER SessionIdle
+        $true when nothing holds a target COM port right now (and port hold is
+        actually observed). Callers that cannot know pass $false and keep the
+        per-line behavior -- claiming idle without observing it would suppress
+        real transitions.
+    .PARAMETER IdleNoticeAlreadyShown
+        $true once the caller has already rendered the one idle-sawtooth
+        notice. State lives with the caller; this function stays pure. The
+        caller resets it when a session starts, so the first idle cycle after
+        each session explains itself once, and only once.
     .OUTPUTS
-        [hashtable] @{ Text; Level } or $null.
+        [hashtable] @{ Text; Level } (plus IdleNotice = $true on the one
+        coalesced sawtooth line) or $null.
     #>
     [CmdletBinding()]
     param(
         [string]$Kind,
         [string]$State,
-        [string]$Level = 'INFO'
+        [string]$Level = 'INFO',
+        [bool]$SessionIdle = $false,
+        [bool]$IdleNoticeAlreadyShown = $false
     )
 
     $text = $null
     switch ($Kind) {
         'BTLINK' {
+            if ($SessionIdle) {
+                if ($IdleNoticeAlreadyShown) { return $null }
+                return @{
+                    Text       = 'Wireless idle -- the link parks between checks and reconnects (normal)'
+                    Level      = 'INFO'
+                    IdleNotice = $true
+                }
+            }
             if ($State -eq 'Connected')    { $text = 'Wireless connected' }
             if ($State -eq 'NotConnected') { $text = 'Wireless disconnected' }
         }

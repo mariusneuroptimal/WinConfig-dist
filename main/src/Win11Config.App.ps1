@@ -6774,6 +6774,10 @@ $buttonHandlers = @{
             $script:BtChain_LinesWritten    = 0
             $script:BtChain_LinesDropped    = 0
             $script:BtChain_LastBoundaryKey = $null
+            # The one-time idle-sawtooth notice, re-armed per run for the same
+            # reason as the counters: a second recording must explain the parked
+            # link once for ITS operator, not inherit "already said it".
+            $script:BtRec_IdleLinkNoticeShown = $false
             $btIdentityDetailLabel.Text = "Run ID: $btRunId"
             if (-not $btIdentityPanel.Visible) { $btIdentityPanel.Visible = $true }
 
@@ -7979,8 +7983,20 @@ $buttonHandlers = @{
                             # remove evidence from the capture, which is the one
                             # thing this redesign must not do.
                             if (Get-Command Get-BtRecorderEventText -ErrorAction SilentlyContinue) {
-                                $viewEvt = try { Get-BtRecorderEventText -Kind $evt.Kind -State $evt.State -Level $evt.Level } catch { $null }
-                                if ($viewEvt) { script:Add-BtRecorderEvent -Text $viewEvt.Text -Level $viewEvt.Level -At $evt.Timestamp }
+                                # Idle = port hold observed AND empty right now.
+                                # With the active probe off nothing observes the
+                                # hold, so idle is never claimed and BTLINK keeps
+                                # its per-line rendering.
+                                $evtSessionIdle = [bool]$btProbeSession.ActivePortOpenProbeEnabled -and (@($btProbeSession.HeldPorts | Where-Object { $_ }).Count -eq 0)
+                                # A session starting re-arms the one-time idle
+                                # notice, so the first parked-link cycle after
+                                # each session explains itself again.
+                                if ($evt.Kind -eq 'STREAM' -and $evt.State -eq 'Active') { $script:BtRec_IdleLinkNoticeShown = $false }
+                                $viewEvt = try { Get-BtRecorderEventText -Kind $evt.Kind -State $evt.State -Level $evt.Level -SessionIdle $evtSessionIdle -IdleNoticeAlreadyShown ([bool]$script:BtRec_IdleLinkNoticeShown) } catch { $null }
+                                if ($viewEvt) {
+                                    if ($viewEvt.IdleNotice) { $script:BtRec_IdleLinkNoticeShown = $true }
+                                    script:Add-BtRecorderEvent -Text $viewEvt.Text -Level $viewEvt.Level -At $evt.Timestamp
+                                }
                             }
                             if ($evt.Annotation) {
                                 $annoLevel = if ($evt.Annotation.StartsWith('[!]')) { 'FAIL' } elseif ($evt.Annotation.StartsWith('[~]')) { 'WARN' } else { 'OK' }

@@ -1,14 +1,21 @@
 @{
+    # R2 upload configuration — credentials injected at publish time by CI.
+    # This file in source contains placeholders only; real values live in GitHub secrets.
+    #
+    # R2        = Bluetooth diagnostics channel (bucket winconfig-diagnostics). DO NOT RENAME.
+    # SupportR2 = Support bundle channel (bucket winconfig-support) — SUPPORT-PROBE-001 §12.
+    #             MUST stay a separate bucket: the BT ingest pipeline lists the whole
+    #             winconfig-diagnostics bucket and would try to parse support ZIPs.
     R2 = @{
         AccountId   = 'f1a5f21df12cd7ca88df390a2b106037'
         BucketName  = 'winconfig-diagnostics'
-        AccessKeyId = '746290acd98ddc0b41c9e9cd9ae84563'
-        SecretKey   = '4fdd45b3de331b3c874a9b80a399b6ff78d236c9779d5f704eb6ff392081844c'
+        AccessKeyId = 'PLACEHOLDER'
+        SecretKey   = 'PLACEHOLDER'
     }
     SupportR2 = @{
         AccountId   = 'f1a5f21df12cd7ca88df390a2b106037'
         BucketName  = 'winconfig-support'
-        AccessKeyId = '2534ed77120f791bd2fd10794cb6876b'
-        SecretKey   = '4ff5714b6e20f6f209236fbcd7b6d7989029a80b39e5cbbfd4a315ccea0e52a8'
+        AccessKeyId = 'PLACEHOLDER'
+        SecretKey   = 'PLACEHOLDER'
     }
 }
