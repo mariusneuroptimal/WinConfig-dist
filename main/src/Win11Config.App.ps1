@@ -5445,6 +5445,73 @@ $buttonHandlers = @{
             $btButtonRow.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 0)
             $btStatusPanel.Controls.Add($btButtonRow)
 
+            # ── Operator intent: "What are you testing today?" ────────────────
+            #
+            # The instrument cannot discern NO Device-Panel operations from
+            # sessions: Device tests hold both ports, a flash holds COM4 only,
+            # Get details holds for 3-6 s -- all of it reads as "STREAM Active",
+            # and ~7 s tick sampling undercounts or misses the short holds
+            # entirely (run 8C51CF75C0ED needed manual after-the-fact marking).
+            # The operator's declaration is the only reliable label, so it is
+            # collected up front and travels with the capture.
+            #
+            # THE DECLARATION IS A CLAIM, NOT A MEASUREMENT. It is recorded and
+            # surfaced -- PROVENANCE line, manifest key, dashboard digest --
+            # and it NEVER feeds detector verdicts, chain localization or
+            # STREAM classification. The operator can declare "Running Session"
+            # and then flash a device; fusing an unverified declaration into
+            # classification is exactly the misattribution class #111 removed.
+            # The chain keeps saying "could not determine cause"; the capture
+            # ADDITIONALLY says what was declared.
+            #
+            # One table owns the enum-to-label mapping; the ComboBox renders the
+            # labels and the lock at recording start reads back through this
+            # table by index. Order is load-bearing: index 0 is the pre-selected
+            # clinic default, so the dominant field case clicks nothing new.
+            # 'Other' is the escape hatch -- without it the field lies the first
+            # time an operator does two things in one run.
+            $script:BtRec_OperatorIntentChoices = @(
+                @{ Enum = 'RunningSession';  Label = 'Running Session' }
+                @{ Enum = 'DiscoveryPairing'; Label = 'Discovery & Pairing' }
+                @{ Enum = 'DeviceFlash';     Label = 'Device Flash' }
+                @{ Enum = 'GetDetails';      Label = 'Get Details' }
+                @{ Enum = 'DeviceTests';     Label = 'Device Tests' }
+                @{ Enum = 'Other';           Label = 'Other' }
+            )
+            # Null until the lock at recording start writes it; the manifest
+            # reads these variables, so a run that somehow never locks renders
+            # absent -- never a defaulted 'RunningSession' it did not declare.
+            $script:BtRec_OperatorIntent      = $null
+            $script:BtRec_OperatorIntentLabel = $null
+
+            # EXPLICIT colours: BackColor is AMBIENT in WinForms, so a control
+            # that sets none inherits $btStatusPanel's near-black while the
+            # foreground falls back to black -- present, hit-testable and
+            # invisible (the 2026-08-18 "Open Folder is hidden" failure class).
+            $btIntentLabel = New-Object System.Windows.Forms.Label
+            $btIntentLabel.Text = "What are you testing today?"
+            $btIntentLabel.AutoSize = $true
+            $btIntentLabel.Margin = New-Object System.Windows.Forms.Padding(0, 7, 4, 0)
+            $btIntentLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+            $btIntentLabel.BackColor = [System.Drawing.Color]::FromArgb(28, 28, 34)
+            $btIntentLabel.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+            $btButtonRow.Controls.Add($btIntentLabel)
+
+            # DropDownList, not DropDown: the enum needs no free text (v1), and
+            # a typed value would be a second answerer to the choices table.
+            $btIntentCombo = New-Object System.Windows.Forms.ComboBox
+            $btIntentCombo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+            $btIntentCombo.Width = [int](150 * $script:BtViewScale)
+            $btIntentCombo.Margin = New-Object System.Windows.Forms.Padding(0, 3, 8, 0)
+            $btIntentCombo.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btIntentCombo.BackColor = [System.Drawing.Color]::FromArgb(48, 48, 56)
+            $btIntentCombo.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+            foreach ($btIntentChoice in $script:BtRec_OperatorIntentChoices) {
+                [void]$btIntentCombo.Items.Add([string]$btIntentChoice.Label)
+            }
+            $btIntentCombo.SelectedIndex = 0
+            $btButtonRow.Controls.Add($btIntentCombo)
+
             # "Open Folder" — appears after packaging so the operator can grab the ZIP,
             # which matters most when the cloud upload fails and the file is saved locally.
             $btOpenFolderBtn = New-Object System.Windows.Forms.Button
@@ -6960,6 +7027,25 @@ $buttonHandlers = @{
             $btButtonRow.Controls.Add($btAbortBtn)
 
             $btRecordStart = Get-Date
+
+            # ── Operator intent: read ONCE, here, and locked ──────────────────
+            # The value is taken off the ComboBox at the instant the recording
+            # window opens and never again (one field, one answerer -- the same
+            # pattern as the ActivePortOpenProbeEnabled lock at session
+            # construction). Every downstream consumer -- the PROVENANCE line,
+            # the manifest, the announcement below -- reads the locked copy,
+            # never the control. Immutable per run: the plan changed means stop
+            # and relaunch, which is cheap; a mid-run mutation channel is not
+            # v1. Disabling the control makes the lock visible to the operator
+            # rather than silently ignoring a late change.
+            $btIntentIdx = $btIntentCombo.SelectedIndex
+            if ($btIntentIdx -lt 0) { $btIntentIdx = 0 }
+            $btIntentChoiceLocked = $script:BtRec_OperatorIntentChoices[$btIntentIdx]
+            $script:BtRec_OperatorIntent      = [string]$btIntentChoiceLocked.Enum
+            $script:BtRec_OperatorIntentLabel = [string]$btIntentChoiceLocked.Label
+            $btIntentCombo.Enabled = $false
+            Write-BtLog "  Operator intent: $($script:BtRec_OperatorIntentLabel)  (operator declaration -- recorded, not verified; it does not affect any verdict)" -Level 'DIM'
+
             $btPollJob     = $null
             # A bounded pre-roll is persisted on every run. Authentication and
             # BTHUSB failures often precede the operator clicking Record; starting
@@ -7160,6 +7246,31 @@ $buttonHandlers = @{
                         if (-not $provWrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
                         else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
                     }
+                }
+
+                # ── PROVENANCE, line 2: what the operator DECLARED ────────────
+                # Same reasoning as line 1: the manifest is produced at
+                # teardown, so a window closed without uploading loses it, and
+                # the declaration cannot be reconstructed from anything else in
+                # the package. Written from the LOCKED copy, never the control.
+                #
+                # This is a CLAIM by the operator, not a measurement by the
+                # instrument. No consumer may fuse it into a verdict or chain
+                # localization -- an absent line simply means the capture
+                # predates the feature.
+                if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticJsonLine -ErrorAction SilentlyContinue)) {
+                    $intentWrote = Add-WinConfigDiagnosticJsonLine -RunFolder $btDiagRun.RunFolder -Name 'events.jsonl' -Data ([ordered]@{
+                        AtUtc      = $btRecordStart.ToUniversalTime().ToString('o')
+                        Kind       = 'PROVENANCE'
+                        State      = 'OperatorIntent'
+                        Level      = 'INFO'
+                        OperatorIntent       = $script:BtRec_OperatorIntent
+                        OperatorIntentLabel  = $script:BtRec_OperatorIntentLabel
+                        OperatorIntentSource = 'RecorderWindowSelection'
+                        RunId      = $btRunId
+                    })
+                    if (-not $intentWrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
+                    else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
                 }
 
                 # FI-012 baseline. Read-only registry + QueryDosDevice; cheap
@@ -9482,6 +9593,16 @@ $buttonHandlers = @{
                         # Contradictions present before recording started -- the
                         # transition-driven alarms are blind to these by design.
                         ArrivalContradictionCount = if ($btProbeSession) { @($btProbeSession.StartupConsistency).Count } else { $null }
+                        # What the operator DECLARED they were testing when the
+                        # recording started, read from the copy locked at
+                        # recording start -- never re-read from the control. A
+                        # CLAIM, not a measurement: it organizes the corpus by
+                        # declared test type and must never feed a verdict.
+                        # Null when the lock never ran; the key's absence
+                        # remains the discriminator for packages written before
+                        # the feature existed.
+                        OperatorIntent      = $script:BtRec_OperatorIntent
+                        OperatorIntentLabel = $script:BtRec_OperatorIntentLabel
                         # Operator-labelled moments. The NO codes let triage group
                         # recordings by what the application actually said, which
                         # is the axis the code mapping needs and the one the
