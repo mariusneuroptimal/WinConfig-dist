@@ -5579,6 +5579,82 @@ namespace WinConfigDiag {
                 }
             }
 
+            # ── NO-window appearance detector (feeds the screenshot trigger) ──
+            # The automatic screenshot triggers were BLIND to NO's own error
+            # dialogs: NO_messages.xml does not change on a 12005/12006 (measured
+            # empty during a live 12006), and a Get-details error can fire with
+            # no transport event at all -- run B2F0D09A10F5 took 0 shots on a run
+            # where the operator hit Get-details errors. This detector closes
+            # that gap by noticing when a NEW top-level window owned by NO.exe
+            # appears (an error dialog, the Device Panel, a Get-details result)
+            # and firing a HIGH-VALUE shot.
+            #
+            # EXISTENCE ONLY. It reads window HANDLES and owning PIDs -- never a
+            # title or any window CONTENT -- so it stays off the OCR/no-read-NO-
+            # windows deny-list. The screenshot it triggers is the operator-
+            # consented capture (double confirmation), which is the only place
+            # NO window content is ever imaged, and only with consent.
+            #
+            # Compiled + lazy + fail-safe, exactly like the screen-capture
+            # backend: if the P/Invoke will not compile the detector is simply
+            # off and the recorder is unaffected.
+            $script:BtRec_WindowScanReady = $null
+            function script:Initialize-BtWindowScan {
+                if ($null -ne $script:BtRec_WindowScanReady) { return $script:BtRec_WindowScanReady }
+                try {
+                    if (-not ('WinConfigDiag.WindowScan' -as [type])) {
+                        $wsCs = @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace WinConfigDiag {
+    public static class WindowScan {
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+        delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        // Handles of visible top-level windows owned by the given PIDs.
+        // Returns HANDLES ONLY -- no titles, no class text, no content.
+        public static long[] TopLevelWindowsForPids(int[] pids) {
+            HashSet<uint> want = new HashSet<uint>();
+            foreach (int p in pids) { want.Add((uint)p); }
+            List<long> found = new List<long>();
+            EnumWindows(delegate(IntPtr h, IntPtr l) {
+                if (IsWindowVisible(h)) {
+                    uint wpid; GetWindowThreadProcessId(h, out wpid);
+                    if (want.Contains(wpid)) { found.Add(h.ToInt64()); }
+                }
+                return true;
+            }, IntPtr.Zero);
+            return found.ToArray();
+        }
+    }
+}
+"@
+                        Add-Type -TypeDefinition $wsCs -ErrorAction Stop
+                    }
+                    $script:BtRec_WindowScanReady = [bool]('WinConfigDiag.WindowScan' -as [type])
+                } catch {
+                    $script:BtRec_WindowScanReady = $false
+                }
+                return $script:BtRec_WindowScanReady
+            }
+
+            function script:Get-BtNoWindowHandles {
+                param([string[]]$ProcessNames)
+                if (-not (script:Initialize-BtWindowScan)) { return @() }
+                $noPids = @()
+                foreach ($pn in $ProcessNames) {
+                    if (-not $pn) { continue }
+                    $noPids += @(Get-Process -Name $pn -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+                }
+                $noPids = @($noPids | Where-Object { $_ } | Select-Object -Unique)
+                if (-not $noPids) { return @() }
+                try { return @([WinConfigDiag.WindowScan]::TopLevelWindowsForPids([int[]]$noPids)) } catch { return @() }
+            }
+
             # Bottom status bar. AutoSize + TopDown flow: the panel reserves
             # exactly the height its content needs, so on scaled/high-DPI displays
             # the labels and action buttons grow with the font instead of
@@ -5811,6 +5887,13 @@ namespace WinConfigDiag {
             # corroborates what is on screen; the rest of the budget is reserved
             # for high-value triggers (NO_messages, collapse, anomaly, marks).
             $script:BtRec_EstablishingShotTaken  = $false
+            # NO-window appearance detector state. The seen-set is seeded once
+            # (baseline pass) so windows already open when recording starts do
+            # NOT each fire a shot -- only windows that APPEAR during the run do.
+            # (A dialog already up at Start is caught instead by the guaranteed
+            # start-of-recording shot.)
+            $script:BtRec_SeenNoWindows          = New-Object 'System.Collections.Generic.HashSet[long]'
+            $script:BtRec_NoWindowBaselineDone   = $false
             $script:BtRec_ShotConfirmGuard       = $false   # reentrancy guard: reverting .Checked refires CheckedChanged
 
             # EXPLICIT colours: the $btButtonRow class guard auto-covers
@@ -7196,6 +7279,8 @@ namespace WinConfigDiag {
             $script:BtRec_ScreenshotsHighValue  = 0
             $script:BtRec_LastScreenshotAt      = $null
             $script:BtRec_EstablishingShotTaken = $false
+            $script:BtRec_SeenNoWindows         = New-Object 'System.Collections.Generic.HashSet[long]'
+            $script:BtRec_NoWindowBaselineDone  = $false
             # The one-time idle-sawtooth notice, re-armed per run for the same
             # reason as the counters: a second recording must explain the parked
             # link once for ITS operator, not inherit "already said it".
@@ -7686,6 +7771,21 @@ namespace WinConfigDiag {
                     })
                     if (-not $shotProvWrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
                     else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
+                }
+
+                # ── Guaranteed start-of-recording shot ────────────────────────
+                # An enabled run must never end with zero shots just because the
+                # transport stayed quiet and NO surfaced nothing our triggers can
+                # see (run B2F0D09A10F5: 0 shots on a real error run). One
+                # establishing shot at Start captures whatever is on screen NOW --
+                # including a NO dialog already open before recording began, which
+                # the NO-window detector deliberately does not fire on. Counts as
+                # the session's establishing shot so the first idle drop does not
+                # duplicate it.
+                if ($script:BtRec_ScreenshotEnabled -and $btDiagRun) {
+                    $shotSnap = script:Get-BtShotStateSnapshot -Session $btProbeSession -Watch $btProbeWatch
+                    $startShot = script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger 'RecordingStart' -StateSnapshot $shotSnap
+                    if ($startShot) { $script:BtRec_EstablishingShotTaken = $true }
                 }
 
                 # FI-012 baseline. Read-only registry + QueryDosDevice; cheap
@@ -8608,6 +8708,27 @@ namespace WinConfigDiag {
                                     $shotSnap = script:Get-BtShotStateSnapshot -Session $btProbeSession -Watch $btProbeWatch
                                     [void](script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger "NO_MESSAGES/$($noMsgChange.ChangeType)" -HighValue -StateSnapshot $shotSnap)
                                 }
+                            }
+                        }
+
+                        # ── NO-window appearance → high-value shot ────────────
+                        # Closes the gap that run B2F0D09A10F5 exposed: NO's own
+                        # error dialogs fire none of the other triggers. Existence
+                        # only -- handles and owning PID, never a title or content.
+                        # The first pass SEEDS the baseline (windows already open
+                        # at Start do not fire; the start shot covered those); a
+                        # later pass fires ONE high-value shot per tick if any new
+                        # NO window appeared, seeding all of them so each appears
+                        # once.
+                        if ($script:BtRec_ScreenshotEnabled -and $btDiagRun) {
+                            $noWins = script:Get-BtNoWindowHandles -ProcessNames @($btProbeAppName)
+                            $newWins = @($noWins | Where-Object { -not $script:BtRec_SeenNoWindows.Contains([long]$_) })
+                            foreach ($nw in $newWins) { [void]$script:BtRec_SeenNoWindows.Add([long]$nw) }
+                            if (-not $script:BtRec_NoWindowBaselineDone) {
+                                $script:BtRec_NoWindowBaselineDone = $true
+                            } elseif ($newWins.Count -gt 0) {
+                                $shotSnap = script:Get-BtShotStateSnapshot -Session $btProbeSession -Watch $btProbeWatch
+                                [void](script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger 'NoWindowAppeared' -HighValue -StateSnapshot $shotSnap)
                             }
                         }
 
