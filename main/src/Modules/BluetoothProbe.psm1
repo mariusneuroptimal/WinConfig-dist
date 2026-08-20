@@ -3979,7 +3979,10 @@ function Get-HostSleepCapability {
         $result.Note = 'Modern Standby only: S3 is unavailable, so Kernel-Power 42/107 CANNOT appear on this host. Their absence says nothing about sleep activity.'
     } elseif ($result.S0LowPowerIdleAvailable -eq $false -and $result.S3Available) {
         $result.ModernStandbyOnly = $false
-        $result.Note = 'Classic S3 only: no Modern Standby, so this host cannot reproduce the FI-012 trigger observed on MMEVOLD_06.'
+        # SCOPED 2026-08-20 (defect D4): only the Modern-Standby MINTING
+        # mechanism is host-capability-gated. The held-handle unpair mechanism
+        # (2026-08-19) needs no sleep support at all.
+        $result.Note = 'Classic S3 only: no Modern Standby, so this host cannot reproduce the Modern-Standby minting mechanism observed on MMEVOLD_06. The held-handle unpair mechanism is host-independent and remains reproducible here.'
     } elseif ($null -ne $result.S3Available) {
         $result.ModernStandbyOnly = $false
     }
@@ -4119,9 +4122,11 @@ function Get-BluetoothSerialPortIntegrity {
 
         HKLM\HARDWARE is a VOLATILE hive rebuilt from scratch at every boot,
         so a collision there was necessarily created during the current boot
-        session - the Bluetooth serial driver re-registers COM names across
-        sleep/resume without tearing down the previous generation, and the
-        symlink is lost in the collision. A reboot clears it. Unpair/re-pair
+        session - by either reproduced mechanism: an unpair while a process
+        held one of the device's COM ports (the re-pair then reuses the
+        stranded name), or sleep/resume re-registering COM names without
+        tearing down the previous generation on Modern-Standby-susceptible
+        machines. A reboot clears it. Unpair/re-pair
         does NOT - it just mints another colliding generation.
 
         Read-only. Makes no changes.
@@ -4403,7 +4408,16 @@ function Get-BluetoothSerialTroubleshootingResponse {
             # still open", "pre-failure", "at risk"), which a regression test
             # greps for across this whole response. This is a present-tense
             # outage, not a forecast, so no forecast vocabulary belongs here.
-            $result.Impact = 'Every Bluetooth COM port on this PC is expected to be unopenable right now. The COM names survive but point at abandoned RFCOMM device objects, so opens fail instantly (win32 433) even though Device Manager still reports every port healthy.'
+            # SCOPED 2026-08-20 (defect D4). The old text claimed EVERY
+            # Bluetooth COM port on the PC was unopenable, from the 2026-08-13
+            # measurement (all 8 failed, symlinks -> dead generation). On
+            # 2026-08-19 the same fault measured the other way: symlinks -> live
+            # owners, 4 of 8 ports opened, ONLY the collided names failed. Which
+            # owner each symlink resolves to decides - so the impact claim is
+            # scoped to the collided names and defers the rest to an open
+            # attempt. It also names both failure codes: 433 while the dead
+            # object persists, then 2 once the driver reclaims it.
+            $result.Impact = 'The collided COM names are in a live outage when their symlinks resolve to abandoned RFCOMM device objects: opens on them fail instantly (win32 433 while the dead object persists, then 2 once the driver reclaims it) even though Device Manager still reports every port healthy. Whether the OTHER Bluetooth COM ports on this PC also fail depends on which owner each name''s symlink resolves to - measured both ways under this same fault - so only an open attempt on each name decides.'
         } elseif ($missing -gt 0) {
             $result.FaultStage = 'MissingComSymlinks'
             $result.Impact = 'One or more COM names no longer exist in the Windows object namespace. Applications can report that the selected control/data port is invalid.'
@@ -4422,10 +4436,19 @@ function Get-BluetoothSerialTroubleshootingResponse {
         } elseif ($Readiness.PSObject.Properties.Name -contains 'CorrelationAssessment') {
             $correlation = [string]$Readiness.CorrelationAssessment
         }
+        # REWRITTEN 2026-08-20 (defect D4). The old 'Consistent' branch named
+        # Modern Standby, alone, as the reproduced trigger for this fault.
+        # TWO mechanisms are reproduced - unpair/re-pair while a process holds
+        # an Arc COM port open (2026-08-19, end to end in front of a 1 Hz
+        # poller, with Kernel-Power 42/107 = 0 that boot), and sleep/wake
+        # minting on Modern-Standby-susceptible machines (2026-08-13) - and a
+        # wake-count correlation cannot distinguish them, so no branch may
+        # claim one. The dialog states the measurement and the ambiguity.
+        $mechanisms = 'Two mechanisms are reproduced for this fault - unpairing/re-pairing the device while a process holds one of its COM ports open, and sleep/wake on Modern-Standby-susceptible machines - and this check cannot distinguish them.'
         $result.LikelyCause = switch ($correlation) {
-            'Consistent'  { 'Windows Bluetooth/RFCOMM registrations accumulated during this boot. The recorded sleep/wake count can account for the extra generations; Modern Standby is a reproduced trigger for this fault.' }
-            'Unexplained' { 'Windows Bluetooth/RFCOMM registrations accumulated during this boot. Sleep/wake is a known trigger, but the recorded wake count does not fully account for this machine, so the exact trigger remains unknown.' }
-            default       { 'Windows Bluetooth/RFCOMM registrations accumulated or became stale during this boot. Sleep/wake, including Modern Standby, is a known trigger, but this sample alone does not prove which event triggered it.' }
+            'Consistent'  { "Windows Bluetooth/RFCOMM registrations accumulated during this boot. $mechanisms The recorded sleep/wake count can account for the extra generations, which is consistent with the sleep mechanism but does not prove it acted here." }
+            'Unexplained' { "Windows Bluetooth/RFCOMM registrations accumulated during this boot. $mechanisms The recorded wake count does not fully account for this machine, so the exact trigger remains unknown." }
+            default       { "Windows Bluetooth/RFCOMM registrations accumulated or became stale during this boot. $mechanisms This sample alone does not prove which event triggered it." }
         }
 
         if ($RecorderActive) {
@@ -6240,8 +6263,12 @@ function Get-SerialOpenClassification {
 
         433 is the SERIALCOMM-collision signature. The COM name still exists and
         still resolves, so it is not fault 1; it fails in 0-2 ms, so it is not
-        fault 2 (which takes ~5.1 s to time out). The symlink simply points at a
-        generation the driver abandoned across a Modern Standby cycle.
+        fault 2 (which takes ~5.1 s to time out). The symlink points at a
+        generation the driver abandoned - via either reproduced route: a
+        re-pair reusing a name stranded by an unpair-while-held, or a Modern
+        Standby mint on a susceptible machine. Measured 2026-08-19: 433 ages
+        into 2 (~3 min) once the driver reclaims the dead object, with the
+        symlink still resolving - so 2 does NOT imply the symlink is absent.
 
         121 IS AMBIGUOUS ON A SINGLE ATTEMPT. A cold ACL link and a powered-off
         device both return it at ~5.1s. Measured 2026-08-06 on Arc 000019: cold
@@ -6272,9 +6299,16 @@ function Get-SerialOpenClassification {
 
     switch ($Win32Error) {
         0   { return @{ Classification = 'Healthy'; Meaning = 'Port opened'; Action = $null } }
-        2   { return @{ Classification = 'PortMissing'
-                        Meaning = 'ERROR_FILE_NOT_FOUND - the COM symlink does not exist, so no process can open this port'
-                        Action  = 'Reboot. HKLM\HARDWARE is volatile and rebuilt at boot. Do not re-pair first.' } }
+        2   {
+            # REWRITTEN 2026-08-20 (defect D5). The old Meaning said "the COM
+            # symlink does not exist". Measured false a third way on
+            # 2026-08-19: a stranded name returned 433 while the dead device
+            # object persisted, then 2 once the driver reclaimed it, WITH the
+            # symlink present and resolving in both phases. Error 2 has two
+            # measured causes and the code alone cannot separate them.
+            return @{ Classification = 'PortMissing'
+                      Meaning = 'ERROR_FILE_NOT_FOUND - no live target behind the COM name. Two measured causes: the \GLOBAL??\ symlink is genuinely absent (2026-07-27), or a stranded registration whose symlink still resolves to a dead owner the driver has since reclaimed (2026-08-19, the late phase of the 433 fault). The code alone cannot separate them - read the symlink.'
+                      Action  = 'Reboot. HKLM\HARDWARE is volatile and rebuilt at boot. Do not re-pair first.' } }
         5   { return @{ Classification = 'InUse'
                         Meaning = 'ERROR_ACCESS_DENIED - the port exists and another process holds it'
                         Action  = 'Close the application holding the port (usually NO.exe) and retry.' } }
@@ -6289,9 +6323,17 @@ function Get-SerialOpenClassification {
                       Meaning = 'ERROR_NETWORK_UNREACHABLE - the RFCOMM link could not be established. On its own this does NOT establish a stale or mismatched pairing; that reading requires target-matched BTHUSB authentication events from the same window.'
                       Action  = 'Collect the Bluetooth event evidence for this device before acting. Do NOT re-pair on this code alone - it is also consistent with the device being out of range or the radio being in a bad state.' }
         }
-        433 { return @{ Classification = 'PortTargetDead'
-                        Meaning = 'ERROR_NO_SUCH_DEVICE - the COM name resolves, but to an RFCOMM device object the driver has abandoned. Measured with duplicate SERIALCOMM owners after Modern Standby: every Bluetooth COM name on the PC fails this way in under 2 ms, including names with no device behind them, while the live generation opens normally one layer down.'
-                        Action  = 'Reboot without unpairing. This is not a headset fault and not a range/power problem - do not toggle the radio, re-pair, or reset COM numbers, and do not power-cycle the device chasing it.' } }
+        433 {
+            # REWRITTEN 2026-08-20 (defect D5). The old Meaning attributed the
+            # abandoned object to "a Modern Standby cycle" - one of TWO
+            # reproduced routes - and generalized one measurement ("every COM
+            # name on the PC fails") that a 2026-08-19 collision measured the
+            # other way (live symlinks, 4 of 8 opened). It also carried no
+            # aging note: 433 turns into 2 once the driver reclaims the dead
+            # object (~3 min in the measured run), symlink resolving throughout.
+            return @{ Classification = 'PortTargetDead'
+                      Meaning = 'ERROR_NO_SUCH_DEVICE - the COM name resolves, but to an RFCOMM device object the driver has abandoned. Two reproduced routes leave a name in this state: a re-pair reusing a name stranded by an unpair-while-held, and Modern Standby minting a new generation on susceptible machines. Ages into win32 2 once the driver reclaims the dead object (~3 minutes in the measured run) - 433 and 2 are two phases of one fault, and the symlink can stay resolving through both.'
+                      Action  = 'Reboot without unpairing. This is not a headset fault and not a range/power problem - do not toggle the radio, re-pair, or reset COM numbers, and do not power-cycle the device chasing it.' } }
         121 {
             # A SINGLE 121 does not settle anything, and the returned text now
             # says so. Retry evidence is what separates a cold ACL link from an
@@ -6706,7 +6748,7 @@ function Test-BluetoothDeviceReachability {
         $evidence += "TRUTH: $($r.PortName) timed out (win32 121) $tail."
     }
     foreach ($r in $portMissing) {
-        $evidence += "NON-PROBATIVE: $($r.PortName) does not exist (win32 2), so no reachability test happened on it. That is FI-012 fault 1, a host-side fault - see Get-BluetoothSerialPortIntegrity."
+        $evidence += "NON-PROBATIVE: $($r.PortName) returned win32 2 (no live target behind the name - symlink absent, or resolving to a reclaimed dead owner), so no reachability test happened on it. That is FI-012 host-side fault 1 or the late phase of fault 3 - see Get-BluetoothSerialPortIntegrity."
     }
     foreach ($r in $inUse) {
         $evidence += "NON-PROBATIVE: $($r.PortName) is held by another process (win32 5), so it could not be tested. Note the holder is usually NO.exe, which implies the device WAS reachable when it opened the port."
