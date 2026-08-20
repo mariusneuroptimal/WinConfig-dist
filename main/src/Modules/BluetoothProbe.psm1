@@ -7979,7 +7979,12 @@ function Get-BluetoothRecentEvents {
             }
         } catch {
             # FilterHashtable throws "no events matched" as an error — treat as empty, not failure.
-            if ($_.Exception.Message -match 'No events were found') {
+            # Classified by FullyQualifiedErrorId FIRST: it is locale-stable,
+            # while the message text is localized and a non-English box would
+            # have every empty query recorded as a Failure. The message match
+            # stays as a fallback only.
+            $fqid = [string]$_.FullyQualifiedErrorId
+            if ($fqid -like 'NoMatchingEventsFound*' -or $_.Exception.Message -match 'No events were found') {
                 $queries += [pscustomobject]@{
                     LogName = $ch; ProviderName = $null; Status = 'Empty'
                     ReturnedCount = 0; HitLimit = $false; Reason = $null
@@ -8023,10 +8028,28 @@ function Get-BluetoothRecentEvents {
                 Reason = $null
             }
         } catch {
-            if ($_.Exception.Message -match 'No events were found') {
+            # Classified by FullyQualifiedErrorId FIRST (locale-stable; the
+            # message text is localized). Both FQIDs verified live 2026-08-19:
+            #   NoMatchingProvidersFound   -> the provider does not exist on
+            #                                 this host at all
+            #   LogsAndProvidersDontOverlap-> it exists but never writes to the
+            #                                 queried log
+            # Either way that is a STATIC fact about the box, not a runtime
+            # failure. Recording it as a Failure per poll manufactured 657
+            # phantom failures in a healthy capture (3 dead names x 219 polls,
+            # run 04, 2026-08-18) -- which reads as a broken collector and
+            # discredits a genuine zero. It gets its own query status and never
+            # inflates FailureCount.
+            $fqid = [string]$_.FullyQualifiedErrorId
+            if ($fqid -like 'NoMatchingEventsFound*' -or $_.Exception.Message -match 'No events were found') {
                 $queries += [pscustomobject]@{
                     LogName = 'System'; ProviderName = $provider; Status = 'Empty'
                     ReturnedCount = 0; HitLimit = $false; Reason = $null
+                }
+            } elseif ($fqid -like 'NoMatchingProvidersFound*' -or $fqid -like 'LogsAndProvidersDontOverlap*') {
+                $queries += [pscustomobject]@{
+                    LogName = 'System'; ProviderName = $provider; Status = 'ProviderAbsent'
+                    ReturnedCount = 0; HitLimit = $false; Reason = $_.Exception.Message
                 }
             } else {
                 $failures += [pscustomobject]@{

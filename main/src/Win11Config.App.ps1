@@ -8630,6 +8630,19 @@ $buttonHandlers = @{
                             # is the only place a collapse that preceded a
                             # re-open is recoverable from the bundle.
                             ReadRateRecord  = $btIoRecord
+                            # Raw CPU-per-tick series for the stall channel,
+                            # beside the threshold that was in force -- so the
+                            # StreamCpuStalled constant (measurably ~3x too
+                            # tight, D6) can be re-scored offline from field
+                            # captures instead of retuned from n=1. Absent on
+                            # sessions built by older module copies.
+                            StreamCpuRecord = if ($btProbeSession -and $btProbeSession.ContainsKey('StreamCpuSamples')) { @{
+                                Samples             = @($btProbeSession.StreamCpuSamples)
+                                SampleMax           = [int]$btProbeSession.StreamCpuSampleMax
+                                DroppedSampleCount  = [int]$btProbeSession.StreamCpuSamplesDropped
+                                ThresholdSPerTick   = [double]$btProbeSession.StreamCpuStallThresholdSPerTick
+                                FlatTicksRequired   = [int]$btProbeSession.StreamCpuStallFlatTicks
+                            } } else { $null }
                             Observations    = @($btProbeWatch.Observations)
                             # How long each tick actually took, per collector.
                             # A capture used to assert "watching every 3s" with
@@ -8987,6 +9000,12 @@ $buttonHandlers = @{
                                 Contract         = $btEventReport.Contract
                                 EventCount       = $btEventReport.EventCount
                                 FailureCount     = $btEventReport.FailureCount
+                                # Absent-on-this-host providers, distinct from
+                                # failures -- a reader who sees FailureCount 0
+                                # beside a non-empty list here knows the dead
+                                # names were classified, not silently dropped.
+                                ProviderAbsentCount = if (@($btEventReport.PSObject.Properties.Name) -contains 'QueryProviderAbsentCount') { $btEventReport.QueryProviderAbsentCount } else { $null }
+                                AbsentProviders  = if (@($btEventReport.PSObject.Properties.Name) -contains 'AbsentProviders') { @($btEventReport.AbsentProviders) } else { $null }
                                 FinalDrainStatus = $btEventReport.FinalDrainStatus
                             }
                         } else { $null }

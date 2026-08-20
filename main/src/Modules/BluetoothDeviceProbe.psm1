@@ -2006,6 +2006,11 @@ function Get-BluetoothEventEvidenceReport {
 
     $queryFailures = @($Record.Queries | Where-Object { $_.Status -eq 'Failed' }).Count
     $queryTruncations = @($Record.Queries | Where-Object { $_.HitLimit }).Count
+    # ProviderAbsent is a static fact about the box, kept apart from Failed so
+    # a reader can tell "this host does not have that provider" from "a query
+    # broke" -- conflating them put 657 phantom failures into a healthy capture.
+    $providerAbsentQueries = @($Record.Queries | Where-Object { $_.Status -eq 'ProviderAbsent' })
+    $absentProviders = @($providerAbsentQueries | ForEach-Object { [string]$_.ProviderName } | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
     return [pscustomobject]@{
         PSTypeName                 = 'WinConfig.BluetoothEventEvidence.Report'
         Contract                   = $Record.Contract
@@ -2020,6 +2025,8 @@ function Get-BluetoothEventEvidenceReport {
         QueryCount                 = @($Record.Queries).Count
         QueryFailureCount          = $queryFailures
         QueryHitLimitCount         = $queryTruncations
+        QueryProviderAbsentCount   = @($providerAbsentQueries).Count
+        AbsentProviders            = $absentProviders
         DroppedQueryCount          = [int]$Record.DroppedQueryCount
         Queries                    = @($Record.Queries)
         FailureCount               = @($Record.Failures).Count
@@ -4540,7 +4547,16 @@ function New-DeviceProbeSession {
         ActivePortOpenProbeReadStatus = [string]$apop.SettingReadStatus
         ActivePortOpenProbeSource     = [string]$apop.Source
         ActivePortOpenProbeRawValue   = $apop.RawValue
-        ActivePortOpenProbeReason     = [string]$apop.Reason
+        # The Reason must describe the EFFECTIVE treatment. Copying the
+        # setting's prose verbatim shipped a PROVENANCE line whose Reason said
+        # "probe ENABLED (shipped default)" beside Enabled:false/ForcedOff:true
+        # (D8, capture 41194CD099B1). The setting's own prose survives inside
+        # the composed text, attributed as the setting read, so the audit
+        # trail loses nothing.
+        ActivePortOpenProbeReason     = $(if ($ForcePassiveOnly) {
+            $fpWhy = if ($ForcePassiveOnlyReason) { [string]$ForcePassiveOnlyReason } else { 'no reason supplied' }
+            "Active port-open probe FORCED OFF for this session: $fpWhy. Setting as read: $([string]$apop.Reason)"
+        } else { [string]$apop.Reason })
         ActivePortOpenProbeLockedAt   = Get-Date
         # End-of-run re-read. Drift is DETECTED and reported; it never changes
         # behaviour, because a run whose treatment changed halfway through is not
@@ -4757,6 +4773,22 @@ function New-DeviceProbeSession {
         StreamFlatCpuTicks       = 0
         StreamCpuStalled         = $false
         StreamCpuStallReported   = $false
+        # The stall threshold, OWNED HERE and read by the tick (one constant,
+        # one owner) -- and exported with the capture so a reader can score the
+        # raw series below against what was in force. The shipped value is
+        # measurably ~3x too tight against the one real 12006 stall on record
+        # (fires < 0.06 s/tick; the stall burned 0.183 s/tick, D6). It is NOT
+        # retuned here: the retune must be argued from a corpus, and the raw
+        # series below is what makes that corpus exist.
+        StreamCpuStallThresholdSPerTick = 0.06
+        StreamCpuStallFlatTicks         = 8
+        # Raw CPU-per-tick series for the stall channel, persisted to
+        # probe-session.json so the threshold can be re-scored OFFLINE from
+        # field captures. Record, don't decide. Bounded; the drop is counted.
+        # 4800 samples at the ~3 s cadence is ~4 hours of streaming.
+        StreamCpuSamples         = [System.Collections.ArrayList]::new()
+        StreamCpuSampleMax       = 4800
+        StreamCpuSamplesDropped  = 0
         # Read-operation rate. Catches the case CPU cannot: only ONE of the
         # application's jobs dies, so it stays busy (audio kept playing through
         # the 12006 capture) while its serial reads stop. Relative to the box's
@@ -5542,10 +5574,31 @@ function Invoke-DeviceProbeTick {
                 # the counter long before this fires.
                 $rawCpu = try { [double]$noProc.CPU } catch { $null }
                 if ($null -ne $rawCpu) {
+                    # Threshold and tick count come off the SESSION (seeded in
+                    # New-DeviceProbeSession, exported with the capture), with
+                    # the shipped literals as fallback for a session built by
+                    # an older module copy or a bare test fixture.
+                    $cpuFlatThreshold = if ($Session.ContainsKey('StreamCpuStallThresholdSPerTick')) { [double]$Session.StreamCpuStallThresholdSPerTick } else { 0.06 }
+                    $cpuFlatTicksNeeded = if ($Session.ContainsKey('StreamCpuStallFlatTicks')) { [int]$Session.StreamCpuStallFlatTicks } else { 8 }
                     if ($null -eq $Session.StreamCpuFirstSample) { $Session.StreamCpuFirstSample = $rawCpu }
                     if ($null -ne $Session.StreamCpuLastSample) {
                         $cpuDelta = $rawCpu - [double]$Session.StreamCpuLastSample
-                        if ($cpuDelta -lt 0.06) {
+                        # The raw series, kept beside the verdict so the D6
+                        # threshold can be re-scored offline from the capture.
+                        # AtUtc lets a reader recover the real tick interval --
+                        # the cadence is a target, not a fact.
+                        if ($Session.ContainsKey('StreamCpuSamples')) {
+                            if ($Session.StreamCpuSamples.Count -lt [int]$Session.StreamCpuSampleMax) {
+                                [void]$Session.StreamCpuSamples.Add(@{
+                                    AtUtc     = $now.ToUniversalTime().ToString('o')
+                                    CpuTotalS = [math]::Round($rawCpu, 3)
+                                    CpuDeltaS = [math]::Round($cpuDelta, 3)
+                                })
+                            } else {
+                                $Session.StreamCpuSamplesDropped++
+                            }
+                        }
+                        if ($cpuDelta -lt $cpuFlatThreshold) {
                             $Session.StreamFlatCpuTicks++
                         } else {
                             $Session.StreamFlatCpuTicks = 0
@@ -5553,7 +5606,7 @@ function Invoke-DeviceProbeTick {
                     }
                     $Session.StreamCpuLastSample = $rawCpu
 
-                    if ($Session.StreamFlatCpuTicks -ge 8 -and -not $Session.StreamCpuStallReported) {
+                    if ($Session.StreamFlatCpuTicks -ge $cpuFlatTicksNeeded -and -not $Session.StreamCpuStallReported) {
                         $Session.StreamCpuStalled       = $true
                         $Session.StreamCpuStallReported = $true
                         $flatSec  = $Session.StreamFlatCpuTicks * 3
@@ -6783,12 +6836,26 @@ function Get-ProbeObservationCoverage {
     # A rival is any OTHER candidate the selector saw. Activity on the rival is
     # the strongest single indicator that the recording is pointed at the wrong
     # headset, so it is tracked separately from mere presence.
+    #
+    # Null vs empty is the discriminator here, never Count: a probe-OFF run
+    # seeds every candidate's HeldPorts to $null on purpose ("no sensor
+    # looked"), and @($null).Count is 1 in PS 5.1 -- which scored every
+    # UNEXAMINED rival as holding a port and fired this verdict's High-severity
+    # finding on every probe-OFF capture (verified on published 7b02521,
+    # 2026-08-17, in a run with zero active opens). The examined/unexamined
+    # split is carried to the output as a tri-state, mirroring
+    # TargetPortEverHeld/TargetPortHoldObserved above.
     $rivals = @()
+    $rivalsExamined = @()
     $rivalActive = $false
     if ($Target -and $Target.Candidates) {
         $rivals = @($Target.Candidates | Where-Object { $_ -and $_.Mac -and $_.Mac -ne $Target.Mac })
-        $rivalActive = @($rivals | Where-Object { @($_.HeldPorts).Count -gt 0 }).Count -gt 0
+        $rivalsExamined = @($rivals | Where-Object { $null -ne $_.HeldPorts })
+        $rivalActive = @($rivalsExamined | Where-Object { @($_.HeldPorts | Where-Object { $_ }).Count -gt 0 }).Count -gt 0
     }
+    # Vacuously observed when there are no rivals: nothing existed to examine,
+    # and RivalCandidates = 0 beside it says why.
+    $rivalHoldObserved = ($rivals.Count -eq 0) -or ($rivalsExamined.Count -gt 0)
 
     $reasons = @()
     if (-not $linked)        { $reasons += 'The target headset never linked to the radio during this recording.' }
@@ -6799,6 +6866,7 @@ function Get-ProbeObservationCoverage {
     }
     if ($ioSamples -eq 0)    { $reasons += 'No read-rate samples were taken, so data flow was never measured.' }
     if ($rivalActive)        { $reasons += "Another paired NeurOptimal headset WAS holding a COM port while this one was idle -- this recording is very likely pointed at the wrong headset." }
+    elseif ($rivals.Count -gt 0 -and -not $rivalHoldObserved) { $reasons += "$($rivals.Count) other NeurOptimal headset(s) are paired on this box, and whether any of them held a COM port was NOT OBSERVED (the active port-open probe was disabled) -- wrong-headset activity can neither be claimed nor ruled out." }
     elseif ($rivals.Count -gt 0) { $reasons += "$($rivals.Count) other NeurOptimal headset(s) are paired on this box, so the recording may have watched the wrong one." }
 
     $level =
@@ -6978,7 +7046,12 @@ function Get-ProbeObservationCoverage {
         IoSampleCountCurrentEpisode = $ioSamplesCurrent
         TargetComPortSeen = $sawPort
         RivalCandidates   = $rivals.Count
-        RivalWasActive    = $rivalActive
+        # TRI-STATE like TargetPortEverHeld: $true / $false / $null when rivals
+        # exist but no sensor examined their ports (probe-OFF run). Truthiness
+        # consumers keep working; RivalHoldObserved beside it says which
+        # without anyone having to know that $null is meaningful.
+        RivalWasActive    = $(if (-not $rivalHoldObserved) { $null } else { $rivalActive })
+        RivalHoldObserved = $rivalHoldObserved
         # Quality axis. Deliberately separate from Level so that "did we see all
         # channels?" and "for how long?" stay separate claims.
         Quality              = $quality
