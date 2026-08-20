@@ -1,8 +1,5 @@
 {
-  "event": "push",
-  "timestamp": "2026-08-20T12:20:21.1311571Z",
-  "schema_version": "2.0",
-  "branch": "main",
+  "timestamp": "2026-08-20T13:47:19.5382821Z",
   "artifacts": [
     {
       "sha256": "d1278321cdcd5c0759d3dfa773e964cda8d254ccdfd7f08dce12f878d317fff9",
@@ -155,11 +152,14 @@
       "path": "src/Modules/TargetDeviceWatch.psm1"
     },
     {
-      "sha256": "f2785d3dd6ced523dc2a339a07d7c829e324105976bc7d95b879cd74d67b9715",
-      "size": 467350,
+      "sha256": "fa2e3eae1c8f32334f6a44a4640192857b69095dc1aa0eed4149036acc8da217",
+      "size": 469411,
       "path": "src/Modules/BluetoothDeviceProbe.psm1"
     }
   ],
-  "source_ref": "03f48861c1a1dc941dfd1e4cde4d8093067da0af",
-  "build_id": "32368294245-1"
+  "build_id": "32376232901-1",
+  "source_ref": "952aa73bd5aff8ef66f1bb7c6e90e429d9ae02c5",
+  "event": "push",
+  "branch": "main",
+  "schema_version": "2.0"
 }

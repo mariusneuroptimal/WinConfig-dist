@@ -3084,9 +3084,12 @@ function Get-BtDiagnosticChain {
     # holds no profile open, so an idle Arc that is working perfectly reads
     # disconnected, and during the FI-012 field case IsConnected read False while
     # both ports opened fine. It is only a failure when something else contradicts
-    # it -- a port is held (something believes it has a session), or this
-    # recording already saw the link UP and it has since gone (a drop, which no
-    # power switch explains).
+    # it -- a port is held (something believes it has a session), or the link
+    # was up earlier AND the data stream it carried died against its own
+    # baseline. Link history WITHOUT that corroboration is not enough: the
+    # recorder's own port check raises the link on an idle box and the headset
+    # parks it seconds later, so an idle recording accumulates up-then-down
+    # cycles that mean nothing.
     $linkHealth = 'Unknown'; $linkObs = 'Observed'; $linkEv = @()
     $linkDetail = Get-ProbeStateUserText -Kind btlink -State $BtLinkState -Short
     # WHY the link reads as it does, as a token rather than as prose. Health
@@ -3108,11 +3111,24 @@ function Get-BtDiagnosticChain {
             $linkCause = 'PortHeldWithoutLink'
             $linkEv += (New-ChainEvidence 'Observed' 'The radio reports no link to this headset, while a process is holding its COM port.')
             $linkEv += (New-ChainEvidence 'Inferred' 'Something believes it has a session over a link that is not there. This is the shape "Arc not detected" takes from the OS side.')
-        } elseif ($BtLinkEverConnected) {
+        } elseif ($BtLinkEverConnected -and ($IoVerdict -eq 'Collapsed' -or $IoVerdict -eq 'Degrading')) {
+            # A down link after an up link is only a DROP when something it was
+            # carrying died with it -- here, a read rate that collapsed against
+            # its own baseline. Link history alone cannot make this claim: the
+            # recorder's own port checks raise the link on an idle box, and an
+            # idle SPP link parks itself seconds later, so up-then-down with
+            # nothing held and nothing measured is the idle rhythm of a healthy
+            # headset, not a fault (measured on an idle box: raise, park,
+            # re-raise, every 12-23 s, forever).
             $linkHealth = 'Failed'
             $linkCause = 'Dropped'
-            $linkEv += (New-ChainEvidence 'Observed' 'The radio reports no link now, but it DID report one earlier in this same recording.')
-            $linkEv += (New-ChainEvidence 'Inferred' 'A link that was up and is now down is a drop. Being switched off does not explain a link that existed minutes ago.')
+            $linkEv += (New-ChainEvidence 'Observed' 'The radio reports no link now, but it DID report one earlier in this same recording, and the data stream died against its own baseline.')
+            $linkEv += (New-ChainEvidence 'Inferred' 'A link that was up and is now down, with the reads it carried collapsed, is a drop. Being switched off does not explain a link that existed minutes ago.')
+        } elseif ($BtLinkEverConnected) {
+            $linkHealth = 'Idle'
+            $linkCause = 'LinkParked'
+            $linkEv += (New-ChainEvidence 'Observed' 'The radio reports no link now. It was up earlier in this recording, with no session using it and no data measured over it.')
+            $linkEv += (New-ChainEvidence 'Inferred' 'This is NORMAL while idle. The recorder''s own port check raises the link, and an idle headset parks it again seconds later, so an idle box cycles between connected and not connected. A drop that matters shows up while a session is holding the port, or as a collapsed data rate.')
         } else {
             $linkHealth = 'Idle'
             $linkCause = 'IdleNoSession'
@@ -3727,8 +3743,13 @@ function Get-BtRecorderView {
         default   { 'Not read' }
     }
     # Idle is a legitimately-negative reading, not a fault, and the note is
-    # where that is said in the panel rather than in a paragraph below it.
-    $wirelessNote = if ($link.Health -eq 'Idle') { 'normal between sessions' } else { '' }
+    # where that is said in the panel rather than in a paragraph below it. The
+    # parked-link idle gets its own words: an operator who just watched the
+    # panel read Connected deserves to be told the cycling is expected, not
+    # merely that "not connected" is normal.
+    $wirelessNote = if ($link.Health -eq 'Idle') {
+        if ([string]$link.Cause -eq 'LinkParked') { 'idle links park between checks -- normal' } else { 'normal between sessions' }
+    } else { '' }
     $tileWireless = New-ViewTile -Slot 'Wireless' -Label 'Bluetooth Link' -Node $link -Caption $wirelessCaption -Note $wirelessNote
 
     # ── NeurOptimal Arc  <- Pairing, gated by target identity ─────────────────
@@ -3988,6 +4009,7 @@ function Get-BtRecorderView {
                     'Dropped'             { 'Wireless connection to the Arc was lost.' }
                     'PortHeldWithoutLink' { "The Arc's COM port is held open, but there is no wireless connection." }
                     'IdleNoSession'       { 'No wireless connection yet -- this is normal before a session starts.' }
+                    'LinkParked'          { 'No session in progress -- an idle Arc parks its wireless link between checks. This is normal.' }
                     default               { 'The wireless connection could not be read.' }
                 }
             }
