@@ -5512,6 +5512,31 @@ $buttonHandlers = @{
             $btIntentCombo.SelectedIndex = 0
             $btButtonRow.Controls.Add($btIntentCombo)
 
+            # ── Start gate button ─────────────────────────────────────────────
+            # Recording used to begin the moment this window opened, which made
+            # the intent dropdown a RACE: the value locked whenever the baseline
+            # snapshot happened to finish (5-60 s), and the operator reported
+            # (2026-08-20) barely making the choice in time. A label that locks
+            # before a human can reliably act lies by inertia, which defeats
+            # the reason it exists. Nothing is lost by waiting: the 10-minute
+            # event pre-roll is anchored to the recording start, so it follows
+            # the click, and the protocol already requires starting the
+            # recorder before the NO session.
+            $script:BtRec_StartClicked = $false
+            $btStartBtn = New-Object System.Windows.Forms.Button
+            $btStartBtn.Text = "Start Recording"
+            $btStartBtn.AutoSize = $true
+            $btStartBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btStartBtn.Padding = New-Object System.Windows.Forms.Padding(14, 5, 14, 5)
+            $btStartBtn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0)
+            $btStartBtn.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+            $btStartBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btStartBtn.FlatAppearance.BorderSize = 0
+            $btStartBtn.BackColor = [System.Drawing.Color]::FromArgb(50, 130, 60)
+            $btStartBtn.ForeColor = [System.Drawing.Color]::White
+            $btStartBtn.Add_Click({ $script:BtRec_StartClicked = $true })
+            $btButtonRow.Controls.Add($btStartBtn)
+
             # "Open Folder" — appears after packaging so the operator can grab the ZIP,
             # which matters most when the cloud upload fails and the file is saved locally.
             $btOpenFolderBtn = New-Object System.Windows.Forms.Button
@@ -5555,7 +5580,7 @@ $buttonHandlers = @{
             $btBannerLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
             $btBannerLabel.TextAlign = "MiddleLeft"
             $btBannerLabel.Padding = New-Object System.Windows.Forms.Padding(18, 0, 0, 0)
-            $btBannerLabel.Text = "Step 1 of 3 - Taking Bluetooth baseline snapshot, please wait..."
+            $btBannerLabel.Text = "Ready to record -- choose what you are testing today, then click Start Recording."
             $btBanner.Controls.Add($btBannerLabel)
 
             # Anomaly confirmation bar (initially hidden, shown when anomaly detected)
@@ -6849,6 +6874,42 @@ $buttonHandlers = @{
             if (-not $btIdentityPanel.Visible) { $btIdentityPanel.Visible = $true }
 
             Write-BtLog "Run ID: $btRunId" -Level "DIM"
+
+            # ── Start gate: nothing is observed until the operator says go ────
+            # The intent choice is the first mandatory step of a run: the
+            # window waits here, pumping input, until Start Recording is
+            # clicked. No baseline, no recording window, no probe work happens
+            # behind the gate, so the choice is never a race against a timer
+            # the operator cannot see. Closing the window during the gate
+            # cancels cleanly -- no capture is produced and the outer finally
+            # releases the recorder lock.
+            Write-BtLog "Choose what you are testing today, then click Start Recording." -Level "STEP"
+            while (-not $script:BtRec_StartClicked) {
+                if ($btForm.IsDisposed -or -not $btForm.Visible) { return }
+                Wait-BtPump -Milliseconds 100
+            }
+            $btStartBtn.Enabled = $false
+            $btStartBtn.Visible = $false
+
+            # ── Operator intent: read ONCE, at the Start click, and locked ────
+            # The value is taken off the ComboBox at the instant the operator
+            # starts the run and never again (one field, one answerer -- the
+            # same pattern as the ActivePortOpenProbeEnabled lock at session
+            # construction). Every downstream consumer -- the PROVENANCE line,
+            # the manifest, the announcement below -- reads the locked copy,
+            # never the control. Immutable per run: the plan changed means stop
+            # and relaunch, which is cheap; a mid-run mutation channel is not
+            # v1. Disabling the control makes the lock visible to the operator
+            # rather than silently ignoring a late change.
+            $btIntentIdx = $btIntentCombo.SelectedIndex
+            if ($btIntentIdx -lt 0) { $btIntentIdx = 0 }
+            $btIntentChoiceLocked = $script:BtRec_OperatorIntentChoices[$btIntentIdx]
+            $script:BtRec_OperatorIntent      = [string]$btIntentChoiceLocked.Enum
+            $script:BtRec_OperatorIntentLabel = [string]$btIntentChoiceLocked.Label
+            $btIntentCombo.Enabled = $false
+            Write-BtLog "  Operator intent: $($script:BtRec_OperatorIntentLabel)  (operator declaration -- recorded, not verified; it does not affect any verdict)" -Level 'DIM'
+
+            $btBannerLabel.Text = "Step 1 of 3 - Taking Bluetooth baseline snapshot, please wait..."
             Write-BtLog "Step 1 of 3: Taking Bluetooth baseline snapshot (5-10 seconds)..." -Level "STEP"
 
             # ── PHASE 1: Baseline — background job, DoEvents loop keeps UI live ───
@@ -7027,25 +7088,6 @@ $buttonHandlers = @{
             $btButtonRow.Controls.Add($btAbortBtn)
 
             $btRecordStart = Get-Date
-
-            # ── Operator intent: read ONCE, here, and locked ──────────────────
-            # The value is taken off the ComboBox at the instant the recording
-            # window opens and never again (one field, one answerer -- the same
-            # pattern as the ActivePortOpenProbeEnabled lock at session
-            # construction). Every downstream consumer -- the PROVENANCE line,
-            # the manifest, the announcement below -- reads the locked copy,
-            # never the control. Immutable per run: the plan changed means stop
-            # and relaunch, which is cheap; a mid-run mutation channel is not
-            # v1. Disabling the control makes the lock visible to the operator
-            # rather than silently ignoring a late change.
-            $btIntentIdx = $btIntentCombo.SelectedIndex
-            if ($btIntentIdx -lt 0) { $btIntentIdx = 0 }
-            $btIntentChoiceLocked = $script:BtRec_OperatorIntentChoices[$btIntentIdx]
-            $script:BtRec_OperatorIntent      = [string]$btIntentChoiceLocked.Enum
-            $script:BtRec_OperatorIntentLabel = [string]$btIntentChoiceLocked.Label
-            $btIntentCombo.Enabled = $false
-            Write-BtLog "  Operator intent: $($script:BtRec_OperatorIntentLabel)  (operator declaration -- recorded, not verified; it does not affect any verdict)" -Level 'DIM'
-
             $btPollJob     = $null
             # A bounded pre-roll is persisted on every run. Authentication and
             # BTHUSB failures often precede the operator clicking Record; starting
