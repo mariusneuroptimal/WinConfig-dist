@@ -1,8 +1,8 @@
 {
-    "timestamp":  "2026-08-20T17:47:23.0498765Z",
+    "timestamp":  "2026-08-20T18:11:29.4544609Z",
     "branch":  "main",
     "schema_version":  "2.0",
-    "source_ref":  "31cb6f3de383d7c47e1e3b8276003bc8136f7fc3",
+    "source_ref":  "4225dafe991d69cba334e9765a3908dc137ce0cb",
     "artifacts":  [
                       {
                           "path":  "Win11Config.ps1",
@@ -11,8 +11,8 @@
                       },
                       {
                           "path":  "src/Win11Config.App.ps1",
-                          "sha256":  "171c140ba5a3b30b2e796286c5a6274c710967e519259ec314078084416e4fa3",
-                          "size":  829456
+                          "sha256":  "8fd14d211651e00cc3b5f2df29fecc13e94dc7ec80c0fc29d1acfb2d6a57b0ab",
+                          "size":  846499
                       },
                       {
                           "path":  "src/VERSION.psd1",
@@ -160,6 +160,6 @@
                           "size":  471271
                       }
                   ],
-    "build_id":  "manual-20260820134723",
+    "build_id":  "manual-20260820141129",
     "event":  "manual"
 }

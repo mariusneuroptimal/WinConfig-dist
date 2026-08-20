@@ -5373,6 +5373,89 @@ $buttonHandlers = @{
                 }
             }
 
+            # ── Screenshot-on-error capture ───────────────────────────────────
+            # Called from the recording loop when a drop/error event fires (and
+            # when the operator marks a moment). Every outcome is COUNTED --
+            # taken, suppressed by throttle/cap, or failed -- because a shot
+            # that silently didn't happen reads as "nothing was on screen".
+            # Gated on the LOCKED opt-in copy, never the checkbox.
+            function script:Invoke-BtEventScreenshot {
+                param(
+                    [string]$RunFolder,
+                    [string]$Trigger,
+                    $At,
+                    [switch]$OperatorRequested
+                )
+                if (-not $script:BtRec_ScreenshotEnabled) { return }
+                if (-not $RunFolder) { return }
+                $when = $(if ($At) { [datetime]$At } else { Get-Date })
+                # Hard per-run cap: an idle link sawtooth emits a WARN pair
+                # every ~30 s and would otherwise fill the package.
+                if ($script:BtRec_ScreenshotsTaken -ge 12) {
+                    $script:BtRec_ScreenshotsSuppressed = [int]$script:BtRec_ScreenshotsSuppressed + 1
+                    return
+                }
+                # Cooldown between automatic shots. An operator mark bypasses
+                # it: a human pressed the button because something is on screen
+                # RIGHT NOW, which is the whole point of the feature.
+                if (-not $OperatorRequested -and $script:BtRec_LastScreenshotAt -and
+                    (($when - [datetime]$script:BtRec_LastScreenshotAt).TotalSeconds -lt 15)) {
+                    $script:BtRec_ScreenshotsSuppressed = [int]$script:BtRec_ScreenshotsSuppressed + 1
+                    return
+                }
+                $shotBmp = $null; $shotGfx = $null
+                try {
+                    $shotDir = Join-Path $RunFolder 'screenshots'
+                    if (-not (Test-Path -LiteralPath $shotDir)) {
+                        [void](New-Item -ItemType Directory -Path $shotDir -Force)
+                    }
+                    $safeTrigger = if ($Trigger) { ($Trigger -replace '[^A-Za-z0-9_-]', '_') } else { 'event' }
+                    $shotName = "shot_{0}_{1}.jpg" -f $when.ToUniversalTime().ToString('yyyyMMdd_HHmmss_fff'), $safeTrigger
+                    $shotPath = Join-Path $shotDir $shotName
+                    # Whole virtual screen: an NO error dialog can sit on any
+                    # monitor, and cropping is a guess about where it is.
+                    $shotVs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+                    $shotBmp = New-Object System.Drawing.Bitmap([int]$shotVs.Width, [int]$shotVs.Height)
+                    $shotGfx = [System.Drawing.Graphics]::FromImage($shotBmp)
+                    $shotGfx.CopyFromScreen($shotVs.Left, $shotVs.Top, 0, 0, $shotBmp.Size)
+                    # JPEG at quality 85, not PNG: a full desktop PNG measured
+                    # 6.4 MB on the dev box, which at the 12-shot cap is ~78 MB
+                    # of package -- against a dialog that stays fully legible
+                    # at ~1/10th of that.
+                    $shotCodec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
+                    $shotEncParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
+                    $shotEncParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]85)
+                    $shotBmp.Save($shotPath, $shotCodec, $shotEncParams)
+                    $script:BtRec_ScreenshotsTaken  = [int]$script:BtRec_ScreenshotsTaken + 1
+                    $script:BtRec_LastScreenshotAt  = $when
+                    if (Get-Command Add-WinConfigDiagnosticJsonLine -ErrorAction SilentlyContinue) {
+                        $shotWrote = Add-WinConfigDiagnosticJsonLine -RunFolder $RunFolder -Name 'events.jsonl' -Data ([ordered]@{
+                            AtUtc             = $when.ToUniversalTime().ToString('o')
+                            Kind              = 'SCREENSHOT'
+                            State             = 'Captured'
+                            Level             = 'INFO'
+                            Reason            = "Screen captured on $Trigger (operator opted in with double confirmation)"
+                            Trigger           = $Trigger
+                            File              = "screenshots/$shotName"
+                            OperatorRequested = [bool]$OperatorRequested
+                        })
+                        if (-not $shotWrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
+                        else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
+                    }
+                    if (Get-Command Write-BtLog -ErrorAction SilentlyContinue) {
+                        Write-BtLog "  $($when.ToString('HH:mm:ss'))  [SHOT    ]  Screen captured ($Trigger) -> screenshots\$shotName" -Level 'DIM'
+                    }
+                } catch {
+                    $script:BtRec_ScreenshotFailures = [int]$script:BtRec_ScreenshotFailures + 1
+                    if (Get-Command Write-BtLog -ErrorAction SilentlyContinue) {
+                        Write-BtLog "  Screenshot failed ($Trigger): $_" -Level 'WARN'
+                    }
+                } finally {
+                    if ($shotGfx) { $shotGfx.Dispose() }
+                    if ($shotBmp) { $shotBmp.Dispose() }
+                }
+            }
+
             # Bottom status bar. AutoSize + TopDown flow: the panel reserves
             # exactly the height its content needs, so on scaled/high-DPI displays
             # the labels and action buttons grow with the font instead of
@@ -5536,6 +5619,83 @@ $buttonHandlers = @{
             $btStartBtn.ForeColor = [System.Drawing.Color]::White
             $btStartBtn.Add_Click({ $script:BtRec_StartClicked = $true })
             $btButtonRow.Controls.Add($btStartBtn)
+
+            # ── Screenshot-on-error opt-in ────────────────────────────────────
+            #
+            # When a drop or an error fires, the recorder can save a PNG of the
+            # whole screen into the run folder, so the capture carries the one
+            # piece of evidence the two vetted ProgramData files have never
+            # carried: WHAT THE OPERATOR WAS LOOKING AT. NO's message store was
+            # measured EMPTY during a live 12006, and the 12005 dialog has two
+            # observed variants that only a human has ever recorded -- a shot
+            # taken at the event closes exactly that gap.
+            #
+            # PRIVACY IS THE DESIGN CONSTRAINT, not an afterthought. A full-
+            # screen shot can contain clinical data (client names in NO's UI,
+            # anything else on any monitor), which this project's collectors
+            # are otherwise built never to touch. So:
+            #   - OFF by default, every run. The choice does NOT persist.
+            #   - Enabling requires TWO consecutive explicit confirmations that
+            #     no personal information is or will be in view; declining
+            #     either reverts the checkbox.
+            #   - The state is LOCKED at the Start click (one field, one
+            #     answerer -- same pattern as the intent lock) and disclosed in
+            #     a PROVENANCE line and manifest keys, so a package always says
+            #     whether shots could exist and how many were taken/suppressed.
+            #   - Shots are throttled (cooldown + hard per-run cap, both
+            #     COUNTED when they suppress) so an idle link sawtooth cannot
+            #     fill a package with near-identical images.
+            $script:BtRec_ScreenshotOptIn        = $false   # checkbox-backed, pre-lock
+            $script:BtRec_ScreenshotEnabled      = $null    # locked copy; null until the Start-click lock runs
+            $script:BtRec_ScreenshotsTaken       = 0
+            $script:BtRec_ScreenshotsSuppressed  = 0
+            $script:BtRec_ScreenshotFailures     = 0
+            $script:BtRec_LastScreenshotAt       = $null
+            $script:BtRec_ShotConfirmGuard       = $false   # reentrancy guard: reverting .Checked refires CheckedChanged
+
+            # EXPLICIT colours: the $btButtonRow class guard auto-covers
+            # Buttons only; a CheckBox with no colours inherits the near-black
+            # ambient BackColor with a black default ForeColor -- the invisible-
+            # control class the ComboBox and Label already guard against.
+            $btShotCheck = New-Object System.Windows.Forms.CheckBox
+            $btShotCheck.Text = "Screenshot on error"
+            $btShotCheck.AutoSize = $true
+            $btShotCheck.Checked = $false
+            $btShotCheck.Margin = New-Object System.Windows.Forms.Padding(0, 5, 8, 0)
+            $btShotCheck.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+            $btShotCheck.BackColor = [System.Drawing.Color]::FromArgb(28, 28, 34)
+            $btShotCheck.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+            $btShotCheck.Add_CheckedChanged({
+                if ($script:BtRec_ShotConfirmGuard) { return }
+                if (-not $this.Checked) { $script:BtRec_ScreenshotOptIn = $false; return }
+                # TWO consecutive warnings, both mandatory. The second is not a
+                # duplicate of the first: the first is about what a shot can
+                # contain, the second about where it goes.
+                $shotWarn1 = [System.Windows.Forms.MessageBox]::Show(
+                    "Screenshots capture EVERYTHING visible on ALL of this computer's monitors at the moment of a drop or error -- including any client names, session details or other personal information that happens to be on screen.`n`nAre you sure NO personal information is, or will be, visible on screen during this recording?",
+                    "Screenshot on error -- privacy check 1 of 2",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning,
+                    [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+                if ($shotWarn1 -ne [System.Windows.Forms.DialogResult]::Yes) {
+                    $script:BtRec_ShotConfirmGuard = $true; $this.Checked = $false; $script:BtRec_ShotConfirmGuard = $false
+                    $script:BtRec_ScreenshotOptIn = $false
+                    return
+                }
+                $shotWarn2 = [System.Windows.Forms.MessageBox]::Show(
+                    "Please confirm once more.`n`nScreenshots are saved into the diagnostic package and travel with it when it is uploaded. Once uploaded they cannot be recalled.`n`nAre you CERTAIN no personal or client information will be visible on any monitor while this recording runs?",
+                    "Screenshot on error -- privacy check 2 of 2",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning,
+                    [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+                if ($shotWarn2 -ne [System.Windows.Forms.DialogResult]::Yes) {
+                    $script:BtRec_ShotConfirmGuard = $true; $this.Checked = $false; $script:BtRec_ShotConfirmGuard = $false
+                    $script:BtRec_ScreenshotOptIn = $false
+                    return
+                }
+                $script:BtRec_ScreenshotOptIn = $true
+            })
+            $btButtonRow.Controls.Add($btShotCheck)
 
             # "Open Folder" — appears after packaging so the operator can grab the ZIP,
             # which matters most when the cloud upload fails and the file is saved locally.
@@ -6866,6 +7026,14 @@ $buttonHandlers = @{
             $script:BtChain_LinesWritten    = 0
             $script:BtChain_LinesDropped    = 0
             $script:BtChain_LastBoundaryKey = $null
+            # Screenshot state, reset per run for the same reason as the
+            # counters above. Enabled goes back to null (not false): the lock
+            # at this run's Start click is the only writer of a boolean.
+            $script:BtRec_ScreenshotEnabled     = $null
+            $script:BtRec_ScreenshotsTaken      = 0
+            $script:BtRec_ScreenshotsSuppressed = 0
+            $script:BtRec_ScreenshotFailures    = 0
+            $script:BtRec_LastScreenshotAt      = $null
             # The one-time idle-sawtooth notice, re-armed per run for the same
             # reason as the counters: a second recording must explain the parked
             # link once for ITS operator, not inherit "already said it".
@@ -6908,6 +7076,17 @@ $buttonHandlers = @{
             $script:BtRec_OperatorIntentLabel = [string]$btIntentChoiceLocked.Label
             $btIntentCombo.Enabled = $false
             Write-BtLog "  Operator intent: $($script:BtRec_OperatorIntentLabel)  (operator declaration -- recorded, not verified; it does not affect any verdict)" -Level 'DIM'
+
+            # ── Screenshot opt-in: locked at the same click, same pattern ─────
+            # The checkbox can only be true if both privacy confirmations were
+            # answered Yes (the CheckedChanged handler enforces that); the lock
+            # takes the confirmed value once and the control is retired, so a
+            # mid-run toggle cannot exist. False stays false for the whole run.
+            $script:BtRec_ScreenshotEnabled = [bool]$script:BtRec_ScreenshotOptIn
+            $btShotCheck.Enabled = $false
+            if ($script:BtRec_ScreenshotEnabled) {
+                Write-BtLog "  Screenshot on error: ENABLED (operator confirmed twice that no personal information is in view; full-screen PNGs go into this run's package)" -Level 'WARN'
+            }
 
             $btBannerLabel.Text = "Step 1 of 3 - Taking Bluetooth baseline snapshot, please wait..."
             Write-BtLog "Step 1 of 3: Taking Bluetooth baseline snapshot (5-10 seconds)..." -Level "STEP"
@@ -7312,6 +7491,30 @@ $buttonHandlers = @{
                         RunId      = $btRunId
                     })
                     if (-not $intentWrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
+                    else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
+                }
+
+                # ── PROVENANCE, line 3: whether the screen could be captured ──
+                # Disclosed for the same reason as lines 1 and 2: a package must
+                # say up front whether screenshots COULD exist in it. Enabled is
+                # only ever true after two explicit operator confirmations; the
+                # value written is the locked copy, never the control.
+                if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticJsonLine -ErrorAction SilentlyContinue)) {
+                    $shotProvWrote = Add-WinConfigDiagnosticJsonLine -RunFolder $btDiagRun.RunFolder -Name 'events.jsonl' -Data ([ordered]@{
+                        AtUtc      = $btRecordStart.ToUniversalTime().ToString('o')
+                        Kind       = 'PROVENANCE'
+                        State      = 'ScreenshotOnEvent'
+                        Level      = $(if ($script:BtRec_ScreenshotEnabled) { 'WARN' } else { 'INFO' })
+                        Reason     = $(if ($script:BtRec_ScreenshotEnabled) {
+                            'Screenshot-on-error ENABLED by the operator after two consecutive privacy confirmations; full-screen PNGs may be present under screenshots/.'
+                        } else {
+                            'Screenshot-on-error OFF (the shipped default). No screen content is captured in this package.'
+                        })
+                        ScreenshotCaptureEnabled = [bool]$script:BtRec_ScreenshotEnabled
+                        ScreenshotCaptureSource  = 'RecorderWindowOptIn'
+                        RunId      = $btRunId
+                    })
+                    if (-not $shotProvWrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
                     else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
                 }
 
@@ -7913,6 +8116,12 @@ $buttonHandlers = @{
                     $script:BtRec_MarkRequested = $false
                     try {
                         $mkLabel = if ($btMarkBox.Tag -eq 'placeholder') { '' } else { $btMarkBox.Text }
+                        # An operator mark means a human is looking at a dialog
+                        # RIGHT NOW -- the single most valuable moment to shoot.
+                        # Bypasses the automatic cooldown (not the per-run cap).
+                        if ($btDiagRun) {
+                            script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger 'OperatorMark' -At $now -OperatorRequested
+                        }
                         if ($btDeepProbeAvailable -and $btProbeWatch -and (Get-Command New-ProbeStateMarker -ErrorAction SilentlyContinue)) {
                             $mk = New-ProbeStateMarker -Label $mkLabel -At $now `
                                 -ElapsedSeconds ([int]$elapsed.TotalSeconds) `
@@ -8111,6 +8320,14 @@ $buttonHandlers = @{
                                 # as an unmeasured zero rendered as 0.
                                 if (-not $wrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
                                 else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
+                                # Screenshot on drops/errors: any WARN/FAIL
+                                # timeline event (link drop, unexpected stream
+                                # stop, anomaly). Persist-first order holds --
+                                # the event line is already on disk. No-op
+                                # unless the operator double-confirmed opt-in.
+                                if ($evt.Level -eq 'WARN' -or $evt.Level -eq 'FAIL') {
+                                    script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger "$($evt.Kind)/$($evt.State)" -At $evt.Timestamp
+                                }
                             }
                             $ts = $evt.Timestamp.ToString('HH:mm:ss')
                             $kindTag = switch ($evt.Kind) {
@@ -8184,6 +8401,12 @@ $buttonHandlers = @{
                                     else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
                                 }
                                 Write-BtLog "  $((Get-Date).ToString('HH:mm:ss'))  [NO-MSG ]  NO's message store $($noMsgChange.ChangeType.ToLower()): $($noMsgChange.Length) bytes, MessageCount=$($noMsgChange.MessageCount)" -Level 'WARN'
+                                # NO's message store changing is the closest
+                                # thing to "NO just surfaced something" this
+                                # instrument has -- capture the screen with it.
+                                if ($btDiagRun) {
+                                    script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger "NO_MESSAGES/$($noMsgChange.ChangeType)"
+                                }
                             }
                         }
 
@@ -9645,6 +9868,17 @@ $buttonHandlers = @{
                         # the feature existed.
                         OperatorIntent      = $script:BtRec_OperatorIntent
                         OperatorIntentLabel = $script:BtRec_OperatorIntentLabel
+                        # Screenshot-on-error disclosure. Enabled is the copy
+                        # locked at the Start click (true only after two
+                        # explicit privacy confirmations); null means the lock
+                        # never ran; key ABSENCE means the package predates the
+                        # feature. Suppressed and failed shots are counted so a
+                        # package can never imply "nothing was on screen" when
+                        # the throttle or a capture error was the reason.
+                        ScreenshotCaptureEnabled = $script:BtRec_ScreenshotEnabled
+                        ScreenshotsTaken         = [int]$script:BtRec_ScreenshotsTaken
+                        ScreenshotsSuppressed    = [int]$script:BtRec_ScreenshotsSuppressed
+                        ScreenshotFailures       = [int]$script:BtRec_ScreenshotFailures
                         # Operator-labelled moments. The NO codes let triage group
                         # recordings by what the application actually said, which
                         # is the axis the code mapping needs and the one the
