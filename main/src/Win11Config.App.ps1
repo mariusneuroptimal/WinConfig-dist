@@ -5712,6 +5712,33 @@ namespace WinConfigDiag {
             $btIntentCombo.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
             $btIntentCombo.BackColor = [System.Drawing.Color]::FromArgb(48, 48, 56)
             $btIntentCombo.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+            # OWNER-DRAW so the text is readable in EVERY state. A DropDownList
+            # combo paints its own colours only for the closed edit area; the
+            # DROPPED-OPEN list still uses the system palette, so the highlighted
+            # item rendered as system-highlight text on our dark background (dark
+            # on dark on some themes) -- present but unreadable, the same failure
+            # class as the ambient-BackColor buttons. Drawing every row ourselves
+            # -- an explicit background AND foreground for both the selected and
+            # the normal state -- guarantees contrast whether the list is closed,
+            # open, or an item is highlighted. Colours kept above as the fallback
+            # if OwnerDraw is ever removed.
+            $btIntentCombo.DrawMode = [System.Windows.Forms.DrawMode]::OwnerDrawFixed
+            $btIntentCombo.Add_DrawItem({
+                param($ddSender, $ddEvent)
+                $ddEvent.DrawBackground()
+                if ($ddEvent.Index -lt 0) { $ddEvent.DrawFocusRectangle(); return }
+                $ddSelected = ($ddEvent.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
+                $ddBackColor = if ($ddSelected) { [System.Drawing.Color]::FromArgb(64, 92, 140) } else { [System.Drawing.Color]::FromArgb(48, 48, 56) }
+                $ddForeColor = [System.Drawing.Color]::FromArgb(235, 235, 235)
+                $ddBackBrush = New-Object System.Drawing.SolidBrush $ddBackColor
+                $ddEvent.Graphics.FillRectangle($ddBackBrush, $ddEvent.Bounds)
+                $ddBackBrush.Dispose()
+                $ddText = [string]$ddSender.Items[$ddEvent.Index]
+                $ddTextBrush = New-Object System.Drawing.SolidBrush $ddForeColor
+                $ddEvent.Graphics.DrawString($ddText, $ddEvent.Font, $ddTextBrush, ($ddEvent.Bounds.X + 2), ($ddEvent.Bounds.Y + 1))
+                $ddTextBrush.Dispose()
+                $ddEvent.DrawFocusRectangle()
+            })
             foreach ($btIntentChoice in $script:BtRec_OperatorIntentChoices) {
                 [void]$btIntentCombo.Items.Add([string]$btIntentChoice.Label)
             }
@@ -7218,7 +7245,15 @@ namespace WinConfigDiag {
             # takes the confirmed value once and the control is retired, so a
             # mid-run toggle cannot exist. False stays false for the whole run.
             $script:BtRec_ScreenshotEnabled = [bool]$script:BtRec_ScreenshotOptIn
+            # RETIRE the checkbox, don't just disable it. The action row does not
+            # wrap, and a disabled-but-visible checkbox keeps its width for the
+            # whole recording -- which pushed the Abort button half off the right
+            # edge once this control was added (#119). Hiding it at the lock,
+            # like the Start button above, frees that width and restores the
+            # pre-#119 layout. The choice is preserved in the lock, the log line
+            # and the PROVENANCE line, so nothing is lost by hiding the control.
             $btShotCheck.Enabled = $false
+            $btShotCheck.Visible = $false
             if ($script:BtRec_ScreenshotEnabled) {
                 Write-BtLog "  Screenshot on error: ENABLED (operator confirmed twice that no personal information is in view; full-screen PNGs go into this run's package)" -Level 'WARN'
             }
