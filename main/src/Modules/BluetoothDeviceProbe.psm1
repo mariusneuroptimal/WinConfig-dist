@@ -8146,6 +8146,9 @@ function Get-NoDeviceManagerConfigSnapshot {
         ComPorts         = $null
         MacAddresses     = $null
         DeviceLabels     = $null
+        DeviceTable      = $null
+        CurrentAlias     = $null
+        CurrentAliasMac  = $null
         RawBase64        = $null
         RawOmittedReason = $null
         ReadStatus       = 'Missing'
@@ -8167,6 +8170,32 @@ function Get-NoDeviceManagerConfigSnapshot {
         $r.ComPorts     = @([regex]::Matches($text, 'COM\d{1,3}') | ForEach-Object { $_.Value } | Select-Object -Unique)
         $r.MacAddresses = @([regex]::Matches($text, '(?i)\b(?:[0-9A-F]{2}:){5}[0-9A-F]{2}\b') | ForEach-Object { $_.Value.ToUpper() } | Select-Object -Unique)
         $r.DeviceLabels = @([regex]::Matches($text, 'NeurOptimal Arc - \d{6}') | ForEach-Object { $_.Value } | Select-Object -Unique)
+        # Per-device tuples. In the flattened blob each device record's strings
+        # appear in schema order (alias digits, COM port(s), MAC) separated only
+        # by short binary prefixes -- length words and the Type enum -- so a
+        # bounded gap keeps a tuple from being stitched together across records.
+        # The full "NeurOptimal Arc - NNNNNN" labels never match: no COM string
+        # follows them within the gap.
+        $r.DeviceTable = @([regex]::Matches($text,
+            '(\d{6})[\s\S]{1,16}?(COM\d{1,3})(?:[\s\S]{1,16}?(COM\d{1,3}))?[\s\S]{1,16}?((?i:(?:[0-9A-F]{2}:){5}[0-9A-F]{2}))') |
+            ForEach-Object {
+                [ordered]@{
+                    Alias    = $_.Groups[1].Value
+                    ComPorts = @(@($_.Groups[2].Value, $_.Groups[3].Value) | Where-Object { $_ })
+                    Mac      = $_.Groups[4].Value.ToUpper()
+                }
+            })
+        # NO's default device. HEURISTIC: the schema flattens "Current Alias"
+        # after the Devices array, so the LAST full label in the byte stream is
+        # the current one (verified against live ground truth on MMEVOLD_06,
+        # 2026-08-20). The MAC comes from the device table above, never from
+        # decimal-label -> hex-suffix arithmetic.
+        $curMatches = @([regex]::Matches($text, 'NeurOptimal Arc - (\d{6})'))
+        if ($curMatches.Count -gt 0) {
+            $r.CurrentAlias = $curMatches[$curMatches.Count - 1].Groups[1].Value
+            $curRow = @($r.DeviceTable) | Where-Object { $_.Alias -eq $r.CurrentAlias } | Select-Object -First 1
+            if ($curRow) { $r.CurrentAliasMac = $curRow.Mac }
+        }
         if ($bytes.Length -le $MaxRawBytes) {
             $r.RawBase64 = [System.Convert]::ToBase64String($bytes)
         } else {

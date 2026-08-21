@@ -5459,6 +5459,46 @@ namespace WinConfigDiag {
             # keeps declarations and measurements apart. The typed NO code is
             # the one thing a shot cannot supply, so manual marking still exists
             # for that.
+            # ── NO default device vs recording target ────────────────────────
+            # NO's Device Panel can switch the default headset mid-run while the
+            # probe target stays LOCKED at launch (three-host Arc-019 runs,
+            # 2026-08-20: the operator switched 013<->019 and the recorder was
+            # blind to it). This check LABELS that state from NO's own cached
+            # table. It is a CLAIM about NO's config, not a measurement of the
+            # transport -- it must never feed a verdict, a chain localization or
+            # STREAM classification; PROVENANCE lines, the manifest and the
+            # screenshot state stamp are its only consumers.
+            function script:Get-BtNoDefaultDeviceCheck {
+                param($Snapshot, [string]$TargetMac)
+                $norm = {
+                    param($m)
+                    $h = ([string]$m -replace '[^0-9A-Fa-f]', '').ToUpper()
+                    if ($h.Length -eq 12) { $h } else { $null }
+                }
+                $noMac  = if ($Snapshot) { & $norm $Snapshot.CurrentAliasMac } else { $null }
+                $tgtMac = & $norm $TargetMac
+                $status, $reason =
+                    if (-not $Snapshot -or -not $Snapshot.Exists) {
+                        'Undecidable', 'NO Device Manager.config was not readable at this instant.'
+                    } elseif (-not $noMac) {
+                        'Undecidable', 'No current-alias MAC could be extracted from the config (older NO layout, or the current alias has no device-table row).'
+                    } elseif (-not $tgtMac) {
+                        'Undecidable', 'The recording has no resolved target MAC to compare against.'
+                    } elseif ($noMac -eq $tgtMac) {
+                        'Match', "NO's default device is the recording target."
+                    } else {
+                        'Mismatch', "NO's default device is NOT the device this recording is scoped to; NO-side events in this window may describe a different headset."
+                    }
+                [ordered]@{
+                    Status               = $status
+                    Reason               = $reason
+                    NoDefaultAlias       = if ($Snapshot) { $Snapshot.CurrentAlias } else { $null }
+                    NoDefaultMac         = $noMac
+                    TargetMac            = $tgtMac
+                    ConfigLastWriteTimeUtc = if ($Snapshot) { $Snapshot.LastWriteTimeUtc } else { $null }
+                }
+            }
+
             function script:Get-BtShotStateSnapshot {
                 param($Session, $Watch)
                 if (-not $Session) { return $null }
@@ -5476,6 +5516,10 @@ namespace WinConfigDiag {
                     IoRecentOpsPerSecond   = [double]$Session.IoRecentOpsPerSecond
                     PortHoldObserved       = [bool]$Session.ActivePortOpenProbeEnabled
                     SerialIntegrityHealthy = if ($Session.SerialPortIntegrity) { [bool]$Session.SerialPortIntegrity.Healthy } else { $null }
+                    # NO's default device as last read from its config (a CLAIM
+                    # about NO's cached table, stamped so a shot of a NO dialog
+                    # carries which headset NO thought it was talking to).
+                    NoDefaultDevice        = if ($Session.ContainsKey('NoDefaultDeviceCheck')) { $Session.NoDefaultDeviceCheck } else { $null }
                 }
             }
 
@@ -5967,6 +6011,35 @@ namespace WinConfigDiag {
                 }
             })
             $btButtonRow.Controls.Add($btOpenFolderBtn)
+
+            # "Copy File Name" -- appears once the package exists. Support triage
+            # is keyed by the packaged ZIP's name (it carries model, host and the
+            # RunId), and operators relay it by pasting it into a message; a Label
+            # cannot be selected, so the name needs its own copy action.
+            $btCopyNameBtn = New-Object System.Windows.Forms.Button
+            $btCopyNameBtn.Text = "Copy File Name"
+            $btCopyNameBtn.AutoSize = $true
+            $btCopyNameBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $btCopyNameBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
+            $btCopyNameBtn.Margin = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
+            $btCopyNameBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $btCopyNameBtn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(120, 120, 120)
+            $btCopyNameBtn.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+            $btCopyNameBtn.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+            $btCopyNameBtn.Visible = $false
+            $btCopyNameBtn.Add_Click({
+                if ($this.Tag) {
+                    try {
+                        [System.Windows.Forms.Clipboard]::SetText([string]$this.Tag)
+                        $this.Text = "Copied!"
+                    } catch {
+                        # Clipboard can be held by another process; the name is
+                        # still visible on the status line for manual retyping.
+                        $this.Text = "Copy failed"
+                    }
+                }
+            })
+            $btButtonRow.Controls.Add($btCopyNameBtn)
 
             # Phase strip. SLIMMED from a 56px banner to a single quiet line: it
             # says which of the three phases the run is in, which is worth one
@@ -7943,6 +8016,37 @@ namespace WinConfigDiag {
                     $initPnp = [pscustomobject]@{ Devices = @(); Failures = @() }
                 }
 
+                # ── NO default device vs frozen target, at start ─────────────
+                # Runs the moment BOTH answers exist: the config snapshot from a
+                # few lines up and the target frozen just above. PROVENANCE, not
+                # a verdict input -- see script:Get-BtNoDefaultDeviceCheck.
+                $btNoDefCheck = script:Get-BtNoDefaultDeviceCheck -Snapshot $btProbeSession.NoDeviceConfigStart -TargetMac $btProbeSession.TargetMacFrozen
+                $btProbeSession.NoDefaultDeviceCheck       = $btNoDefCheck
+                $btProbeSession.NoDefaultDeviceCheckStart  = $btNoDefCheck
+                $btProbeSession.NoDefaultDeviceChangeCount = 0
+                if ($btNoDefCheck.Status -eq 'Mismatch') {
+                    Write-BtLog "  [!] NO's default device is $($btNoDefCheck.NoDefaultAlias) ($($btNoDefCheck.NoDefaultMac)) but this recording is scoped to $($btNoDefCheck.TargetMac). NO-side events may describe a different headset." -Level 'WARN'
+                } elseif ($btNoDefCheck.Status -eq 'Match') {
+                    Write-BtLog "  NO default device: $($btNoDefCheck.NoDefaultAlias) -- matches the recording target." -Level 'DIM'
+                }
+                if ($btDiagRun -and (Get-Command Add-WinConfigDiagnosticJsonLine -ErrorAction SilentlyContinue)) {
+                    $noDefWrote = Add-WinConfigDiagnosticJsonLine -RunFolder $btDiagRun.RunFolder -Name 'events.jsonl' -Data ([ordered]@{
+                        AtUtc      = (Get-Date).ToUniversalTime().ToString('o')
+                        Kind       = 'PROVENANCE'
+                        State      = 'NoDefaultDevice'
+                        Level      = $(if ($btNoDefCheck.Status -eq 'Mismatch') { 'WARN' } else { 'INFO' })
+                        Reason     = [string]$btNoDefCheck.Reason
+                        NoDefaultDeviceStatus = [string]$btNoDefCheck.Status
+                        NoDefaultAlias        = $btNoDefCheck.NoDefaultAlias
+                        NoDefaultMac          = $btNoDefCheck.NoDefaultMac
+                        TargetMac             = $btNoDefCheck.TargetMac
+                        ConfigLastWriteTimeUtc = $btNoDefCheck.ConfigLastWriteTimeUtc
+                        RunId      = $btRunId
+                    })
+                    if (-not $noDefWrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
+                    else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
+                }
+
                 # ── FI-014 baseline: BTHPORT pairing record vs PnP node ──────
                 # Read-only (registry + PnP enumeration), so unlike the serial
                 # OPEN probes this is safe on the automatic path during a live
@@ -8709,6 +8813,64 @@ namespace WinConfigDiag {
                                     [void](script:Invoke-BtEventScreenshot -RunFolder $btDiagRun.RunFolder -Trigger "NO_MESSAGES/$($noMsgChange.ChangeType)" -HighValue -StateSnapshot $shotSnap)
                                 }
                             }
+                        }
+
+                        # ── NO's default device, watched per tick ─────────────
+                        # A Device-Panel default switch is invisible to the
+                        # LOCKED probe target (three-host Arc-019 runs,
+                        # 2026-08-20). NO rewrites its config at exit, so the
+                        # change lands here with NO's own write timing, not the
+                        # instant of the click -- the stat is a cheap FileInfo;
+                        # the full read runs only when the file actually changed.
+                        # PROVENANCE labeling only, never a verdict input.
+                        if (Get-Command Get-NoDeviceManagerConfigSnapshot -ErrorAction SilentlyContinue) {
+                            try {
+                                if (-not $btProbeSession.ContainsKey('NoDeviceConfigLatest') -or -not $btProbeSession.NoDeviceConfigLatest) {
+                                    $btProbeSession.NoDeviceConfigLatest = $btProbeSession.NoDeviceConfigStart
+                                }
+                                $prevCfg = $btProbeSession.NoDeviceConfigLatest
+                                $cfgFi = if ($prevCfg -and $prevCfg.Path) { [System.IO.FileInfo]::new([string]$prevCfg.Path) } else { $null }
+                                $cfgChanged = $cfgFi -and (
+                                    ([bool]$cfgFi.Exists -ne [bool]$prevCfg.Exists) -or
+                                    ($cfgFi.Exists -and (
+                                        [long]$cfgFi.Length -ne [long]$prevCfg.Length -or
+                                        $cfgFi.LastWriteTimeUtc.ToString('o') -ne [string]$prevCfg.LastWriteTimeUtc)))
+                                if ($cfgChanged) {
+                                    $newCfg = try { Get-NoDeviceManagerConfigSnapshot } catch { $null }
+                                    if ($newCfg) {
+                                        $btProbeSession.NoDeviceConfigLatest = $newCfg
+                                        $prevCheck = if ($btProbeSession.ContainsKey('NoDefaultDeviceCheck')) { $btProbeSession.NoDefaultDeviceCheck } else { $null }
+                                        $newCheck = script:Get-BtNoDefaultDeviceCheck -Snapshot $newCfg -TargetMac $btProbeSession.TargetMacFrozen
+                                        $btProbeSession.NoDefaultDeviceCheck = $newCheck
+                                        $defMoved = $prevCheck -and (
+                                            [string]$newCheck.NoDefaultMac -ne [string]$prevCheck.NoDefaultMac -or
+                                            [string]$newCheck.NoDefaultAlias -ne [string]$prevCheck.NoDefaultAlias)
+                                        if ($defMoved) {
+                                            $btProbeSession.NoDefaultDeviceChangeCount = [int]$btProbeSession.NoDefaultDeviceChangeCount + 1
+                                            Write-BtLog "  $((Get-Date).ToString('HH:mm:ss'))  [NO-DEV ]  NO's default device changed: $($prevCheck.NoDefaultAlias) ($($prevCheck.NoDefaultMac)) -> $($newCheck.NoDefaultAlias) ($($newCheck.NoDefaultMac)); recording target stays $($newCheck.TargetMac)." -Level 'WARN'
+                                            if ($btDiagRun) {
+                                                $defWrote = Add-WinConfigDiagnosticJsonLine -RunFolder $btDiagRun.RunFolder -Name 'events.jsonl' -Data ([ordered]@{
+                                                    AtUtc      = (Get-Date).ToUniversalTime().ToString('o')
+                                                    Kind       = 'PROVENANCE'
+                                                    State      = 'DefaultDeviceChanged'
+                                                    Level      = 'WARN'
+                                                    Reason     = "NO's default device changed mid-recording; the probe target is locked at launch and did not follow."
+                                                    PreviousDefaultAlias = $prevCheck.NoDefaultAlias
+                                                    PreviousDefaultMac   = $prevCheck.NoDefaultMac
+                                                    NoDefaultAlias       = $newCheck.NoDefaultAlias
+                                                    NoDefaultMac         = $newCheck.NoDefaultMac
+                                                    NoDefaultDeviceStatus = [string]$newCheck.Status
+                                                    TargetMac            = $newCheck.TargetMac
+                                                    ConfigLastWriteTimeUtc = $newCheck.ConfigLastWriteTimeUtc
+                                                    TickIndex  = [int]$btProbeSession.TickCount
+                                                })
+                                                if (-not $defWrote) { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
+                                                else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch { }
                         }
 
                         # ── NO-window appearance → high-value shot ────────────
@@ -9540,6 +9702,11 @@ namespace WinConfigDiag {
                         if ((Get-Command Get-NoDeviceManagerConfigSnapshot -ErrorAction SilentlyContinue) -and
                             $btProbeSession.ContainsKey('NoDeviceConfigEnd')) {
                             $btProbeSession.NoDeviceConfigEnd = try { Get-NoDeviceManagerConfigSnapshot } catch { $null }
+                            # Final default-vs-target state for the manifest --
+                            # the timeline already carries every transition.
+                            if ($btProbeSession.NoDeviceConfigEnd -and $btProbeSession.ContainsKey('NoDefaultDeviceCheck')) {
+                                $btProbeSession.NoDefaultDeviceCheck = script:Get-BtNoDefaultDeviceCheck -Snapshot $btProbeSession.NoDeviceConfigEnd -TargetMac $btProbeSession.TargetMacFrozen
+                            }
                         }
                         $noMsgState = if ($btProbeSession.ContainsKey('NoMessageStore')) { $btProbeSession.NoMessageStore } else { $null }
                         $noDevStart = if ($btProbeSession.ContainsKey('NoDeviceConfigStart')) { $btProbeSession.NoDeviceConfigStart } else { $null }
@@ -10190,6 +10357,19 @@ namespace WinConfigDiag {
                         # the feature existed.
                         OperatorIntent      = $script:BtRec_OperatorIntent
                         OperatorIntentLabel = $script:BtRec_OperatorIntentLabel
+                        # NO's default device vs the frozen recording target, as
+                        # of teardown (the events.jsonl PROVENANCE lines carry
+                        # start state and every mid-run change). A CLAIM read
+                        # from NO's own cached table -- labels the capture, never
+                        # feeds a verdict. Key ABSENCE = package predates the
+                        # check; Undecidable = the check ran and could not
+                        # answer, and Reason says why.
+                        NoDefaultDeviceCheck = if ($btProbeSession -and $btProbeSession.ContainsKey('NoDefaultDeviceCheck')) {
+                            $btProbeSession.NoDefaultDeviceCheck
+                        } else { $null }
+                        NoDefaultDeviceChangeCount = if ($btProbeSession -and $btProbeSession.ContainsKey('NoDefaultDeviceChangeCount')) {
+                            [int]$btProbeSession.NoDefaultDeviceChangeCount
+                        } else { $null }
                         # Screenshot-on-error disclosure. Enabled is the copy
                         # locked at the Start click (true only after two
                         # explicit privacy confirmations); null means the lock
@@ -10257,9 +10437,12 @@ namespace WinConfigDiag {
                     $sizeKb    = [Math]::Round($pkg.SizeBytes / 1024, 1)
                     Write-BtLog "Package ready: $btZipPath ($sizeKb KB)"
 
-                    # Let the operator open the folder holding the package.
+                    # Let the operator open the folder holding the package, and
+                    # copy its name for support correspondence.
                     $btOpenFolderBtn.Tag     = Split-Path $btZipPath -Parent
                     $btOpenFolderBtn.Visible = $true
+                    $btCopyNameBtn.Tag       = Split-Path $btZipPath -Leaf
+                    $btCopyNameBtn.Visible   = $true
                 } catch {
                     Write-BtLog "Packaging failed: $($_.Exception.Message)" -Level "WARN"
                 }
@@ -10289,6 +10472,10 @@ namespace WinConfigDiag {
                         if ($uploadResult.Provider -eq 'R2') {
                             Write-BtLog "Sent to support successfully." -Level "OK"
                             $btUploadLabel.Text = "Upload: Sent to support OK"
+                            # Support identifies the capture by this name; show it
+                            # so the operator can quote it after a SUCCESSFUL send
+                            # too (it used to appear only on the kept-locally paths).
+                            $btLocalPathLabel.Text = "Uploaded file: $(Split-Path $btZipPath -Leaf)"
                             $btOutcomeLevel = 'success'
                             $btOutcomeMsg   = "Done - your Bluetooth results were captured and sent to support. You can close this window."
                         } else {
