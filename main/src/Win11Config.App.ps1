@@ -5481,7 +5481,17 @@ namespace WinConfigDiag {
                     if (-not $Snapshot -or -not $Snapshot.Exists) {
                         'Undecidable', 'NO Device Manager.config was not readable at this instant.'
                     } elseif (-not $noMac) {
-                        'Undecidable', 'No current-alias MAC could be extracted from the config (older NO layout, or the current alias has no device-table row).'
+                        # The alias-present-but-row-missing case is the stale-table
+                        # fingerprint (MM06 08-21: NO 12005'd 52/52 on Arc 019 while
+                        # its table had no row for it; a panel re-detect rewrote the
+                        # table and the errors vanished). It must not hide inside
+                        # Undecidable: table parsed, alias read, row absent is a
+                        # POSITIVE finding about NO's cache, not a failure to read.
+                        if ($Snapshot.CurrentAlias -and $Snapshot.DeviceTable -and @($Snapshot.DeviceTable).Count -gt 0) {
+                            'DefaultAliasNotInTable', "NO's current alias ($($Snapshot.CurrentAlias)) has no row in NO's own device table -- NO's cached table is stale for its default device, and NO may be opening the wrong COM ports until its Device Panel re-detects."
+                        } else {
+                            'Undecidable', 'No current-alias MAC could be extracted from the config (older NO layout, or the config carries no parsed device table).'
+                        }
                     } elseif (-not $tgtMac) {
                         'Undecidable', 'The recording has no resolved target MAC to compare against.'
                     } elseif ($noMac -eq $tgtMac) {
@@ -8026,6 +8036,8 @@ namespace WinConfigDiag {
                 $btProbeSession.NoDefaultDeviceChangeCount = 0
                 if ($btNoDefCheck.Status -eq 'Mismatch') {
                     Write-BtLog "  [!] NO's default device is $($btNoDefCheck.NoDefaultAlias) ($($btNoDefCheck.NoDefaultMac)) but this recording is scoped to $($btNoDefCheck.TargetMac). NO-side events may describe a different headset." -Level 'WARN'
+                } elseif ($btNoDefCheck.Status -eq 'DefaultAliasNotInTable') {
+                    Write-BtLog "  [!] $($btNoDefCheck.Reason)" -Level 'WARN'
                 } elseif ($btNoDefCheck.Status -eq 'Match') {
                     Write-BtLog "  NO default device: $($btNoDefCheck.NoDefaultAlias) -- matches the recording target." -Level 'DIM'
                 }
@@ -8034,7 +8046,7 @@ namespace WinConfigDiag {
                         AtUtc      = (Get-Date).ToUniversalTime().ToString('o')
                         Kind       = 'PROVENANCE'
                         State      = 'NoDefaultDevice'
-                        Level      = $(if ($btNoDefCheck.Status -eq 'Mismatch') { 'WARN' } else { 'INFO' })
+                        Level      = $(if ($btNoDefCheck.Status -in @('Mismatch', 'DefaultAliasNotInTable')) { 'WARN' } else { 'INFO' })
                         Reason     = [string]$btNoDefCheck.Reason
                         NoDefaultDeviceStatus = [string]$btNoDefCheck.Status
                         NoDefaultAlias        = $btNoDefCheck.NoDefaultAlias
@@ -8946,7 +8958,23 @@ namespace WinConfigDiag {
                         }
                     }
 
-                    # Anomaly confirmation bar handling
+                    # Anomaly confirmation bar handling.
+                    # Under a locked PANEL-OPERATION intent (Get Details, Device
+                    # tests, flash, pairing) a short COM hold ending is the
+                    # expected success path of the very click being tested, so
+                    # "was this a manual stop?" asks about an event the operator
+                    # caused deliberately -- it fired on every Get-details
+                    # release in run 457178A901B5 (operator report, 08-21).
+                    # DISPLAY-ONLY suppression: the STREAM event, its WARN level
+                    # and the events.jsonl line are measurements and unchanged;
+                    # the locked intent -- a CLAIM -- gates only this prompt and
+                    # never a verdict (the #117 boundary). RunningSession and
+                    # Other keep the prompt: there a stop genuinely is ambiguous.
+                    if ($btProbeSession.PendingConfirmation -and -not $btAnomalyBar.Visible -and
+                        $script:BtRec_OperatorIntent -in @('GetDetails', 'DeviceTests', 'DeviceFlash', 'DiscoveryPairing')) {
+                        Write-BtLog "  COM hold ended -- expected while testing '$($script:BtRec_OperatorIntentLabel)' (panel operations hold the port briefly); confirmation prompt not shown" -Level 'INFO'
+                        $btProbeSession.PendingConfirmation = $null
+                    }
                     if ($btProbeSession.PendingConfirmation -and -not $btAnomalyBar.Visible) {
                         $btAnomalyBar.Visible = $true
                         $btAnomalyBarTime = Get-Date
