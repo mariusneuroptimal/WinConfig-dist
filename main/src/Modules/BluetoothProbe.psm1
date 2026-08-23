@@ -1034,6 +1034,10 @@ function Get-BluetoothAdapterInfo {
             Status = $btAdapter.Status
             FriendlyName = $btAdapter.FriendlyName
             InstanceId = $btAdapter.InstanceId
+            # Additive (field-evidence registry): the PnP hardware IDs, when the
+            # enumeration exposes them. Null-safe -- an adapter object without
+            # the property yields an empty list, never a throw.
+            HardwareIds = @($btAdapter.HardwareID | Where-Object { $_ })
             DriverInfo = @{
                 Version = $driverInfo.DriverVersion
                 Date = $driverInfo.DriverDate
@@ -4591,6 +4595,14 @@ function Test-BluetoothSerialPortIntegrity {
         # while \GLOBAL??\COMx pointed at the dead old generation and the new
         # generation opened cleanly one layer down. Registration is not liveness.
         # Do not report a reassuring zero here; report that it is undecidable.
+        #
+        # AND THE CONVERSE, measured 2026-08-17 on the same box: 24 entries / 8
+        # names, THREE owners each, every symlink resolving -- to the LIVE
+        # generation this time -- and 4 of 8 ports opened in 0.6-2.8 ms with
+        # zero 433. So the undecidable state is genuinely undecidable in both
+        # directions. A collision is the setting, not the cause; which
+        # generation the symlink lands on is what decides the outcome, and this
+        # test cannot see that. Never let this count imply either verdict.
         $staleUndecidable = ($owners.Count -gt 1 -and $targetRegistered -eq $true)
 
         if ($owners.Count -gt 1)                 { $result.CollisionCount++ }
@@ -4624,7 +4636,7 @@ function Test-BluetoothSerialPortIntegrity {
         $result.Findings += "SYMLINK STALE: $($e.ComName) resolves to $($e.Symlink), which is NOT among the $($e.OwnerCount) device object(s) currently registered for it ($($e.DeviceObjects -join ', ')) - opens reach an abandoned device object and time out (ERROR_SEM_TIMEOUT), which looks exactly like a device that is not answering. It is not: the serial stack is stale and the fix is a reboot, NOT a radio toggle."
     }
     foreach ($e in ($result.Entries | Where-Object { $_.StaleTargetUndecidable })) {
-        $result.Findings += "SYMLINK LIVENESS UNKNOWN: $($e.ComName) resolves to $($e.Symlink), which IS among the $($e.OwnerCount) device objects registered for it ($($e.DeviceObjects -join ', ')) - but a collided name registers every generation, including abandoned ones, so this check cannot tell a live target from a dead one. Measured on a box in this exact state, the symlink pointed at the DEAD generation and every open failed with win32 433 (ERROR_NO_SUCH_DEVICE) in under 2 ms. Do not read this as evidence the port works."
+        $result.Findings += "SYMLINK LIVENESS UNKNOWN: $($e.ComName) resolves to $($e.Symlink), which IS among the $($e.OwnerCount) device objects registered for it ($($e.DeviceObjects -join ', ')) - but a collided name registers every generation, including abandoned ones, so this check cannot tell a live target from a dead one. This state has been measured with BOTH outcomes: on 2026-08-13 the symlink pointed at the DEAD generation and all 8 ports failed with win32 433 (ERROR_NO_SUCH_DEVICE) in under 2 ms; on 2026-08-17, same box and a 3-deep collision, the symlinks pointed at the LIVE generation and 4 of 8 ports opened normally in 0.6-2.8 ms. The state predicts neither outcome - only an open attempt settles it. Do not read this as evidence the port works, and do not read it as evidence the port is dead."
     }
     if (-not $result.SymlinksChecked) {
         $result.Findings += "NOTE: symlink layer not readable - collision findings only"
@@ -4775,7 +4787,7 @@ function Test-BluetoothOrphanPairingRecord {
         for a device it has merely SEEN during an inquiry, with no pairing of
         any kind. That record blocks nothing and needs no action, but the old
         logic counted it as an orphan: a 30s scan run on the dev box 2026-08-06
-        created one and OrphanCount immediately read 2. Measured against the two
+        created one and TargetOrphanCount immediately read 2. Measured against the two
         Arc records live on that box the same day:
 
                           sighting (8c1f6471000d)   pairing (8c1f64710013)
@@ -4812,8 +4824,16 @@ function Test-BluetoothOrphanPairingRecord {
         as a substring, so -TargetName 'Arc' finds 'NeurOptimal Arc - 000019'.
     .OUTPUTS
         [hashtable] Healthy, Scoped, TargetMac, TargetName, TargetState,
-        OrphanCount, ResidueCount, DormantCount, SightingCount, RecordCount,
-        Records, Findings, Summary, Recommendation, Error
+        TargetOrphanCount, ResidueCount, DormantCount, SightingCount,
+        RecordCount, Records, Findings, Summary, Recommendation, Error
+
+        TargetOrphanCount counts ONLY nodeless records for the scoped target, so
+        an unscoped run always reads 0. It was called OrphanCount until the
+        scoping landed, and the old name is deliberately GONE rather than
+        aliased: a caller doing `if ((...).OrphanCount -gt 0)` against the
+        current semantics would go silently zero on a box that does have
+        nodeless records, and a key that is absent and throws beats a key that
+        exists and lies. ResidueCount is the unscoped nodeless count.
     #>
     [CmdletBinding()]
     param(
@@ -4840,7 +4860,7 @@ function Test-BluetoothOrphanPairingRecord {
         TargetMac      = $(if ($targetHex) { $targetHex } else { $null })
         TargetName     = $(if ($TargetName) { $TargetName } else { $null })
         TargetState    = $(if ($scoped) { 'NoRecord' } else { $null })
-        OrphanCount    = 0
+        TargetOrphanCount = 0
         ResidueCount   = 0
         DormantCount   = 0
         SightingCount  = 0
@@ -4898,7 +4918,7 @@ function Test-BluetoothOrphanPairingRecord {
                  elseif ($isTarget)   { 'Orphan' }
                  else            { 'Residue' }
 
-        if ($state -eq 'Orphan')   { $result.OrphanCount++ }
+        if ($state -eq 'Orphan')   { $result.TargetOrphanCount++ }
         if ($state -eq 'Residue')  { $result.ResidueCount++ }
         if ($state -eq 'Dormant')  { $result.DormantCount++ }
         if ($state -eq 'Sighting') { $result.SightingCount++ }
@@ -8583,6 +8603,296 @@ function Invoke-BluetoothDiagnosticsAndRecord {
 
 #endregion
 
+#region Field-evidence identity (Bluetooth field-evidence registry)
+
+# Placeholder strings OEMs ship instead of a real BIOS serial. Matching one of
+# these means the serial CANNOT identify the machine: two different boxes of
+# the same make would collide on the shared constant, so the systemKey falls
+# back to the documented low-confidence basis instead of hashing it.
+$script:BtSystemSerialPlaceholders = @(
+    'TO BE FILLED BY O.E.M.', 'DEFAULT STRING', 'SYSTEM SERIAL NUMBER',
+    'SERIAL NUMBER', 'NONE', 'N/A', 'NOT APPLICABLE', 'NOT SPECIFIED',
+    'UNKNOWN', 'INVALID', '0', '00000000', '0123456789', '123456789'
+)
+
+function ConvertTo-BtSystemKey {
+    <#
+    .SYNOPSIS
+        Pure. Derives the stable systemKey the field-evidence registry joins on.
+    .DESCRIPTION
+        The raw BIOS serial is never used as a join key: the key is a SHA-256
+        over a normalized (trimmed, uppercased, whitespace-stripped) serial
+        with a versioned prefix, so the generated occurrence data can join runs
+        without carrying the serial into every derived record.
+
+        Identity rules the registry depends on:
+        - A hostname rename with the same BIOS serial stays ONE system (the
+          serial-based key ignores the machine name).
+        - Two identical models with different serials stay DIFFERENT systems.
+        - A missing or placeholder serial produces the documented LOW-confidence
+          fallback key (machine name + model), never a merge with other
+          unknown-identity systems: with no name and no model there is NO key,
+          and the caller must keep such runs unmerged.
+    .OUTPUTS
+        [hashtable] SystemKey, SystemKeySource, IdentityQuality, SerialStatus
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$SerialNumber,
+        [AllowNull()][AllowEmptyString()][string]$MachineName,
+        [AllowNull()][AllowEmptyString()][string]$Model
+    )
+
+    $hash = {
+        param([string]$text)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($text))
+            return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+        } finally { $sha.Dispose() }
+    }
+
+    $normSerial = if ($null -ne $SerialNumber) { ($SerialNumber -replace '\s', '').ToUpperInvariant() } else { '' }
+    # Placeholders are compared under the SAME normalization as the serial --
+    # 'To be filled by O.E.M.' must match with its spaces stripped, or the
+    # constant gets hashed into a shared key after all.
+    $normPlaceholders = @($script:BtSystemSerialPlaceholders | ForEach-Object { ($_ -replace '\s', '').ToUpperInvariant() })
+    $serialStatus =
+        if ([string]::IsNullOrWhiteSpace($SerialNumber)) { 'Missing' }
+        elseif ($normPlaceholders -contains $normSerial) { 'Placeholder' }
+        else { 'Ok' }
+
+    if ($serialStatus -eq 'Ok') {
+        return @{
+            SystemKey       = 's1:' + (& $hash "WinConfigBtSystem/v1|SERIAL|$normSerial")
+            SystemKeySource = 'BiosSerial'
+            IdentityQuality = 'High'
+            SerialStatus    = $serialStatus
+        }
+    }
+
+    $normName  = if ($null -ne $MachineName) { $MachineName.Trim().ToUpperInvariant() } else { '' }
+    $normModel = if ($null -ne $Model)       { $Model.Trim().ToUpperInvariant() }       else { '' }
+    if ($normName -or $normModel) {
+        return @{
+            SystemKey       = 'n1:' + (& $hash "WinConfigBtSystem/v1|NAMEMODEL|$normName|$normModel")
+            SystemKeySource = 'MachineNameModel'
+            IdentityQuality = 'Low'
+            SerialStatus    = $serialStatus
+        }
+    }
+
+    return @{
+        SystemKey       = $null
+        SystemKeySource = 'None'
+        IdentityQuality = 'None'
+        SerialStatus    = $serialStatus
+    }
+}
+
+function Resolve-BtSystemIdentity {
+    <#
+    .SYNOPSIS
+        Pure. Shapes raw identity values into the manifest SystemIdentity block.
+    .DESCRIPTION
+        Split from Get-BtSystemIdentity so tests can exercise every fallback
+        without mocking CIM. Every not-read value renders as null beside a read
+        status -- absence must stay distinguishable from an empty answer.
+    #>
+    [CmdletBinding()]
+    param([hashtable]$Raw = @{})
+
+    $get = { param([string]$k) if ($Raw.ContainsKey($k) -and -not [string]::IsNullOrWhiteSpace([string]$Raw[$k])) { [string]$Raw[$k] } else { $null } }
+
+    $serial = & $get 'BiosSerialNumber'
+    $name   = & $get 'MachineName'
+    $model  = & $get 'Model'
+    $key    = ConvertTo-BtSystemKey -SerialNumber $serial -MachineName $name -Model $model
+
+    $serialReadStatus =
+        if ($Raw.ContainsKey('BiosSerialError')) { 'Error' }
+        elseif ($key.SerialStatus -eq 'Placeholder') { 'Placeholder' }
+        elseif ($null -eq $serial) { 'Missing' }
+        else { 'Ok' }
+
+    return [ordered]@{
+        Contract             = 'WinConfig.BtSystemIdentity/v1'
+        # Raw serial rides in Path B only; the systemKey is the join key.
+        BiosSerialNumber     = $serial
+        BiosSerialReadStatus = $serialReadStatus
+        SystemKey            = $key.SystemKey
+        SystemKeySource      = $key.SystemKeySource
+        IdentityQuality      = $key.IdentityQuality
+        MachineName          = $name
+        Manufacturer         = & $get 'Manufacturer'
+        Model                = $model
+        SystemFamily         = & $get 'SystemFamily'
+        SystemSkuNumber      = & $get 'SystemSkuNumber'
+        OSArchitecture       = & $get 'OSArchitecture'
+        OSCaption            = & $get 'OSCaption'
+        OSDisplayVersion     = & $get 'OSDisplayVersion'
+        OSBuild              = & $get 'OSBuild'
+        OSUbr                = $(if ($Raw.ContainsKey('OSUbr') -and $null -ne $Raw['OSUbr'] -and "$($Raw['OSUbr'])" -match '^\d+$') { [int]$Raw['OSUbr'] } else { $null })
+        CollectionErrors     = @(foreach ($k in @('ComputerSystemError','BiosSerialError','OSError','RegistryError')) {
+            if ($Raw.ContainsKey($k) -and $Raw[$k]) { "${k}: $($Raw[$k])" }
+        })
+    }
+}
+
+function Get-BtSystemIdentity {
+    <#
+    .SYNOPSIS
+        Collects the stable system identity for the Flight Recorder manifest.
+    .DESCRIPTION
+        NEVER THROWS, NEVER BLOCKS A RECORDING. Read-only CIM/registry queries;
+        every failed read renders as null plus a read status, and the whole
+        collector degrades to a contract-shaped record with nulls.
+    .PARAMETER Raw
+        Test override: pre-collected raw values. When bound, no CIM or registry
+        query runs at all.
+    #>
+    [CmdletBinding()]
+    param([hashtable]$Raw)
+
+    try {
+        if (-not $PSBoundParameters.ContainsKey('Raw')) {
+            $Raw = @{}
+            try {
+                $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+                $Raw.MachineName     = [string]$cs.Name
+                $Raw.Manufacturer    = [string]$cs.Manufacturer
+                $Raw.Model           = [string]$cs.Model
+                $Raw.SystemFamily    = [string]$cs.SystemFamily
+                $Raw.SystemSkuNumber = [string]$cs.SystemSKUNumber
+            } catch { $Raw.ComputerSystemError = $_.Exception.Message }
+            try {
+                $Raw.BiosSerialNumber = [string](Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SerialNumber
+            } catch { $Raw.BiosSerialError = $_.Exception.Message }
+            try {
+                $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+                $Raw.OSCaption      = [string]$os.Caption
+                $Raw.OSBuild        = [string]$os.BuildNumber
+                $Raw.OSArchitecture = [string]$os.OSArchitecture
+            } catch { $Raw.OSError = $_.Exception.Message }
+            try {
+                $cv = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+                $Raw.OSDisplayVersion = [string]$cv.DisplayVersion
+                $Raw.OSUbr            = $cv.UBR
+                if (-not $Raw.ContainsKey('OSBuild') -or [string]::IsNullOrWhiteSpace([string]$Raw.OSBuild)) {
+                    $Raw.OSBuild = [string]$cv.CurrentBuild
+                }
+            } catch { $Raw.RegistryError = $_.Exception.Message }
+            if (-not $Raw.ContainsKey('MachineName') -or [string]::IsNullOrWhiteSpace([string]$Raw.MachineName)) {
+                $Raw.MachineName = [string]$env:COMPUTERNAME
+            }
+        }
+        return Resolve-BtSystemIdentity -Raw $Raw
+    } catch {
+        return [ordered]@{
+            Contract             = 'WinConfig.BtSystemIdentity/v1'
+            BiosSerialNumber     = $null
+            BiosSerialReadStatus = 'Error'
+            SystemKey            = $null
+            SystemKeySource      = 'None'
+            IdentityQuality      = 'None'
+            MachineName          = $null
+            Manufacturer         = $null
+            Model                = $null
+            SystemFamily         = $null
+            SystemSkuNumber      = $null
+            OSArchitecture       = $null
+            OSCaption            = $null
+            OSDisplayVersion     = $null
+            OSBuild              = $null
+            OSUbr                = $null
+            CollectionErrors     = @("CollectorError: $($_.Exception.Message)")
+        }
+    }
+}
+
+function Get-BtTargetDeviceIdentity {
+    <#
+    .SYNOPSIS
+        Pure. Shapes the frozen recording target into the manifest identity block.
+    .DESCRIPTION
+        Derives the Arc's DISPLAY/LABEL serial (the 000013-style number the
+        device wears) from two independent sources and reports which one
+        answered:
+
+          FriendlyNameSuffix -- the trailing digits of the frozen friendly name
+              ('NeurOptimal Arc - 000019' -> 000019). A name suffix is a LABEL
+              the stack cached, NOT a manufacturer serial, so its confidence is
+              'Reported'.
+          MacDerived -- the last 4 hex digits of the MAC read as a hex number
+              and rendered in decimal (8C1F6471000D -> 0x000D -> 000013).
+              Verified on Arcs 000013/000019; an assumption beyond those, so
+              its confidence is 'Derived'.
+
+        When both answer and agree the serial is 'Corroborated'. When they
+        DISAGREE the serial is withheld ('Conflict') and both raw derivations
+        are kept -- a wrong label sends a tech to the wrong headset with
+        confidence, which is worse than no label.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$FriendlyName,
+        [AllowNull()][AllowEmptyString()][string]$Mac,
+        [AllowNull()][AllowEmptyString()][string]$SelectionMode,
+        [AllowNull()][AllowEmptyString()][string]$SelectionReason,
+        # The target's matched PnP device nodes (the COM-port children), so a
+        # handoff can name the exact instance paths. Passed in -- this function
+        # stays pure and queries nothing.
+        [AllowNull()][AllowEmptyCollection()][array]$PnpInstanceIds
+    )
+
+    $macNorm = if ($null -ne $Mac) { ($Mac -replace '[^0-9A-Fa-f]', '').ToUpperInvariant() } else { '' }
+    if ($macNorm.Length -ne 12) { $macNorm = $null }
+
+    $nameSerial = $null
+    if ($FriendlyName -and $FriendlyName -match '-\s*(\d{4,6})\s*$') {
+        $nameSerial = $Matches[1].PadLeft(6, '0')
+    }
+
+    $macSerial = $null
+    if ($macNorm) {
+        try {
+            $macSerial = ([Convert]::ToInt32($macNorm.Substring(8, 4), 16)).ToString().PadLeft(6, '0')
+        } catch { $macSerial = $null }
+    }
+
+    $serial = $null; $source = 'None'; $confidence = 'None'
+    if ($nameSerial -and $macSerial) {
+        if ($nameSerial -eq $macSerial) {
+            $serial = $nameSerial; $source = 'FriendlyNameSuffix+MacDerived'; $confidence = 'Corroborated'
+        } else {
+            $source = 'FriendlyNameSuffix+MacDerived'; $confidence = 'Conflict'
+        }
+    } elseif ($nameSerial) {
+        $serial = $nameSerial; $source = 'FriendlyNameSuffix'; $confidence = 'Reported'
+    } elseif ($macSerial) {
+        $serial = $macSerial; $source = 'MacDerived'; $confidence = 'Derived'
+    }
+
+    return [ordered]@{
+        Contract                = 'WinConfig.BtTargetIdentity/v1'
+        FriendlyName            = $(if ([string]::IsNullOrWhiteSpace($FriendlyName)) { $null } else { [string]$FriendlyName })
+        Mac                     = $macNorm
+        TargetKey               = $(if ($macNorm) { "bt:$macNorm" }
+                                    elseif (-not [string]::IsNullOrWhiteSpace($FriendlyName)) { 'name:' + $FriendlyName.Trim().ToUpperInvariant() }
+                                    else { $null })
+        DisplaySerial           = $serial
+        DisplaySerialSource     = $source
+        DisplaySerialConfidence = $confidence
+        FriendlyNameSerial      = $nameSerial
+        MacDerivedSerial        = $macSerial
+        PnpInstanceIds          = @($PnpInstanceIds | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
+        SelectionMode           = $(if ([string]::IsNullOrWhiteSpace($SelectionMode))   { $null } else { [string]$SelectionMode })
+        SelectionReason         = $(if ([string]::IsNullOrWhiteSpace($SelectionReason)) { $null } else { [string]$SelectionReason })
+    }
+}
+
+#endregion
+
 # Export public functions
 Export-ModuleMember -Function @(
     'Get-BluetoothDiagnostics',
@@ -8693,5 +9003,11 @@ Export-ModuleMember -Function @(
     'Get-BluetoothServiceSurfaceSnapshot',
     'Get-BluetoothEventLogInventory',
     'Get-BluetoothRecentEvents',
-    'Compare-BluetoothSnapshot'
+    'Compare-BluetoothSnapshot',
+    # Field-evidence registry identity (manifest SystemIdentity /
+    # TargetDeviceIdentity blocks; see docs/BLUETOOTH_PROBE_DATA.md)
+    'ConvertTo-BtSystemKey',
+    'Resolve-BtSystemIdentity',
+    'Get-BtSystemIdentity',
+    'Get-BtTargetDeviceIdentity'
 )

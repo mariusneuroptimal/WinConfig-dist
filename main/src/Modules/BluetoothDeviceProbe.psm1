@@ -2039,7 +2039,121 @@ function Get-BluetoothEventEvidenceReport {
         StructuredTargetMatchCount = $structuredMatches
         MessageOnlyTargetMatchCount = $messageOnlyMatches
         MessageDiagnosticUse       = 'ContextOnlyLocalized'
+        AuthFailure                = (Measure-BluetoothAuthFailures -Events @($Record.Events) -TargetMac $TargetMac)
     }
+}
+
+function Measure-BluetoothAuthFailures {
+    <#
+    .SYNOPSIS
+        Pure. Counts BTHUSB Event 16 (mutual authentication failed) rows that
+        are target-matched to one headset, and stamps the latest one.
+    .DESCRIPTION
+        WHY THIS EXISTS (2026-08-23, SP6). A displaced bond produced 125
+        target-matched Event 16 rows from the FIRST session attempt onward
+        while every other sensor read healthy: pairing Present, namespace 8/8,
+        the radio link connecting and dropping on the idle-sawtooth shape. The
+        recorder collected every one of those rows and counted none of them, so
+        the link flapping was classified "expected idle state" and the
+        diagnosis was re-derived by hand from the raw System log. This is the
+        counter that makes the next displaced bond a one-tick read.
+
+        SELF-ATTRIBUTION CAVEAT, unchanged from the standing rule: the probe's
+        own open attempts also provoke Event 16, so this number counts
+        AUTHENTICATION FAILURES AGAINST THE TARGET, not external attempts. That
+        is the correct thing to count here -- a rejected key is a rejected key
+        whoever presented it -- but a reader must not read the COUNT as "N
+        NO.exe attempts failed". Event 16 counts attempts, not devices.
+
+        TARGET MATCHING uses the same normalization as
+        Get-BluetoothEventEvidenceReport: structured EventData values first,
+        the localized Message only as fallback. A row with no MAC match is NOT
+        counted -- a lone Event 16 for some other device is somebody else's
+        story. Providers are restricted to the BTHUSB family because that is
+        where Windows logs the mutual-authentication failure; BTHPORT and the
+        audio providers never carry it.
+    .OUTPUTS
+        [pscustomobject] Count / LastAtUtc / MessageOnlyCount, or $null when no
+        target MAC is available -- absent stays absent: without an identity to
+        match, "0" would be the claim "no auth failures against the target",
+        which nothing measured.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][array]$Events = @(),
+        [AllowNull()][string]$TargetMac
+    )
+
+    $normalizedTarget = if ($TargetMac) { ($TargetMac -replace '[^0-9A-Fa-f]', '').ToUpperInvariant() } else { '' }
+    if (-not $normalizedTarget) { return $null }
+
+    $count = 0
+    $messageOnly = 0
+    $lastAt = $null
+    foreach ($eventRow in @($Events)) {
+        if ($null -eq $eventRow) { continue }
+        $names = if ($eventRow -is [System.Collections.IDictionary]) { @($eventRow.Keys) } else { @($eventRow.PSObject.Properties.Name) }
+        $id = if ($names -contains 'Id') { [int]$eventRow.Id } else { -1 }
+        if ($id -ne 16) { continue }
+        $provider = if ($names -contains 'ProviderName') { [string]$eventRow.ProviderName } else { '' }
+        if ($provider -notmatch 'BTHUSB') { continue }
+
+        $eventDataValues = if ($names -contains 'EventData') { @($eventRow.EventData | ForEach-Object { [string]$_.Value }) } else { @() }
+        $structuredNormalized = (($eventDataValues -join ' ') -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+        $matched = $false
+        if ($structuredNormalized -like "*$normalizedTarget*") {
+            $matched = $true
+        } else {
+            $messageValue = if ($names -contains 'Message') { [string]$eventRow.Message } else { '' }
+            $messageNormalized = ($messageValue -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+            if ($messageNormalized -like "*$normalizedTarget*") { $matched = $true; $messageOnly++ }
+        }
+        if (-not $matched) { continue }
+
+        $count++
+        if ($names -contains 'TimeCreated' -and $eventRow.TimeCreated) {
+            $t = ([datetime]$eventRow.TimeCreated).ToUniversalTime()
+            if ($null -eq $lastAt -or $t -gt $lastAt) { $lastAt = $t }
+        }
+    }
+
+    return [pscustomobject]@{
+        PSTypeName       = 'WinConfig.BluetoothAuthFailure.Measurement'
+        Count            = $count
+        LastAtUtc        = $lastAt
+        MessageOnlyCount = $messageOnly
+    }
+}
+
+function Add-BtAuthFailureObservation {
+    <#
+    .SYNOPSIS
+        Folds one accepted event batch's auth-failure measurement into the
+        session, in place. Returns the number of NEW target-matched failures.
+    .DESCRIPTION
+        The session fields start $null (never observed). The FIRST call with a
+        resolved target MAC initializes the count to 0 -- from that point on,
+        0 is a real measurement ("watched, none seen"). Batches arriving
+        before a target is resolved change nothing, so a run that never
+        resolves its headset keeps the honest $null.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [AllowEmptyCollection()][array]$Events = @(),
+        [AllowNull()][string]$TargetMac
+    )
+
+    $m = Measure-BluetoothAuthFailures -Events $Events -TargetMac $TargetMac
+    if ($null -eq $m) { return 0 }
+    if ($null -eq $Session.BtAuthFailureCount) { $Session.BtAuthFailureCount = 0 }
+    $Session.BtAuthFailureCount += [int]$m.Count
+    if ($m.LastAtUtc) {
+        if ($null -eq $Session.BtAuthFailureLastAt -or $m.LastAtUtc -gt $Session.BtAuthFailureLastAt) {
+            $Session.BtAuthFailureLastAt = $m.LastAtUtc
+        }
+    }
+    return [int]$m.Count
 }
 
 function Complete-SerialOpenTopologyRequest {
@@ -2904,6 +3018,11 @@ function Get-BtDiagnosticChain {
         [string]$StreamState,
         [AllowEmptyCollection()][array]$HeldPorts = @(),
         [AllowEmptyCollection()][array]$UnavailablePorts = @(),
+        # Port -> raw win32 code for the unavailable set (2026-08-23). Optional:
+        # an older caller that does not pass it leaves the evidence exactly as
+        # before -- names only. $null and a missing key both mean "no code was
+        # recorded for that port" (legacy SerialPort fallback), never 0.
+        [hashtable]$UnavailablePortReasons,
         [System.Nullable[bool]]$AppRunning,
         [bool]$BtLinkEverConnected = $false,
         [bool]$PortHoldObserved = $true,
@@ -3211,7 +3330,17 @@ function Get-BtDiagnosticChain {
     # which applies the FI-012 hedge that a switched-off headset and a broken
     # serial stack are indistinguishable from the error alone.
     if ($dead.Count -gt 0) {
-        $holdEv += (New-ChainEvidence 'Observed' "$($dead -join ', ') is registered but did not open when tested. Whether that is a fault depends on the headset's power state -- see the cross-check findings in the log; this chain does not judge it.")
+        # Name each port WITH its raw win32 code when one was recorded
+        # (2026-08-23): "COM5 (error 1231)" vs "COM3 (error 121)" is the entire
+        # displaced-bond / no-response / dead-generation discrimination, and
+        # rendering the bare names forced that diagnosis to be re-run by hand.
+        # A port with no recorded code renders as the bare name -- absent stays
+        # absent.
+        $deadLabels = @($dead | ForEach-Object {
+            $code = if ($UnavailablePortReasons -and $UnavailablePortReasons.ContainsKey($_) -and $null -ne $UnavailablePortReasons[$_]) { $UnavailablePortReasons[$_] } else { $null }
+            if ($null -ne $code) { "$_ (error $code)" } else { $_ }
+        })
+        $holdEv += (New-ChainEvidence 'Observed' "$($deadLabels -join ', ') is registered but did not open when tested. Whether that is a fault depends on the headset's power state -- see the cross-check findings in the log; this chain does not judge it.")
     }
     [void]$nodes.Add(@{
         # Three dependencies merging. This is where the transport branch and the
@@ -4669,6 +4798,16 @@ function New-DeviceProbeSession {
         # fleet counting; this field is the ordering-aware answer used by the
         # verdict.
         BtLinkActiveSessionDropCount = 0
+        # Target-matched BTHUSB Event 16 (mutual authentication failed)
+        # accumulator (2026-08-23). $null until the first event batch arrives
+        # WITH a resolved target MAC -- an unmatched run keeps the honest
+        # "never observed", because 0 here is the claim "watched and saw no
+        # auth failures against this headset". Fed by
+        # Add-BtAuthFailureObservation from the App's poll merge; read by the
+        # BTLINK drop branch to mark a flap that coincides with key rejection
+        # (the displaced-bond shape the idle-sawtooth model mislabels).
+        BtAuthFailureCount       = $null
+        BtAuthFailureLastAt      = $null
         BtLinkEverConnected      = $false
         # Cross-evidence context findings are latched for the run. A scope
         # mismatch can disappear from the live inputs when NeurOptimal exits;
@@ -4785,6 +4924,17 @@ function New-DeviceProbeSession {
         # "worked, then stopped opening" must use this ordered subset.
         UnavailableAfterHeldPorts        = $(if ($apopEffective) { ,@() } else { $null })
         UnavailableAfterHeldPortsCurrent = $(if ($apopEffective) { ,@() } else { $null })
+        # Per-port WHY for the unavailable sets above (2026-08-23). The names
+        # alone forced every diagnosis to re-run the open by hand: 1231 vs 121
+        # vs 433 was the entire displaced-bond/dead-generation discrimination on
+        # SP6/MM06, and the attempt already measured it (Win32Error travels in
+        # PortOpenObservations). Current = last tick's port->code map;
+        # the unsuffixed field = session-long map keeping the LAST code seen per
+        # port, because the latest failure mode is the one a reader acts on.
+        # Hashtables, not arrays: absent measurement stays $null, observed-empty
+        # stays @{} -- same discipline as the sets they explain.
+        UnavailablePortReasonsCurrent    = $(if ($apopEffective) { @{} } else { $null })
+        UnavailablePortReasons           = $(if ($apopEffective) { @{} } else { $null })
         # ── Active-open throttle state (see Get-ActiveOpenDecision) ──────
         # The probe owns a target port for 12-23 % of every window in which
         # nobody else holds it (measured 2026-08-19 from captures 026B63C26C4D
@@ -5231,6 +5381,24 @@ function Invoke-DeviceProbeTick {
         # in the record even if it opens later.
         $Session.UnavailablePorts = @(@($Session.UnavailablePorts) + $newDeadPorts | Where-Object { $_ } | Select-Object -Unique)
         $Session.UnavailablePortsEver = @($Session.UnavailablePorts)
+        # WHY each port refused (2026-08-23): the open attempt already carries
+        # the raw win32 code (PortOpenObservations); losing it here is what made
+        # 1231-auth-refused, 121-no-response and 433-dead-generation all render
+        # as the same bare port name. Current is rebuilt each tick; the session
+        # map keeps the LAST code per port. Legacy-fallback observations carry
+        # Win32Error=$null -- recorded as absent, never as 0.
+        $reasonsNow = @{}
+        if ($streamResult -is [hashtable] -and $streamResult.ContainsKey('PortOpenObservations')) {
+            foreach ($obs in @($streamResult.PortOpenObservations)) {
+                if ($null -eq $obs) { continue }
+                if ($obs.CoarseState -eq 'Unavailable' -and $obs.PortName) {
+                    $reasonsNow[[string]$obs.PortName] = $obs.Win32Error
+                }
+            }
+        }
+        $Session.UnavailablePortReasonsCurrent = $reasonsNow
+        if ($null -eq $Session.UnavailablePortReasons) { $Session.UnavailablePortReasons = @{} }
+        foreach ($k in $reasonsNow.Keys) { $Session.UnavailablePortReasons[$k] = $reasonsNow[$k] }
         # The counterpart the record never had: which ports were held at ANY
         # point. PortEverHeld below answers the boolean; nothing answered "which".
         $Session.HeldPortsEver = @(
@@ -5559,7 +5727,24 @@ function Invoke-DeviceProbeTick {
                 $Session.BtLinkActiveSessionDropCount++
                 $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "Radio link dropped during active EEG stream$fromStr"; Annotation = "[!] Radio link lost while streaming -- this is the mid-session disconnect event"; Level = 'FAIL'; Timestamp = $now }
             } elseif ($WatchState.DeviceState -eq 'PairedCandidate') {
-                $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "Radio link dropped, device still paired$fromStr"; Annotation = "[~] Device paired but radio link down"; Level = 'WARN'; Timestamp = $now }
+                # A paired-but-dropping link is USUALLY the benign idle
+                # sawtooth (#114): the probe raises the link, the Arc parks it.
+                # But the 2026-08-23 displaced bond produced the SAME shape
+                # while the headset was rejecting the host's key -- 125
+                # target-matched Event 16 rows that this branch ignored, so the
+                # capture called a hard auth fault "expected idle". When a
+                # target-matched auth failure landed within the last two
+                # minutes, this drop is NOT idle and says so. The window is
+                # deliberately generous: the event log commits late (the batch
+                # merge rewinds 30s for the same reason) and one flap period is
+                # 30-90s.
+                $authAnno = "[~] Device paired but radio link down"
+                $authLevel = 'WARN'
+                if ($Session.BtAuthFailureLastAt -and ($now.ToUniversalTime() - $Session.BtAuthFailureLastAt).TotalSeconds -le 120) {
+                    $authAnno = "[!] Link flapping WITH mutual-authentication failures against this headset (BTHUSB Event 16, $($Session.BtAuthFailureCount) so far) -- bond suspect, not idle. Measured remedy: re-pair through the NO Device Panel."
+                    $authLevel = 'FAIL'
+                }
+                $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "Radio link dropped, device still paired$fromStr"; Annotation = $authAnno; Level = $authLevel; Timestamp = $now }
                 $Session.BtLinkFlapCount++
                 if (-not [bool]$Session.PortEverHeld) {
                     $Session.BtLinkPreSessionFlapCount++
@@ -6449,7 +6634,35 @@ function Get-DeviceProbeSessionSummary {
             if ($Session.BtLinkState -eq 'Unknown') {
                 [void]$findings.Add("[info] BT radio link state could not be read this session (no readings -- likely no MAC available)")
             } else {
-                [void]$findings.Add("[~] BT radio link never connected during this session (radio stayed disconnected) -- link stability could not be assessed")
+                # Radio never connected despite readings. If the headset was paired,
+                # its COM port(s) were present + healthy, and NO.exe was running, this
+                # is not "nothing to assess" -- it is a failed connect: NO.exe never
+                # opened the serial port, so the link never came up. Field signature
+                # 2026-07-21 ("the specified control port COMx is not valid").
+                #
+                # DELIBERATELY NAMES NO CAUSE. An earlier version of this finding
+                # asserted a "stale stored control port" on >= 4.0 and prescribed
+                # unpair + re-pair. FI-012 refutes that outright (docs/FIELD-ISSUES.md:
+                # channel->role is invariant, the COM NUMBER moves on every re-pair),
+                # and its decision table makes reboot the first move -- unpairing is
+                # the slowest, most disruptive route for the common fault. So this
+                # reports the observation and routes to the tools that discriminate,
+                # rather than shipping a mechanism the evidence no longer supports.
+                #
+                # Stays [~]: the probe cannot confirm a connection was ever ATTEMPTED.
+                # An idle NO.exe beside a paired headset presents identically.
+                $devPaired  = ($WatchState.DeviceState -eq 'PairedCandidate')
+                $comPresent = ($WatchState.ComPortState -in @('ComPortFound', 'ComPortAmbiguous'))
+                $noRunning  = ($WatchState.AppProcessState -eq 'Running')
+                if ($devPaired -and $comPresent -and $noRunning) {
+                    # Version is reported as an observed FACT, never as a gate on the
+                    # wording -- the only reason the old finding branched on it was the
+                    # refuted mechanism.
+                    $noVer = if ($Session.NoExeVersion) { " $($Session.NoExeVersion)" } else { '' }
+                    [void]$findings.Add("[~] NO.exe never connected: headset paired, COM port(s) present + healthy, NO.exe$noVer running -- but the radio link never came up. If a connection was attempted, NO.exe never opened the serial port ('the specified control port COMx is not valid'). Cause is NOT determined from this alone: discriminate with Get-BluetoothSerialPortIntegrity / Test-BluetoothSerialPortOpen (FI-012), then remediate in order reboot -> radio toggle (>=10s off) -> re-pair.")
+                } else {
+                    [void]$findings.Add("[~] BT radio link never connected during this session (radio stayed disconnected) -- link stability could not be assessed")
+                }
             }
         } elseif ($preSessionFlaps -eq 0) {
             [void]$findings.Add("[ok] BT radio link stable throughout session (no drops observed)")
@@ -6533,6 +6746,10 @@ function Get-DeviceProbeSessionSummary {
         BtLinkPreSessionFlapCount = $Session.BtLinkPreSessionFlapCount
         BtLinkActiveSessionDropCount = $Session.BtLinkActiveSessionDropCount
         BtLinkEverConnected = $Session.BtLinkEverConnected
+        # $null = never observed with a resolved target; 0 = watched, none seen
+        # (2026-08-23 displaced-bond counter).
+        BtAuthFailureCount = $Session.BtAuthFailureCount
+        BtAuthFailureLastAtUtc = if ($Session.BtAuthFailureLastAt) { $Session.BtAuthFailureLastAt.ToString('o') } else { $null }
         UnavailableAfterHeldPorts = @($Session.UnavailableAfterHeldPorts | Where-Object { $_ })
         ObservationCount = $WatchState.Observations.Count
         OperatorMarkers = @($Session.OperatorMarkers)
@@ -8248,6 +8465,8 @@ Export-ModuleMember -Function @(
     'Add-BluetoothEventEvidenceBatch',
     'Set-BluetoothEventEvidenceFinalDrain',
     'Get-BluetoothEventEvidenceReport',
+    'Measure-BluetoothAuthFailures',
+    'Add-BtAuthFailureObservation',
     'Complete-SerialOpenTopologyRequest',
     'New-SerialOpenAttemptRecord',
     'Add-SerialOpenAttempt',

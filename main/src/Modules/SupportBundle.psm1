@@ -56,7 +56,13 @@ Set-StrictMode -Off
 #   RedactInstallationLog also redacts the mysql client's attached '-p<value>'
 #   argv (FI-017 — same secret as FI-007 through a syntax the key=value pattern
 #   cannot see, shipped in the clear on adjacent lines of one bundle).
-$script:SupportBundleProbeVersion = '1.5.0'
+# 1.6.0 (2026-08-21): WIN-VISA-002 collector (FI-012 — NO reaches the Arc's COM
+#   ports through NI-VISA, so visaconf.ini is a THIRD COM identity table beside
+#   Windows SERIALCOMM/PnP and NO's own device record. Measured on SP6 holding 9
+#   stale ASRL resources while the box had ZERO COM ports, with ASRL11::INSTR
+#   and ASRL3::INSTR both mapped to COM3. Nothing collected that layer, and the
+#   existing COM-arbiter/BTHENUM remedies do not clean it).
+$script:SupportBundleProbeVersion = '1.6.0'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -131,6 +137,31 @@ $script:TrustFetchHosts   = @('ctldl.windowsupdate.com', 'crt.sectigo.com')  # K
 # a healthy 4.x box. These are the load-bearing VISA DLLs NO.exe loads from
 # System32; their presence/versions are the 4.x amp-stack facts.
 $script:VisaSystemDlls = @('nivisa64.dll', 'NiViSv64.dll', 'visa64.dll', 'visaUtilities.dll', 'visaConfMgr.dll')
+
+# FI-012 (2026-08-21, measured on SP6): NO reaches the Arc's COM ports THROUGH
+# NI-VISA, not a raw Win32 serial open — NO.exe carries nivisa64.dll and the
+# NiViAsrl.dll serial passport, and LabVIEW's serial VIs are VISA. So
+# visaconf.ini holds a THIRD COM identity table, independent of both Windows
+# SERIALCOMM/PnP and NO's own 'NO Device Manager.config', and nothing collected
+# it. On SP6 that table was STALE (9 ASRL resources persisting while the box
+# had ZERO COM ports, empty SERIALCOMM, every BTHENUM node Present=False) and
+# self-inconsistent: ASRL11::INSTR and ASRL3::INSTR BOTH mapped to COM3, and
+# the ASRL number is not the COM number. FI-012 is a COM-IDENTITY fault, so a
+# duplicate mapping sitting in the layer NO addresses ports through belongs in
+# the bundle. It also explains a gap in the remedies: a COM-arbiter reset or
+# BTHENUM ghost removal cleans the Windows layer and leaves this one untouched.
+#
+# ⚠️ MECHANISM HYPOTHESIS, NOT A MEASURED FAULT. No capture yet shows the
+# duplicate causing a failure. This collector exists to make it testable and
+# must report only what the file says — never a verdict that it caused anything.
+# ⛔ READ ONLY. Never write visaconf.ini: it is on the path NO uses to reach the
+# Arc, and repairing it blind is a write to the command channel in all but name.
+$script:VisaConfIniPath = Join-Path $env:ProgramData 'National Instruments\NIvisa\visaconf.ini'
+$script:NiVisaRegPaths = @(
+    @{ view = '64-bit'; path = 'HKLM:\SOFTWARE\National Instruments\NI-VISA' }
+    @{ view = '32-bit'; path = 'HKLM:\SOFTWARE\WOW6432Node\National Instruments\NI-VISA' }
+)
+$script:NiServiceNames = @('niauth', 'NIDomainService', 'NiSvcLoc', 'nimDNSResponder', 'niLXIDiscovery')
 
 # MsiInstaller 1918 field lesson: ODBC "driver could not be loaded" events were
 # falsely escalated; the documented triage move is checking the CURRENT ODBC
@@ -1530,6 +1561,131 @@ function Get-WinConfigSupportCollectors {
             }
         }
         @{
+            Id = 'WIN-VISA-002'; Ring = 2; RequiresAdmin = $false; RequiresZengar = $false
+            Script = {
+                param($Context)
+                # FI-012: the THIRD COM identity table. See the note on
+                # $script:VisaConfIniPath. Facts only — this reads a plain INI
+                # and reports what it says, INCLUDING where it contradicts
+                # itself. It does not decide that a contradiction caused
+                # anything, and it never writes to the file.
+                #
+                # Only the two identity sections are kept. The file also carries
+                # 256 TULIP Interface<n> lines that say nothing about COM
+                # identity and would burn the bundle's size budget.
+                $iniPath = $Context.VisaConfIniPath
+                $facts = @{
+                    visaConfPath = $iniPath
+                    present      = (Test-Path -LiteralPath $iniPath)
+                    # $null, not @(): "not read" must never render as "read, and
+                    # there were none" — an empty alias table is a real finding.
+                    asrlResources = $null
+                    aliases       = $null
+                    declared      = $null
+                    anomalies     = $null
+                    parseStatus   = 'NotAttempted'
+                }
+                if ($facts.present) {
+                    try {
+                        $item = Get-Item -LiteralPath $iniPath -ErrorAction Stop
+                        $facts.sizeBytes     = $item.Length
+                        $facts.lastWriteTime = $item.LastWriteTime.ToString('o')
+
+                        $section         = ''
+                        $asrl            = @{}
+                        $aliasList       = @()
+                        $declaredAsrl    = $null
+                        $declaredAliases = $null
+
+                        foreach ($line in (Get-Content -LiteralPath $iniPath -ErrorAction Stop)) {
+                            $trimmed = $line.Trim()
+                            if ($trimmed -match '^\[(.+)\]$') { $section = $Matches[1]; continue }
+                            # Keys are letters then an OPTIONAL trailing index:
+                            # SystemName0 -> SystemName/0, NumAliases -> NumAliases/''.
+                            if ($trimmed -notmatch '^([A-Za-z]+)(\d*)\s*=\s*(.*)$') { continue }
+                            $key = $Matches[1]
+                            $idx = $Matches[2]
+                            $val = $Matches[3].Trim().Trim('"')
+
+                            if ($section -eq 'ASRL-RSRC-ALIAS') {
+                                # NumOfResources is section-scoped: TCPIP-RSRCS
+                                # carries a key of the same name.
+                                if ($key -eq 'NumOfResources') { $declaredAsrl = [int]$val; continue }
+                                if ($idx -eq '') { continue }
+                                if (-not $asrl.ContainsKey($idx)) { $asrl[$idx] = @{ index = [int]$idx } }
+                                switch ($key) {
+                                    'Name'       { $asrl[$idx].resourceName = $val }
+                                    'SystemName' { $asrl[$idx].systemName   = $val }
+                                    'Enabled'    { $asrl[$idx].enabled      = ($val -eq '1') }
+                                    'Static'     { $asrl[$idx].static       = ($val -eq '1') }
+                                }
+                            } elseif ($section -eq 'ALIASES') {
+                                if ($key -eq 'NumAliases') { $declaredAliases = [int]$val; continue }
+                                if ($key -eq 'Alias') { $aliasList += @{ index = [int]$idx; value = $val } }
+                            }
+                        }
+
+                        $resources = @($asrl.Values | Sort-Object { $_.index })
+                        $facts.asrlResources = $resources
+                        $facts.aliases       = @($aliasList | Sort-Object { $_.index })
+                        $facts.declared      = @{ numOfResources = $declaredAsrl; numAliases = $declaredAliases }
+
+                        # Two VISA resource names resolving to one system port.
+                        $dupes = @($resources | Where-Object { $_.systemName } |
+                            Group-Object -Property { $_.systemName } | Where-Object { $_.Count -gt 1 } |
+                            ForEach-Object {
+                                @{
+                                    systemName    = "$($_.Name)"
+                                    count         = $_.Count
+                                    resourceNames = @($_.Group | ForEach-Object { "$($_.resourceName)" })
+                                }
+                            })
+
+                        # ASRL11::INSTR -> COM3 is legal and load-bearing: the
+                        # ASRL number is NOT the COM number, so anything that
+                        # infers one from the other is reading a label as an id.
+                        $mismatch = @(foreach ($res in $resources) {
+                            $asrlNum = $null; $comNum = $null
+                            if ("$($res.resourceName)" -match '(\d+)') { $asrlNum = [int]$Matches[1] }
+                            if ("$($res.systemName)"   -match '(\d+)') { $comNum  = [int]$Matches[1] }
+                            if ($null -ne $asrlNum -and $null -ne $comNum -and $asrlNum -ne $comNum) {
+                                @{ resourceName = "$($res.resourceName)"; systemName = "$($res.systemName)"; asrlNumber = $asrlNum; comNumber = $comNum }
+                            }
+                        })
+
+                        $facts.anomalies = @{
+                            duplicateSystemNames   = $dupes
+                            asrlNumberNotComNumber = $mismatch
+                            declaredCountsDisagree = ($null -ne $declaredAsrl -and $null -ne $declaredAliases -and $declaredAsrl -ne $declaredAliases)
+                            parsedVsDeclaredAsrl   = @{ declared = $declaredAsrl; parsed = $resources.Count }
+                        }
+                        $facts.parseStatus = 'Ok'
+                    } catch {
+                        # Unreadable is a fact, not a failure (§3.1)
+                        $facts.parseStatus = "Unavailable: $($_.Exception.Message)"
+                    }
+                } else {
+                    $facts.parseStatus = 'Absent'
+                }
+
+                $facts.niVisaVersions = @(foreach ($entry in $Context.NiVisaRegPaths) {
+                    $view = @{ view = $entry.view; regPath = $entry.path; present = (Test-Path $entry.path) }
+                    if ($view.present) {
+                        try { $view.currentVersion = "$((Get-ItemProperty -LiteralPath $entry.path -ErrorAction Stop).CurrentVersion)" } catch { }
+                    }
+                    $view
+                })
+
+                $facts.niServices = @(foreach ($svcName in $Context.NiServiceNames) {
+                    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                    if ($svc) { @{ name = $svcName; present = $true; status = "$($svc.Status)"; startType = "$($svc.StartType)" } }
+                    else      { @{ name = $svcName; present = $false } }
+                })
+
+                @{ Facts = $facts }
+            }
+        }
+        @{
             Id = 'WIN-ODBC-001'; Ring = 2; RequiresAdmin = $false; RequiresZengar = $false
             Script = {
                 param($Context)
@@ -1936,6 +2092,9 @@ function Invoke-WinConfigSupportCollection {
         SectigoE46Thumb  = $script:SectigoE46Thumb
         ZampVidMatch     = $script:ZampVidMatch
         VisaSystemDlls   = $script:VisaSystemDlls
+        VisaConfIniPath  = $script:VisaConfIniPath
+        NiVisaRegPaths   = $script:NiVisaRegPaths
+        NiServiceNames   = $script:NiServiceNames
         OdbcInstRegPaths = $script:OdbcInstRegPaths
         ExternalComponents = $script:ExternalComponentTargets
         UninstallRegPaths  = $script:UninstallRegPaths
