@@ -5741,7 +5741,7 @@ function Invoke-DeviceProbeTick {
                 $authAnno = "[~] Device paired but radio link down"
                 $authLevel = 'WARN'
                 if ($Session.BtAuthFailureLastAt -and ($now.ToUniversalTime() - $Session.BtAuthFailureLastAt).TotalSeconds -le 120) {
-                    $authAnno = "[!] Link flapping WITH mutual-authentication failures against this headset (BTHUSB Event 16, $($Session.BtAuthFailureCount) so far) -- bond suspect, not idle. Measured remedy: re-pair through the NO Device Panel."
+                    $authAnno = "[!] Link flapping WITH mutual-authentication failures against this headset (BTHUSB Event 16, $($Session.BtAuthFailureCount) so far) -- bond suspect, not idle. Measured remedy: re-pair through the NO Device Panel; the first session attempt after the re-pair may still fail 12005 while the link is flapping -- one Try Again cleared it (2026-08-23 SP6 rep #4)."
                     $authLevel = 'FAIL'
                 }
                 $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "Radio link dropped, device still paired$fromStr"; Annotation = $authAnno; Level = $authLevel; Timestamp = $now }

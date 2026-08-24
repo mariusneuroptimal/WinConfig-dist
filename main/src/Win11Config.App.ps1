@@ -5920,6 +5920,7 @@ namespace WinConfigDiag {
                 @{ Enum = 'DeviceFlash';     Label = 'Device Flash' }
                 @{ Enum = 'GetDetails';      Label = 'Get Details' }
                 @{ Enum = 'DeviceTests';     Label = 'Device Tests' }
+                @{ Enum = 'SessionPauseResume'; Label = 'Session Pause/Resume' }
                 @{ Enum = 'Other';           Label = 'Other' }
             )
             # Null until the lock at recording start writes it; the manifest
@@ -9107,9 +9108,14 @@ namespace WinConfigDiag {
                     # the locked intent -- a CLAIM -- gates only this prompt and
                     # never a verdict (the #117 boundary). RunningSession and
                     # Other keep the prompt: there a stop genuinely is ambiguous.
+                    # SessionPauseResume is in the set for the same reason as the
+                    # panel operations: the operator is deliberately stopping the
+                    # stream over and over (run 54673AE24281 logged 18+ stop
+                    # WARNs in one pause/resume stress run), so "was this a
+                    # manual stop?" asks about the very click being tested.
                     if ($btProbeSession.PendingConfirmation -and -not $btAnomalyBar.Visible -and
-                        $script:BtRec_OperatorIntent -in @('GetDetails', 'DeviceTests', 'DeviceFlash', 'DiscoveryPairing')) {
-                        Write-BtLog "  COM hold ended -- expected while testing '$($script:BtRec_OperatorIntentLabel)' (panel operations hold the port briefly); confirmation prompt not shown" -Level 'INFO'
+                        $script:BtRec_OperatorIntent -in @('GetDetails', 'DeviceTests', 'DeviceFlash', 'DiscoveryPairing', 'SessionPauseResume')) {
+                        Write-BtLog "  COM hold ended -- expected while testing '$($script:BtRec_OperatorIntentLabel)' (panel operations and pause/resume release the port deliberately); confirmation prompt not shown" -Level 'INFO'
                         $btProbeSession.PendingConfirmation = $null
                     }
                     if ($btProbeSession.PendingConfirmation -and -not $btAnomalyBar.Visible) {
