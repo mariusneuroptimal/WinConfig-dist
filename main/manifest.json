@@ -1,8 +1,8 @@
 {
-    "timestamp":  "2026-08-26T13:31:22.3247683Z",
+    "timestamp":  "2026-08-26T14:04:10.1488507Z",
     "branch":  "main",
     "schema_version":  "2.0",
-    "source_ref":  "7fc575001e77d0633be89dbe8b6d99c19910e323",
+    "source_ref":  "ee9e26dcc2a6222d7cd7d2ab2ba9a3801e4b835a",
     "artifacts":  [
                       {
                           "path":  "Win11Config.ps1",
@@ -160,6 +160,6 @@
                           "size":  486592
                       }
                   ],
-    "build_id":  "manual-20260826093122",
+    "build_id":  "manual-20260826100410",
     "event":  "manual"
 }
