@@ -6065,7 +6065,7 @@ namespace WinConfigDiag {
             # are the runspace's, so the timeline stays sub-second even when
             # the loop is busy.
             function script:Invoke-BtNoWindowSampler {
-                param([string]$RunFolder)
+                param([string]$RunFolder, $Session, $Watch)
                 $st = $script:BtRec_NoWinSampler
                 if (-not $st) { return }
                 try {
@@ -6078,6 +6078,25 @@ namespace WinConfigDiag {
                         $w = $item
                         $cls = script:Get-BtNoWindowClass -Title $w.Title
                         $utc = ([datetime]$w.AtUtc).ToString('o')
+                        # The two automations that retire the routine operator
+                        # Mark (operator-requested 2026-08-26): the NO code,
+                        # INFERRED from the proven title lexicon (a typed Mark
+                        # stays the ground truth for any OTHER code), and the
+                        # machine state at the dialog, bound below.
+                        $impliedCode = $null
+                        if ($w.Title -match '^Arc Not Detected')        { $impliedCode = 12005 }
+                        elseif ($w.Title -match '^Arc Connection Lost') { $impliedCode = 12006 }
+                        $dlgSnap = $null
+                        $dlgSnapLagMs = $null
+                        if ($w.State -eq 'Appeared' -and $cls -eq 'ErrorDialog' -and $Session) {
+                            # State snapshot bound to the dialog row, exactly
+                            # what a Mark used to record. Taken at DRAIN time --
+                            # the lag is stated on the row, so a reader knows
+                            # how stale the binding is (usually well under a
+                            # tick; the row timestamp itself is the runspace's).
+                            $dlgSnap = try { script:Get-BtShotStateSnapshot -Session $Session -Watch $Watch } catch { $null }
+                            if ($dlgSnap) { $dlgSnapLagMs = [int]([datetime]::UtcNow - [datetime]$w.AtUtc).TotalMilliseconds }
+                        }
                         if ($w.State -eq 'Appeared') {
                             # Baseline windows never reach the queue, so every
                             # Appeared row is a real mid-run appearance.
@@ -6112,6 +6131,19 @@ namespace WinConfigDiag {
                                 # 3 s vs 6.5 s fault discriminator, measured.
                                 # Null on Appeared rows and on baseline windows.
                                 LifetimeMs = $w.LifetimeMs
+                                # INFERRED from the title lexicon ('Arc Not
+                                # Detected' = 12005, 'Arc Connection Lost' =
+                                # 12006); a typed operator Mark remains the
+                                # ground truth for any other code. Null when
+                                # the title implies nothing.
+                                ImpliedNoCode = $impliedCode
+                                # The machine state a Mark used to bind by
+                                # hand -- attached automatically to every
+                                # error-dialog appearance, with the binding's
+                                # own staleness stated beside it. Null on
+                                # every other row.
+                                MachineState  = $dlgSnap
+                                StateSnapshotLagMs = $dlgSnapLagMs
                             })
                             if ($wrote) { $st.EventLinesWritten = [int]$st.EventLinesWritten + 1 }
                             else { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
@@ -6136,7 +6168,7 @@ namespace WinConfigDiag {
             }
 
             function script:Stop-BtNoWindowSampler {
-                param([string]$RunFolder)
+                param([string]$RunFolder, $Session, $Watch)
                 $st = $script:BtRec_NoWinSampler
                 if (-not $st) { return }
                 try { $st.Control.Stop = $true } catch { }
@@ -6146,7 +6178,7 @@ namespace WinConfigDiag {
                 $st.StoppedUtc = [datetime]::UtcNow
                 # Final drain AFTER the thread stops, so a dialog open at Stop
                 # still gets its Gone row and the summary counts everything.
-                script:Invoke-BtNoWindowSampler -RunFolder $RunFolder
+                script:Invoke-BtNoWindowSampler -RunFolder $RunFolder -Session $Session -Watch $Watch
                 try { $st.Shell.Dispose() } catch { }
                 try { $st.Runspace.Dispose() } catch { }
             }
@@ -8931,7 +8963,7 @@ namespace WinConfigDiag {
                 # write NOWINDOW rows, fire the immediate error-dialog shot.
                 # The drain can lag on a busy tick; the row timestamps are the
                 # runspace's, so the timeline stays sub-second regardless.
-                script:Invoke-BtNoWindowSampler -RunFolder $(if ($btDiagRun) { $btDiagRun.RunFolder } else { $null })
+                script:Invoke-BtNoWindowSampler -RunFolder $(if ($btDiagRun) { $btDiagRun.RunFolder } else { $null }) -Session $btProbeSession -Watch $btProbeWatch
 
                 # Update elapsed label with current state summary.
                 #
@@ -9592,7 +9624,7 @@ namespace WinConfigDiag {
             # Stop the background NO-window sampler and run the FINAL drain, so
             # a dialog still open at Stop gets its Gone row and the summary
             # below counts everything the runspace observed.
-            script:Stop-BtNoWindowSampler -RunFolder $(if ($btDiagRun) { $btDiagRun.RunFolder } else { $null })
+            script:Stop-BtNoWindowSampler -RunFolder $(if ($btDiagRun) { $btDiagRun.RunFolder } else { $null }) -Session $btProbeSession -Watch $btProbeWatch
 
             # Both operator paths out of the recording are closed the instant the
             # loop exits. A live-looking Abort during packaging would promise an
@@ -9963,7 +9995,19 @@ namespace WinConfigDiag {
                         # [i], not [!]: under a panel-operation intent the dialogs
                         # ARE the thing under test, and NO's codes are 1:many --
                         # a dialog is NO's claim, never a transport verdict.
-                        $btProbeSummary.Findings = @($btProbeSummary.Findings) + "[i] NeurOptimal showed $btNwErrCount error dialog(s) during this recording ('$btNwErrList'$btNwShortest) -- sub-second timeline with lifetimes in events.jsonl (Kind=NOWINDOW). Read beside the link/port evidence; the dialog text itself is only in screenshots."
+                        $btProbeSummary.Findings = @($btProbeSummary.Findings) + "[i] NeurOptimal showed $btNwErrCount error dialog(s) during this recording ('$btNwErrList'$btNwShortest) -- sub-second timeline with lifetimes, inferred NO codes, and per-dialog machine state in events.jsonl (Kind=NOWINDOW). Read beside the link/port evidence; the dialog text itself is only in screenshots."
+                        # The module's no-markers caveat says the record cannot
+                        # attribute a dialog to a machine state. Since the
+                        # sampler binds a state snapshot to every error-dialog
+                        # row, that claim is now false whenever dialogs were
+                        # captured -- replace it rather than let the report
+                        # contradict itself. (The module cannot see the
+                        # App-side sampler, so the correction lives here.)
+                        $btProbeSummary.Findings = @($btProbeSummary.Findings | ForEach-Object {
+                            if ($_ -like '`[info`] No operator markers in this recording.*') {
+                                "[info] No operator markers in this recording; the window sampler bound machine state to each of the $btNwErrCount error dialog(s) automatically. A typed Mark is still the ground truth for a NO code the title lexicon does not imply."
+                            } else { $_ }
+                        })
                     }
                 }
 
