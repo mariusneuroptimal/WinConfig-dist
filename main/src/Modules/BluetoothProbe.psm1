@@ -4388,6 +4388,12 @@ function Get-BluetoothSerialTroubleshootingResponse {
         Title            = $null
         LikelyCause      = $null
         Impact           = $null
+        # Recorder-mode status ("recording continues PASSIVE-ONLY") used to be
+        # Steps[1]. It is a statement about what the recorder will do, not an
+        # action the operator takes, so it moved out of the numbered list
+        # (2026-08-26): the dialog renders it in the status area and Steps
+        # stays pure operator actions.
+        RecorderModeNotice = $null
         Steps            = @()
         Summary          = if ($Readiness) { [string]$Readiness.Summary } else { 'Bluetooth serial readiness could not be verified.' }
     }
@@ -4455,6 +4461,11 @@ function Get-BluetoothSerialTroubleshootingResponse {
             default       { "Windows Bluetooth/RFCOMM registrations accumulated or became stale during this boot. $mechanisms This sample alone does not prove which event triggered it." }
         }
 
+        if ($status -eq 'PassiveOnly') {
+            $result.RecorderModeNotice = 'The Bluetooth recording will continue in PASSIVE-ONLY mode: this recorder will not open any serial port while the fault is present.'
+        }
+        # Steps are pure operator actions, ordered by what to do first; the
+        # passive-only recorder notice lives in RecorderModeNotice above.
         if ($RecorderActive) {
             $result.Steps = @(
                 'Stop and save/upload the current Bluetooth recording before rebooting.',
@@ -4465,25 +4476,20 @@ function Get-BluetoothSerialTroubleshootingResponse {
             )
         } elseif ($NoExeRunning) {
             $result.Steps = @(
-                $(if ($status -eq 'PassiveOnly') { 'The Bluetooth recording will continue in PASSIVE-ONLY mode: this recorder will not open any serial port while the fault is present.' }),
-                'Do not start another NO session or open additional Bluetooth serial ports.',
                 'If the current NO session has work in progress, finish or save it if possible, then close NO.',
+                'Do not start another NO session or open additional Bluetooth serial ports.',
                 'Reboot Windows without unpairing the Bluetooth device.',
                 'After sign-in, run Bluetooth Diagnostics again before starting NO; proceed only when serial readiness is Ready.',
                 'Do not unpair/re-pair, toggle the radio, or reset COM numbers for this signature.'
             )
         } else {
             $result.Steps = @(
-                $(if ($status -eq 'PassiveOnly') { 'The Bluetooth recording will continue in PASSIVE-ONLY mode: this recorder will not open any serial port while the fault is present.' }),
                 'Do not start NO or open a Bluetooth serial port in the current state.',
                 'Reboot Windows without unpairing the Bluetooth device.',
                 'After sign-in, run Bluetooth Diagnostics again before starting NO; proceed only when serial readiness is Ready.',
                 'Do not unpair/re-pair, toggle the radio, or reset COM numbers for this signature.'
             )
         }
-        # The array-subexpression steps above contribute $null when the branch
-        # is inactive; strip them so Steps stays a clean ordered list.
-        $result.Steps = @($result.Steps | Where-Object { $_ })
         return $result
     }
 

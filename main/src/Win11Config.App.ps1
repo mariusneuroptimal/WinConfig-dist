@@ -4597,7 +4597,12 @@ $buttonHandlers = @{
                 # Preserve the complete registration/symlink table, power
                 # correlation, and whether NO was already running. Do not upload
                 # automatically; the operator owns that external action.
-                if ($btPfResponse.StopRecorderStart -and
+                # Gate on the confirmed-fault statuses, not StopRecorderStart:
+                # since D3 a confirmed fault reports PassiveOnly with
+                # StopRecorderStart=$false, which silently stopped this
+                # preservation ever running (found live on MM06 2026-08-26 --
+                # confirmed FI-012 preflight, no evidence zip).
+                if ($btPfResponse.Status -in @('Blocked', 'PassiveOnly') -and
                     (Get-Command New-WinConfigDiagnosticRun -ErrorAction SilentlyContinue) -and
                     (Get-Command Add-WinConfigDiagnosticArtifact -ErrorAction SilentlyContinue) -and
                     (Get-Command Compress-WinConfigDiagnosticRun -ErrorAction SilentlyContinue)) {
@@ -4633,7 +4638,7 @@ $buttonHandlers = @{
                             SerialPortDanglingSymlinkCount     = $btSerialPreflight.DanglingSymlinkCount
                             SerialResumeCountSinceBoot         = $btSerialPreflight.ResumeCountSinceBoot
                             NoExeRunning                       = ($btNoProcesses.Count -gt 0)
-                            RecorderStartPrevented             = $true
+                            RecorderStartPrevented             = [bool]$btPfResponse.StopRecorderStart
                             PassiveCheckOpenedSerialPort       = $false
                         })
                         $btPfHost = ($env:COMPUTERNAME -replace '[^A-Za-z0-9]', '').ToUpper()
@@ -4645,18 +4650,100 @@ $buttonHandlers = @{
                     }
                 }
 
+                # Structured dialog replacing the former single-string
+                # MessageBox: the operator acts on the numbered steps, so they
+                # render first and largest; the cause/impact prose (measurement-
+                # calibrated, regression-tested wording -- rendered verbatim)
+                # is demoted to a dimmed Details section below them. Every
+                # control gets explicit colors: BackColor is ambient in
+                # WinForms and this dialog must stay readable on any parent.
                 $btPfSteps = @($btPfResponse.Steps)
-                $btPfStepText = if ($btPfSteps.Count -gt 0) {
-                    ((0..($btPfSteps.Count - 1) | ForEach-Object { "$($_ + 1). $($btPfSteps[$_])" }) -join "`n")
-                } else { '' }
                 $btPfAppText = if ($btNoProcesses.Count -gt 0) { 'NO.exe is currently running.' } else { 'NO.exe is currently closed.' }
-                $btPfEvidenceText = if ($btPfEvidencePath) { "`n`nEvidence saved locally:`n$btPfEvidencePath" } else { '' }
-                [System.Windows.Forms.MessageBox]::Show(
-                    "$($btPfResponse.Summary)`n`nLikely cause:`n$($btPfResponse.LikelyCause)`n`nImpact:`n$($btPfResponse.Impact)`n`nCurrent application state:`n$btPfAppText`n`nWhat to do:`n$btPfStepText`n`nThis passive check opened no serial port and changed no pairing or process state.$btPfEvidenceText",
-                    $btPfResponse.Title,
-                    [System.Windows.Forms.MessageBoxButtons]::OK,
-                    [System.Windows.Forms.MessageBoxIcon]::Warning
-                ) | Out-Null
+                $btPfDlg = New-Object System.Windows.Forms.Form
+                $btPfDlg.Text            = $(if ($btPfResponse.Title) { [string]$btPfResponse.Title } else { 'Bluetooth Serial Readiness' })
+                $btPfDlg.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+                $btPfDlg.MaximizeBox     = $false
+                $btPfDlg.MinimizeBox     = $false
+                $btPfDlg.ShowInTaskbar   = $false
+                $btPfDlg.StartPosition   = [System.Windows.Forms.FormStartPosition]::CenterScreen
+                $btPfDlg.BackColor       = [System.Drawing.Color]::White
+                $btPfInk  = [System.Drawing.Color]::FromArgb(24, 24, 24)
+                $btPfDim  = [System.Drawing.Color]::FromArgb(96, 96, 96)
+                $btPfWarn = [System.Drawing.Color]::FromArgb(154, 92, 0)
+                $btPfFontHead    = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+                $btPfFontSection = New-Object System.Drawing.Font('Segoe UI', 9,  [System.Drawing.FontStyle]::Bold)
+                $btPfFontStep    = New-Object System.Drawing.Font('Segoe UI', 10)
+                $btPfFontDim     = New-Object System.Drawing.Font('Segoe UI', 8.5)
+                $btPfFlow = New-Object System.Windows.Forms.FlowLayoutPanel
+                $btPfFlow.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+                $btPfFlow.WrapContents  = $false
+                $btPfFlow.AutoScroll    = $true
+                $btPfFlow.Dock          = [System.Windows.Forms.DockStyle]::Fill
+                $btPfFlow.BackColor     = [System.Drawing.Color]::White
+                $btPfFlow.Padding       = New-Object System.Windows.Forms.Padding(16, 14, 16, 6)
+                # 584 client - 32 padding - 17 vertical scrollbar - slack:
+                # wider labels force a horizontal scrollbar when content
+                # overflows vertically.
+                $btPfTextWidth = 520
+                $btPfAddLabel = {
+                    param($text, $font, $color, [int]$topPad, [int]$leftPad)
+                    $l = New-Object System.Windows.Forms.Label
+                    $l.Text        = [string]$text
+                    $l.Font        = $font
+                    $l.ForeColor   = $color
+                    $l.BackColor   = [System.Drawing.Color]::White
+                    $l.AutoSize    = $true
+                    $l.MaximumSize = New-Object System.Drawing.Size(($btPfTextWidth - $leftPad), 0)
+                    $l.Margin      = New-Object System.Windows.Forms.Padding($leftPad, $topPad, 0, 0)
+                    $btPfFlow.Controls.Add($l)
+                }
+                & $btPfAddLabel $btPfResponse.Summary $btPfFontHead $btPfWarn 0 0
+                & $btPfAddLabel $btPfAppText $btPfFontDim $btPfDim 10 0
+                if ($btPfResponse.RecorderModeNotice) {
+                    & $btPfAddLabel $btPfResponse.RecorderModeNotice $btPfFontDim $btPfDim 3 0
+                }
+                & $btPfAddLabel 'WHAT TO DO' $btPfFontSection $btPfInk 16 0
+                for ($btPfI = 0; $btPfI -lt $btPfSteps.Count; $btPfI++) {
+                    & $btPfAddLabel "$($btPfI + 1).  $($btPfSteps[$btPfI])" $btPfFontStep $btPfInk 7 8
+                }
+                & $btPfAddLabel 'Details' $btPfFontSection $btPfDim 18 0
+                if ($btPfResponse.LikelyCause) {
+                    & $btPfAddLabel "Likely cause: $($btPfResponse.LikelyCause)" $btPfFontDim $btPfDim 5 0
+                }
+                if ($btPfResponse.Impact) {
+                    & $btPfAddLabel "Impact: $($btPfResponse.Impact)" $btPfFontDim $btPfDim 5 0
+                }
+                $btPfFooter = 'This passive check opened no serial port and changed no pairing or process state.'
+                if ($btPfEvidencePath) { $btPfFooter += "`nEvidence saved locally: $btPfEvidencePath" }
+                & $btPfAddLabel $btPfFooter $btPfFontDim $btPfDim 12 0
+                $btPfBtnPanel = New-Object System.Windows.Forms.Panel
+                $btPfBtnPanel.Dock      = [System.Windows.Forms.DockStyle]::Bottom
+                # Match the final client width BEFORE the right-anchored button
+                # is added: anchoring tracks resize deltas, so a button placed
+                # in the default 200px-wide panel slides off-form when docking
+                # stretches the panel to 584.
+                $btPfBtnPanel.Size      = New-Object System.Drawing.Size(584, 46)
+                $btPfBtnPanel.BackColor = [System.Drawing.Color]::FromArgb(243, 243, 243)
+                $btPfOk = New-Object System.Windows.Forms.Button
+                $btPfOk.Text = 'OK'
+                $btPfOk.Size = New-Object System.Drawing.Size(88, 28)
+                $btPfOk.Location = New-Object System.Drawing.Point((584 - 88 - 16), 9)
+                $btPfOk.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+                $btPfOk.UseVisualStyleBackColor = $true
+                $btPfOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+                $btPfBtnPanel.Controls.Add($btPfOk)
+                $btPfDlg.Controls.Add($btPfFlow)
+                $btPfDlg.Controls.Add($btPfBtnPanel)
+                $btPfDlg.AcceptButton = $btPfOk
+                $btPfDlg.CancelButton = $btPfOk
+                # Size to content, capped for small screens; overflow scrolls.
+                $btPfContentH = $btPfFlow.Padding.Vertical
+                foreach ($btPfCtl in $btPfFlow.Controls) {
+                    $btPfContentH += $btPfCtl.GetPreferredSize((New-Object System.Drawing.Size($btPfCtl.MaximumSize.Width, 0))).Height + $btPfCtl.Margin.Top
+                }
+                $btPfDlg.ClientSize = New-Object System.Drawing.Size(584, ([Math]::Min(700, $btPfContentH + $btPfBtnPanel.Height + 16)))
+                $btPfDlg.ShowDialog() | Out-Null
+                $btPfDlg.Dispose()
 
                 if ($btPfResponse.StopRecorderStart) { return }
             }
