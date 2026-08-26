@@ -2479,6 +2479,57 @@ function Get-SerialOpenAttemptReport {
     }
 }
 
+function Get-LinkParkedAfterHeldPorts {
+    <#
+    .SYNOPSIS
+        Pure. Returns the subset of unavailable-after-held ports whose recorded
+        failure is explained by the Bluetooth link re-parking, not by the port's
+        registration being lost.
+    .DESCRIPTION
+        "Held earlier, unavailable later" reads as in-run namespace loss, and on
+        2026-08-26 (MM06, 4.0.0.7, run DBB602AB5684) that sentence was a FALSE
+        ALARM: NO released the control port, the ACL link re-parked ~6 s later,
+        and the probe's next open timed out with win32=121 -- ordinary link
+        behaviour, SerialIntegrityHealthy=true throughout. The temporal ordering
+        alone cannot carry the claim; the failure code and the link state at the
+        failed open can.
+
+        A port is link-park-explained only on POSITIVE evidence of both:
+          - win32 121 (ERROR_SEM_TIMEOUT: the ~5 s parked-link open timeout) or
+            1167 (ERROR_DEVICE_NOT_CONNECTED: the drop-instant fast fail,
+            ~160 ms, first seen in the field 2026-08-26), AND
+          - the recorded link state at that observation was not 'Connected'.
+        A missing code, a missing context entry, or any other code (433/2/3 are
+        dead-object signatures; 1231 is auth refusal) keeps the port in the
+        in-run-loss set. Downgrading on absence of evidence would re-open #81's
+        hole from the other side.
+    .PARAMETER Context
+        The session's UnavailableAfterHeldContext map (port -> Win32Error,
+        BtLinkState, AtUtc), captured on the tick each port entered the
+        after-held set. $null (unobserved) explains nothing.
+    .OUTPUTS
+        [array] the explained subset, possibly empty.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][array]$Ports = @(),
+        [hashtable]$Context
+    )
+    # NO leading comma on these returns: every call site wraps the call in @()
+    # (the module-wide convention for list-returning helpers), and a ,@() here
+    # would nest -- @(,@()) is a ONE-element array holding an empty array, which
+    # made `.Count -gt 0` true on no evidence at all when this was first written.
+    if ($null -eq $Context) { return @() }
+    @($Ports | Where-Object {
+        $p = [string]$_
+        if (-not $p -or -not $Context.ContainsKey($p)) { return $false }
+        $ctx = $Context[$p]
+        $code = if ($ctx -is [hashtable] -and $ctx.ContainsKey('Win32Error')) { $ctx.Win32Error } else { $null }
+        $link = if ($ctx -is [hashtable] -and $ctx.ContainsKey('BtLinkState')) { [string]$ctx.BtLinkState } else { '' }
+        ($null -ne $code) -and ([int]$code -in 121, 1167) -and ($link -ne 'Connected')
+    })
+}
+
 function Get-ProbeStateConsistency {
     <#
     .SYNOPSIS
@@ -2540,6 +2591,11 @@ function Get-ProbeStateConsistency {
         # on an earlier tick and unavailable on a later one.  This is the only
         # evidence that can support "reachable earlier, then stopped opening".
         [AllowEmptyCollection()][array]$UnavailableAfterHeldPorts = @(),
+        # Per-port WHY for the after-held set (port -> Win32Error, BtLinkState,
+        # AtUtc). Feeds the link-park guard: 121/1167 with no link underneath is
+        # the Arc's ordinary re-park after a release, not in-run port loss
+        # (false alarm, 2026-08-26). $null = not captured; explains nothing.
+        [hashtable]$UnavailableAfterHeldContext,
         [System.Nullable[bool]]$AppRunning,
         [bool]$CpuStalled = $false,
         [bool]$IoStalled = $false,
@@ -2567,6 +2623,13 @@ function Get-ProbeStateConsistency {
     $afterHeld = @($UnavailableAfterHeldPorts | Where-Object {
         $_ -and $_ -in $dead
     } | Select-Object -Unique)
+    # Link-park guard (2026-08-26): held-then-unavailable where the recorded
+    # failure is 121/1167 with no link underneath is the ACL re-parking after
+    # the holder released the port. It stays out of the FAIL corroboration and
+    # gets its own INFO line below; the integrity-fault branch is unaffected
+    # (an OS-level fault corroborates regardless of the open's error code).
+    $linkParked = @(Get-LinkParkedAfterHeldPorts -Ports $afterHeld -Context $UnavailableAfterHeldContext)
+    $afterHeld  = @($afterHeld | Where-Object { $_ -notin $linkParked })
     $heldStr  = if ($held.Count -gt 0) { $held -join ', ' } else { 'a COM port' }
     # The Arc exposes two SPP channels, so a held-port list is routinely plural.
     # These findings are read by clinic techs; "COM3, COM6 is held open" reads as
@@ -2601,7 +2664,18 @@ function Get-ProbeStateConsistency {
         # Wrap the conditional itself: PowerShell otherwise unwraps a one-item
         # branch to a scalar under StrictMode, where `.Count` is unavailable.
         $failedDead = @(if ($SerialIntegrityFault) { $dead } else { $afterHeld })
-        $uncorroboratedDead = @($dead | Where-Object { $_ -notin $failedDead })
+        $uncorroboratedDead = @($dead | Where-Object { $_ -notin $failedDead -and $_ -notin $linkParked })
+
+        if (-not $SerialIntegrityFault -and $linkParked.Count -gt 0) {
+            $parkedCodes = ($linkParked | ForEach-Object {
+                $c = $UnavailableAfterHeldContext[[string]$_].Win32Error
+                "$_ (win32=$c)"
+            }) -join ', '
+            $out += @{
+                Level = 'INFO'
+                Text  = "[i] $parkedCodes was held earlier and later refused to open while the radio reported no link to the headset. That code+link combination is the signature of the Bluetooth link re-parking after the holder released the port (121 = the ~5 s parked-link open timeout; 1167 = the drop-instant fast fail), not of the port's registration being lost -- an idle Arc parks its link within seconds of a release. This is NOT counted as in-run port loss. If it repeats while Windows shows the headset connected, run the serial port integrity check with NO.exe closed."
+            }
+        }
 
         if ($failedDead.Count -gt 0) {
             $why = if ($SerialIntegrityFault) {
@@ -4351,6 +4425,12 @@ function New-ProbeStateMarker {
         [AllowEmptyCollection()][array]$HeldPorts = @(),
         [AllowEmptyCollection()][array]$UnavailablePorts = @(),
         [AllowEmptyCollection()][array]$UnavailableAfterHeldPorts = @(),
+        # Per-port failure context for the after-held set (see
+        # Get-LinkParkedAfterHeldPorts). Reaches both the cross-check and the
+        # stored marker: the archive is clustered offline, and a marker that
+        # says "held then unavailable" without saying "121, no link" re-creates
+        # the 2026-08-26 false alarm for every future reader.
+        [hashtable]$UnavailableAfterHeldContext,
         [System.Nullable[bool]]$AppRunning,
         [string]$NoExeVersion,
         [string]$IoVerdict,
@@ -4393,6 +4473,7 @@ function New-ProbeStateMarker {
         -BtLinkState $BtLinkState -StreamState $StreamState `
         -HeldPorts $HeldPorts -UnavailablePorts $UnavailablePorts `
         -UnavailableAfterHeldPorts $UnavailableAfterHeldPorts `
+        -UnavailableAfterHeldContext $UnavailableAfterHeldContext `
         -AppRunning $AppRunning -IoStalled ($IoVerdict -eq 'Collapsed') `
         -IoDegrading ($IoVerdict -eq 'Degrading') `
         -SerialIntegrityFault $SerialIntegrityFault -TargetEverActive $TargetEverActive `
@@ -4426,6 +4507,12 @@ function New-ProbeStateMarker {
         HeldPorts        = $(if ($PortHoldObserved) { ,@($HeldPorts | Where-Object { $_ }) } else { $null })
         UnavailablePorts = $(if ($PortHoldObserved) { ,@($UnavailablePorts | Where-Object { $_ }) } else { $null })
         UnavailableAfterHeldPorts = $(if ($PortHoldObserved) { ,@($UnavailableAfterHeldPorts | Where-Object { $_ }) } else { $null })
+        # The subset of the line above whose failure the link-park guard
+        # explains (121/1167 with no link underneath -- see
+        # Get-LinkParkedAfterHeldPorts). Recomputed here so the marker is
+        # self-describing; $null when the hold channel was unobserved, for the
+        # same reason as its parent field.
+        UnavailableAfterHeldLinkParkedPorts = $(if ($PortHoldObserved) { ,@(Get-LinkParkedAfterHeldPorts -Ports @($UnavailableAfterHeldPorts | Where-Object { $_ }) -Context $UnavailableAfterHeldContext) } else { $null })
         # Stated as its own field so no reader has to know that $null above is
         # meaningful, and so a marker from a pre-toggle build (field absent) is
         # not confused with one that recorded a genuine observation.
@@ -4935,6 +5022,13 @@ function New-DeviceProbeSession {
         # stays @{} -- same discipline as the sets they explain.
         UnavailablePortReasonsCurrent    = $(if ($apopEffective) { @{} } else { $null })
         UnavailablePortReasons           = $(if ($apopEffective) { @{} } else { $null })
+        # Context captured on the tick a port ENTERS the after-held set (LAST
+        # occurrence kept, matching the reasons map): the win32 code of the
+        # failed open plus the link state under it. This is what lets the
+        # link-park guard (Get-LinkParkedAfterHeldPorts) separate "the ACL
+        # re-parked after a release" (121/1167, no link -- ordinary, 2026-08-26
+        # false alarm) from a registration genuinely lost mid-run.
+        UnavailableAfterHeldContext      = $(if ($apopEffective) { @{} } else { $null })
         # ── Active-open throttle state (see Get-ActiveOpenDecision) ──────
         # The probe owns a target port for 12-23 % of every window in which
         # nobody else holds it (measured 2026-08-19 from captures 026B63C26C4D
@@ -5399,6 +5493,26 @@ function Invoke-DeviceProbeTick {
         $Session.UnavailablePortReasonsCurrent = $reasonsNow
         if ($null -eq $Session.UnavailablePortReasons) { $Session.UnavailablePortReasons = @{} }
         foreach ($k in $reasonsNow.Keys) { $Session.UnavailablePortReasons[$k] = $reasonsNow[$k] }
+        # Context for the link-park guard, stamped as each port enters the
+        # after-held set. BtLinkState here is the LAST REFRESHED value -- the
+        # link monitor runs later in this same tick, so it can be up to one
+        # tick (~6 s) stale relative to the failed open. That skew is why the
+        # guard also demands the win32 code: neither field alone carries it.
+        # ContainsKey-guarded like AppEverRunning, for sessions built by older
+        # callers or test mocks that predate the field.
+        if ($afterHeldNow.Count -gt 0) {
+            if (-not $Session.ContainsKey('UnavailableAfterHeldContext') -or $null -eq $Session.UnavailableAfterHeldContext) {
+                $Session.UnavailableAfterHeldContext = @{}
+            }
+            foreach ($p in $afterHeldNow) {
+                $pk = [string]$p
+                $Session.UnavailableAfterHeldContext[$pk] = @{
+                    Win32Error  = $(if ($reasonsNow.ContainsKey($pk)) { $reasonsNow[$pk] } else { $null })
+                    BtLinkState = $(if ($Session.ContainsKey('BtLinkState')) { [string]$Session.BtLinkState } else { 'Unknown' })
+                    AtUtc       = $now.ToUniversalTime().ToString('o')
+                }
+            }
+        }
         # The counterpart the record never had: which ports were held at ANY
         # point. PortEverHeld below answers the boolean; nothing answered "which".
         $Session.HeldPortsEver = @(
@@ -6499,6 +6613,13 @@ function Get-DeviceProbeSessionSummary {
     $deadAfterHeld = @($Session.UnavailableAfterHeldPorts | Where-Object {
         $_ -and $_ -in $deadPorts
     } | Select-Object -Unique)
+    # Link-park guard (2026-08-26): the ordered subset alone still convicted a
+    # port whose failed open was the ACL re-parking after NO released it
+    # (win32=121, no link underneath, SerialIntegrityHealthy). Split on the
+    # recorded context; only positive 121/1167+no-link evidence downgrades.
+    $afterHeldCtx = if ($Session.ContainsKey('UnavailableAfterHeldContext')) { $Session.UnavailableAfterHeldContext } else { $null }
+    $linkParkedAfterHeld = @(Get-LinkParkedAfterHeldPorts -Ports $deadAfterHeld -Context $afterHeldCtx)
+    $unexplainedAfterHeld = @($deadAfterHeld | Where-Object { $_ -notin $linkParkedAfterHeld })
     $heldEver = @($Session.HeldPortsEver | Where-Object { $_ })
     $resolvedStartupDead = @($deadPorts | Where-Object {
         $_ -in $heldEver -and $_ -notin $deadAfterHeld
@@ -6513,8 +6634,15 @@ function Get-DeviceProbeSessionSummary {
         if ($integBad) {
             [void]$findings.Add("[!] $($deadPorts -join ', ') registered as a Bluetooth serial port but would not open during this session. The serial port integrity check independently reports an OS-level fault, so this is not simply a device that was switched off. No process can reach the headset through it. Cause not classified here (an absent symlink and a stale one need different fixes) -- run the serial port integrity check with NO.exe closed.")
         } else {
-            if ($deadAfterHeld.Count -gt 0) {
-                [void]$findings.Add("[!] $($deadAfterHeld -join ', ') was held successfully earlier in this recording and became unavailable on a later tick. That ordering is a real in-run loss, not a headset that was merely off before the session. Cause not classified here (an absent symlink and a stale one need different fixes) -- run the serial port integrity check with NO.exe closed.")
+            if ($unexplainedAfterHeld.Count -gt 0) {
+                [void]$findings.Add("[!] $($unexplainedAfterHeld -join ', ') was held successfully earlier in this recording and became unavailable on a later tick. That ordering is a real in-run loss, not a headset that was merely off before the session. Cause not classified here (an absent symlink and a stale one need different fixes) -- run the serial port integrity check with NO.exe closed.")
+            }
+            if ($linkParkedAfterHeld.Count -gt 0) {
+                $parkedDetail = ($linkParkedAfterHeld | ForEach-Object {
+                    $c = $afterHeldCtx[[string]$_].Win32Error
+                    "$_ (win32=$c)"
+                }) -join ', '
+                [void]$findings.Add("[i] $parkedDetail was held earlier and later refused to open, but the failure code and the absent radio link at that moment are the signature of the Bluetooth link re-parking after the holder released the port (121 = the ~5 s parked-link open timeout; 1167 = the drop-instant fast fail), and the serial integrity check stayed healthy. An idle Arc parks its link within seconds of a release -- this is NOT in-run port loss. If it repeats while Windows shows the headset connected, run the serial port integrity check with NO.exe closed.")
             }
             if ($resolvedStartupDead.Count -gt 0) {
                 [void]$findings.Add("[i] $($resolvedStartupDead -join ', ') did not open before the application session, then was held successfully later. The ordered evidence shows a resolved startup/offline condition rather than a later port-opening failure.")
@@ -6751,6 +6879,11 @@ function Get-DeviceProbeSessionSummary {
         BtAuthFailureCount = $Session.BtAuthFailureCount
         BtAuthFailureLastAtUtc = if ($Session.BtAuthFailureLastAt) { $Session.BtAuthFailureLastAt.ToString('o') } else { $null }
         UnavailableAfterHeldPorts = @($Session.UnavailableAfterHeldPorts | Where-Object { $_ })
+        # The WHY behind each after-held port (win32 + link state at the failed
+        # open) and the subset the link-park guard explains. Without these the
+        # list above reads as in-run loss on every re-park (2026-08-26).
+        UnavailableAfterHeldContext = $afterHeldCtx
+        UnavailableAfterHeldLinkParkedPorts = @($linkParkedAfterHeld)
         ObservationCount = $WatchState.Observations.Count
         OperatorMarkers = @($Session.OperatorMarkers)
     }
@@ -8482,6 +8615,7 @@ Export-ModuleMember -Function @(
     'Get-ActiveOpenDecision',
     'Test-ActivePortOpenProbeEnabled',
     'Get-ProbeStateConsistency',
+    'Get-LinkParkedAfterHeldPorts',
     # The failure-boundary chain. Exported because the window, the persisted
     # chain.jsonl and the tests must all read ONE computation of "where does the
     # verified part of the chain end" -- deriving it a second time at the render

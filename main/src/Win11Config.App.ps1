@@ -8734,6 +8734,7 @@ namespace WinConfigDiag {
                                 -HeldPorts    @($btProbeSession.HeldPorts | Where-Object { $_ }) `
                                 -UnavailablePorts @($btProbeSession.UnavailablePortsCurrent | Where-Object { $_ }) `
                                 -UnavailableAfterHeldPorts @($btProbeSession.UnavailableAfterHeldPortsCurrent | Where-Object { $_ }) `
+                                -UnavailableAfterHeldContext $btProbeSession.UnavailableAfterHeldContext `
                                 -PortHoldObserved ([bool]$btProbeSession.ActivePortOpenProbeEnabled) `
                                 -AppRunning   ($btProbeWatch.AppProcessState -eq 'Running') `
                                 -NoExeVersion $btProbeSession.NoExeVersion `
@@ -9857,6 +9858,7 @@ namespace WinConfigDiag {
                                 HeldPorts        = @($_.HeldPorts)
                                 UnavailablePorts = @($_.UnavailablePorts)
                                 UnavailableAfterHeldPorts = @($_.UnavailableAfterHeldPorts)
+                                UnavailableAfterHeldLinkParkedPorts = @($_.UnavailableAfterHeldLinkParkedPorts)
                                 AppRunning       = $_.AppRunning
                                 IoVerdict            = $_.IoVerdict
                                 IoBaselineOpsPerSecond = $_.IoBaselineOpsPerSecond
@@ -10663,6 +10665,16 @@ namespace WinConfigDiag {
                         UnavailablePortsEver    = if ($btProbeSession) { @($btProbeSession.UnavailablePortsEver | Where-Object { $_ }) } else { @() }
                         UnavailableAfterHeldPortsCurrent = if ($btProbeSession) { @($btProbeSession.UnavailableAfterHeldPortsCurrent | Where-Object { $_ }) } else { @() }
                         UnavailableAfterHeldPorts = if ($btProbeSession) { @($btProbeSession.UnavailableAfterHeldPorts | Where-Object { $_ }) } else { @() }
+                        # Per-port WHY behind the after-held set (win32 + link
+                        # state at the failed open) and the subset the link-park
+                        # guard explains (121/1167, no link -- ordinary re-park
+                        # after a release, 2026-08-26 false alarm). Without
+                        # these, the list above reads as in-run loss on every
+                        # re-park when the bundle is triaged remotely.
+                        UnavailableAfterHeldContext = if ($btProbeSession) { $btProbeSession.UnavailableAfterHeldContext } else { $null }
+                        UnavailableAfterHeldLinkParkedPorts = if ($btProbeSession -and (Get-Command Get-LinkParkedAfterHeldPorts -ErrorAction SilentlyContinue)) {
+                            @(Get-LinkParkedAfterHeldPorts -Ports @($btProbeSession.UnavailableAfterHeldPorts | Where-Object { $_ }) -Context $btProbeSession.UnavailableAfterHeldContext)
+                        } else { $null }
                         SecondsToReadBaseline = if ($btCoverage) { $btCoverage.SecondsToReadBaseline } else { $null }
                         PostBaselineObservationSeconds = if ($btCoverage) { $btCoverage.PostBaselineSeconds } else { $null }
                         # When the recorder told the operator a read baseline
