@@ -5904,6 +5904,155 @@ namespace WinConfigDiag {
                 }
             }
 
+            # ── Sub-second NO-window sampler ─────────────────────────────────
+            # The ~3 s probe tick undercounts NO dialogs: the 08-26 short-flavor
+            # run showed dialogs living ~1.6 s (rapid Try Again), and the tick
+            # detector photographed 7 of ~11. This sampler runs off the pump
+            # loop (~200 ms passes, throttled to one enumeration per 700 ms),
+            # diffs the top-level NO windows by hwnd+title+enabled, and writes
+            # an appear/gone timeline -- WITH lifetimes -- to events.jsonl as
+            # Kind=NOWINDOW. Same identity-not-content boundary as the tick
+            # detector: top-level title + enabled flag, never child windows,
+            # never content. The classifier below is why titles matter: it
+            # turns "a window appeared" into "an ERROR dialog appeared", which
+            # the existence-only detector could never say.
+            function script:Get-BtNoWindowClass {
+                param([string]$Title)
+                # Lexicon from the 08-20..08-26 field work. 'Arc Not Detected'
+                # = 12005 class; 'Arc Connection Lost' = 12006 (NO holding both
+                # ports -- the danger window); 'Wake Up Arc' = the normal link
+                # raise step on a fresh Get Details; 'Device Details' = the
+                # Get Details success result; 'Pair Device with Retry' = the
+                # panel re-pair marker. Match on the leading phrase, never a
+                # substring of a longer unrelated title.
+                $t = [string]$Title
+                if ($t -match '^Arc Not Detected')        { return 'ErrorDialog' }
+                if ($t -match '^Arc Connection Lost')     { return 'ErrorDialog' }
+                if ($t -match '^Wake Up Arc')             { return 'WakeStep' }
+                if ($t -match '^Device Details')          { return 'Result' }
+                if ($t -match 'Pair Device with Retry')   { return 'PairRetry' }
+                return 'Other'
+            }
+
+            function script:Invoke-BtNoWindowSampler {
+                param(
+                    [string[]]$ProcessNames,
+                    [string]$RunFolder,
+                    $Now
+                )
+                $st = $script:BtRec_NoWinSampler
+                if (-not $st -or -not $st.Enabled) { return }
+                $when = $(if ($Now) { [datetime]$Now } else { Get-Date })
+                if ($st.LastSampleAt -and ($when - [datetime]$st.LastSampleAt).TotalMilliseconds -lt 700) { return }
+                $st.LastSampleAt = $when
+                try {
+                    if (-not (script:Initialize-BtWindowScan)) { $st.Enabled = $false; return }
+                    $descs = @(script:Get-BtNoWindowDescriptions -ProcessNames $ProcessNames)
+                    $st.SampleCount = [int]$st.SampleCount + 1
+                    $cur = @{}
+                    foreach ($w in $descs) {
+                        # Title is part of the key on purpose: a LabVIEW window
+                        # that RETITLES (Device Panel <-> a dialog reusing the
+                        # frame) is a state change worth two timeline rows.
+                        $cur["$($w.Hwnd)|$($w.Title)|$($w.Enabled)"] = $w
+                    }
+                    if (-not $st.BaselineDone) {
+                        # Windows already open at the first sample are arrival
+                        # state, not events -- the start shot covered them.
+                        foreach ($k in $cur.Keys) { $st.FirstSeenAt[$k] = $when }
+                        $st.Prev = $cur
+                        $st.BaselineDone = $true
+                        return
+                    }
+                    $utc = $when.ToUniversalTime().ToString('o')
+                    foreach ($k in $cur.Keys) {
+                        if ($st.Prev.ContainsKey($k)) { continue }
+                        $w = $cur[$k]
+                        $st.FirstSeenAt[$k] = $when
+                        $cls = script:Get-BtNoWindowClass -Title $w.Title
+                        if (-not $st.Appearances.Contains($cls)) { $st.Appearances[$cls] = 0 }
+                        $st.Appearances[$cls] = [int]$st.Appearances[$cls] + 1
+                        if ($cls -eq 'ErrorDialog') {
+                            if (-not $st.ErrorTitles.Contains($w.Title)) { $st.ErrorTitles[$w.Title] = 0 }
+                            $st.ErrorTitles[$w.Title] = [int]$st.ErrorTitles[$w.Title] + 1
+                            Write-BtLog "  $($when.ToString('HH:mm:ss'))  [NO-DLG ]  NeurOptimal error dialog appeared: '$($w.Title)'" -Level 'WARN'
+                        }
+                        if ($RunFolder -and $st.EventLinesWritten -lt 400) {
+                            $wrote = Add-WinConfigDiagnosticJsonLine -RunFolder $RunFolder -Name 'events.jsonl' -Data ([ordered]@{
+                                AtUtc  = $utc
+                                Kind   = 'NOWINDOW'
+                                State  = 'Appeared'
+                                Level  = $(if ($cls -eq 'ErrorDialog') { 'WARN' } else { 'INFO' })
+                                Reason = "NeurOptimal top-level window appeared (sub-second sampler; title is identity metadata, not content)"
+                                Hwnd   = [long]$w.Hwnd
+                                Title  = [string]$w.Title
+                                Enabled = [bool]$w.Enabled
+                                Class  = $cls
+                            })
+                            if ($wrote) { $st.EventLinesWritten = [int]$st.EventLinesWritten + 1 }
+                            else { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
+                        } elseif ($RunFolder) { $st.EventLinesSuppressed = [int]$st.EventLinesSuppressed + 1 }
+                        # Immediate shot on an ERROR dialog only -- results and
+                        # the wake step are routine and stay with the tick
+                        # detector. The shared seen-set keeps the two detectors
+                        # from double-shooting one window in either order.
+                        if ($cls -eq 'ErrorDialog' -and $script:BtRec_ScreenshotEnabled -and $RunFolder -and
+                            $script:BtRec_NoWindowBaselineDone -and
+                            -not $script:BtRec_SeenNoWindows.Contains([long]$w.Hwnd)) {
+                            [void]$script:BtRec_SeenNoWindows.Add([long]$w.Hwnd)
+                            $modal = script:Get-BtNoModalState -WindowDescriptions $descs
+                            $shot = script:Invoke-BtEventScreenshot -RunFolder $RunFolder -Trigger 'NoDialogAppeared' -HighValue -AppearedWindows @($w) -NoModalState $modal
+                            if ($shot) { $st.ShotsFired = [int]$st.ShotsFired + 1 }
+                        }
+                    }
+                    foreach ($k in $st.Prev.Keys) {
+                        if ($cur.ContainsKey($k)) { continue }
+                        $w = $st.Prev[$k]
+                        $cls = script:Get-BtNoWindowClass -Title $w.Title
+                        $lifeMs = $null
+                        if ($st.FirstSeenAt.Contains($k)) {
+                            $lifeMs = [int]($when - [datetime]$st.FirstSeenAt[$k]).TotalMilliseconds
+                            $st.FirstSeenAt.Remove($k)
+                        }
+                        if ($cls -eq 'ErrorDialog' -and $null -ne $lifeMs -and
+                            ($null -eq $st.ShortestErrorDialogMs -or $lifeMs -lt [int]$st.ShortestErrorDialogMs)) {
+                            $st.ShortestErrorDialogMs = $lifeMs
+                        }
+                        if ($RunFolder -and $st.EventLinesWritten -lt 400) {
+                            $wrote = Add-WinConfigDiagnosticJsonLine -RunFolder $RunFolder -Name 'events.jsonl' -Data ([ordered]@{
+                                AtUtc  = $utc
+                                Kind   = 'NOWINDOW'
+                                State  = 'Gone'
+                                Level  = 'INFO'
+                                Reason = 'NeurOptimal top-level window gone (sub-second sampler)'
+                                Hwnd   = [long]$w.Hwnd
+                                Title  = [string]$w.Title
+                                Enabled = [bool]$w.Enabled
+                                Class  = $cls
+                                # Sampler-resolution lifetime: how long the
+                                # window existed, +/- one 700 ms sample. This is
+                                # the 3 s vs 6.5 s fault discriminator the ticket
+                                # work needs, measured instead of hand-timed.
+                                LifetimeMs = $lifeMs
+                            })
+                            if ($wrote) { $st.EventLinesWritten = [int]$st.EventLinesWritten + 1 }
+                            else { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
+                        } elseif ($RunFolder) { $st.EventLinesSuppressed = [int]$st.EventLinesSuppressed + 1 }
+                    }
+                    $st.Prev = $cur
+                    $st.FailStreak = 0
+                } catch {
+                    # Fail-safe like every window-scan path: three consecutive
+                    # failures turn the sampler off for the run; the tick
+                    # detector keeps working and the recording is unaffected.
+                    $st.FailStreak = [int]$st.FailStreak + 1
+                    if ($st.FailStreak -ge 3) {
+                        $st.Enabled = $false
+                        try { Write-BtLog "  [~] NO-window sampler stopped after repeated failures; the ~3 s tick detector still covers dialogs." -Level 'DIM' } catch { }
+                    }
+                }
+            }
+
             # Bottom status bar. AutoSize + TopDown flow: the panel reserves
             # exactly the height its content needs, so on scaled/high-DPI displays
             # the labels and action buttons grow with the font instead of
@@ -6144,6 +6293,9 @@ namespace WinConfigDiag {
             # start-of-recording shot.)
             $script:BtRec_SeenNoWindows          = New-Object 'System.Collections.Generic.HashSet[long]'
             $script:BtRec_NoWindowBaselineDone   = $false
+            # Sub-second sampler state (see Invoke-BtNoWindowSampler). Null here;
+            # built at Start so a run that never starts renders it ABSENT.
+            $script:BtRec_NoWinSampler           = $null
             $script:BtRec_ShotConfirmGuard       = $false   # reentrancy guard: reverting .Checked refires CheckedChanged
 
             # EXPLICIT colours: the $btButtonRow class guard auto-covers
@@ -7565,6 +7717,24 @@ namespace WinConfigDiag {
             $script:BtRec_EstablishingShotTaken = $false
             $script:BtRec_SeenNoWindows         = New-Object 'System.Collections.Generic.HashSet[long]'
             $script:BtRec_NoWindowBaselineDone  = $false
+            # Sub-second NO-window sampler, re-armed per run like the seen-set
+            # above. Runs regardless of the screenshot opt-in (the timeline is
+            # titles-only metadata); only its SHOT path is gated on the opt-in.
+            $script:BtRec_NoWinSampler = @{
+                Enabled               = $true
+                BaselineDone          = $false
+                Prev                  = @{}
+                FirstSeenAt           = @{}
+                LastSampleAt          = $null
+                SampleCount           = 0
+                FailStreak            = 0
+                Appearances           = @{}
+                ErrorTitles           = @{}
+                ShortestErrorDialogMs = $null
+                ShotsFired            = 0
+                EventLinesWritten     = 0
+                EventLinesSuppressed  = 0
+            }
             # The one-time idle-sawtooth notice, re-armed per run for the same
             # reason as the counters: a second recording must explain the parked
             # link once for ITS operator, not inherit "already said it".
@@ -8663,6 +8833,13 @@ namespace WinConfigDiag {
                     script:Add-BtRecorderEvent -Text "Operator ran '$($opa.Tool)'" -Level 'WARN'
                 }
 
+                # Sub-second NO-window sampler: called every pump pass (~200 ms),
+                # self-throttled to one enumeration per 700 ms. The ~3 s probe
+                # tick misses dialogs that live under one tick (measured 1.6 s
+                # on rapid Try Again); this is the productized scratchpad
+                # watcher, and it fires the immediate error-dialog shot.
+                script:Invoke-BtNoWindowSampler -ProcessNames @($btProbeAppName) -RunFolder $(if ($btDiagRun) { $btDiagRun.RunFolder } else { $null }) -Now $now
+
                 # Update elapsed label with current state summary.
                 #
                 # Recomputed at 1 Hz, not on every 200 ms pass, and assigned only
@@ -9657,6 +9834,34 @@ namespace WinConfigDiag {
                     $btProbeSummary.Findings = @($btProbeSummary.Findings) + "[info] Operator ran $($script:BtRecOperatorActions.Count) repair action(s) during this recording ($opaTools) -- some changes above may be operator-induced, not spontaneous"
                 }
 
+                # Sub-second NO-window sampler record. Null when the sampler
+                # never completed a sample (scan unavailable, run never started)
+                # -- an absent measurement must render as absent, never as 0.
+                $btNoWinRecord = $null
+                $btNwst = $script:BtRec_NoWinSampler
+                if ($btNwst -and [int]$btNwst.SampleCount -gt 0) {
+                    $btNoWinRecord = [ordered]@{
+                        Enabled               = [bool]$btNwst.Enabled
+                        SampleCount           = [int]$btNwst.SampleCount
+                        Appearances           = $btNwst.Appearances
+                        ErrorDialogTitles     = $btNwst.ErrorTitles
+                        ShortestErrorDialogMs = $btNwst.ShortestErrorDialogMs
+                        ShotsFired            = [int]$btNwst.ShotsFired
+                        EventLinesWritten     = [int]$btNwst.EventLinesWritten
+                        EventLinesSuppressed  = [int]$btNwst.EventLinesSuppressed
+                    }
+                    $btNwErrCount = 0
+                    foreach ($v in $btNwst.ErrorTitles.Values) { $btNwErrCount += [int]$v }
+                    if ($btNwErrCount -gt 0) {
+                        $btNwErrList = @($btNwst.ErrorTitles.Keys | Sort-Object) -join "', '"
+                        $btNwShortest = if ($null -ne $btNwst.ShortestErrorDialogMs) { "; shortest lived $([int]$btNwst.ShortestErrorDialogMs) ms" } else { '' }
+                        # [i], not [!]: under a panel-operation intent the dialogs
+                        # ARE the thing under test, and NO's codes are 1:many --
+                        # a dialog is NO's claim, never a transport verdict.
+                        $btProbeSummary.Findings = @($btProbeSummary.Findings) + "[i] NeurOptimal showed $btNwErrCount error dialog(s) during this recording ('$btNwErrList'$btNwShortest) -- sub-second timeline with lifetimes in events.jsonl (Kind=NOWINDOW). Read beside the link/port evidence; the dialog text itself is only in screenshots."
+                    }
+                }
+
                 Write-BtLog ""
                 Write-BtLog "SESSION SUMMARY" -Level "STEP"
                 Write-BtLog "  Final device state  : $(Get-ProbeStateUserText -Kind device -State $btWatchReport.DeviceState -Short)" -Level (Get-ProbeStateGuiLevel $btWatchReport.DeviceState)
@@ -9751,6 +9956,11 @@ namespace WinConfigDiag {
                             SessionSummary  = $btProbeSummary
                             WatchReport     = $btWatchReport
                             SessionVerdict  = $btVerdict
+                            # Sub-second NO-window timeline summary (classifier
+                            # counts, shortest error-dialog lifetime). Null when
+                            # the sampler never ran; the per-event rows live in
+                            # events.jsonl as Kind=NOWINDOW.
+                            NoWindowSampler = $btNoWinRecord
                             # Which headset this capture is about, why it was
                             # chosen, and what else it could have been. Without
                             # the rejected candidates a reader cannot tell a
