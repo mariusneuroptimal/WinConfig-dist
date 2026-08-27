@@ -6409,6 +6409,26 @@ function Get-SerialOpenClassification {
                       Meaning = "ERROR_SEM_TIMEOUT - the port is healthy; the device did not answer the RFCOMM connect$persisted"
                       Action  = 'Check the headset is powered ON and in range FIRST. A powered-off device fails exactly this way on every retry while every static signal - PnP nodes, SERIALCOMM, port integrity - still reads healthy. Only once it is confirmed on does a Bluetooth radio toggle (>=10s off) apply.' }
         }
+        87 {
+            # OBSERVED-UNEXPLAINED (2026-08-27, HS-124 campaign corpus pass).
+            # 25 instances in one day across the three Realtek Vivobooks; ZERO
+            # on the Intel SLG2 control despite 130 displaced-bond 1231s
+            # there, and zero in the 9-capture MM06/local corpus that carries
+            # timing data. Every instance BLOCKED 32.3-35.8 s (per-port means
+            # 32.6-34.2 s) - a band tight enough to be a fixed driver-level
+            # timeout, mechanism unknown. The third latency class after
+            # 1167-instant and 121-~5s. NOT auth-gated: TDUNN's last 87
+            # window had no target-matched Event 16 anywhere near it. NOT
+            # corpse-only: NVANWILLEGEN COM3 threw 87 nine seconds after six
+            # successful opens on the live generation. The blocking open
+            # STALLS the tick loop for its full duration - the measured cause
+            # of MPAVOURIS's early-run StateSnapshotLagMs (6-31 s, exactly
+            # the 87 window). Emphatically NOT link-park evidence - that
+            # guard keys on {121,1167} and must stay that way.
+            return @{ Classification = 'ObservedUnexplained'
+                      Meaning = 'ERROR_INVALID_PARAMETER from a Bluetooth COM open that BLOCKED ~33 s (measured 32.3-35.8 s, n=25, 3 Realtek boxes, 2026-08-26/27 displaced-bond-era captures; absent on an Intel control box under the same fault and absent from the quiescent corpus). Mechanism unknown: observed only during disturbed link/flap windows, but not tied to auth-in-progress and not exclusive to corpse-generation ports. The open blocks its caller for the full ~33 s.'
+                      Action  = 'None established - do NOT remediate on this code alone. Do not toggle the radio, re-pair, or reboot chasing an 87; record it with its timing. Recurring 87s OUTSIDE a disturbed link window would be new evidence worth a capture.' }
+        }
         default { return @{ Classification = 'Unknown'
                             Meaning = "win32 error $Win32Error"
                             Action  = $null } }

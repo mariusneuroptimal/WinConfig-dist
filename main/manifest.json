@@ -1,8 +1,8 @@
 {
-    "timestamp":  "2026-08-27T14:39:17.4554877Z",
+    "timestamp":  "2026-08-27T15:20:10.0117885Z",
     "branch":  "main",
     "schema_version":  "2.0",
-    "source_ref":  "24c2efb843f7a1a6c95ed50e6400d080200a8e54",
+    "source_ref":  "cebadd003f99affbb8ebe3f6ac786b869d92ca54",
     "artifacts":  [
                       {
                           "path":  "Win11Config.ps1",
@@ -146,8 +146,8 @@
                       },
                       {
                           "path":  "src/Modules/BluetoothProbe.psm1",
-                          "sha256":  "af1729f0566a2e922339e5824f567bad84dac41a8566553fb9a09b49cb5f0f00",
-                          "size":  398637
+                          "sha256":  "503dd94152f40284fdb90842c817f419d2821ee81ae85631da96096be5acfb6b",
+                          "size":  400581
                       },
                       {
                           "path":  "src/Modules/TargetDeviceWatch.psm1",
@@ -160,6 +160,6 @@
                           "size":  498404
                       }
                   ],
-    "build_id":  "manual-20260827103917",
+    "build_id":  "manual-20260827112010",
     "event":  "manual"
 }
