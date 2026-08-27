@@ -5948,11 +5948,14 @@ namespace WinConfigDiag {
                 # discoverable for ~3.5-6 min after power-on (measured
                 # 2026-08-27, SP6 soaks, both Arcs), "random" appearances are
                 # any in-range Arc entering that window, e.g. a neighbour
-                # power-cycling theirs. The title regex is INFERRED from the
-                # banner text (the error dialogs title themselves with their
-                # header phrase); until a capture proves it, the unknown-window
-                # shot below is the safety net that identifies the real title.
-                if ($t -match '^A new Arc device')        { return 'DiscoveryPrompt' }
+                # power-cycling theirs. Title PROVEN by capture 4291D2CC92E3
+                # (the unknown-window net photographed the banner and the
+                # timeline row carried this): the top-level title is the VI
+                # path 'zengar_NO_device_NO Device Manager.lvlib:New Headset
+                # Discovered Notification--dialog.vi', so the key is the
+                # distinctive VI name, not a leading phrase -- the lvlib
+                # prefix is shared by other Device Manager VIs.
+                if ($t -match 'New Headset Discovered Notification') { return 'DiscoveryPrompt' }
                 if ($t -match '^Wake Up Arc')             { return 'WakeStep' }
                 if ($t -match '^Device Details')          { return 'Result' }
                 if ($t -match 'Pair Device with Retry')   { return 'PairRetry' }
