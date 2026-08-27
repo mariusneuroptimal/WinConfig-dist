@@ -5940,6 +5940,19 @@ namespace WinConfigDiag {
                 # the 2026-08-27 HS-124 campaign, where every collision-minting
                 # re-pair FIRST failed with this dialog.
                 if ($t -match '^Bluetooth Error')         { return 'ErrorDialog' }
+                # Discovery banner: "A new Arc device has been discovered and
+                # is ready to be paired!" with the device name + MAC in the
+                # BODY (screenshot-only) and Pair Device / Ignore this Device
+                # buttons. Fires when NO's background discovery hears an
+                # unpaired-to-this-box Arc -- and since an Arc is only
+                # discoverable for ~3.5-6 min after power-on (measured
+                # 2026-08-27, SP6 soaks, both Arcs), "random" appearances are
+                # any in-range Arc entering that window, e.g. a neighbour
+                # power-cycling theirs. The title regex is INFERRED from the
+                # banner text (the error dialogs title themselves with their
+                # header phrase); until a capture proves it, the unknown-window
+                # shot below is the safety net that identifies the real title.
+                if ($t -match '^A new Arc device')        { return 'DiscoveryPrompt' }
                 if ($t -match '^Wake Up Arc')             { return 'WakeStep' }
                 if ($t -match '^Device Details')          { return 'Result' }
                 if ($t -match 'Pair Device with Retry')   { return 'PairRetry' }
@@ -6056,6 +6069,13 @@ namespace WinConfigDiag {
                         ShotsFired            = 0
                         EventLinesWritten     = 0
                         EventLinesSuppressed  = 0
+                        # Unknown-window shot budget: LabVIEW popups can carry
+                        # internal VI titles ("...Backdrop VI.vi:1450003
+                        # (clone)") or empty titles, so a lexicon keyed on
+                        # friendly phrases cannot see them. One shot per
+                        # distinct unknown title, small per-run cap.
+                        UnknownShotTitles     = @{}
+                        UnknownShotCount      = 0
                     }
                     return $true
                 } catch {
@@ -6197,10 +6217,37 @@ namespace WinConfigDiag {
                         # from double-shooting one window in either order. The
                         # shot itself can lag the appearance by a loop pass;
                         # the row timestamp above is the accurate one.
-                        if ($w.State -eq 'Appeared' -and $cls -eq 'ErrorDialog' -and $script:BtRec_ScreenshotEnabled -and $RunFolder -and
+                        if ($w.State -eq 'Appeared' -and $cls -in @('ErrorDialog', 'DiscoveryPrompt') -and $script:BtRec_ScreenshotEnabled -and $RunFolder -and
                             -not $script:BtRec_SeenNoWindows.Contains([long]$w.Hwnd)) {
+                            # DiscoveryPrompt shoots immediately for the same
+                            # reason errors do: the payload (device name + MAC)
+                            # is in the BODY, which only a screenshot records.
                             [void]$script:BtRec_SeenNoWindows.Add([long]$w.Hwnd)
                             $shot = script:Invoke-BtEventScreenshot -RunFolder $RunFolder -Trigger 'NoDialogAppeared' -HighValue -AppearedWindows @([pscustomobject]@{ Hwnd = [long]$w.Hwnd; Enabled = [bool]$w.Enabled; Title = [string]$w.Title })
+                            if ($shot) { $st.ShotsFired = [int]$st.ShotsFired + 1 }
+                        }
+                        # Safety net for windows the lexicon cannot key: the
+                        # first appearance of each distinct UNKNOWN title gets
+                        # one shot (per-run cap 3). This is how a new NO popup
+                        # -- like the discovery banner, whose real top-level
+                        # title is unproven -- identifies itself: the events
+                        # row carries the title, the shot carries the body.
+                        # The recorder starts BEFORE NO, so NO's own launch
+                        # parade (main window, splash, licensing refresh) are
+                        # mid-run Appearances that would burn the whole cap --
+                        # skip the titles the local corpus proved benign.
+                        # Backdrop VI clones and empty titles stay ELIGIBLE:
+                        # they are exactly the anonymous-popup shapes the net
+                        # exists for.
+                        if ($w.State -eq 'Appeared' -and $cls -eq 'Other' -and $script:BtRec_ScreenshotEnabled -and $RunFolder -and
+                            $w.Title -notmatch '^(NeurOptimal|Splashscreen|Refreshing Licensing)' -and
+                            [int]$st.UnknownShotCount -lt 3 -and
+                            -not $st.UnknownShotTitles.ContainsKey([string]$w.Title) -and
+                            -not $script:BtRec_SeenNoWindows.Contains([long]$w.Hwnd)) {
+                            $st.UnknownShotTitles[[string]$w.Title] = $true
+                            $st.UnknownShotCount = [int]$st.UnknownShotCount + 1
+                            [void]$script:BtRec_SeenNoWindows.Add([long]$w.Hwnd)
+                            $shot = script:Invoke-BtEventScreenshot -RunFolder $RunFolder -Trigger 'NoUnknownWindowAppeared' -HighValue -AppearedWindows @([pscustomobject]@{ Hwnd = [long]$w.Hwnd; Enabled = [bool]$w.Enabled; Title = [string]$w.Title })
                             if ($shot) { $st.ShotsFired = [int]$st.ShotsFired + 1 }
                         }
                     }
