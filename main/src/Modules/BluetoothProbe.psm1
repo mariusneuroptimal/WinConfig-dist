@@ -5561,8 +5561,17 @@ function Get-SerialRegistrationCorrelation {
         pair. Only a positive value can support InRunRepair.
     .PARAMETER InRunRepairSignalCount
         Count of direct unpair/re-pair signals observed during the same run
-        (device Missing-then-back transitions, COM-port set changes). 0 when
-        none or when the caller does not track them.
+        (device Missing-then-back transitions, COM-port set changes, observed
+        pair-window episodes). 0 when none or when the caller does not track
+        them.
+    .PARAMETER PairEpisodeCount
+        P3 (2026-08-27): number of panel pair-attempt episodes the NO-window
+        sampler observed during the run ('Pair Device with Retry' windows).
+    .PARAMETER FailedRetriedPairCount
+        Of those episodes, how many FIRST FAILED with a 12012 'Bluetooth
+        Error' and were retried -- the pattern every collision-minting
+        re-pair in the 08-27 campaign showed. Lets an InRunRepair verdict
+        name the minting mechanism, not just the re-pair.
     #>
     [CmdletBinding()]
     param(
@@ -5570,7 +5579,9 @@ function Get-SerialRegistrationCorrelation {
         [Parameter(Mandatory)][int]$ComNameCount,
         [System.Nullable[int]]$ResumeCount,
         [System.Nullable[int]]$InRunEntryGrowth,
-        [int]$InRunRepairSignalCount = 0
+        [int]$InRunRepairSignalCount = 0,
+        [int]$PairEpisodeCount = 0,
+        [int]$FailedRetriedPairCount = 0
     )
 
     $result = @{
@@ -5580,6 +5591,8 @@ function Get-SerialRegistrationCorrelation {
         ResumeCount        = $ResumeCount
         InRunEntryGrowth   = $InRunEntryGrowth
         InRunRepairSignalCount = $InRunRepairSignalCount
+        PairEpisodeCount   = $PairEpisodeCount
+        FailedRetriedPairCount = $FailedRetriedPairCount
         Summary            = $null
     }
 
@@ -5607,7 +5620,14 @@ function Get-SerialRegistrationCorrelation {
     if ($null -ne $InRunEntryGrowth -and $InRunEntryGrowth -gt 0 -and $InRunRepairSignalCount -gt 0) {
         $result.Assessment = 'InRunRepair'
         $resumeNote = if ($null -ne $ResumeCount) { " ($ResumeCount resume(s) since boot; direct in-run evidence outranks the resume correlation)" } else { '' }
-        $result.Summary = "$excess excess registration generation(s) per COM name; $InRunEntryGrowth SERIALCOMM entr$(if ($InRunEntryGrowth -eq 1) { 'y' } else { 'ies' }) appeared DURING this recording alongside $InRunRepairSignalCount in-run unpair/re-pair signal(s) - attributed to the in-run re-pair, not sleep/resume$resumeNote"
+        # P3: when the sampler saw the pair attempts, say which KIND of
+        # re-pair minted -- failed-then-retried is the 08-27 minting pattern.
+        $pairNote = if ($FailedRetriedPairCount -gt 0) {
+            " Of $PairEpisodeCount observed pair attempt(s), $FailedRetriedPairCount FIRST FAILED (12012 'Bluetooth Error') and $(if ($FailedRetriedPairCount -eq 1) { 'was' } else { 'were' }) retried - the pattern every collision-minting re-pair showed in the 2026-08-27 campaign."
+        } elseif ($PairEpisodeCount -gt 0) {
+            " All $PairEpisodeCount observed pair attempt(s) completed without a 12012 - a mint from a CLEAN pair attempt would be evidence AGAINST the failed-then-retried minting hypothesis, worth capturing."
+        } else { '' }
+        $result.Summary = "$excess excess registration generation(s) per COM name; $InRunEntryGrowth SERIALCOMM entr$(if ($InRunEntryGrowth -eq 1) { 'y' } else { 'ies' }) appeared DURING this recording alongside $InRunRepairSignalCount in-run unpair/re-pair signal(s) - attributed to the in-run re-pair, not sleep/resume$resumeNote.$pairNote"
         return $result
     }
 

@@ -5334,6 +5334,14 @@ function New-DeviceProbeSession {
         # never checked (older sessions, collector off); an empty check result
         # is never stored, so a non-null value always names real blindness.
         AbsentEventProvidersAtStart = $null
+        # P3 (2026-08-27): panel pair-attempt episodes, from the NO-window
+        # sampler. One entry per 'Pair Device with Retry' window observed
+        # (Hwnd, StartUtc, EndUtc, FailedThenRetried). FailedThenRetried is
+        # set when a 12012 'Bluetooth Error' dialog appears while the pair
+        # window is open -- the pattern every collision-minting re-pair in
+        # the 08-27 campaign showed. This is the instrument for the standing
+        # mint hypothesis: mint <=> failed-then-retried pair.
+        PairEpisodes             = [System.Collections.ArrayList]::new()
         # FI-012 fault 2 fingerprint (paired, ports clean, no link). Derived
         # without opening a port, because the open collector must never run
         # inside a live recording session.
@@ -6323,6 +6331,39 @@ function Get-DeviceProbeSessionSummary {
         if ($integStart -and $integEnd -and $integStart.Healthy -and -not $integEnd.Healthy) {
             [void]$findings.Add("[!] Bluetooth serial port registrations DEGRADED during this session: healthy at start, $($integEnd.CollisionCount) collision(s) / $($integEnd.MissingSymlinkCount) absent symlink(s) at end. Whatever happened in this recording is what corrupts them -- check the session log for sleep/resume or a re-pair.")
         }
+
+        # ── P3: automatic mint attribution against the observed pair attempts ──
+        # The 08-27 campaign's standing hypothesis: mint <=> failed-then-retried
+        # pair (every minting re-pair first failed 12012; both clean-link
+        # re-pairs minted nothing). With the sampler recording pair episodes,
+        # every future mint is scored against it automatically -- FOR, AGAINST,
+        # or "different minter" -- instead of by hand.
+        # @(if ...) not `= if ... { @() }`: an if that emits an empty array
+        # assigns $null, and $null.Count throws under StrictMode.
+        $pairEps = @(if ($Session.ContainsKey('PairEpisodes')) { $Session.PairEpisodes })
+        $failedRetriedEps = @($pairEps | Where-Object { $_.FailedThenRetried }).Count
+        $collStart = $null; $collEnd = $null
+        try { if ($integStart -and $null -ne $integStart.CollisionCount) { $collStart = [int]$integStart.CollisionCount } } catch { }
+        try { if ($integEnd   -and $null -ne $integEnd.CollisionCount)   { $collEnd   = [int]$integEnd.CollisionCount } } catch { }
+        if ($null -ne $collStart -and $null -ne $collEnd -and $collEnd -gt $collStart) {
+            $minted = $collEnd - $collStart
+            if ($failedRetriedEps -gt 0) {
+                [void]$findings.Add("[!] $minted collision(s) minted DURING this recording, and $failedRetriedEps of the observed pair attempt(s) FIRST FAILED (12012 'Bluetooth Error') and $(if ($failedRetriedEps -eq 1) { 'was' } else { 'were' }) retried -- a data point FOR the standing mint hypothesis (mint <=> failed-then-retried pair, 2026-08-27).")
+            } elseif ($pairEps.Count -gt 0) {
+                [void]$findings.Add("[!] $minted collision(s) minted DURING this recording with only CLEAN pair attempt(s) observed (no 12012) -- a data point AGAINST the failed-then-retried mint hypothesis. Worth capturing.")
+            } else {
+                [void]$findings.Add("[i] $minted collision(s) minted DURING this recording with NO pair attempt observed -- a different minter was at work (Modern Standby is the reproduced alternative); check the resume count.")
+            }
+        }
+    }
+
+    # ── Pair-attempt episodes (P3) ────────────────────────────────────────────
+    # Rendered whether or not integrity samples exist: the pairing evidence
+    # stands on its own, and a 12012 with no mint is also a data point.
+    $pairEpsAll = @(if ($Session.ContainsKey('PairEpisodes')) { $Session.PairEpisodes })
+    if ($pairEpsAll.Count -gt 0) {
+        $frCount = @($pairEpsAll | Where-Object { $_.FailedThenRetried }).Count
+        [void]$findings.Add("[i] $($pairEpsAll.Count) panel pair attempt(s) observed in-run: $frCount failed-then-retried (12012 'Bluetooth Error'), $($pairEpsAll.Count - $frCount) clean.")
     }
 
     # ── FI-014: pairing record vs device node, for the target ─────────────────

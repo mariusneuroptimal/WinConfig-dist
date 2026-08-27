@@ -6102,8 +6102,27 @@ namespace WinConfigDiag {
                         # record start is not tracked; the recorder starts
                         # before NO, so that window is effectively unreachable.
                         if ($cls -eq 'PairRetry') {
-                            if ($w.State -eq 'Appeared') { $st.LivePairRetry[[long]$w.Hwnd] = $true }
-                            else { [void]$st.LivePairRetry.Remove([long]$w.Hwnd) }
+                            if ($w.State -eq 'Appeared') {
+                                $st.LivePairRetry[[long]$w.Hwnd] = $true
+                                # P3: one pair EPISODE per pair window. The
+                                # episode is the unit the mint hypothesis is
+                                # tested on: did a 12012 fire inside it or not.
+                                if ($Session -and $Session.ContainsKey('PairEpisodes')) {
+                                    [void]$Session.PairEpisodes.Add(@{ Hwnd = [long]$w.Hwnd; StartUtc = $utc; EndUtc = $null; FailedThenRetried = $false })
+                                }
+                            } else {
+                                [void]$st.LivePairRetry.Remove([long]$w.Hwnd)
+                                if ($Session -and $Session.ContainsKey('PairEpisodes')) {
+                                    $openEp = @($Session.PairEpisodes | Where-Object { $_.Hwnd -eq [long]$w.Hwnd -and -not $_.EndUtc })
+                                    if ($openEp.Count -gt 0) { $openEp[-1].EndUtc = $utc }
+                                }
+                            }
+                        }
+                        # A 12012 'Bluetooth Error' during an open pair episode
+                        # marks it failed-then-retried -- the discriminator the
+                        # 08-27 campaign found on every minting re-pair.
+                        if ($w.State -eq 'Appeared' -and $w.Title -match '^Bluetooth Error' -and $Session -and $Session.ContainsKey('PairEpisodes')) {
+                            foreach ($ep in @($Session.PairEpisodes | Where-Object { -not $_.EndUtc })) { $ep.FailedThenRetried = $true }
                         }
                         $dlgSnap = $null
                         $dlgSnapLagMs = $null
@@ -9874,12 +9893,19 @@ namespace WinConfigDiag {
                     if ($btIntegEndSample -and $btProbeSession.SerialPortIntegrity) {
                         try {
                             $btEntryGrowth = [int]$btIntegEndSample.EntryCount - [int]$btProbeSession.SerialPortIntegrity.EntryCount
+                            # P3: pair-window episodes are direct re-pair
+                            # evidence too, and the failed-then-retried count
+                            # lets the verdict name the minting mechanism.
+                            $btPairEps = @(if ($btProbeSession.ContainsKey('PairEpisodes')) { $btProbeSession.PairEpisodes })
+                            $btFailedRetried = @($btPairEps | Where-Object { $_.FailedThenRetried }).Count
                             $btRepairSignals = @($btProbeSession.ReconnectTimes).Count +
-                                @($btProbeSession.ComPortHistory | Where-Object { $_.Changed -and -not $_.IsFirst }).Count
+                                @($btProbeSession.ComPortHistory | Where-Object { $_.Changed -and -not $_.IsFirst }).Count +
+                                $btPairEps.Count
                             $btIntegEndSample.Correlation = Get-SerialRegistrationCorrelation `
                                 -EntryCount $btIntegEndSample.EntryCount -ComNameCount $btIntegEndSample.ComNameCount `
                                 -ResumeCount $(if ($btIntegEndSample.PowerContext) { $btIntegEndSample.PowerContext.ResumeCount } else { $null }) `
-                                -InRunEntryGrowth $btEntryGrowth -InRunRepairSignalCount $btRepairSignals
+                                -InRunEntryGrowth $btEntryGrowth -InRunRepairSignalCount $btRepairSignals `
+                                -PairEpisodeCount $btPairEps.Count -FailedRetriedPairCount $btFailedRetried
                         } catch { }
                     }
                 }
@@ -10718,6 +10744,16 @@ namespace WinConfigDiag {
                         # homes that could disagree. The consumer gets both facts.
                         ComPortChangeCount     = if ($btProbeSession) {
                             @($btProbeSession.ComPortHistory | Where-Object { $_.Changed -and -not $_.IsFirst }).Count
+                        } else { $null }
+                        # P3 mint-hypothesis instrument: pair-window episodes
+                        # and how many first failed 12012. Null (not 0) when
+                        # the session predates the field -- the dashboard keys
+                        # on manifest fields, and null must not count.
+                        PairEpisodeCount       = if ($btProbeSession -and $btProbeSession.ContainsKey('PairEpisodes')) {
+                            @($btProbeSession.PairEpisodes).Count
+                        } else { $null }
+                        FailedRetriedPairCount = if ($btProbeSession -and $btProbeSession.ContainsKey('PairEpisodes')) {
+                            @($btProbeSession.PairEpisodes | Where-Object { $_.FailedThenRetried }).Count
                         } else { $null }
                         SlowReconnectCount     = if ($btProbeSession) {
                             @($btProbeSession.ReconnectTimes | Where-Object { $_ -ge 90 }).Count
