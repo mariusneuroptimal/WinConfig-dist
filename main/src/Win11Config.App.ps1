@@ -5935,6 +5935,11 @@ namespace WinConfigDiag {
                 $t = [string]$Title
                 if ($t -match '^Arc Not Detected')        { return 'ErrorDialog' }
                 if ($t -match '^Arc Connection Lost')     { return 'ErrorDialog' }
+                # 'Bluetooth Error' = 12012, a PAIRING-stage failure (Device
+                # Panel path, recovered by Try Again) -- proven on 3 boxes in
+                # the 2026-08-27 HS-124 campaign, where every collision-minting
+                # re-pair FIRST failed with this dialog.
+                if ($t -match '^Bluetooth Error')         { return 'ErrorDialog' }
                 if ($t -match '^Wake Up Arc')             { return 'WakeStep' }
                 if ($t -match '^Device Details')          { return 'Result' }
                 if ($t -match 'Pair Device with Retry')   { return 'PairRetry' }
@@ -6044,6 +6049,7 @@ namespace WinConfigDiag {
                         Handle                = $handle
                         StartedUtc            = [datetime]::UtcNow
                         RunspaceErrorLogged   = $false
+                        LivePairRetry         = @{}
                         Appearances           = @{}
                         ErrorTitles           = @{}
                         ShortestErrorDialogMs = $null
@@ -6086,6 +6092,19 @@ namespace WinConfigDiag {
                         $impliedCode = $null
                         if ($w.Title -match '^Arc Not Detected')        { $impliedCode = 12005 }
                         elseif ($w.Title -match '^Arc Connection Lost') { $impliedCode = 12006 }
+                        elseif ($w.Title -match '^Bluetooth Error')     { $impliedCode = 12012 }
+                        # Pairing context, tracked BEFORE the dialog rows read
+                        # it: a dialog that appears while 'Pair Device with
+                        # Retry.vi' is open is a PAIRING-stage failure, not a
+                        # session-start one -- the discriminator the 08-27
+                        # campaign needed to attribute 12012s. Baseline windows
+                        # never reach the queue, so a PairRetry already open at
+                        # record start is not tracked; the recorder starts
+                        # before NO, so that window is effectively unreachable.
+                        if ($cls -eq 'PairRetry') {
+                            if ($w.State -eq 'Appeared') { $st.LivePairRetry[[long]$w.Hwnd] = $true }
+                            else { [void]$st.LivePairRetry.Remove([long]$w.Hwnd) }
+                        }
                         $dlgSnap = $null
                         $dlgSnapLagMs = $null
                         if ($w.State -eq 'Appeared' -and $cls -eq 'ErrorDialog' -and $Session) {
@@ -6144,6 +6163,11 @@ namespace WinConfigDiag {
                                 # every other row.
                                 MachineState  = $dlgSnap
                                 StateSnapshotLagMs = $dlgSnapLagMs
+                                # True when a 'Pair Device with Retry' window
+                                # was open as this error dialog appeared: the
+                                # failure is pairing-stage, not session-start.
+                                # Null on every non-error row.
+                                PairingWindowOpen = $(if ($w.State -eq 'Appeared' -and $cls -eq 'ErrorDialog') { [bool]($st.LivePairRetry.Count -gt 0) } else { $null })
                             })
                             if ($wrote) { $st.EventLinesWritten = [int]$st.EventLinesWritten + 1 }
                             else { $script:BtRec_EventLinesDropped = [int]$script:BtRec_EventLinesDropped + 1 }
@@ -8102,6 +8126,7 @@ namespace WinConfigDiag {
             $btNextPoll    = $btRecordStart.AddSeconds(6)
             $btSvcStates   = $null
             $btFirstPoll   = $true
+            $btAbsentProvidersChecked = $false
             $btEventReport = $null
             $btDeviceProbeModPath = Join-Path $PSScriptRoot "Modules\BluetoothDeviceProbe.psm1"
             $btEventEvidence = if (Get-Command New-BluetoothEventEvidenceRecord -ErrorAction SilentlyContinue) {
@@ -8162,6 +8187,23 @@ namespace WinConfigDiag {
                             if ($newAuthFails -gt 0 -and $renderLive) {
                                 Write-BtLog "  [!] $newAuthFails mutual-authentication failure(s) against the target headset (BTHUSB Event 16) -- bond suspect" -Level FAIL
                             }
+                        }
+                    }
+
+                    # Run-start event-channel presence check (2026-08-27): the
+                    # same three System providers are absent fleet-wide and
+                    # FLAP per boot, so a zero event count from an absent
+                    # provider is blindness, not quiet. The end-of-run report
+                    # only COUNTED absences; an absent measurement must render
+                    # as absent, so this is said once, up front, on the first
+                    # poll that carries query results, and stashed for the
+                    # summary findings.
+                    if (-not $btAbsentProvidersChecked -and $pollData.Events -and $pollData.Events.Queries) {
+                        $btAbsentProvidersChecked = $true
+                        $btAbsentAtStart = @($pollData.Events.Queries | Where-Object { $_.Status -eq 'ProviderAbsent' } | ForEach-Object { [string]$_.ProviderName } | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+                        if ($btAbsentAtStart.Count -gt 0) {
+                            if ($btProbeSession) { $btProbeSession.AbsentEventProvidersAtStart = $btAbsentAtStart }
+                            Write-BtLog "  [~] Event channel partially BLIND this run: ETW provider(s) $($btAbsentAtStart -join ', ') absent on this host at run start -- zero events from them means 'not observable', not 'nothing happened'." -Level 'WARN'
                         }
                     }
 
@@ -9820,6 +9862,26 @@ namespace WinConfigDiag {
                 # "arrived broken".
                 if (Get-Command Get-BluetoothSerialPortIntegrity -ErrorAction SilentlyContinue) {
                     $btProbeSession.SerialPortIntegrityEnd = try { Get-BluetoothSerialPortIntegrity } catch { $null }
+                    # Attribution pass (2026-08-27): the box-level correlation
+                    # can only weigh resumes, and blamed resume for a
+                    # generation this recorder WATCHED an in-run panel re-pair
+                    # mint (MPAVOURIS 08-27). With both samples in hand, feed
+                    # it the run's own evidence -- entry growth start-to-end,
+                    # plus the session's unpair/re-pair signals (device
+                    # Missing-then-back reconnects, COM-port set changes) --
+                    # and let in-run re-pair outrank resume.
+                    $btIntegEndSample = $btProbeSession.SerialPortIntegrityEnd
+                    if ($btIntegEndSample -and $btProbeSession.SerialPortIntegrity) {
+                        try {
+                            $btEntryGrowth = [int]$btIntegEndSample.EntryCount - [int]$btProbeSession.SerialPortIntegrity.EntryCount
+                            $btRepairSignals = @($btProbeSession.ReconnectTimes).Count +
+                                @($btProbeSession.ComPortHistory | Where-Object { $_.Changed -and -not $_.IsFirst }).Count
+                            $btIntegEndSample.Correlation = Get-SerialRegistrationCorrelation `
+                                -EntryCount $btIntegEndSample.EntryCount -ComNameCount $btIntegEndSample.ComNameCount `
+                                -ResumeCount $(if ($btIntegEndSample.PowerContext) { $btIntegEndSample.PowerContext.ResumeCount } else { $null }) `
+                                -InRunEntryGrowth $btEntryGrowth -InRunRepairSignalCount $btRepairSignals
+                        } catch { }
+                    }
                 }
 
                 # FI-014 second sample, same reasoning as the FI-012 pair above:

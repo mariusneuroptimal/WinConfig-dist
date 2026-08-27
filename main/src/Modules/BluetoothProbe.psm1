@@ -5530,12 +5530,24 @@ function Get-SerialRegistrationCorrelation {
         Assessment values -- deliberately NOT called a Verdict, which in this
         codebase means a DiagnosticResult (PASS/WARN/FAIL/NOT_RUN) governed by
         the DCTC contract. This is a hypothesis test, not a diagnostic verdict:
+          InRunRepair   excess generations appeared DURING the observed run
+                        alongside direct unpair/re-pair evidence from the same
+                        run; the re-pair, not resume, is the attributed minter
           Consistent    excess generations <= resumes; hypothesis survives
           Unexplained   excess generations > resumes; something ELSE is
                         re-registering COM names, and reboot-only advice is
                         treating a symptom
           Clean         no excess generations
           Unknown       resume count unavailable (non-admin, cleared log)
+
+        ATTRIBUTION PRECEDENCE (2026-08-27): in-run re-pair > resume >
+        unexplained. The MPAVOURIS 08-27 capture blamed "driver re-registering
+        on resume" for a generation provably minted by an in-run panel
+        re-pair, because resume was the only hypothesis this function could
+        hold. When the caller can see the run (entry growth between its start
+        and end integrity samples, plus unpair/re-pair signals such as the
+        target device going Missing and coming back or its COM port set
+        changing), that direct evidence outranks the boot-wide resume count.
     .PARAMETER EntryCount
         Total SERIALCOMM entries.
     .PARAMETER ComNameCount
@@ -5543,12 +5555,22 @@ function Get-SerialRegistrationCorrelation {
     .PARAMETER ResumeCount
         Combined legacy Kernel-Power 107 and Modern Standby 507 events since
         boot, or $null when unknown.
+    .PARAMETER InRunEntryGrowth
+        SERIALCOMM entry-count growth between the caller's start and end
+        samples of one observed run, or $null when the caller has no such
+        pair. Only a positive value can support InRunRepair.
+    .PARAMETER InRunRepairSignalCount
+        Count of direct unpair/re-pair signals observed during the same run
+        (device Missing-then-back transitions, COM-port set changes). 0 when
+        none or when the caller does not track them.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][int]$EntryCount,
         [Parameter(Mandatory)][int]$ComNameCount,
-        [System.Nullable[int]]$ResumeCount
+        [System.Nullable[int]]$ResumeCount,
+        [System.Nullable[int]]$InRunEntryGrowth,
+        [int]$InRunRepairSignalCount = 0
     )
 
     $result = @{
@@ -5556,6 +5578,8 @@ function Get-SerialRegistrationCorrelation {
         ExcessGenerations  = $null
         GenerationsPerName = $null
         ResumeCount        = $ResumeCount
+        InRunEntryGrowth   = $InRunEntryGrowth
+        InRunRepairSignalCount = $InRunRepairSignalCount
         Summary            = $null
     }
 
@@ -5574,6 +5598,16 @@ function Get-SerialRegistrationCorrelation {
     if ($excess -eq 0) {
         $result.Assessment = 'Clean'
         $result.Summary = "1 registration per COM name; no stale generations"
+        return $result
+    }
+
+    # Direct in-run evidence first: generations that appeared during the
+    # observed run while the run also saw unpair/re-pair activity are
+    # attributed to that re-pair, whatever the boot-wide resume count says.
+    if ($null -ne $InRunEntryGrowth -and $InRunEntryGrowth -gt 0 -and $InRunRepairSignalCount -gt 0) {
+        $result.Assessment = 'InRunRepair'
+        $resumeNote = if ($null -ne $ResumeCount) { " ($ResumeCount resume(s) since boot; direct in-run evidence outranks the resume correlation)" } else { '' }
+        $result.Summary = "$excess excess registration generation(s) per COM name; $InRunEntryGrowth SERIALCOMM entr$(if ($InRunEntryGrowth -eq 1) { 'y' } else { 'ies' }) appeared DURING this recording alongside $InRunRepairSignalCount in-run unpair/re-pair signal(s) - attributed to the in-run re-pair, not sleep/resume$resumeNote"
         return $result
     }
 

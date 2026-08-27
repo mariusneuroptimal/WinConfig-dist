@@ -5330,6 +5330,10 @@ function New-DeviceProbeSession {
         SerialPortPreflight      = $null
         SerialPortIntegrity      = $null
         SerialPortIntegrityEnd   = $null
+        # ETW providers absent at the first event poll of this run. $null =
+        # never checked (older sessions, collector off); an empty check result
+        # is never stored, so a non-null value always names real blindness.
+        AbsentEventProvidersAtStart = $null
         # FI-012 fault 2 fingerprint (paired, ports clean, no link). Derived
         # without opening a port, because the open collector must never run
         # inside a live recording session.
@@ -6271,7 +6275,19 @@ function Get-DeviceProbeSessionSummary {
         if (-not $integ.Healthy -and $integ.MissingSymlinkCount -gt 0) {
             [void]$findings.Add("[!] Bluetooth COM ports are broken at the OS level: $($integ.EntryCount) SERIALCOMM registrations for $($integ.ComNameCount) COM name(s), $($integ.CollisionCount) collided, $($integ.MissingSymlinkCount) symlink(s) absent. No process can open ANY Bluetooth COM port in this state -- expect 'Control Port not valid' / 'Arc not detected'. FIX: reboot. Re-pairing also clears it but is more disruptive and adds another COM-name generation.")
         } elseif (-not $integ.Healthy -and $integ.CollisionCount -gt 0) {
-            [void]$findings.Add("[!] Bluetooth serial port registrations are colliding: $($integ.CollisionCount) COM name(s) claimed by more than one device object. The symlinks still resolve, but they resolve to the ABANDONED generation -- measured in this exact state, every Bluetooth COM port on the box failed to open with win32 433 in under 2 ms, including ports with no device behind them. Treat this as broken now, not as an early warning. FIX: reboot without unpairing.")
+            # REWRITTEN 2026-08-27. The previous prose asserted the symlinks
+            # resolve to the ABANDONED generation and every open fails 433 --
+            # contradicted in 3/3 collision captures from the HS-124 campaign
+            # (live-generation symlinks; one box streamed 343 ops/s on the
+            # collided namespace). Registration data cannot decide symlink-
+            # target liveness; only an open attempt can. Cite the run's own
+            # open evidence when it exists instead of asserting an outcome.
+            $liveCite = ''
+            $heldOnCollided = @($Session.HeldPorts | Where-Object { $_ })
+            if ($heldOnCollided.Count -gt 0) {
+                $liveCite = " In THIS run the namespace was demonstrably live despite the collision: $($heldOnCollided -join ', ') held open through it."
+            }
+            [void]$findings.Add("[!] Bluetooth serial port registrations are colliding: $($integ.CollisionCount) COM name(s) claimed by more than one device object -- an old registration generation was never torn down (FI-012). What the registration data can NOT say is which generation the symlinks point at or whether opens fail: field captures show both outcomes (every open failing win32 433 in under 2 ms, and full-rate EEG streaming on a collided namespace). Only an open attempt settles it.$liveCite FIX: reboot without unpairing clears the stale generations; a Bluetooth radio cycle has also re-pointed the symlinks without a reboot. Re-pairing mints another generation instead of reclaiming any.")
         } elseif ($integ.Healthy) {
             [void]$findings.Add("[ok] Bluetooth serial port registrations are consistent ($($integ.EntryCount) entries for $($integ.ComNameCount) COM name(s), all symlinks resolve)")
         }
@@ -6291,7 +6307,11 @@ function Get-DeviceProbeSessionSummary {
         # this box and the FI-012 story is incomplete for it.
         $corr = $null
         try { $corr = $integ.Correlation } catch { }
-        if ($corr -and $corr.Assessment -eq 'Unexplained') {
+        if ($corr -and $corr.Assessment -eq 'InRunRepair') {
+            # Direct evidence beats correlation: this run WATCHED the minting
+            # re-pair, so the resume hypothesis is not even in play here.
+            [void]$findings.Add("[i] $($corr.Summary)")
+        } elseif ($corr -and $corr.Assessment -eq 'Unexplained') {
             [void]$findings.Add("[!] $($corr.Summary). Worth capturing: FI-012 assumes sleep/resume is the trigger, and this box contradicts that.")
         } elseif ($corr -and $corr.Assessment -eq 'Consistent') {
             [void]$findings.Add("[i] $($corr.Summary)")
@@ -6366,6 +6386,16 @@ function Get-DeviceProbeSessionSummary {
         [void]$findings.Add("[!] $($fp.Summary) NEXT: $($fp.Action)")
     } elseif ($fp -and $fp.Fault -eq 'NoActiveLink') {
         [void]$findings.Add("[i] $($fp.Summary) NEXT: $($fp.Action)")
+    }
+
+    # ── Event-channel blindness ───────────────────────────────────────────────
+    # Absent providers were previously only COUNTED in the end-of-run report,
+    # where zero events from an absent provider read as a healthy quiet. The
+    # blindness is a per-boot flap seen fleet-wide (08-27 campaign), so it is
+    # stated as an explicit finding: an absent measurement renders as absent.
+    $absentProv = @($Session.AbsentEventProvidersAtStart | Where-Object { $_ })
+    if ($absentProv.Count -gt 0) {
+        [void]$findings.Add("[~] Event-log channel partially BLIND this run: ETW provider(s) $($absentProv -join ', ') were absent on this host at run start. Zero events from them is lack of observability, not evidence nothing happened; the absence flaps per boot, so other captures from this box may differ.")
     }
 
     # ── Arrival-state contradictions ──────────────────────────────────────────
