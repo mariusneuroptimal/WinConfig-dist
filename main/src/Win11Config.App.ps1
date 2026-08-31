@@ -5959,6 +5959,21 @@ namespace WinConfigDiag {
                 if ($t -match '^Wake Up Arc')             { return 'WakeStep' }
                 if ($t -match '^Device Details')          { return 'Result' }
                 if ($t -match 'Pair Device with Retry')   { return 'PairRetry' }
+                # VI-name fallback net (2026-08-31). The CLEF error-email
+                # corpus tied each dialog VI to its NO code: 'Headset Not
+                # Detected--dialog.vi' = 12005, 'Headset Connection Lost
+                # (Session)--dialog.vi' = 12006, 'Bluetooth Error--dialog.vi'
+                # = 12012, and the three 'Wake Up Arc' prompt flavors
+                # 'Headset Button Prompt - Details' = 12013 / '- Flashing' =
+                # 12014 / '- Battery' = 14036. LabVIEW can title a top-level
+                # window as the VI path instead of the display phrase -- the
+                # discovery banner above is the proven case -- and a VI-path
+                # title defeats every ^-anchored phrase key, so each known
+                # dialog VI is matched here by its distinctive VI name.
+                if ($t -match 'Headset Not Detected--dialog')                 { return 'ErrorDialog' }
+                if ($t -match 'Headset Connection Lost \(Session\)--dialog')  { return 'ErrorDialog' }
+                if ($t -match 'Bluetooth Error--dialog')                      { return 'ErrorDialog' }
+                if ($t -match 'Headset Button Prompt - (Details|Flashing|Battery)') { return 'WakeStep' }
                 return 'Other'
             }
 

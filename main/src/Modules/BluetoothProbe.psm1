@@ -6361,6 +6361,14 @@ function Get-SerialOpenClassification {
     .PARAMETER FirstWin32Error
         The FIRST attempt's error code, when a retry happened. Leave at the
         default when there was only one attempt.
+    .OUTPUTS
+        Hashtable with Classification, Meaning, Action -- and LiveGloss, a
+        ONE-LINE rendering for the live recorder window (2026-08-31). Meaning
+        stays the full report text; LiveGloss exists so the live line and the
+        report cannot drift apart by growing separate wordings. Every hedge in
+        the Meaning that changes what an operator does next (a lone 121 is
+        unresolved; 1231 alone is not a bond verdict) must survive into the
+        gloss.
     #>
     [CmdletBinding()]
     param(
@@ -6374,11 +6382,12 @@ function Get-SerialOpenClassification {
     if ($Win32Error -eq 0 -and $FirstWin32Error -eq 121) {
         return @{ Classification = 'ColdLink'
                   Meaning = 'ERROR_SEM_TIMEOUT on the first attempt, then the port opened - a cold ACL link being established, not a fault. The device IS reachable.'
+                  LiveGloss = 'opened on retry after a 121 - a cold ACL link waking, not a fault'
                   Action  = $null }
     }
 
     switch ($Win32Error) {
-        0   { return @{ Classification = 'Healthy'; Meaning = 'Port opened'; Action = $null } }
+        0   { return @{ Classification = 'Healthy'; Meaning = 'Port opened'; LiveGloss = 'port opened'; Action = $null } }
         2   {
             # REWRITTEN 2026-08-20 (defect D5). The old Meaning said "the COM
             # symlink does not exist". Measured false a third way on
@@ -6388,9 +6397,11 @@ function Get-SerialOpenClassification {
             # measured causes and the code alone cannot separate them.
             return @{ Classification = 'PortMissing'
                       Meaning = 'ERROR_FILE_NOT_FOUND - no live target behind the COM name. Two measured causes: the \GLOBAL??\ symlink is genuinely absent (2026-07-27), or a stranded registration whose symlink still resolves to a dead owner the driver has since reclaimed (2026-08-19, the late phase of the 433 fault). The code alone cannot separate them - read the symlink.'
+                      LiveGloss = 'no live target behind the COM name - reboot-class fault; do NOT re-pair first'
                       Action  = 'Reboot. HKLM\HARDWARE is volatile and rebuilt at boot. Do not re-pair first.' } }
         5   { return @{ Classification = 'InUse'
                         Meaning = 'ERROR_ACCESS_DENIED - the port exists and another process holds it'
+                        LiveGloss = 'the port exists and another process holds it'
                         Action  = 'Close the application holding the port (usually NO.exe) and retry.' } }
         1231 {
             # ERROR_NETWORK_UNREACHABLE. Observed on MMEVOLD_06 alongside a
@@ -6401,6 +6412,7 @@ function Get-SerialOpenClassification {
             # Raw evidence, pending the event correlation.
             return @{ Classification = 'LinkUnreachable'
                       Meaning = 'ERROR_NETWORK_UNREACHABLE - the RFCOMM link could not be established. On its own this does NOT establish a stale or mismatched pairing; that reading requires target-matched BTHUSB authentication events from the same window.'
+                      LiveGloss = 'RFCOMM connect refused - NOT proof of a bad bond by itself; the displaced-bond reading needs target-matched auth failures (BTHUSB Event 16) from the same window'
                       Action  = 'Collect the Bluetooth event evidence for this device before acting. Do NOT re-pair on this code alone - it is also consistent with the device being out of range or the radio being in a bad state.' }
         }
         433 {
@@ -6413,6 +6425,7 @@ function Get-SerialOpenClassification {
             # object (~3 min in the measured run), symlink resolving throughout.
             return @{ Classification = 'PortTargetDead'
                       Meaning = 'ERROR_NO_SUCH_DEVICE - the COM name resolves, but to an RFCOMM device object the driver has abandoned. Two reproduced routes leave a name in this state: a re-pair reusing a name stranded by an unpair-while-held, and Modern Standby minting a new generation on susceptible machines. Ages into win32 2 once the driver reclaims the dead object (~3 minutes in the measured run) - 433 and 2 are two phases of one fault, and the symlink can stay resolving through both.'
+                      LiveGloss = 'COM name resolves to a dead device object - reboot WITHOUT unpairing; not a headset, range, or power problem'
                       Action  = 'Reboot without unpairing. This is not a headset fault and not a range/power problem - do not toggle the radio, re-pair, or reset COM numbers, and do not power-cycle the device chasing it.' } }
         121 {
             # A SINGLE 121 does not settle anything, and the returned text now
@@ -6424,8 +6437,19 @@ function Get-SerialOpenClassification {
             } elseif ($FirstWin32Error -lt 0) {
                 ' on a SINGLE attempt, which cannot separate a cold ACL link from an unreachable device - this reading is UNRESOLVED until a retry is made'
             } else { '' }
+            # The gloss carries the SAME resolution state as the Meaning: the
+            # recorder tick never retries, so its live line must render the
+            # single-attempt case as unresolved, never as "device off".
+            $liveGloss = if ($FirstWin32Error -eq 121) {
+                'no answer in ~5 s on attempt AND retry - not a cold link: headset off or out of range'
+            } elseif ($FirstWin32Error -lt 0) {
+                'no answer in ~5 s - headset off, out of range, or a cold link; a single 121 is UNRESOLVED'
+            } else {
+                'no answer in ~5 s to the RFCOMM connect'
+            }
             return @{ Classification = 'DeviceNotResponding'
                       Resolved = ($FirstWin32Error -ge 0)
+                      LiveGloss = $liveGloss
                       Meaning = "ERROR_SEM_TIMEOUT - the port is healthy; the device did not answer the RFCOMM connect$persisted"
                       Action  = 'Check the headset is powered ON and in range FIRST. A powered-off device fails exactly this way on every retry while every static signal - PnP nodes, SERIALCOMM, port integrity - still reads healthy. Only once it is confirmed on does a Bluetooth radio toggle (>=10s off) apply.' }
         }
@@ -6446,11 +6470,13 @@ function Get-SerialOpenClassification {
             # the 87 window). Emphatically NOT link-park evidence - that
             # guard keys on {121,1167} and must stay that way.
             return @{ Classification = 'ObservedUnexplained'
+                      LiveGloss = 'unexplained ~33 s blocking failure - record it; do NOT remediate on this code alone'
                       Meaning = 'ERROR_INVALID_PARAMETER from a Bluetooth COM open that BLOCKED ~33 s (measured 32.3-35.8 s, n=25, 3 Realtek boxes, 2026-08-26/27 displaced-bond-era captures; absent on an Intel control box under the same fault and absent from the quiescent corpus). Mechanism unknown: observed only during disturbed link/flap windows, but not tied to auth-in-progress and not exclusive to corpse-generation ports. The open blocks its caller for the full ~33 s.'
                       Action  = 'None established - do NOT remediate on this code alone. Do not toggle the radio, re-pair, or reboot chasing an 87; record it with its timing. Recurring 87s OUTSIDE a disturbed link window would be new evidence worth a capture.' }
         }
         default { return @{ Classification = 'Unknown'
                             Meaning = "win32 error $Win32Error"
+                            LiveGloss = "win32 error $Win32Error - meaning not yet established for this code"
                             Action  = $null } }
     }
 }

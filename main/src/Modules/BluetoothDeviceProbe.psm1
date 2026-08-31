@@ -5022,6 +5022,10 @@ function New-DeviceProbeSession {
         # stays @{} -- same discipline as the sets they explain.
         UnavailablePortReasonsCurrent    = $(if ($apopEffective) { @{} } else { $null })
         UnavailablePortReasons           = $(if ($apopEffective) { @{} } else { $null })
+        # Last ANNOUNCED code per port for the live WHY lines (2026-08-31):
+        # the transition dedup, not a record - the evidence stays in
+        # UnavailablePortReasons and events.jsonl. Same absent-vs-empty rule.
+        PortReasonAnnounced              = $(if ($apopEffective) { @{} } else { $null })
         # Context captured on the tick a port ENTERS the after-held set (LAST
         # occurrence kept, matching the reasons map): the win32 code of the
         # failed open plus the link state under it. This is what lets the
@@ -5530,6 +5534,73 @@ function Invoke-DeviceProbeTick {
         $Session.HeldPortsEver = @(
             @($Session.HeldPortsEver) + @($Session.HeldPorts) | Where-Object { $_ } | Select-Object -Unique
         )
+
+        # ── Live WHY for refused opens (2026-08-31) ──────────────────────────
+        # The raw code was already on the tick (PortOpenObservations,
+        # 2026-08-23) and the meaning already existed
+        # (Get-SerialOpenClassification), but they only met in the end-of-run
+        # report: live, a refused port rendered as "COM5 (error 1231)" with no
+        # meaning attached, and the 1231/121/433 discrimination was re-run by
+        # hand. This is the join, at the same choke point that builds
+        # $reasonsNow. Announced on TRANSITION only (first sighting of a code,
+        # or the code changing) - never per tick, so a steady fault says its
+        # name once. A port with no recorded code stays silent: absent is
+        # absent, and the bare name already renders in the chain evidence. The
+        # tick never retries an open, so the classifier's single-attempt hedge
+        # applies verbatim - a lone 121 renders UNRESOLVED, never "device off".
+        if (-not $Session.ContainsKey('PortReasonAnnounced') -or $null -eq $Session.PortReasonAnnounced) {
+            $Session.PortReasonAnnounced = @{}
+        }
+        if ($streamResult -is [hashtable] -and $streamResult.ContainsKey('PortOpenObservations')) {
+            foreach ($obs in @($streamResult.PortOpenObservations)) {
+                if ($null -eq $obs -or [string]::IsNullOrWhiteSpace([string]$obs.PortName)) { continue }
+                $pk = [string]$obs.PortName
+                $lastCode = if ($Session.PortReasonAnnounced.ContainsKey($pk)) { $Session.PortReasonAnnounced[$pk] } else { $null }
+                if ($obs.CoarseState -eq 'Unavailable' -and $null -ne $obs.Win32Error) {
+                    $code = [int]$obs.Win32Error
+                    if ($lastCode -ne $code) {
+                        $Session.PortReasonAnnounced[$pk] = $code
+                        $cls = if (Get-Command Get-SerialOpenClassification -ErrorAction SilentlyContinue) {
+                            Get-SerialOpenClassification -Win32Error $code
+                        } else { $null }
+                        $label = if ($cls) { [string]$cls.Classification } else { 'OpenRefused' }
+                        $gloss = if ($cls -and $cls.ContainsKey('LiveGloss') -and $cls.LiveGloss) { " -- $($cls.LiveGloss)" } else { '' }
+                        # FAIL only for the codes whose measured meaning IS a
+                        # fault; the ambiguous ones (a lone 121, the
+                        # unexplained 87) stay WARN so the screenshot tiering
+                        # does not spend its uncapped budget on them.
+                        $level = switch ($label) {
+                            'PortMissing'     { 'FAIL' }
+                            'PortTargetDead'  { 'FAIL' }
+                            'LinkUnreachable' { 'FAIL' }
+                            default           { 'WARN' }
+                        }
+                        # The conjunction that upgrades 1231 to the
+                        # displaced-bond signature is target-matched Event 16
+                        # in THIS session - 1231 alone must never be reported
+                        # as a bond verdict (measured: it is also a cold radio
+                        # or an out-of-range device).
+                        $anno = $null
+                        if ($code -eq 1231 -and $Session.ContainsKey('BtAuthFailureCount') -and [int]$Session.BtAuthFailureCount -gt 0) {
+                            $anno = "[!] 1231 with $([int]$Session.BtAuthFailureCount) target-matched mutual-authentication failure(s) (BTHUSB Event 16) this session -- displaced-bond signature: this machine's pairing has been superseded by a more recent pairing on another system. Re-pairing here will break that other system and permanently consume COM numbers."
+                        }
+                        $events += @{ Kind = 'PORTWHY'; State = $label; Reason = "$pk refused to open: win32 $code$gloss"; Annotation = $anno; Level = $level; Timestamp = $now }
+                    }
+                } elseif ($null -ne $lastCode -and 0 -ne $lastCode -and ($obs.CoarseState -eq 'Free' -or $obs.CoarseState -eq 'Held')) {
+                    # Recovery edge: the port answers again (opened, or alive
+                    # and held by another process). For a prior 121 the
+                    # classifier's retry rule applies - open-after-121 is a
+                    # cold ACL link waking, not a fault.
+                    $Session.PortReasonAnnounced[$pk] = 0
+                    $recoverReason = if ($lastCode -eq 121) {
+                        "$pk answers again after a 121 -- a cold ACL link waking, not a fault"
+                    } else {
+                        "$pk answers again (was win32 $lastCode)"
+                    }
+                    $events += @{ Kind = 'PORTWHY'; State = 'Recovered'; Reason = $recoverReason; Annotation = $null; Level = 'OK'; Timestamp = $now }
+                }
+            }
+        }
     }
     # else: left at the $null New-DeviceProbeSession seeded. Assigning @() here
     # -- even "harmlessly", even to a union that will never gain a member -- is

@@ -1,8 +1,8 @@
 {
-    "timestamp":  "2026-08-27T19:26:17.3541308Z",
+    "timestamp":  "2026-08-31T15:56:58.9950455Z",
     "branch":  "main",
     "schema_version":  "2.0",
-    "source_ref":  "ead05961483ee6e88fed0afd8b0c7b9224b7d3cf",
+    "source_ref":  "73b9a351ad5d43b9637d14de228d712b5d05d509",
     "artifacts":  [
                       {
                           "path":  "Win11Config.ps1",
@@ -11,8 +11,8 @@
                       },
                       {
                           "path":  "src/Win11Config.App.ps1",
-                          "sha256":  "816b73aef1826d1763a56b7928ab8a799da28843e9effc5da009338ad54a5919",
-                          "size":  947565
+                          "sha256":  "84098bb9c30ea7eabe53779511a0880fb9d9c0102220965c9131398f9bdf4935",
+                          "size":  948804
                       },
                       {
                           "path":  "src/VERSION.psd1",
@@ -146,8 +146,8 @@
                       },
                       {
                           "path":  "src/Modules/BluetoothProbe.psm1",
-                          "sha256":  "ae58012aa58fe47514a971e72c9828e729152de7d87d55255a833c9bad41754e",
-                          "size":  402077
+                          "sha256":  "0c0277c4f27721afcbde1402a2b939851df6c762357c62f1cabc99459e2347c5",
+                          "size":  404141
                       },
                       {
                           "path":  "src/Modules/TargetDeviceWatch.psm1",
@@ -156,10 +156,10 @@
                       },
                       {
                           "path":  "src/Modules/BluetoothDeviceProbe.psm1",
-                          "sha256":  "40fd8eaad4d11284ee0f36000ed952ec27ac9bd7b6ceb0a82099a9240f670c67",
-                          "size":  501879
+                          "sha256":  "9eb9cc25c3e614fd4ce6e9a30a0cfa75b07b9b589f508af4d3b6e00a0703a6f8",
+                          "size":  507221
                       }
                   ],
-    "build_id":  "manual-20260827152617",
+    "build_id":  "manual-20260831115658",
     "event":  "manual"
 }
