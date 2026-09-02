@@ -17,17 +17,19 @@
     ManifestVersion = "1.0.0"
 
     # Categories in display order (SSOT)
+    # Reordered 2026-09-01: Support, Network, Bluetooth promoted to the top --
+    # the three categories support techs actually open on a call.
     Categories = @(
+        "Support"
         "Network"
+        "Bluetooth"
         "Updates"
         "NO Shortcuts"
         "Disk"
         "System"
         "Audio"
-        "Bluetooth"
         "zAmp"
         "Zengar UI"
-        "Support"
     )
 
     # Tools per category (SSOT)

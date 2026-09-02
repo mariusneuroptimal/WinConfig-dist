@@ -7470,29 +7470,86 @@ function Get-BluetoothPnpInventory {
         reason attached, so the caller can fall back to letting each collector
         run its own scoped queries. That fallback is the point: sharing one
         enumeration must not mean losing both evidence channels together.
+    .PARAMETER MaxAgeSeconds
+        0 (the default) always enumerates -- every pre-existing caller and test
+        mock keeps its exact behavior. A positive value lets a fresh-enough
+        previous inventory be returned instead, PROVIDED the SERIALCOMM registry
+        snapshot -- a ~30 ms read -- is byte-identical to the one taken with it.
+        Field-measured 2026-09-01: the enumeration is the recorder tick's single
+        largest steady-state cost (522 ms/tick mean on MM06, 976 ms on the
+        Vivobook), and the tick pumps on the UI thread, so this is frozen-window
+        time. SERIALCOMM is the guard because it moves on exactly the events
+        this inventory must not be stale for -- pair, unpair, port mint, radio
+        off (which empties it). What the guard does NOT catch, stated: a PnP
+        Status/Problem change (e.g. CM_PROB_DISABLED) with no port change can be
+        reported up to MaxAgeSeconds late. A cached return carries its ORIGINAL
+        CapturedAt -- the enumeration instant is when the data was true, and
+        restamping it would fabricate a fresh observation -- plus FromCache so
+        no reader mistakes it for one.
     .OUTPUTS
         PSCustomObject (PSTypeName WinConfig.FlightRecorder.PnpInventory) with
-        CapturedAt, Ok, Devices, Failure.
+        CapturedAt, Ok, Devices, Failure, FromCache.
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [int]$MaxAgeSeconds = 0
+    )
+
+    $serialNow = $null
+    if ($MaxAgeSeconds -gt 0) {
+        try {
+            $sc = Get-ItemProperty -Path 'HKLM:\HARDWARE\DEVICEMAP\SERIALCOMM' -ErrorAction Stop
+            $serialNow = @($sc.PSObject.Properties |
+                Where-Object { $_.Name -notlike 'PS*' } |
+                Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join '|'
+        } catch {
+            # An unreadable SERIALCOMM key means the guard cannot vouch for the
+            # cache; fall through to a real enumeration rather than serve a
+            # snapshot nothing verified.
+            $serialNow = $null
+        }
+        $cached = $script:BtPnpInventoryCache
+        if ($null -ne $serialNow -and $cached -and $cached.Inventory.Ok -and
+            $serialNow -eq $cached.SerialComm -and
+            ((Get-Date) - $cached.Inventory.CapturedAt).TotalSeconds -lt $MaxAgeSeconds) {
+            return $cached.Inventory
+        }
+    }
 
     try {
         $all = @(Get-PnpDevice -ErrorAction Stop)
-        return [pscustomobject]@{
+        $inv = [pscustomobject]@{
             PSTypeName = 'WinConfig.FlightRecorder.PnpInventory'
             CapturedAt = Get-Date
             Ok         = $true
             Devices    = $all
             Failure    = $null
+            FromCache  = $false
         }
+        if ($MaxAgeSeconds -gt 0 -and $null -ne $serialNow) {
+            # Cache a COPY flagged FromCache so the fresh return above stays
+            # labeled fresh while every replayed one says it was replayed.
+            $replay = [pscustomobject]@{
+                PSTypeName = 'WinConfig.FlightRecorder.PnpInventory'
+                CapturedAt = $inv.CapturedAt
+                Ok         = $true
+                Devices    = $all
+                Failure    = $null
+                FromCache  = $true
+            }
+            $script:BtPnpInventoryCache = @{ Inventory = $replay; SerialComm = $serialNow }
+        }
+        return $inv
     } catch {
+        # A failed enumeration is never cached: the next call must retry.
+        $script:BtPnpInventoryCache = $null
         return [pscustomobject]@{
             PSTypeName = 'WinConfig.FlightRecorder.PnpInventory'
             CapturedAt = Get-Date
             Ok         = $false
             Devices    = @()
             Failure    = $_.Exception.Message
+            FromCache  = $false
         }
     }
 }

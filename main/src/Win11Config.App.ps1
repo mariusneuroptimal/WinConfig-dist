@@ -9237,8 +9237,18 @@ namespace WinConfigDiag {
                         # field parity. On inventory failure $btInv is unusable,
                         # both collectors fall back to their own queries, and the
                         # two channels fail independently as before.
+                        #
+                        # MaxAgeSeconds 9 = up to two ticks served from cache,
+                        # guarded by a byte-identical SERIALCOMM snapshot.
+                        # Field-measured 2026-09-01: this enumeration was the
+                        # tick's largest steady-state cost (522 ms/tick mean on
+                        # MM06, 976 ms on the Vivobook) on a loop that pumps on
+                        # the UI thread. The trade, stated in the function help:
+                        # a PnP Status change with no port change can be seen up
+                        # to 9 s late; pair/unpair/mint/radio-off all move
+                        # SERIALCOMM and always get a fresh enumeration.
                         $btPartSw.Restart()
-                        $btInv = try { Get-BluetoothPnpInventory } catch { $null }
+                        $btInv = try { Get-BluetoothPnpInventory -MaxAgeSeconds 9 } catch { $null }
                         if ($btInv -and -not $btInv.Ok -and -not $btInvFailWarned) {
                             $btInvFailWarned = $true
                             Write-BtLog "  [~] Shared device enumeration unavailable ($($btInv.Failure)) -- each check is querying separately, which is slower but complete." -Level "DIM"
@@ -12699,16 +12709,16 @@ foreach ($tabPage in $tabControl.TabPages) {
         # This ordered array is THE ONLY place categories are defined
         # Used for: list population, panel creation, selection, badges
         $script:Categories = @(
+            "Support",
             "Network",
+            "Bluetooth",
             "Updates",
             "NO Shortcuts",
             "Disk",
             "System",
             "Audio",
-            "Bluetooth",
             "zAmp",
-            "Zengar UI",
-            "Support"
+            "Zengar UI"
         )
 
         # === DRY RUN INFRASTRUCTURE ===

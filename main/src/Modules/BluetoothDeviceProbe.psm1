@@ -1151,7 +1151,12 @@ function Get-ActiveOpenDecision {
 
         A DENIED open is free (~0 ms, no handle) and a SUCCESSFUL one is not.
         The backoff therefore only ever suppresses the expensive, hazardous case,
-        which is why the streak counts consecutive ticks where we ACQUIRED.
+        which is why the streak counts consecutive ticks where at least one port
+        was ACQUIRED and every port repeated its previous hold state. (It
+        originally required EVERY port acquired; with one port held and the
+        other free -- the ordinary mid-pairing shape -- that streak never built
+        and the free port was re-acquired every tick, measured live 2026-09-01
+        at 37.65 % occupancy of the uncontended window.)
     .PARAMETER Session
         Read for the streak state and the last-seen world. Mutated only by
         Set-ActiveOpenStreak, never here -- this function is pure so it can be
@@ -1397,17 +1402,28 @@ function Get-StreamingState {
         }
     }
 
-    # Streak bookkeeping for the throttle. Counts consecutive ticks on which we
-    # ACQUIRED every port and nothing was held or unavailable -- the only shape
-    # that is both expensive (a real handle, an RFCOMM setup over the air) and
-    # uninformative (the same answer as last time). A held or unavailable port
-    # resets it, because those are the transitions worth catching promptly.
+    # Streak bookkeeping for the throttle. Counts consecutive ticks whose shape
+    # is both expensive (at least one port ACQUIRED -- a real handle, an RFCOMM
+    # setup over the air) and uninformative (every port answered with the SAME
+    # hold state as last tick). Requiring ALL ports acquired was the 09-01
+    # defect: with one port held and the other free -- the ordinary mid-pairing
+    # and session-start shape -- the streak never built, so the free port was
+    # re-acquired every 3 s indefinitely, and the live run measured the probe
+    # owning COM6 for 37.65 % of the uncontended window. An unavailable port or
+    # any hold-state change still resets, because those are the transitions
+    # worth catching promptly; an all-held tick also resets, but that shape
+    # costs ~0 ms and takes no handle, so probing it every tick is free.
     if ($sessionHas) {
-        if ($activePorts.Count -eq 0 -and $deadPorts.Count -eq 0 -and $openedPorts.Count -eq $ports.Count) {
+        $holdMapNow = @($durations | Sort-Object { $_.Port } | ForEach-Object { "$($_.Port)=$($_.State)" }) -join ','
+        $holdMapPrev = $(if ($Session.ContainsKey('ActiveOpenLastHoldMap')) { [string]$Session.ActiveOpenLastHoldMap } else { $null })
+        if ($deadPorts.Count -eq 0 -and $openedPorts.Count -gt 0 -and
+            ($activePorts.Count + $openedPorts.Count) -eq $ports.Count -and
+            $holdMapNow -eq $holdMapPrev) {
             $Session.ActiveOpenAcquiredStreak++
         } else {
             $Session.ActiveOpenAcquiredStreak = 0
         }
+        $Session.ActiveOpenLastHoldMap = $holdMapNow
     }
 
     if ($activePorts.Count -gt 0) {
@@ -2435,9 +2451,18 @@ function Get-SerialOpenAttemptReport {
     $uncontendedSeconds = if ($RecordingSeconds -gt 0 -and $totalAttempts -gt 0) {
         [math]::Round($RecordingSeconds * (($totalAttempts - $refusedCount) / [double]$totalAttempts), 1)
     } else { $null }
-    $uncontendedPct = if ($uncontendedSeconds -gt 0) {
+    # The numerator SUMS successful-open milliseconds across every port, but the
+    # denominator is one wall-clock window -- two ports opened on the same tick
+    # own overlapping wall clock, so the ratio can exceed 100 % (bundle
+    # BD189655ED06 read 109.34 %). A percentage over 100 reads as a broken
+    # metric and discredits the honest ones next to it, so it saturates at 100
+    # and SAYS so, rather than either printing the impossible number or
+    # silently clamping.
+    $uncontendedPctRaw = if ($uncontendedSeconds -gt 0) {
         [math]::Round((($openMs / 1000.0) / $uncontendedSeconds) * 100, 2)
     } else { $null }
+    $uncontendedSaturated = ($null -ne $uncontendedPctRaw -and $uncontendedPctRaw -gt 100)
+    $uncontendedPct = if ($uncontendedSaturated) { 100 } else { $uncontendedPctRaw }
 
     $topology = if ($null -eq $Record.TopologyRequest) {
         $null
@@ -2474,8 +2499,9 @@ function Get-SerialOpenAttemptReport {
         SuccessfulOpenCallPercentOfRecording = $pct
         UncontendedWindowSeconds             = $uncontendedSeconds
         SuccessfulOpenCallPercentOfUncontendedWindow = $uncontendedPct
+        UncontendedPercentSaturated          = $uncontendedSaturated
         TopologyRequest                      = $topology
-        Basis                                = 'One CreateFile open attempt per port per phase: CreateFile + (on success) CloseHandle. No DCB/baud configuration, no retry, no sleep. UPPER BOUND on the exclusive-ownership interval, not a measurement of it. PercentOfRecording divides by the whole recording; PercentOfUncontendedWindow divides by the estimated wall clock in which no other process held the port, which is the only window in which a session start or a re-pair can collide with this probe. Read the second one for exposure.'
+        Basis                                = 'One CreateFile open attempt per port per phase: CreateFile + (on success) CloseHandle. No DCB/baud configuration, no retry, no sleep. UPPER BOUND on the exclusive-ownership interval, not a measurement of it. PercentOfRecording divides by the whole recording; PercentOfUncontendedWindow divides by the estimated wall clock in which no other process held the port, which is the only window in which a session start or a re-pair can collide with this probe. Read the second one for exposure. The numerator sums per-port open time, which can overlap in wall clock, so the percentage saturates at 100 (UncontendedPercentSaturated marks when it did).'
     }
 }
 
