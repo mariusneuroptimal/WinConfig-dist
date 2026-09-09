@@ -34,6 +34,19 @@ $script:GfxEngineTypes = @('3D', 'VideoDecode', 'VideoProcessing', 'Copy')
 # Paths that must never be read, in any form, by anything in this module.
 $script:GfxDeniedPathRoots = @('C:\zengar\sessions', 'C:\zengar\BLT_data')
 
+# Engine-load floors that separate "this surface is drawing" from "this
+# surface is present but quiet". ONE definition, read by every classifier and
+# published to the two harnesses through Get-GraphicsBenchFloors -- a floor
+# that lives in four places is a floor that will one day differ between the
+# live screen and the report.
+#
+# Measured, not chosen: butterchurn's unconditional render loop sits at
+# 7.6-10.6% 3D on the boxes captured so far, and video.js hardware decode at
+# 2.7-2.9% while playing, so both floors sit well under a real reading and
+# well over counter noise.
+$script:GfxVisualizerFloorPercent = 1.0
+$script:GfxMediaFloorPercent = 0.3
+
 # ---------------------------------------------------------------------------
 # Guards and small helpers
 # ---------------------------------------------------------------------------
@@ -1209,8 +1222,8 @@ function Get-GraphicsActivityState {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$Sample,
-        [double]$VisualizerFloorPercent = 1.0,
-        [double]$MediaFloorPercent = 0.3
+        [double]$VisualizerFloorPercent = $script:GfxVisualizerFloorPercent,
+        [double]$MediaFloorPercent = $script:GfxMediaFloorPercent
     )
 
     $anyEngines = $false
@@ -1270,8 +1283,8 @@ function Get-GraphicsPreRunActivity {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][array]$Samples,
-        [double]$VisualizerFloorPercent = 1.0,
-        [double]$MediaFloorPercent = 0.3
+        [double]$VisualizerFloorPercent = $script:GfxVisualizerFloorPercent,
+        [double]$MediaFloorPercent = $script:GfxMediaFloorPercent
     )
 
     $result = @{
@@ -1601,8 +1614,8 @@ function Get-GraphicsBenchSessionSummary {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][array]$Samples,
         [array]$Markers = @(),
-        [double]$VisualizerFloorPercent = 1.0,
-        [double]$MediaFloorPercent = 0.3,
+        [double]$VisualizerFloorPercent = $script:GfxVisualizerFloorPercent,
+        [double]$MediaFloorPercent = $script:GfxMediaFloorPercent,
         [hashtable]$AdapterLuidMap = @{}
     )
 
@@ -2381,43 +2394,424 @@ function Format-GraphicsBenchReport {
     return ,$r
 }
 
+function Get-GfxGridScalar {
+    <#
+    .SYNOPSIS
+        One reading out of a surface record, whichever arm it came from.
+    .DESCRIPTION
+        The two arms carry the same quantity in two SHAPES. A live sample holds
+        the raw reading ($surf.Engines['3D'] is a double, $surf.CpuPercent is a
+        double); an aggregated surface holds a Get-GfxStats table and the
+        reading wanted is its Mean. Every caller that reached into one shape
+        directly is a caller that could only ever render one arm, which is how
+        the live grid and the result grid ended up as two renderers of one
+        contract.
+
+        Absent stays absent. A missing engine, an empty stats table and a
+        surface with no counters all return $null, and Format-GraphicsValue
+        turns that into an em dash -- never into a measured zero.
+    #>
+    [CmdletBinding()]
+    param($Value)
+
+    if ($null -eq $Value) { return $null }
+    # Aggregated arm: a Get-GfxStats table. Its Mean is $null for an empty
+    # series, and that $null is the honest answer, not a reason to look further.
+    if ($Value -is [hashtable]) {
+        if ($Value.ContainsKey('Mean')) { return $Value['Mean'] }
+        return $null
+    }
+    return $Value
+}
+
+function Get-GfxGridEngine {
+    <#
+    .SYNOPSIS
+        One engine's reading off a surface, in either arm's shape.
+    #>
+    [CmdletBinding()]
+    param($Engines, [Parameter(Mandatory)][string]$Name)
+
+    if ($null -eq $Engines) { return $null }
+    if ($Engines -isnot [hashtable]) { return $null }
+    if (-not $Engines.ContainsKey($Name)) { return $null }
+    return Get-GfxGridScalar -Value $Engines[$Name]
+}
+
 function Get-GraphicsBenchGridRows {
     <#
     .SYNOPSIS
-        The result grid as ordered rows. THE one place a grid row is decided.
+        The surface grid as ordered rows. THE one place a grid row is decided,
+        for BOTH the live tick and the finished result.
     .DESCRIPTION
         The app paints these into a ListView and the package carries the same
-        values; neither surface computes a cell of its own. Whole-run means,
-        because the grid IS the on-screen summary once a run has stopped --
-        the last live sample is not a result.
+        values; neither surface computes a cell of its own.
+
+        TWO ARMS, ONE CONTRACT. -Summary renders whole-run means, because the
+        grid IS the on-screen summary once a run has stopped and the last live
+        sample is not a result. -Sample renders the latest reading while a run
+        is under way. Both emit the same nine cells in the same order with the
+        same em-dash rule and the same unresolved flag, so the grid a tech
+        watches during a session and the grid they screenshot afterwards can
+        never disagree about what a column means.
+
+        This used to be one function plus a hand-rolled copy of it inside the
+        window's tick handler. The copy resolved the adapter name differently
+        (first LUID that answered, rather than every name the surface rendered
+        on) and reached into the live shape directly, so it could never have
+        been pointed at a summary. Two renderers of one contract is this
+        repo's channel-mismatch bug class; it is deleted here rather than
+        guarded against.
+    .PARAMETER Summary
+        A Get-GraphicsBenchSessionSummary result. Whole-run means.
+    .PARAMETER Sample
+        One 'Sample' record from the sampler. $null yields no rows -- a tick
+        before the first sample has nothing to show, which is not an error.
+    .PARAMETER AdapterLuidMap
+        LUID -> adapter map from Get-GraphicsInventory, used only by -Sample:
+        a summary has already had its AdapterNames resolved.
     .OUTPUTS
-        Array of @{ Cells[]; Unresolved } in column order:
-        surface, adapter, 3D, decode, videoproc, CPU, working set, VRAM, present.
+        Array of @{ Cells[]; Unresolved; Role; Level } in column order:
+        surface, state, adapter, 3D, decode, videoproc, CPU, working set,
+        VRAM, present.
+
+        STATE IS A COLUMN, NOT A COLOUR. The numbers say what a surface cost;
+        the state word says what it was doing, which is the question answered
+        at a glance and the one a phone screenshot has to survive. It carries
+        a text marker as well as a level for the same reason every Flight
+        Recorder panel does: roughly one man in twelve cannot separate this
+        palette's green from its amber.
     #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$Summary)
+    [CmdletBinding(DefaultParameterSetName = 'Summary')]
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'Summary')][hashtable]$Summary,
+        [Parameter(Mandatory, ParameterSetName = 'Sample')][AllowNull()]$Sample,
+        [Parameter(ParameterSetName = 'Sample')][hashtable]$AdapterLuidMap
+    )
 
     $rows = @()
-    foreach ($surf in @($Summary.Surfaces)) {
-        $eng = { param($n) if ($surf.Engines -and $surf.Engines.ContainsKey($n)) { $surf.Engines[$n].Mean } else { $null } }
-        $adapter = if (@($surf.AdapterNames).Count -gt 0) { @($surf.AdapterNames) -join ', ' } else { [string][char]0x2014 }
-        $presence = if ($null -eq $surf.PresenceRatio) { [string][char]0x2014 } else { "$([math]::Round(100 * $surf.PresenceRatio, 0))%" }
+    $surfaces = @()
+    if ($PSCmdlet.ParameterSetName -eq 'Summary') {
+        $surfaces = @($Summary.Surfaces)
+    } elseif ($null -ne $Sample) {
+        $surfaces = @($Sample.Surfaces)
+    }
+
+    foreach ($surf in $surfaces) {
+        if ($null -eq $surf) { continue }
+
+        # Adapter names. On a hybrid box this column is the whole question, so
+        # it names EVERY adapter the surface was measured on rather than the
+        # first LUID that happened to resolve -- and stays an em dash when the
+        # map cannot answer, rather than naming a guess.
+        $names = @()
+        if ($PSCmdlet.ParameterSetName -eq 'Summary') {
+            $names = @($surf.AdapterNames)
+        } else {
+            foreach ($luid in @($surf.AdapterLuids)) {
+                $n = Resolve-GfxLuidName -Luid $luid -LuidMap $AdapterLuidMap
+                if ($n) { $names += $n }
+            }
+            $names = @($names | Sort-Object -Unique)
+        }
+        $adapter = if (@($names).Count -gt 0) { @($names) -join ', ' } else { [string][char]0x2014 }
+
+        if ($PSCmdlet.ParameterSetName -eq 'Summary') {
+            $cpu      = Get-GfxGridScalar -Value $surf.Cpu
+            $ws       = Get-GfxGridScalar -Value $surf.WorkingSetMB
+            $vram     = Get-GfxGridScalar -Value $surf.GpuMemoryMB
+            # Presence is a whole-run property: it has no meaning for a single
+            # tick, where the surface is present by definition.
+            $presence = if ($null -eq $surf.PresenceRatio) { [string][char]0x2014 } else { "$([math]::Round(100 * $surf.PresenceRatio, 0))%" }
+        } else {
+            $cpu      = Get-GfxGridScalar -Value $surf.CpuPercent
+            $ws       = Get-GfxGridScalar -Value $surf.WorkingSetMB
+            $vram     = Get-GfxGridScalar -Value $surf.GpuMemoryMB
+            $presence = 'live'
+        }
+
+        $state = Get-GfxSurfaceState -Surface $surf
+
         $rows += @{
             Cells = @(
                 (Format-GraphicsValue $surf.Role)
+                ("{0} {1}" -f $state.Marker, $state.State)
                 $adapter
-                (Format-GraphicsValue (& $eng '3D') '%')
-                (Format-GraphicsValue (& $eng 'VideoDecode') '%')
-                (Format-GraphicsValue (& $eng 'VideoProcessing') '%')
-                (Format-GraphicsValue $surf.Cpu.Mean '%')
-                (Format-GraphicsValue $surf.WorkingSetMB.Mean)
-                (Format-GraphicsValue $surf.GpuMemoryMB.Mean)
+                (Format-GraphicsValue (Get-GfxGridEngine -Engines $surf.Engines -Name '3D') '%')
+                (Format-GraphicsValue (Get-GfxGridEngine -Engines $surf.Engines -Name 'VideoDecode') '%')
+                (Format-GraphicsValue (Get-GfxGridEngine -Engines $surf.Engines -Name 'VideoProcessing') '%')
+                (Format-GraphicsValue $cpu '%')
+                (Format-GraphicsValue $ws)
+                (Format-GraphicsValue $vram)
                 $presence
             )
+            # An unresolved surface is FLAGGED, never relabelled: its numbers
+            # are real, only its identity is unproven.
             Unresolved = ($surf.RoleSource -eq 'unresolved')
+            Role       = $surf.Role
+            Level      = $state.Level
         }
     }
+    # An empty result must be EMPTY. 'return ,$rows' over an empty array hands
+    # the caller a one-element array whose single element is the empty array,
+    # and a painter's foreach then draws one blank row -- a surface that does
+    # not exist, on the grid the tool is read from. The comma is only needed to
+    # stop a SINGLE row unwrapping to a bare hashtable.
+    if ($rows.Count -eq 0) { return @() }
     return ,$rows
+}
+
+function Get-GraphicsBenchFloors {
+    <#
+    .SYNOPSIS
+        The engine-load floors every classifier in this module uses.
+    .DESCRIPTION
+        ONE PLACE. The floors separate "this surface is drawing" from "this
+        surface is present but quiet", and they were previously a literal in
+        each function that needed them plus each of the two harnesses. A floor
+        that lives in four places is a floor that will one day differ between
+        the live screen and the report -- the same class of split this module
+        already paid for in the grid.
+    .OUTPUTS
+        Hashtable: VisualizerFloorPercent, MediaFloorPercent.
+    #>
+    [CmdletBinding()]
+    param()
+    return @{
+        VisualizerFloorPercent = $script:GfxVisualizerFloorPercent
+        MediaFloorPercent      = $script:GfxMediaFloorPercent
+    }
+}
+
+function Get-GfxSurfaceState {
+    <#
+    .SYNOPSIS
+        What one surface is DOING, as a word plus a level and a text marker.
+    .DESCRIPTION
+        The grid's numbers say what a surface cost. This says what it was
+        doing, which is the categorical question a tech answers at a glance
+        and the one a screenshot has to survive: colour is never the only
+        signal, so every state carries a marker ([ok] / [~] / [!] / [ ]) and a
+        WORD as well as a level.
+
+        The floors are the module's, not this function's -- see
+        Get-GraphicsBenchFloors. Butterchurn's 3D is judged against the
+        visualizer floor and video.js's decode against the media floor,
+        exactly as Get-GraphicsActivityState judges the whole sample, so a
+        surface can never read 'Drawing' on the grid while the run's activity
+        state reads Quiet.
+
+        UNMEASURED IS NOT IDLE. A surface whose GPU process could not be bound
+        to a counter set has no engine table at all; it returns 'Not measured'
+        and a level of Unknown, never 'Idle'. Grey is what a reader takes for
+        "fine, nothing happening", and an unread sensor must not look like a
+        reading.
+    .PARAMETER Surface
+        One surface record: a live sample's surface, or an aggregated surface
+        from a summary. Both shapes are read through Get-GfxGridEngine.
+    .OUTPUTS
+        Hashtable: State, Level, Marker.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Surface,
+        [double]$VisualizerFloorPercent = $script:GfxVisualizerFloorPercent,
+        [double]$MediaFloorPercent = $script:GfxMediaFloorPercent
+    )
+
+    if ($null -eq $Surface) { return @{ State = 'Not measured'; Level = 'Unknown'; Marker = '[ ]' } }
+
+    $threeD  = Get-GfxGridEngine -Engines $Surface.Engines -Name '3D'
+    $decode  = Get-GfxGridEngine -Engines $Surface.Engines -Name 'VideoDecode'
+    $vidproc = Get-GfxGridEngine -Engines $Surface.Engines -Name 'VideoProcessing'
+
+    if ($null -eq $threeD -and $null -eq $decode -and $null -eq $vidproc) {
+        return @{ State = 'Not measured'; Level = 'Unknown'; Marker = '[ ]' }
+    }
+
+    $decodeTotal = 0.0
+    if ($null -ne $decode)  { $decodeTotal += [double]$decode }
+    if ($null -ne $vidproc) { $decodeTotal += [double]$vidproc }
+
+    $drawing  = ($null -ne $threeD -and [double]$threeD -ge $VisualizerFloorPercent)
+    $decoding = ($decodeTotal -ge $MediaFloorPercent)
+
+    # An unidentified surface keeps its measured state and is flagged on top of
+    # it. Its numbers are real; only its identity is unproven, and relabelling
+    # the reading would be the tool inventing a fact.
+    $unresolved = ($Surface.RoleSource -eq 'unresolved')
+
+    $state = if ($drawing -and $decoding) { 'Drawing+decoding' }
+             elseif ($decoding)           { 'Decoding' }
+             elseif ($drawing)            { 'Drawing' }
+             else                         { 'Quiet' }
+
+    $level = if ($unresolved) { 'Degraded' }
+             elseif ($state -eq 'Quiet') { 'Idle' }
+             else { 'Healthy' }
+
+    $marker = if ($unresolved) { '[!]' }
+              elseif ($state -eq 'Quiet') { '[~]' }
+              else { '[ok]' }
+
+    if ($unresolved) { $state = "$state (unidentified)" }
+
+    return @{ State = $state; Level = $level; Marker = $marker }
+}
+
+function Get-GraphicsBenchCoverage {
+    <#
+    .SYNOPSIS
+        Whether this run can answer the question it exists to answer.
+    .DESCRIPTION
+        THE SECOND QUESTION, KEPT SEPARATE FROM THE VERDICT. The verdict says
+        what the numbers mean; this says whether the run is entitled to a
+        verdict at all. The Flight Recorder keeps the same two lines apart for
+        the same reason: capture 8E39860E4AF2 was confident about the headset
+        and wrong about whether it was watching one.
+
+        The graphics analogue is sharper. Every number this tool reports is a
+        difference against an idle stretch on the same box. With no idle arm
+        there is nothing to subtract, so a run without one reports totals and
+        answers nothing about what the SESSION cost -- and that fact used to
+        surface only at Stop, after the session was over and unrepeatable.
+
+        The two ways to lose the baseline are distinguished because their
+        remedies are opposite, exactly as in Get-GraphicsBenchFindings: an
+        operator who started watching mid-session did nothing wrong and simply
+        started too late.
+    .OUTPUTS
+        Hashtable: State, Marker, Text, Level.
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateSet('NotStarted', 'Watching', 'Stopped')]
+        [string]$Phase = 'NotStarted',
+        $IdleSec,
+        $SessionSec,
+        [bool]$SessionDetected = $false,
+        [bool]$StartedMidSession = $false,
+        $CountersOk
+    )
+
+    $dash = [string][char]0x2014
+
+    $r = switch ($Phase) {
+        'NotStarted' {
+            @{ State = 'NotStarted'; Marker = '[ ]'; Level = 'Idle'
+               Text = 'Not watching yet. Nothing is being measured.' }
+        }
+        'Watching' {
+            if ($StartedMidSession) {
+                @{ State = 'MidSession'; Marker = '[!]'; Level = 'Degraded'
+                   Text = "NO was already busy when watching began $dash no idle baseline, so this run will report totals only." }
+            } elseif ($SessionDetected) {
+                @{ State = 'SessionUnderWay'; Marker = '[ok]'; Level = 'Healthy'
+                   Text = "Session under way. Idle baseline held: $(Format-GraphicsDuration $IdleSec)." }
+            } else {
+                @{ State = 'Baseline'; Marker = '[~]'; Level = 'Unknown'
+                   Text = "No session seen yet. Idle baseline so far: $(Format-GraphicsDuration $IdleSec) $dash start your session when ready." }
+            }
+        }
+        'Stopped' {
+            if ($SessionDetected) {
+                @{ State = 'Complete'; Marker = '[ok]'; Level = 'Healthy'
+                   Text = "Both arms measured: idle $(Format-GraphicsDuration $IdleSec), session $(Format-GraphicsDuration $SessionSec)." }
+            } elseif ($StartedMidSession) {
+                @{ State = 'MidSessionComplete'; Marker = '[!]'; Level = 'Degraded'
+                   Text = "Totals only. Watching began mid-session, so there is no idle arm to subtract." }
+            } else {
+                @{ State = 'NoSplit'; Marker = '[!]'; Level = 'Degraded'
+                   Text = "Totals only. No session start was seen, so nothing here is attributable to a session." }
+            }
+        }
+    }
+
+    # Counters are a separate loss and are ADDED to the line rather than
+    # replacing it: a run can have a perfect idle/session split and still be
+    # unable to say anything about the GPU.
+    if ($CountersOk -eq $false) {
+        $r.Text = "$($r.Text)  GPU engine counters UNAVAILABLE $dash GPU load is absent, not zero."
+        $r.Marker = '[!]'
+        if ($r.Level -ne 'Failed') { $r.Level = 'Degraded' }
+    }
+
+    return $r
+}
+
+function Get-GraphicsBenchVerdict {
+    <#
+    .SYNOPSIS
+        The one-line conclusion, its next action, and the standing caveat.
+    .DESCRIPTION
+        A RENDERER OF THE FINDINGS, NOT A SECOND OPINION. The top finding IS
+        the verdict; this maps its sealed Result onto a level and lifts its
+        ActionHint into the context line. Nothing here judges a number.
+
+        It exists because the conclusion used to be written into the scrolling
+        log at Stop and then pushed up the box by the package block and the
+        send banner. The Flight Recorder puts its boundary sentence full width
+        under the diagram and leaves the working underneath, because the
+        conclusion is what a clinic tech acts on and what a remote assistant
+        triages from a screenshot.
+
+        THE FOOTNOTE IS PERMANENT, for the same reason the recorder's EEG
+        footnote is: it limits every conclusion this tool can draw, and a
+        caveat shown only when it applies is a caveat that is absent exactly
+        when someone is drawing the conclusion it qualifies.
+    .OUTPUTS
+        Hashtable: Text, Context, Footnote, Level, Marker.
+    #>
+    [CmdletBinding()]
+    param(
+        [array]$Findings = @(),
+        [ValidateSet('NotStarted', 'Watching', 'Stopped')]
+        [string]$Phase = 'NotStarted'
+    )
+
+    $footnote = "Butterchurn draws even while NO is idle. A percentage is a session cost only as a difference against this box's own idle stretch."
+
+    if ($Phase -eq 'NotStarted') {
+        return @{ Text = 'No run yet.'; Context = 'Press Start watching before the session begins.'
+                  Footnote = $footnote; Level = 'Idle'; Marker = '[ ]' }
+    }
+    if ($Phase -eq 'Watching') {
+        return @{ Text = 'Collecting. No conclusion yet.'; Context = 'Press Stop when the session ends.'
+                  Footnote = $footnote; Level = 'Unknown'; Marker = '[ ]' }
+    }
+
+    $top = @($Findings) | Select-Object -First 1
+    if (-not $top) {
+        # Get-GraphicsBenchFindings always yields at least one row, so an empty
+        # list means the findings pass did not run. That is unknown, never clean.
+        return @{ Text = 'No findings were produced for this run.'
+                  Context = 'The run stopped before it was scored; the raw samples in the package are still valid.'
+                  Footnote = $footnote; Level = 'Unknown'; Marker = '[ ]' }
+    }
+
+    $level = switch ([string]$top.Result) {
+        'FAIL' { 'Failed' }
+        'WARN' { 'Degraded' }
+        'SKIP' { 'Unscoped' }
+        'PASS' { 'Clean' }
+        default { 'Unknown' }
+    }
+    $marker = switch ($level) {
+        'Failed'   { '[!]' }
+        'Degraded' { '[!]' }
+        'Unscoped' { '[~]' }
+        'Clean'    { '[ok]' }
+        default    { '[ ]' }
+    }
+
+    $context = [string]$top.ActionHint
+    $more = @($Findings).Count - 1
+    if ($more -gt 0) {
+        $context = "$context  (+$more more finding$(if ($more -gt 1) { 's' } else { '' }) in the report below.)"
+    }
+
+    return @{ Text = [string]$top.Title; Context = $context; Footnote = $footnote
+              Level = $level; Marker = $marker }
 }
 
 Export-ModuleMember -Function @(
@@ -2454,6 +2848,12 @@ Export-ModuleMember -Function @(
     'New-GraphicsBenchRunFolder'
     'Write-GraphicsBenchEvent'
     'Save-GraphicsBenchRun'
+    'Get-GfxGridScalar'
+    'Get-GfxGridEngine'
+    'Get-GfxSurfaceState'
+    'Get-GraphicsBenchFloors'
+    'Get-GraphicsBenchCoverage'
+    'Get-GraphicsBenchVerdict'
     'Get-GraphicsBenchGridRows'
     'Format-GraphicsValue'
     'Format-GraphicsDuration'

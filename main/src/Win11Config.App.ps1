@@ -4528,105 +4528,360 @@ $buttonHandlers = @{
                 return
             }
 
+            # ── DISPLAY SCALE ────────────────────────────────────────────────
+            #
+            # 🔴 FONTS SCALE WITH DPI, HAND-WRITTEN PIXELS DO NOT. Every font
+            # here is specified in POINTS, so on a 200 % display Windows draws
+            # it at twice the pixel height. Every geometry constant in this
+            # window was a raw pixel count -- a 132 px grid row, nine column
+            # widths, a 1120x780 form. The two drift apart by a factor of two,
+            # and this is the exact defect the Flight Recorder was rebuilt to
+            # end: headings drawn over the panels they label, captions
+            # ellipsised, the conclusion cut in half.
+            #
+            # WinForms auto-scaling does NOT rescue a code-built form: the
+            # layout stays at its birth DPI. So ONE factor, applied to every
+            # constant, read from the same device context the main form used.
+            #
+            # $script:GfxViewScaleOverride is the seam a test uses to lay the
+            # window out at a scale the test machine does not have. Production
+            # never sets it.
+            $script:GfxViewScale = 1.0
+            if ($script:GfxViewScaleOverride) {
+                $script:GfxViewScale = [double]$script:GfxViewScaleOverride
+            } elseif ($script:DpiScale) {
+                $script:GfxViewScale = [double]$script:DpiScale
+            }
+            if ($script:GfxViewScale -lt 1.0) { $script:GfxViewScale = 1.0 }
+
+            # Every tuned constant, in one table, already scaled. The layout
+            # below reads from HERE and never from a literal -- a literal that
+            # survives in one place is exactly how a heading ends up on top of
+            # the panel it labels.
+            $gfxS = $script:GfxViewScale
+            $script:GfxViewM = @{
+                FormW     = [int](1180 * $gfxS)
+                FormH     = [int](820  * $gfxS)
+                MinW      = [int](940  * $gfxS)
+                MinH      = [int](620  * $gfxS)
+                Pad       = [int](16   * $gfxS)
+                HeadPadX  = [int](18   * $gfxS)
+                HeadPadY  = [int](12   * $gfxS)
+                # The grid holds at most three surfaces (visualizer, player and
+                # an unidentified host), plus its own header row. Measured
+                # against that, not picked to look right at 96 DPI.
+                ListH     = [int](112  * $gfxS)
+                LineH     = [int](17   * $gfxS)
+                # Five transition rows plus a heading. Five is the floor at
+                # which this stops being a timeline; the raw log below still
+                # holds every line.
+                #
+                # The height is DERIVED from the row count and the line height,
+                # never asserted: a literal here was 14 px short of what the
+                # panel needed and clipped the newest transition -- the one
+                # row a reader is actually looking for.
+                EventRows = 5
+                EventsH   = [int](((5 * 17) + 38) * $gfxS)
+                ColSurface = [int](104 * $gfxS)
+                # Wide enough for the longest state the module can emit,
+                # '[!] Drawing+decoding (unidentified)'. An ellipsised state is
+                # a state nobody can read off a screenshot.
+                ColState   = [int](212 * $gfxS)
+                ColAdapter = [int](226 * $gfxS)
+                ColEngine  = [int](72  * $gfxS)
+                ColVidProc = [int](82  * $gfxS)
+                ColCpu     = [int](66  * $gfxS)
+                ColMem     = [int](76  * $gfxS)
+                ColPresent = [int](70  * $gfxS)
+            }
+
+            # ── Colours ──────────────────────────────────────────────────────
+            #
+            # Colour is never the only status signal. Every verdict, coverage
+            # line and grid row also carries a text MARKER ([ok] / [~] / [!])
+            # produced by the module, because roughly one man in twelve cannot
+            # separate this palette's green from its amber and these windows
+            # get read over the phone from a screenshot.
+            $script:GfxInk        = [System.Drawing.Color]::FromArgb(30, 30, 30)
+            $script:GfxInkDim     = [System.Drawing.Color]::FromArgb(110, 110, 110)
+            $script:GfxInkOnDark  = [System.Drawing.Color]::FromArgb(226, 226, 232)
+            $script:GfxInkOnDarkD = [System.Drawing.Color]::FromArgb(150, 150, 160)
+            $script:GfxLevelColors = @{
+                # Clean is deliberately NOT green. A calm state should read as
+                # calm, and a wall of green is what trains a reader to stop
+                # looking at the line that will one day be red.
+                Clean    = [System.Drawing.Color]::FromArgb(30, 30, 30)
+                Healthy  = [System.Drawing.Color]::FromArgb(30, 30, 30)
+                Failed   = [System.Drawing.Color]::FromArgb(190, 40, 40)
+                Degraded = [System.Drawing.Color]::FromArgb(170, 110, 15)
+                Unscoped = [System.Drawing.Color]::FromArgb(170, 110, 15)
+                Idle     = [System.Drawing.Color]::FromArgb(110, 110, 110)
+                # Blue-grey for "nobody looked", NOT the neutral grey the
+                # measured-but-quiet states use. Grey is what a reader takes
+                # for "fine, nothing happening"; an unread sensor must not
+                # look the same as a reading.
+                Unknown  = [System.Drawing.Color]::FromArgb(70, 105, 155)
+            }
+
             $script:GfxForm = New-Object System.Windows.Forms.Form
             $script:GfxForm.Text = "Graphics Session Bench"
             $script:GfxForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-            $script:GfxForm.Size = New-Object System.Drawing.Size(1120, 780)
-            $script:GfxForm.MinimumSize = New-Object System.Drawing.Size(900, 600)
+            $script:GfxForm.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+            $gfxScreen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+            $script:GfxForm.Size = New-Object System.Drawing.Size([Math]::Min($script:GfxViewM.FormW, [int]($gfxScreen.Width * 0.9)), [Math]::Min($script:GfxViewM.FormH, [int]($gfxScreen.Height * 0.9)))
+            $script:GfxForm.MinimumSize = New-Object System.Drawing.Size($script:GfxViewM.MinW, $script:GfxViewM.MinH)
             $script:GfxForm.BackColor = [System.Drawing.Color]::White
 
             $gfxTable = New-Object System.Windows.Forms.TableLayoutPanel
             $gfxTable.Dock = [System.Windows.Forms.DockStyle]::Fill
             $gfxTable.ColumnCount = 1
-            $gfxTable.RowCount = 5
+            $gfxTable.RowCount = 6
             $gfxTable.BackColor = [System.Drawing.Color]::White
-            $gfxTable.Padding = New-Object System.Windows.Forms.Padding(16, 12, 16, 12)
             [void]$gfxTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))          # header
-            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))          # buttons
-            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))          # status
-            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 132)))     # live grid
-            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))      # log
+            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))                              # identity header
+            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))                              # verdict block
+            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $script:GfxViewM.ListH)))      # surface grid
+            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $script:GfxViewM.EventsH)))    # transitions
+            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))                          # log
+            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))                              # secondary actions
             $script:GfxForm.Controls.Add($gfxTable)
 
-            # === HEADER ===
-            $gfxHeader = New-Object System.Windows.Forms.FlowLayoutPanel
-            $gfxHeader.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
-            $gfxHeader.WrapContents = $false
+            # =================================================================
+            # ROW 0 -- IDENTITY HEADER: what run is this, how long has it been
+            # watching, and is it seeing anything?
+            # =================================================================
+            #
+            # A dark pinned band, and the ONE emphasised control on the screen.
+            # Both are the Flight Recorder's fix for the same two defects this
+            # window had:
+            #
+            #   * The Run ID was never on screen at all. It appeared once, at
+            #     the end, inside a folder path in a dim line of a scrolling
+            #     box. It is the string that gets read back over the phone and
+            #     transcribed into a case, and no tick data reaches disk until
+            #     the run ends -- a fact that is not on screen is a fact no
+            #     screenshot can recover.
+            #   * Five buttons of equal visual weight, one of which ends the
+            #     recording and uploads it.
+            #
+            # Start and Stop share this slot and only one is ever visible, so
+            # the primary action for the current phase is the only emphasised
+            # control at any moment.
+            $gfxHeader = New-Object System.Windows.Forms.TableLayoutPanel
+            $gfxHeader.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $gfxHeader.ColumnCount = 2
+            $gfxHeader.RowCount = 1
+            [void]$gfxHeader.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+            [void]$gfxHeader.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
             $gfxHeader.AutoSize = $true
             $gfxHeader.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-            $gfxHeader.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $gfxHeader.BackColor = [System.Drawing.Color]::White
+            $gfxHeader.BackColor = [System.Drawing.Color]::FromArgb(16, 16, 20)
+            $gfxHeader.Padding = New-Object System.Windows.Forms.Padding($script:GfxViewM.HeadPadX, $script:GfxViewM.HeadPadY, $script:GfxViewM.HeadPadX, $script:GfxViewM.HeadPadY)
+            $gfxHeader.Margin = New-Object System.Windows.Forms.Padding(0)
+
+            $gfxHeaderText = New-Object System.Windows.Forms.FlowLayoutPanel
+            $gfxHeaderText.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $gfxHeaderText.WrapContents = $false
+            $gfxHeaderText.AutoSize = $true
+            $gfxHeaderText.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $gfxHeaderText.Margin = New-Object System.Windows.Forms.Padding(0)
+            $gfxHeaderText.BackColor = [System.Drawing.Color]::Transparent
+            $gfxHeader.Controls.Add($gfxHeaderText, 0, 0)
 
             $gfxTitle = New-Object System.Windows.Forms.Label
             $gfxTitle.Text = "Graphics Session Bench"
-            $gfxTitle.Font = New-Object System.Drawing.Font("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
-            $gfxTitle.ForeColor = [System.Drawing.Color]::FromArgb(0, 90, 140)
+            $gfxTitle.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
+            $gfxTitle.ForeColor = [System.Drawing.Color]::FromArgb(120, 190, 230)
             $gfxTitle.AutoSize = $true
             $gfxTitle.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
-            $gfxHeader.Controls.Add($gfxTitle)
+            $gfxHeaderText.Controls.Add($gfxTitle)
 
-            $gfxSubtitle = New-Object System.Windows.Forms.Label
-            $gfxSubtitle.Text = "What NO's butterchurn visualizer and video.js player cost across one real session. Passive: it watches, it never drives NO."
-            $gfxSubtitle.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-            $gfxSubtitle.ForeColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
-            $gfxSubtitle.AutoSize = $true
-            $gfxSubtitle.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 10)
-            $gfxHeader.Controls.Add($gfxSubtitle)
-            $gfxTable.Controls.Add($gfxHeader, 0, 0)
+            # Consolas: a Run ID gets read back over the phone and transcribed
+            # into a case. The cohort key rides the same line because it is
+            # what this box will be POOLED under, and a tech asking "why is my
+            # machine an outlier" is asking about that string.
+            $script:GfxRunIdLabel = New-Object System.Windows.Forms.Label
+            $script:GfxRunIdLabel.Text = "Run ID: (not assigned yet)"
+            $script:GfxRunIdLabel.Font = New-Object System.Drawing.Font("Consolas", 8)
+            $script:GfxRunIdLabel.ForeColor = $script:GfxInkOnDarkD
+            $script:GfxRunIdLabel.AutoSize = $true
+            $script:GfxRunIdLabel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 1)
+            $gfxHeaderText.Controls.Add($script:GfxRunIdLabel)
 
-            # === CONTROLS ===
-            $gfxButtonRow = New-Object System.Windows.Forms.FlowLayoutPanel
-            $gfxButtonRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
-            $gfxButtonRow.WrapContents = $true
-            $gfxButtonRow.AutoSize = $true
-            $gfxButtonRow.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-            $gfxButtonRow.Dock = [System.Windows.Forms.DockStyle]::Fill
-            $gfxButtonRow.BackColor = [System.Drawing.Color]::White
-            $gfxButtonRow.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
+            # COVERAGE. "Can this run answer the question", kept apart from the
+            # verdict's "what do the numbers say". They answer different
+            # questions and the recorder keeps them apart for a measured
+            # reason: a run can be confident about the numbers and wrong about
+            # whether it was watching a session at all. Every word of it comes
+            # from Get-GraphicsBenchCoverage.
+            $script:GfxCoverage = New-Object System.Windows.Forms.Label
+            $script:GfxCoverage.Text = "[ ] Not watching yet. Nothing is being measured."
+            $script:GfxCoverage.Font = New-Object System.Drawing.Font("Segoe UI", 8.75)
+            $script:GfxCoverage.ForeColor = $script:GfxInkOnDarkD
+            $script:GfxCoverage.AutoSize = $true
+            $script:GfxCoverage.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 0)
+            $gfxHeaderText.Controls.Add($script:GfxCoverage)
 
-            # BackColor is AMBIENT in WinForms: a button with no explicit colour
-            # renders invisible on a non-default panel. Every button sets its own.
+            # The activity line: what the TOOL is doing right now (reading the
+            # inventory, sending the package). Distinct from coverage, which is
+            # about the RUN, and deliberately the dimmest text in the band.
+            $script:GfxStatus = New-Object System.Windows.Forms.Label
+            $script:GfxStatus.Text = "Reading this machine's graphics stack..."
+            $script:GfxStatus.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+            $script:GfxStatus.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 130)
+            $script:GfxStatus.AutoSize = $true
+            $script:GfxStatus.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 0)
+            $gfxHeaderText.Controls.Add($script:GfxStatus)
+
+            # Findings raised BEFORE the run loop starts, kept for the life of
+            # the window. Preconditions and the pre-run activity check are
+            # written into the log at open and are gone forty minutes later --
+            # and one of them is the reason a run has no idle baseline. The
+            # Flight Recorder closed the same defect (#68 item 3) after a
+            # SERIALCOMM collision carrying a REBOOT remedy was nearly lost to
+            # it. Hidden while there are none, so the button appearing is
+            # itself the signal.
+            $script:GfxStartupFindings = New-Object System.Collections.ArrayList
+            $script:GfxStartupBtn = New-Object System.Windows.Forms.Button
+            $script:GfxStartupBtn.Text = "Startup findings"
+            $script:GfxStartupBtn.AutoSize = $true
+            $script:GfxStartupBtn.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $script:GfxStartupBtn.Margin = New-Object System.Windows.Forms.Padding(0, 5, 0, 0)
+            $script:GfxStartupBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $script:GfxStartupBtn.BackColor = [System.Drawing.Color]::FromArgb(90, 60, 20)
+            $script:GfxStartupBtn.ForeColor = [System.Drawing.Color]::FromArgb(255, 225, 170)
+            $script:GfxStartupBtn.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+            $script:GfxStartupBtn.Visible = $false
+            # script: scope and FindForm() rather than a closure: an Add_Click
+            # scriptblock does NOT run in the scope it was written in, so a
+            # captured local would resolve to nothing at click time and the
+            # failure would be a dead button on a field machine.
+            $script:GfxStartupBtn.Add_Click({ & $script:GfxShowStartupFindings $this.FindForm() })
+            $gfxHeaderText.Controls.Add($script:GfxStartupBtn)
+
+            $gfxHeaderActions = New-Object System.Windows.Forms.FlowLayoutPanel
+            $gfxHeaderActions.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $gfxHeaderActions.WrapContents = $false
+            $gfxHeaderActions.AutoSize = $true
+            $gfxHeaderActions.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $gfxHeaderActions.Anchor = [System.Windows.Forms.AnchorStyles]::Right
+            $gfxHeaderActions.Margin = New-Object System.Windows.Forms.Padding([int](12 * $gfxS), 0, 0, 0)
+            $gfxHeaderActions.BackColor = [System.Drawing.Color]::Transparent
+            $gfxHeader.Controls.Add($gfxHeaderActions, 1, 0)
+
+            # The clock, promoted out of an interpolated status string. It is
+            # the one number an operator checks repeatedly while running a
+            # session, and it used to be one of five facts in a single line of
+            # 9 pt text.
+            $script:GfxClock = New-Object System.Windows.Forms.Label
+            $script:GfxClock.Text = "--"
+            $script:GfxClock.Font = New-Object System.Drawing.Font("Segoe UI", 15, [System.Drawing.FontStyle]::Bold)
+            $script:GfxClock.ForeColor = [System.Drawing.Color]::FromArgb(210, 210, 218)
+            $script:GfxClock.AutoSize = $true
+            $script:GfxClock.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+            $script:GfxClock.Margin = New-Object System.Windows.Forms.Padding(0, 0, 2, 4)
+            $gfxHeaderActions.Controls.Add($script:GfxClock)
+
+            # BackColor is AMBIENT in WinForms: a button with no explicit
+            # colour renders invisible on a non-default panel, and this band is
+            # nearly black. Every button sets its own.
             $gfxMakeButton = {
-                param([string]$Text, [bool]$Enabled)
+                param([string]$Text, [bool]$Enabled, [bool]$Primary)
                 $b = New-Object System.Windows.Forms.Button
                 $b.Text = $Text
                 $b.AutoSize = $true
                 $b.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
                 $b.Padding = New-Object System.Windows.Forms.Padding(12, 5, 12, 5)
                 $b.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0)
-                $b.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
-                $b.ForeColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
-                $b.FlatStyle = [System.Windows.Forms.FlatStyle]::System
+                if ($Primary) {
+                    $b.BackColor = [System.Drawing.Color]::FromArgb(0, 110, 170)
+                    $b.ForeColor = [System.Drawing.Color]::White
+                    $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+                    $b.FlatAppearance.BorderSize = 0
+                    $b.Font = New-Object System.Drawing.Font("Segoe UI", 9.75, [System.Drawing.FontStyle]::Bold)
+                } else {
+                    $b.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
+                    $b.ForeColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+                    $b.FlatStyle = [System.Windows.Forms.FlatStyle]::System
+                }
                 $b.Enabled = $Enabled
                 return $b
             }
 
-            $script:GfxStartBtn  = & $gfxMakeButton "Start watching" $true
-            $script:GfxStopBtn   = & $gfxMakeButton "Stop and show results" $false
-            $script:GfxMarkerBtn = & $gfxMakeButton "Add marker" $false
-            $script:GfxOpenBtn   = & $gfxMakeButton "Open run folder" $false
-            $gfxCloseBtn         = & $gfxMakeButton "Close" $true
-            $gfxButtonRow.Controls.Add($script:GfxStartBtn)
-            $gfxButtonRow.Controls.Add($script:GfxStopBtn)
-            $gfxButtonRow.Controls.Add($script:GfxMarkerBtn)
-            $gfxButtonRow.Controls.Add($script:GfxOpenBtn)
-            $gfxButtonRow.Controls.Add($gfxCloseBtn)
-            $gfxTable.Controls.Add($gfxButtonRow, 0, 1)
+            # Start and Stop occupy ONE slot: only the action that applies to
+            # the current phase is ever visible, so there is exactly one
+            # emphasised control on the screen at any moment.
+            $script:GfxStartBtn = & $gfxMakeButton "Start watching" $true $true
+            $script:GfxStopBtn  = & $gfxMakeButton "Stop and show results" $false $true
+            $script:GfxStopBtn.Visible = $false
+            $gfxHeaderActions.Controls.Add($script:GfxStartBtn)
+            $gfxHeaderActions.Controls.Add($script:GfxStopBtn)
+            $gfxTable.Controls.Add($gfxHeader, 0, 0)
 
-            # === STATUS ===
-            $script:GfxStatus = New-Object System.Windows.Forms.Label
-            $script:GfxStatus.Text = "Reading this machine's graphics stack..."
-            $script:GfxStatus.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-            $script:GfxStatus.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
-            $script:GfxStatus.AutoSize = $true
-            $script:GfxStatus.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
-            $gfxTable.Controls.Add($script:GfxStatus, 0, 2)
+            # =================================================================
+            # ROW 1 -- THE CONCLUSION
+            # =================================================================
+            #
+            # The verdict, its next action, and the standing caveat. The
+            # highest-value lines in the window, and until now they were
+            # written INTO the scrolling log at Stop and then pushed up it by
+            # the package block and the send banner. Bold and full width,
+            # because it is the conclusion and everything below is the working.
+            $gfxVerdictPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+            $gfxVerdictPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $gfxVerdictPanel.WrapContents = $false
+            $gfxVerdictPanel.AutoSize = $true
+            $gfxVerdictPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $gfxVerdictPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $gfxVerdictPanel.BackColor = [System.Drawing.Color]::White
+            $gfxVerdictPanel.Padding = New-Object System.Windows.Forms.Padding($script:GfxViewM.Pad, [int](10 * $gfxS), $script:GfxViewM.Pad, [int](6 * $gfxS))
+            $gfxVerdictPanel.Margin = New-Object System.Windows.Forms.Padding(0)
 
-            # === LIVE GRID ===
+            $script:GfxVerdict = New-Object System.Windows.Forms.Label
+            $script:GfxVerdict.Text = "[ ] No run yet."
+            $script:GfxVerdict.Font = New-Object System.Drawing.Font("Segoe UI", 11.25, [System.Drawing.FontStyle]::Bold)
+            $script:GfxVerdict.ForeColor = $script:GfxInkDim
+            $script:GfxVerdict.AutoSize = $true
+            $script:GfxVerdict.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 1)
+            $gfxVerdictPanel.Controls.Add($script:GfxVerdict)
+
+            $script:GfxVerdictContext = New-Object System.Windows.Forms.Label
+            $script:GfxVerdictContext.Text = "Press Start watching before the session begins."
+            $script:GfxVerdictContext.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+            $script:GfxVerdictContext.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
+            $script:GfxVerdictContext.AutoSize = $true
+            $script:GfxVerdictContext.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 3)
+            $gfxVerdictPanel.Controls.Add($script:GfxVerdictContext)
+
+            # PERMANENT. The caveat limits every conclusion this tool can draw,
+            # so it is never conditional on the conclusion -- a caveat shown
+            # only when it applies is absent exactly when someone is drawing
+            # the conclusion it qualifies. Same reasoning as the recorder's EEG
+            # footnote, which is a footnote rather than a panel for this reason.
+            $script:GfxFootnote = New-Object System.Windows.Forms.Label
+            $script:GfxFootnote.Text = ""
+            $script:GfxFootnote.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+            $script:GfxFootnote.ForeColor = [System.Drawing.Color]::FromArgb(130, 130, 130)
+            $script:GfxFootnote.AutoSize = $true
+            $script:GfxFootnote.Margin = New-Object System.Windows.Forms.Padding(0)
+            $gfxVerdictPanel.Controls.Add($script:GfxFootnote)
+            $gfxTable.Controls.Add($gfxVerdictPanel, 0, 1)
+
+            # =================================================================
+            # ROW 2 -- THE SURFACE GRID
+            # =================================================================
+            #
             # One row per WebView2 surface. Columns are the ENGINE SPLIT,
             # because a single "GPU %" would hide that the visualizer and the
             # player draw concurrently -- measured, not assumed.
+            #
+            # STATE is a column rather than a second panel above the numbers.
+            # The categorical question ("is this pane drawing?") and the
+            # quantitative one ("what did it cost?") are about the same
+            # surfaces, and answering them in two places is how two views of
+            # one run come to disagree. Both come out of
+            # Get-GraphicsBenchGridRows, in the live arm and the result arm
+            # alike.
             $script:GfxList = New-Object System.Windows.Forms.ListView
             $script:GfxList.View = [System.Windows.Forms.View]::Details
             $script:GfxList.FullRowSelect = $true
@@ -4634,31 +4889,188 @@ $buttonHandlers = @{
             $script:GfxList.HideSelection = $true
             $script:GfxList.Dock = [System.Windows.Forms.DockStyle]::Fill
             $script:GfxList.Font = New-Object System.Drawing.Font("Consolas", 9)
+            $script:GfxList.Margin = New-Object System.Windows.Forms.Padding($script:GfxViewM.Pad, 0, $script:GfxViewM.Pad, 0)
             # Column order is the contract Get-GraphicsBenchGridRows renders
-            # into; the live repaint below fills the same cells from the
-            # latest sample. PIDs and role source left the grid for the
-            # package: they identify a process, they do not answer a
-            # question a tech asks while looking at the screen.
-            [void]$script:GfxList.Columns.Add("Surface", 105)
-            [void]$script:GfxList.Columns.Add("Rendered on", 230)
-            [void]$script:GfxList.Columns.Add("3D", 70)
-            [void]$script:GfxList.Columns.Add("Decode", 70)
-            [void]$script:GfxList.Columns.Add("VideoProc", 80)
-            [void]$script:GfxList.Columns.Add("CPU", 65)
-            [void]$script:GfxList.Columns.Add("WS MB", 75)
-            [void]$script:GfxList.Columns.Add("VRAM MB", 75)
-            [void]$script:GfxList.Columns.Add("Present", 70)
-            $gfxTable.Controls.Add($script:GfxList, 0, 3)
+            # into, in BOTH arms. PIDs and role source are not here: they
+            # identify a process, they do not answer a question a tech asks
+            # while looking at the screen. They are in the package.
+            [void]$script:GfxList.Columns.Add("Surface", $script:GfxViewM.ColSurface)
+            [void]$script:GfxList.Columns.Add("State", $script:GfxViewM.ColState)
+            [void]$script:GfxList.Columns.Add("Rendered on", $script:GfxViewM.ColAdapter)
+            [void]$script:GfxList.Columns.Add("3D", $script:GfxViewM.ColEngine)
+            [void]$script:GfxList.Columns.Add("Decode", $script:GfxViewM.ColEngine)
+            [void]$script:GfxList.Columns.Add("VideoProc", $script:GfxViewM.ColVidProc)
+            [void]$script:GfxList.Columns.Add("CPU", $script:GfxViewM.ColCpu)
+            [void]$script:GfxList.Columns.Add("WS MB", $script:GfxViewM.ColMem)
+            [void]$script:GfxList.Columns.Add("VRAM MB", $script:GfxViewM.ColMem)
+            [void]$script:GfxList.Columns.Add("Present", $script:GfxViewM.ColPresent)
+            $gfxTable.Controls.Add($script:GfxList, 0, 2)
 
-            # === LOG / RESULTS ===
+            # =================================================================
+            # ROW 3 -- TRANSITIONS
+            # =================================================================
+            #
+            # The moments, not the telemetry: when NO's window set changed,
+            # when the activity state moved, which media file was opened, what
+            # the operator marked. They used to be log lines interleaved with
+            # report prose and scrolled away during a 40-minute session.
+            # Newest last, capped, and every line is also in the raw log below.
+            $gfxEventsPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+            $gfxEventsPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $gfxEventsPanel.WrapContents = $false
+            $gfxEventsPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $gfxEventsPanel.BackColor = [System.Drawing.Color]::FromArgb(248, 248, 250)
+            $gfxEventsPanel.Padding = New-Object System.Windows.Forms.Padding($script:GfxViewM.Pad, [int](4 * $gfxS), $script:GfxViewM.Pad, [int](4 * $gfxS))
+            $gfxEventsPanel.Margin = New-Object System.Windows.Forms.Padding(0, [int](8 * $gfxS), 0, 0)
+
+            $gfxEventsHeading = New-Object System.Windows.Forms.Label
+            $gfxEventsHeading.Text = "WHAT HAPPENED"
+            $gfxEventsHeading.Font = New-Object System.Drawing.Font("Segoe UI", 7.5, [System.Drawing.FontStyle]::Bold)
+            $gfxEventsHeading.ForeColor = [System.Drawing.Color]::FromArgb(140, 140, 150)
+            $gfxEventsHeading.AutoSize = $true
+            $gfxEventsHeading.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
+            $gfxEventsPanel.Controls.Add($gfxEventsHeading)
+
+            $script:GfxEvents = New-Object System.Collections.ArrayList
+            $script:GfxEventLabels = @()
+            for ($gfxEi = 0; $gfxEi -lt $script:GfxViewM.EventRows; $gfxEi++) {
+                $lbl = New-Object System.Windows.Forms.Label
+                $lbl.Text = ""
+                $lbl.Font = New-Object System.Drawing.Font("Consolas", 8.25)
+                $lbl.ForeColor = $script:GfxInkDim
+                $lbl.AutoSize = $false
+                $lbl.Height = $script:GfxViewM.LineH
+                $lbl.Width = [int](900 * $gfxS)
+                $lbl.Margin = New-Object System.Windows.Forms.Padding(0)
+                $gfxEventsPanel.Controls.Add($lbl)
+                $script:GfxEventLabels += $lbl
+            }
+            $gfxTable.Controls.Add($gfxEventsPanel, 0, 3)
+
+            # =================================================================
+            # ROW 4 -- THE RAW LOG
+            # =================================================================
+            #
+            # Everything, unfiltered, and still what the package's report is
+            # written from. It is no longer where the conclusion lives.
             $script:GfxLog = New-Object System.Windows.Forms.RichTextBox
             $script:GfxLog.Dock = [System.Windows.Forms.DockStyle]::Fill
             $script:GfxLog.Multiline = $true
             $script:GfxLog.WordWrap = $false
             $script:GfxLog.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Both
-            $script:GfxLog.Margin = New-Object System.Windows.Forms.Padding(0, 8, 0, 0)
+            $script:GfxLog.Margin = New-Object System.Windows.Forms.Padding($script:GfxViewM.Pad, [int](8 * $gfxS), $script:GfxViewM.Pad, 0)
             Initialize-WinConfigGuiDiagnosticBox -Box $script:GfxLog
             $gfxTable.Controls.Add($script:GfxLog, 0, 4)
+
+            # =================================================================
+            # ROW 5 -- SECONDARY ACTIONS
+            # =================================================================
+            #
+            # Demoted out of the row that used to hold Stop as one of five
+            # equals. Nothing here ends a run or sends anything.
+            $gfxButtonRow = New-Object System.Windows.Forms.FlowLayoutPanel
+            $gfxButtonRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+            $gfxButtonRow.WrapContents = $true
+            $gfxButtonRow.AutoSize = $true
+            $gfxButtonRow.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $gfxButtonRow.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $gfxButtonRow.BackColor = [System.Drawing.Color]::White
+            $gfxButtonRow.Padding = New-Object System.Windows.Forms.Padding($script:GfxViewM.Pad, [int](8 * $gfxS), $script:GfxViewM.Pad, [int](10 * $gfxS))
+            $gfxButtonRow.Margin = New-Object System.Windows.Forms.Padding(0)
+
+            $script:GfxMarkerBtn = & $gfxMakeButton "Add marker" $false $false
+            $script:GfxOpenBtn   = & $gfxMakeButton "Open run folder" $false $false
+            $gfxCloseBtn         = & $gfxMakeButton "Close" $true $false
+            $gfxButtonRow.Controls.Add($script:GfxMarkerBtn)
+            $gfxButtonRow.Controls.Add($script:GfxOpenBtn)
+            $gfxButtonRow.Controls.Add($gfxCloseBtn)
+            $gfxTable.Controls.Add($gfxButtonRow, 0, 5)
+
+            # -----------------------------------------------------------------
+            # Pinned-line renderers. Each paints ONE module answer. Nothing
+            # here decides what a line says -- Get-GraphicsBenchCoverage and
+            # Get-GraphicsBenchVerdict do, and the console harness reads the
+            # same two functions.
+            # -----------------------------------------------------------------
+            $script:GfxSetCoverage = {
+                param($Coverage)
+                if (-not $Coverage -or $script:GfxCoverage.IsDisposed) { return }
+                $script:GfxCoverage.Text = "$($Coverage.Marker) $($Coverage.Text)"
+                # On the dark band the level palette would be unreadable, so
+                # coverage carries its level as brightness plus the marker the
+                # module already put in front of the text.
+                $script:GfxCoverage.ForeColor = switch ($Coverage.Level) {
+                    'Failed'   { [System.Drawing.Color]::FromArgb(255, 150, 150) }
+                    'Degraded' { [System.Drawing.Color]::FromArgb(240, 200, 110) }
+                    'Healthy'  { $script:GfxInkOnDark }
+                    'Unknown'  { [System.Drawing.Color]::FromArgb(150, 185, 235) }
+                    default    { $script:GfxInkOnDarkD }
+                }
+            }
+
+            $script:GfxSetVerdict = {
+                param($Verdict)
+                if (-not $Verdict -or $script:GfxVerdict.IsDisposed) { return }
+                $script:GfxVerdict.Text = "$($Verdict.Marker) $($Verdict.Text)"
+                $col = $script:GfxLevelColors[[string]$Verdict.Level]
+                if (-not $col) { $col = $script:GfxInk }
+                $script:GfxVerdict.ForeColor = $col
+                $script:GfxVerdictContext.Text = [string]$Verdict.Context
+                $script:GfxFootnote.Text = [string]$Verdict.Footnote
+            }
+
+            # Retains one startup record AND writes it to the log, so the log
+            # stays the complete account while the record survives the scroll.
+            $script:GfxKeepStartupFinding = {
+                param([string]$Level, [string]$Text)
+                if ([string]::IsNullOrWhiteSpace($Text)) { return }
+                [void]$script:GfxStartupFindings.Add(@{ Level = $Level; Text = $Text })
+                if (-not $script:GfxStartupBtn.IsDisposed) { $script:GfxStartupBtn.Visible = $true }
+            }
+
+            $script:GfxShowStartupFindings = {
+                param($Owner)
+                $dlg = New-Object System.Windows.Forms.Form
+                $dlg.Text = "Startup findings"
+                $dlg.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+                $dlg.ClientSize = New-Object System.Drawing.Size([int](760 * $script:GfxViewScale), [int](420 * $script:GfxViewScale))
+                $box = New-Object System.Windows.Forms.RichTextBox
+                $box.Dock = [System.Windows.Forms.DockStyle]::Fill
+                $box.WordWrap = $false
+                $box.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Both
+                Initialize-WinConfigGuiDiagnosticBox -Box $box
+                $dlg.Controls.Add($box)
+                foreach ($f in @($script:GfxStartupFindings)) {
+                    Write-WinConfigGuiDiagnostic -Level $f.Level -Message ([string]$f.Text) -Box $box -NoPrefix
+                }
+                try { [void]$dlg.ShowDialog($Owner) } finally { $dlg.Dispose() }
+            }
+
+            # Transitions: newest last, capped at the metrics table's row count.
+            $script:GfxAddEvent = {
+                param([string]$Text, [string]$Level = 'INFO', $At)
+                if ([string]::IsNullOrWhiteSpace($Text)) { return }
+                $when = $(if ($At) { $At } else { Get-Date })
+                [void]$script:GfxEvents.Add([pscustomobject]@{ Time = $when.ToString('HH:mm:ss'); Text = $Text; Level = $Level })
+                while ($script:GfxEvents.Count -gt $script:GfxViewM.EventRows) { $script:GfxEvents.RemoveAt(0) }
+                $items = @($script:GfxEvents)
+                for ($i = 0; $i -lt @($script:GfxEventLabels).Count; $i++) {
+                    $lbl = $script:GfxEventLabels[$i]
+                    if ($lbl.IsDisposed) { continue }
+                    if ($i -lt $items.Count) {
+                        $lbl.Text = "$($items[$i].Time)   $($items[$i].Text)"
+                        $lbl.ForeColor = switch ($items[$i].Level) {
+                            'FAIL'   { $script:GfxLevelColors['Failed'] }
+                            'WARN'   { $script:GfxLevelColors['Degraded'] }
+                            'ACTION' { $script:GfxLevelColors['Unscoped'] }
+                            'OK'     { $script:GfxInk }
+                            default  { $script:GfxInkDim }
+                        }
+                    } elseif ($lbl.Text -ne '') {
+                        $lbl.Text = ''
+                    }
+                }
+            }
 
             # -----------------------------------------------------------------
             # Paints a report record list. The records come from the module; the
@@ -4669,6 +5081,39 @@ $buttonHandlers = @{
                 foreach ($rec in @($Records)) {
                     if ($script:GfxLog.IsDisposed) { return }
                     Write-WinConfigGuiDiagnostic -Level $rec.Level -Message ([string]$rec.Text) -Box $script:GfxLog -NoPrefix
+                }
+            }
+
+            # -----------------------------------------------------------------
+            # Paints grid rows. ONE painter for the live tick and the finished
+            # result, because they are one contract: Get-GraphicsBenchGridRows
+            # decides every cell in both arms, and the only thing decided here
+            # is that an unresolved surface is tinted rather than relabelled.
+            # A second painting loop is a second place for the amber flag to be
+            # forgotten in one of the two.
+            # -----------------------------------------------------------------
+            $script:GfxPaintGrid = {
+                param($Rows)
+                if ($script:GfxList.IsDisposed) { return }
+                $script:GfxList.BeginUpdate()
+                try {
+                    $script:GfxList.Items.Clear()
+                    foreach ($row in @($Rows)) {
+                        $cells = @($row.Cells)
+                        if ($cells.Count -eq 0) { continue }
+                        $item = New-Object System.Windows.Forms.ListViewItem([string]$cells[0])
+                        for ($ci = 1; $ci -lt $cells.Count; $ci++) { [void]$item.SubItems.Add([string]$cells[$ci]) }
+                        # The row's LEVEL is the module's, not this loop's.
+                        # An unresolved surface is flagged, never relabelled:
+                        # its numbers are real, only its identity is unproven,
+                        # and Get-GfxSurfaceState already said so in the state
+                        # column and the level.
+                        $lvlCol = $script:GfxLevelColors[[string]$row.Level]
+                        if ($lvlCol) { $item.ForeColor = $lvlCol }
+                        [void]$script:GfxList.Items.Add($item)
+                    }
+                } finally {
+                    $script:GfxList.EndUpdate()
                 }
             }
 
@@ -4692,6 +5137,7 @@ $buttonHandlers = @{
                         $script:GfxMediaFile = $changed[0].FullName
                         $script:GfxMediaAt = $changed[0].LastAccessTimeUtc
                         Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'MediaFileOpened' -Data @{ file = $script:GfxMediaFile; accessedUtc = $script:GfxMediaAt.ToString('o'); method = 'LastAccessTime diff vs pre-run baseline' }
+                        & $script:GfxAddEvent "Media opened: $(Split-Path $script:GfxMediaFile -Leaf)" 'OK'
                         Write-WinConfigGuiDiagnostic -Level INFO -Message "Media opened by NO: $(Split-Path $script:GfxMediaFile -Leaf)" -Box $script:GfxLog
                     }
                     $script:GfxMediaScanCount++
@@ -4709,6 +5155,10 @@ $buttonHandlers = @{
                                 $state = Get-GraphicsActivityState -Sample $rec
                                 if ($state -ne $script:GfxLastState) {
                                     Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'ActivityState' -Data @{ state = $state; previous = $script:GfxLastState; source = 'inferred-from-engine-load' }
+                                    # A transition is a MOMENT and belongs in
+                                    # the timeline. The per-tick state is on
+                                    # the activity line and in the grid.
+                                    if ($null -ne $script:GfxLastState) { & $script:GfxAddEvent "Activity: $($script:GfxLastState) -> $state" 'INFO' }
                                     $script:GfxLastState = $state
                                 }
                                 $surfRows = @()
@@ -4751,6 +5201,12 @@ $buttonHandlers = @{
                                         $script:GfxUiAdded = $added
                                         Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'NoWindowSetChange' -Data @{ added = $added; baseline = $script:GfxUiBaseline; heldSamples = $script:GfxUiPendingCount }
                                         if ($added.Count -gt 0) {
+                                            # The split instant is kept so the
+                                            # coverage line can report the idle
+                                            # arm it actually held, rather than
+                                            # the whole elapsed run.
+                                            if (-not $script:GfxSessionSplitAt) { $script:GfxSessionSplitAt = Get-Date }
+                                            & $script:GfxAddEvent "Session detected: NO opened $($added -join ', ')" 'OK'
                                             Write-WinConfigGuiDiagnostic -Level OK -Message "Session detected -- NO opened: $($added -join ', ')" -Box $script:GfxLog
                                         }
                                     }
@@ -4768,49 +5224,36 @@ $buttonHandlers = @{
                     }
 
                     # --- repaint the live grid ---
+                    #
+                    # The rows come from the module, through the SAME call the
+                    # result grid makes at Stop. This handler used to compose
+                    # the nine cells itself: it reached into the live record
+                    # shape directly, and it named the adapter from the FIRST
+                    # LUID that resolved rather than every one the surface
+                    # rendered on. That is two renderers of one contract,
+                    # differing in the column a hybrid-GPU box is read for --
+                    # the defect class the header of this window claims to have
+                    # designed out.
                     $latest = $null
                     if ($script:GfxSamples.Count -gt 0) { $latest = $script:GfxSamples[$script:GfxSamples.Count - 1] }
-                    $script:GfxList.BeginUpdate()
-                    try {
-                        $script:GfxList.Items.Clear()
-                        foreach ($s in @($latest.Surfaces)) {
-                            $g3 = $null; $gd = $null; $gp = $null
-                            if ($null -ne $s.Engines) {
-                                if ($s.Engines.ContainsKey('3D')) { $g3 = $s.Engines['3D'] }
-                                if ($s.Engines.ContainsKey('VideoDecode')) { $gd = $s.Engines['VideoDecode'] }
-                                if ($s.Engines.ContainsKey('VideoProcessing')) { $gp = $s.Engines['VideoProcessing'] }
-                            }
-                            # Name the adapter from the LUID the sample
-                            # measured. On a hybrid box this is the whole
-                            # question, and it stays absent when the map
-                            # cannot answer rather than naming a guess.
-                            $adapterName = $null
-                            foreach ($luid in @($s.AdapterLuids)) {
-                                $adapterName = Resolve-GfxLuidName -Luid $luid -LuidMap $script:GfxInventory.AdapterLuidMap
-                                if ($adapterName) { break }
-                            }
-                            $item = New-Object System.Windows.Forms.ListViewItem((Format-GraphicsValue $s.Role))
-                            [void]$item.SubItems.Add((Format-GraphicsValue $adapterName))
-                            [void]$item.SubItems.Add((Format-GraphicsValue $g3 '%'))
-                            [void]$item.SubItems.Add((Format-GraphicsValue $gd '%'))
-                            [void]$item.SubItems.Add((Format-GraphicsValue $gp '%'))
-                            [void]$item.SubItems.Add((Format-GraphicsValue $s.CpuPercent '%'))
-                            [void]$item.SubItems.Add((Format-GraphicsValue $s.WorkingSetMB))
-                            [void]$item.SubItems.Add((Format-GraphicsValue $s.GpuMemoryMB))
-                            [void]$item.SubItems.Add("live")
-                            # An unresolved surface is flagged, never relabelled:
-                            # its numbers are real, only its identity is unproven.
-                            if ($s.RoleSource -eq 'unresolved') { $item.ForeColor = [System.Drawing.Color]::FromArgb(180, 120, 20) }
-                            [void]$script:GfxList.Items.Add($item)
-                        }
-                    } finally {
-                        $script:GfxList.EndUpdate()
-                    }
+                    & $script:GfxPaintGrid (Get-GraphicsBenchGridRows -Sample $latest -AdapterLuidMap $script:GfxInventory.AdapterLuidMap)
 
+                    # The clock, the coverage line and the activity line are
+                    # three separate facts and used to be one interpolated
+                    # string. The clock is the number an operator checks
+                    # repeatedly; coverage says whether the run can answer
+                    # anything; the activity line says what the tool is doing.
+                    # Only the last is composed here, and coverage is composed
+                    # nowhere -- Get-GraphicsBenchCoverage owns every word.
                     $elapsed = ((Get-Date) - $script:GfxRunStart).TotalSeconds
-                    $phase = if (@($script:GfxUiAdded).Count -gt 0) { "session under way" } else { "idle baseline -- start your session when ready" }
-                    $counters = if ($latest -and -not $latest.CountersOk) { "  |  GPU counters UNAVAILABLE" } else { "" }
-                    $script:GfxStatus.Text = ("Watching {0}  |  {1} samples  |  activity {2}  |  {3}{4}" -f (Format-GraphicsDuration $elapsed), $script:GfxSamples.Count, (Format-GraphicsValue $script:GfxLastState), $phase, $counters)
+                    $script:GfxClock.Text = Format-GraphicsDuration $elapsed
+                    $sessionSeen = (@($script:GfxUiAdded).Count -gt 0)
+                    $idleSec = $elapsed
+                    if ($sessionSeen -and $script:GfxSessionSplitAt) { $idleSec = ($script:GfxSessionSplitAt - $script:GfxRunStart).TotalSeconds }
+                    $countersOk = $null
+                    if ($latest) { $countersOk = [bool]$latest.CountersOk }
+                    & $script:GfxSetCoverage (Get-GraphicsBenchCoverage -Phase 'Watching' -IdleSec $idleSec -SessionDetected $sessionSeen -StartedMidSession ($script:GfxPreRun.SessionLikely -eq 'Yes') -CountersOk $countersOk)
+                    $script:GfxStatus.Text = ("{0} samples  |  activity {1}" -f $script:GfxSamples.Count, (Format-GraphicsValue $script:GfxLastState))
                 } catch {
                     # A tick failure must not kill the run: the sampler keeps
                     # collecting and the next tick may well succeed. Surface it
@@ -4833,6 +5276,8 @@ $buttonHandlers = @{
                     $script:GfxUiPendingCount = 0
                     $script:GfxUiDwell = Get-GfxUiChangeDwellSamples
                     $script:GfxLastState = $null
+                    $script:GfxSessionSplitAt = $null
+                    $script:GfxEvents.Clear()
                     $script:GfxMediaFile = $null
                     $script:GfxMediaAt = $null
                     $script:GfxMediaScanCount = 0
@@ -4867,9 +5312,15 @@ $buttonHandlers = @{
                         }
                     }
 
+                    # The floors the classifiers will use, read from the
+                    # module rather than restated here. A threshold recorded
+                    # in the package that differs from the one applied to the
+                    # samples makes every pooled comparison unreadable.
+                    $gfxFloors = Get-GraphicsBenchFloors
+
                     Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'RunStart' -Data @{
                         runId = $script:GfxRun.RunId; intervalMs = 1000; runMode = 'Session'; surface = 'app'
-                        visualizerFloorPercent = 1.0; mediaFloorPercent = 0.3
+                        visualizerFloorPercent = $gfxFloors.VisualizerFloorPercent; mediaFloorPercent = $gfxFloors.MediaFloorPercent
                         inventory = $script:GfxInventory
                         # What the tool believed about NO BEFORE it started.
                         # A reader of the package should not have to guess
@@ -4889,10 +5340,23 @@ $buttonHandlers = @{
                     return
                 }
 
+                # ONE emphasised control: Start leaves the header, Stop
+                # takes its place. The Run ID goes up the moment the run
+                # folder exists -- no tick data reaches disk until the run
+                # ends, so a fact that is not on screen is a fact no
+                # screenshot can recover.
+                $script:GfxStartBtn.Visible = $false
                 $script:GfxStartBtn.Enabled = $false
+                $script:GfxStopBtn.Visible = $true
                 $script:GfxStopBtn.Enabled = $true
                 $script:GfxMarkerBtn.Enabled = $true
                 $script:GfxOpenBtn.Enabled = $false
+                $gfxCohortText = ''
+                try { if ($script:GfxInventory.Cohort -and $script:GfxInventory.Cohort.Key) { $gfxCohortText = "   cohort: $($script:GfxInventory.Cohort.Key)" } } catch { }
+                $script:GfxRunIdLabel.Text = "Run ID: $($script:GfxRun.RunId)$gfxCohortText"
+                & $script:GfxSetVerdict (Get-GraphicsBenchVerdict -Phase 'Watching')
+                & $script:GfxSetCoverage (Get-GraphicsBenchCoverage -Phase 'Watching' -IdleSec 0 -StartedMidSession ($script:GfxPreRun.SessionLikely -eq 'Yes'))
+                & $script:GfxAddEvent 'Watching started' 'OK'
                 # The instruction follows the pre-run reading. Repeating "leave
                 # NO idle" at an operator whose session is already running is
                 # advice they cannot act on.
@@ -4941,20 +5405,9 @@ $buttonHandlers = @{
                     }
 
                     # The grid becomes the result: whole-run means, not the
-                    # last live sample. Same rows the package carries.
-                    $script:GfxList.BeginUpdate()
-                    try {
-                        $script:GfxList.Items.Clear()
-                        foreach ($row in (Get-GraphicsBenchGridRows -Summary $summary)) {
-                            $cells = @($row.Cells)
-                            $item = New-Object System.Windows.Forms.ListViewItem([string]$cells[0])
-                            for ($ci = 1; $ci -lt $cells.Count; $ci++) { [void]$item.SubItems.Add([string]$cells[$ci]) }
-                            if ($row.Unresolved) { $item.ForeColor = [System.Drawing.Color]::FromArgb(180, 120, 20) }
-                            [void]$script:GfxList.Items.Add($item)
-                        }
-                    } finally {
-                        $script:GfxList.EndUpdate()
-                    }
+                    # last live sample. Same rows the package carries, painted
+                    # by the same block the live tick uses.
+                    & $script:GfxPaintGrid (Get-GraphicsBenchGridRows -Summary $summary)
 
                     # TWO renderings of one run: Compact on screen, Full into
                     # the package. Both come from the same renderer, so the
@@ -4963,9 +5416,19 @@ $buttonHandlers = @{
                     $reportFull    = Format-GraphicsBenchReport -Summary $summary -Findings $findings -MediaFile $mediaRecord -Detail Full
                     $inventoryFull = Format-GraphicsInventoryReport -Inventory $script:GfxInventory -Nomp $script:GfxNomp
 
+                    # THE CONCLUSION GOES TO THE PINNED LINE, not into the
+                    # log where the package block and the send banner then
+                    # push it out of view. Both come from the findings the
+                    # package carries, so the screen cannot say something the
+                    # package does not.
+                    & $script:GfxSetVerdict (Get-GraphicsBenchVerdict -Findings $findings -Phase 'Stopped')
+                    & $script:GfxSetCoverage (Get-GraphicsBenchCoverage -Phase 'Stopped' -IdleSec $summary.ArmDurationSec.Idle -SessionSec $summary.ArmDurationSec.Session -SessionDetected ($summary.SessionStartSource -ne 'none-detected') -StartedMidSession ([bool]$summary.StartedMidSession) -CountersOk $summary.CountersOk)
+                    & $script:GfxAddEvent 'Run stopped' 'OK'
+
                     Write-WinConfigGuiDiagnostic -Level INFO -Message "" -Box $script:GfxLog -NoPrefix
                     & $script:GfxWriteRecords $reportCompact
 
+                    $gfxFloors = Get-GraphicsBenchFloors
                     $session = @{
                         schema      = 'graphics-bench-session/1'
                         runId       = $script:GfxRun.RunId
@@ -4975,7 +5438,7 @@ $buttonHandlers = @{
                         startedUtc  = $script:GfxRunStart.ToUniversalTime().ToString('o')
                         endedUtc    = [datetime]::UtcNow.ToString('o')
                         intervalMs  = 1000
-                        thresholds  = @{ visualizerFloorPercent = 1.0; mediaFloorPercent = 0.3 }
+                        thresholds  = @{ visualizerFloorPercent = $gfxFloors.VisualizerFloorPercent; mediaFloorPercent = $gfxFloors.MediaFloorPercent }
                         cdpAttached = $false
                         inventory   = $script:GfxInventory
                         nompConfig  = @{ Path = $script:GfxNomp.Path; Exists = $script:GfxNomp.Exists; Sha256 = $script:GfxNomp.Sha256; SchemaKeysPresent = $script:GfxNomp.SchemaKeysPresent; ValuesReadable = $script:GfxNomp.ValuesReadable; ValuesReason = $script:GfxNomp.ValuesReason }
@@ -5050,6 +5513,8 @@ $buttonHandlers = @{
                     $script:GfxOpenBtn.Tag = $script:GfxRun.RunFolder
                     $script:GfxOpenBtn.Enabled = $true
                 }
+                $script:GfxStopBtn.Visible = $false
+                $script:GfxStartBtn.Visible = $true
                 $script:GfxStartBtn.Enabled = $true
                 $script:GfxStatus.Text = "Run complete. Results are below; the package is on disk."
             })
@@ -5109,6 +5574,7 @@ $buttonHandlers = @{
                 if ([string]::IsNullOrWhiteSpace($note)) { return }
                 $script:GfxMarkers += @{ AtUtc = [datetime]::UtcNow.ToString('o'); Text = $note }
                 Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'Marker' -Data @{ text = $note }
+                & $script:GfxAddEvent "Marked: $note" 'ACTION'
                 Write-WinConfigGuiDiagnostic -Level ACTION -Message "Marker: $note" -Box $script:GfxLog
             })
 
@@ -5127,6 +5593,12 @@ $buttonHandlers = @{
                 try { if ($script:GfxSampler) { Stop-GraphicsSampler -Sampler $script:GfxSampler; $script:GfxSampler = $null } } catch { }
             })
 
+            # The pinned lines start from the module, not from the literals
+            # the labels were constructed with -- a default that lives in the
+            # control is a second place for the wording to drift.
+            & $script:GfxSetVerdict (Get-GraphicsBenchVerdict -Phase 'NotStarted')
+            & $script:GfxSetCoverage (Get-GraphicsBenchCoverage -Phase 'NotStarted')
+
             $script:GfxForm.Show()
             [System.Windows.Forms.Application]::DoEvents()
 
@@ -5138,9 +5610,25 @@ $buttonHandlers = @{
                 $script:GfxNomp = Get-NompConfigSnapshot
                 & $script:GfxWriteRecords (Format-GraphicsInventoryReport -Inventory $script:GfxInventory -Nomp $script:GfxNomp -Compact)
 
+                # The cohort key is what this box will be POOLED under, and a
+                # tech asking why their machine is an outlier is asking about
+                # that string. It is known as soon as the inventory is read,
+                # so it is pinned then rather than at Stop.
+                try {
+                    if ($script:GfxInventory.Cohort -and $script:GfxInventory.Cohort.Key) {
+                        $script:GfxRunIdLabel.Text = "Run ID: (not assigned yet)   cohort: $($script:GfxInventory.Cohort.Key)"
+                    }
+                } catch { }
+
                 $pre = Test-GraphicsBenchPreconditions
-                foreach ($w in @($pre.Warnings)) { Write-WinConfigGuiDiagnostic -Level WARN -Message $w -Box $script:GfxLog }
-                foreach ($b in @($pre.Blocking)) { Write-WinConfigGuiDiagnostic -Level FAIL -Message $b -Box $script:GfxLog }
+                foreach ($w in @($pre.Warnings)) {
+                    Write-WinConfigGuiDiagnostic -Level WARN -Message $w -Box $script:GfxLog
+                    & $script:GfxKeepStartupFinding 'WARN' $w
+                }
+                foreach ($b in @($pre.Blocking)) {
+                    Write-WinConfigGuiDiagnostic -Level FAIL -Message $b -Box $script:GfxLog
+                    & $script:GfxKeepStartupFinding 'FAIL' $b
+                }
                 if (-not $pre.Ok) { $script:GfxStartBtn.Enabled = $false }
 
                 Write-WinConfigGuiDiagnostic -Level INFO -Message "" -Box $script:GfxLog -NoPrefix
@@ -5176,7 +5664,14 @@ $buttonHandlers = @{
                     $script:GfxStartBtn.Enabled = $true
                 }
 
-                & $script:GfxWriteRecords (Format-GraphicsPreRunReport -Activity $script:GfxPreRun -Inventory $script:GfxInventory)
+                $gfxPreRecords = @(Format-GraphicsPreRunReport -Activity $script:GfxPreRun -Inventory $script:GfxInventory)
+                & $script:GfxWriteRecords $gfxPreRecords
+                # The pre-run reading is the reason a run may have no baseline.
+                # It must be reachable at Stop, not only in the first ten
+                # seconds of a forty-minute run.
+                if ($script:GfxPreRun.SessionLikely -eq 'Yes') {
+                    foreach ($rec in $gfxPreRecords) { & $script:GfxKeepStartupFinding ([string]$rec.Level) ([string]$rec.Text) }
+                }
 
                 $script:GfxStatus.Text = if (-not $script:GfxInventory.No.Pid) {
                     "Ready. NO.exe is not running yet; the sampler will pick it up when it starts."
@@ -5185,6 +5680,9 @@ $buttonHandlers = @{
                 } else {
                     "Ready. Press Start watching, then start your NeurOptimal session."
                 }
+                # Coverage knows, before a single sample is kept, whether this
+                # run can have an idle arm at all.
+                & $script:GfxSetCoverage (Get-GraphicsBenchCoverage -Phase 'NotStarted' -StartedMidSession ($script:GfxPreRun.SessionLikely -eq 'Yes'))
             } catch {
                 Write-WinConfigGuiDiagnostic -Level FAIL -Message "Could not read the graphics inventory [$($_.Exception.GetType().Name)]: $($_.Exception.Message)" -Box $script:GfxLog
                 Write-WinConfigGuiDiagnostic -Level DIM -Message $_.ScriptStackTrace -Box $script:GfxLog -NoPrefix

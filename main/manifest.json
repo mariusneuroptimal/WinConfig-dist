@@ -1,10 +1,4 @@
 {
-  "schema_version": "2.0",
-  "event": "push",
-  "branch": "main",
-  "build_id": "34357657934-1",
-  "timestamp": "2026-09-09T13:32:07.4023747Z",
-  "source_ref": "504a4b19642f6f3e21421c78feacf3ba0f408f71",
   "artifacts": [
     {
       "sha256": "d1278321cdcd5c0759d3dfa773e964cda8d254ccdfd7f08dce12f878d317fff9",
@@ -12,9 +6,9 @@
       "size": 2001
     },
     {
-      "sha256": "315bda316546264f6925b93e433f54ef30d2aa126ac04748d4da4ca09501cbe0",
+      "sha256": "fd65ed5f9c2f00d980acce5ee88ef25a1ba7c43c212b8665fd199c32629cdd28",
       "path": "src/Win11Config.App.ps1",
-      "size": 997758
+      "size": 1030812
     },
     {
       "sha256": "ff6ee1fdba00afd4e7713d356ed92d752ac386a4528909aa02e29e5c68778622",
@@ -162,9 +156,15 @@
       "size": 509328
     },
     {
-      "sha256": "55bd7244ec21c7f01285960de8f1b45672d87137fb1218b5ab4be404879933ff",
+      "sha256": "d59cb6958e05577d01156fe38d9f21fceaab205a8ad280b5c1c5fbeebf6f6c89",
       "path": "src/Modules/GraphicsBench.psm1",
-      "size": 117269
+      "size": 135178
     }
-  ]
+  ],
+  "timestamp": "2026-09-09T14:38:24.3403392Z",
+  "branch": "main",
+  "source_ref": "53576ee16df7ec8d641cc32fc61841028beca8bf",
+  "event": "push",
+  "build_id": "34364894815-1",
+  "schema_version": "2.0"
 }
