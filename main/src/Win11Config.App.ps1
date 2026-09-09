@@ -4871,6 +4871,10 @@ $buttonHandlers = @{
                         runId = $script:GfxRun.RunId; intervalMs = 1000; runMode = 'Session'; surface = 'app'
                         visualizerFloorPercent = 1.0; mediaFloorPercent = 0.3
                         inventory = $script:GfxInventory
+                        # What the tool believed about NO BEFORE it started.
+                        # A reader of the package should not have to guess
+                        # whether a missing idle arm was operator error.
+                        preRunActivity = $script:GfxPreRun
                     }
 
                     $script:GfxSampler = Start-GraphicsSampler -IntervalMs 1000
@@ -4889,7 +4893,15 @@ $buttonHandlers = @{
                 $script:GfxStopBtn.Enabled = $true
                 $script:GfxMarkerBtn.Enabled = $true
                 $script:GfxOpenBtn.Enabled = $false
-                Write-WinConfigGuiDiagnostic -Level STEP -Message "Watching. Leave NO IDLE for about a minute -- that idle stretch is what the session is measured against -- then start your session and press Stop when it ends." -Box $script:GfxLog
+                # The instruction follows the pre-run reading. Repeating "leave
+                # NO idle" at an operator whose session is already running is
+                # advice they cannot act on.
+                if ($script:GfxPreRun.SessionLikely -eq 'Yes') {
+                    Write-WinConfigGuiDiagnostic -Level WARN -Message "Watching, but NO was already busy when this started -- this run will have NO idle baseline and will report totals only." -Box $script:GfxLog
+                    Write-WinConfigGuiDiagnostic -Level ACTION -Message "Press Stop when the session ends. For a run with a session cost in it, start watching before the NEXT session begins." -Box $script:GfxLog
+                } else {
+                    Write-WinConfigGuiDiagnostic -Level STEP -Message "Watching. Leave NO IDLE for about a minute -- that idle stretch is what the session is measured against -- then start your session and press Stop when it ends." -Box $script:GfxLog
+                }
             })
 
             # -----------------------------------------------------------------
@@ -4967,6 +4979,7 @@ $buttonHandlers = @{
                         cdpAttached = $false
                         inventory   = $script:GfxInventory
                         nompConfig  = @{ Path = $script:GfxNomp.Path; Exists = $script:GfxNomp.Exists; Sha256 = $script:GfxNomp.Sha256; SchemaKeysPresent = $script:GfxNomp.SchemaKeysPresent; ValuesReadable = $script:GfxNomp.ValuesReadable; ValuesReason = $script:GfxNomp.ValuesReason }
+                        preRunActivity = $script:GfxPreRun
                         mediaFile   = $mediaRecord
                         summary     = $summary
                         findings    = $findings
@@ -5131,12 +5144,46 @@ $buttonHandlers = @{
                 if (-not $pre.Ok) { $script:GfxStartBtn.Enabled = $false }
 
                 Write-WinConfigGuiDiagnostic -Level INFO -Message "" -Box $script:GfxLog -NoPrefix
-                if ($script:GfxInventory.No.Pid) {
-                    Write-WinConfigGuiDiagnostic -Level OK -Message "NO.exe is running (PID $($script:GfxInventory.No.Pid)). Press Start watching, leave NO idle a few seconds, then start your session." -Box $script:GfxLog
-                    $script:GfxStatus.Text = "Ready. Press Start watching, then start your NeurOptimal session."
+
+                # Do not TELL the operator to leave NO idle without first
+                # LOOKING at whether it already is. A session already under
+                # way makes the idle baseline unobtainable, and that used to
+                # surface only at Stop -- after the session was over and the
+                # run unrepeatable. A short passive burst answers it up front.
+                $script:GfxPreRun = @{ SessionLikely = 'Unknown'; Reason = 'the pre-run check did not run'; SampleCount = 0 }
+                if ($script:GfxInventory.No.Pid -and $pre.Ok) {
+                    $script:GfxStartBtn.Enabled = $false
+                    $script:GfxStatus.Text = "Checking what NO is doing right now..."
+                    $script:GfxForm.Refresh()
+                    $preSampler = $null
+                    try {
+                        $preSampler = Start-GraphicsSampler -IntervalMs 1000
+                        $preSamples = @()
+                        $deadline = (Get-Date).AddSeconds(20)
+                        while ($preSamples.Count -lt 3 -and (Get-Date) -lt $deadline) {
+                            [System.Windows.Forms.Application]::DoEvents()
+                            Start-Sleep -Milliseconds 250
+                            foreach ($rec in (Receive-GraphicsSamples -Sampler $preSampler)) {
+                                if ($rec.Kind -eq 'Sample') { $preSamples += $rec }
+                            }
+                        }
+                        $script:GfxPreRun = Get-GraphicsPreRunActivity -Samples $preSamples
+                    } catch {
+                        $script:GfxPreRun = @{ SessionLikely = 'Unknown'; Reason = "the pre-run check failed: $($_.Exception.Message)"; SampleCount = 0 }
+                    } finally {
+                        if ($preSampler) { try { Stop-GraphicsSampler -Sampler $preSampler } catch { } }
+                    }
+                    $script:GfxStartBtn.Enabled = $true
+                }
+
+                & $script:GfxWriteRecords (Format-GraphicsPreRunReport -Activity $script:GfxPreRun -Inventory $script:GfxInventory)
+
+                $script:GfxStatus.Text = if (-not $script:GfxInventory.No.Pid) {
+                    "Ready. NO.exe is not running yet; the sampler will pick it up when it starts."
+                } elseif ($script:GfxPreRun.SessionLikely -eq 'Yes') {
+                    "NO looks busy already -- starting now gives totals with no idle baseline. See the log."
                 } else {
-                    Write-WinConfigGuiDiagnostic -Level WARN -Message "NO.exe is not running. You can still press Start watching -- the sampler picks NO up as soon as it appears." -Box $script:GfxLog
-                    $script:GfxStatus.Text = "Ready. NO.exe is not running yet; the sampler will pick it up when it starts."
+                    "Ready. Press Start watching, then start your NeurOptimal session."
                 }
             } catch {
                 Write-WinConfigGuiDiagnostic -Level FAIL -Message "Could not read the graphics inventory [$($_.Exception.GetType().Name)]: $($_.Exception.Message)" -Box $script:GfxLog

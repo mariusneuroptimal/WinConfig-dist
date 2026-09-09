@@ -1239,6 +1239,132 @@ function Get-GraphicsActivityState {
     return 'Quiet'
 }
 
+function Get-GraphicsPreRunActivity {
+    <#
+    .SYNOPSIS
+        What NO is doing RIGHT NOW, from a short passive burst taken before a
+        run starts.
+    .DESCRIPTION
+        The tool's whole method is "measure the idle stretch, then measure the
+        session, report the difference". That is only possible if NO is idle
+        when watching begins -- and the operator was previously told to leave
+        it idle without anyone checking whether it already was. Starting
+        mid-session yields a run with one arm and no deltas, which is only
+        discovered at Stop, after the session is over and unrepeatable.
+
+        WHAT COUNTS AS EVIDENCE. Butterchurn's render loop is unconditional --
+        it draws while NO sits idle -- so 3D load says nothing about whether a
+        session is running. Hardware video decode is different: the video.js
+        surface decodes only when NO is playing media, which it does not do at
+        rest. So MEDIA DECODE IS THE SIGNAL and visualizer load is not.
+
+        This is inference from GPU engine load, not a statement out of NO, and
+        the record says so. It can be wrong in one direction worth naming: a
+        tech playing the explainer video outside a session decodes media too.
+        That is why the result is 'likely', and why the advice is phrased as
+        something to check rather than a verdict.
+    .OUTPUTS
+        Hashtable: State, MediaActive, VisualizerActive, SessionLikely
+        (Yes/No/Unknown), SampleCount, Reason, Method.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$Samples,
+        [double]$VisualizerFloorPercent = 1.0,
+        [double]$MediaFloorPercent = 0.3
+    )
+
+    $result = @{
+        State            = 'Unmeasured'
+        MediaActive      = $false
+        VisualizerActive = $false
+        SessionLikely    = 'Unknown'
+        SampleCount      = @($Samples).Count
+        Reason           = $null
+        Method           = 'GPU engine load over a short passive burst; media decode is the signal, visualizer load is not'
+    }
+
+    if (@($Samples).Count -eq 0) {
+        $result.Reason = 'no samples were collected before the run'
+        return $result
+    }
+
+    $states = @()
+    foreach ($s in @($Samples)) {
+        $states += (Get-GraphicsActivityState -Sample $s -VisualizerFloorPercent $VisualizerFloorPercent -MediaFloorPercent $MediaFloorPercent)
+    }
+
+    $measured = @($states | Where-Object { $_ -ne 'Unmeasured' })
+    if ($measured.Count -eq 0) {
+        $result.Reason = 'GPU engine load could not be measured, so what NO is doing cannot be told from here'
+        return $result
+    }
+
+    # ANY sample decoding counts. Media that started a second ago is still
+    # media; requiring every sample would hide a session that just began.
+    $result.MediaActive = [bool](@($measured | Where-Object { $_ -eq 'MediaOnly' -or $_ -eq 'Both' }).Count)
+    $result.VisualizerActive = [bool](@($measured | Where-Object { $_ -eq 'VisualizerOnly' -or $_ -eq 'Both' }).Count)
+    $result.State = $measured[$measured.Count - 1]
+
+    if ($result.MediaActive) {
+        $result.SessionLikely = 'Yes'
+        $result.Reason = 'the video.js surface is decoding video, which it does not do while NO sits at rest'
+    } else {
+        $result.SessionLikely = 'No'
+        $result.Reason = if ($result.VisualizerActive) {
+            'the visualizer is drawing but nothing is decoding video -- butterchurn draws at rest, so this reads as idle'
+        } else {
+            'neither surface is doing measurable work'
+        }
+    }
+    return $result
+}
+
+function Format-GraphicsPreRunReport {
+    <#
+    .SYNOPSIS
+        The pre-run readout and the instruction that follows from it. ONE
+        renderer, so the console and the app cannot give different advice.
+    .DESCRIPTION
+        The instruction is DERIVED from the measurement rather than printed
+        unconditionally. Telling an operator to "leave NO idle a few seconds"
+        while NO is mid-session is advice they cannot follow, and it produced
+        a run that could answer nothing.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Activity,
+        [hashtable]$Inventory
+    )
+
+    $r = @()
+    $noRunning = $false
+    if ($Inventory -and $Inventory.No -and $Inventory.No.Pid) { $noRunning = $true }
+
+    if (-not $noRunning) {
+        $r += @{ Level = 'WARN'; Text = 'NO.exe is not running. You can still press Start watching -- the sampler picks NO up as soon as it appears, and the stretch before the session becomes the idle baseline.'; NoPrefix = $false }
+        return ,$r
+    }
+
+    $pid_ = $Inventory.No.Pid
+    switch ($Activity.SessionLikely) {
+        'Yes' {
+            $r += @{ Level = 'WARN'; Text = "NO.exe is running (PID $pid_) and A SESSION LOOKS LIKE IT IS ALREADY UNDER WAY -- $($Activity.Reason)."; NoPrefix = $false }
+            $r += @{ Level = 'WARN'; Text = 'Starting now would measure the session against no idle baseline, so the run would report totals it cannot attribute to anything. That is only discoverable at Stop, once the session is over.'; NoPrefix = $false }
+            $r += @{ Level = 'ACTION'; Text = 'Let this session finish, then press Start watching BEFORE the next one begins. If you want the totals for this session anyway, you can start now -- the run will say plainly that it has no idle arm.'; NoPrefix = $false }
+        }
+        'No' {
+            $r += @{ Level = 'OK'; Text = "NO.exe is running (PID $pid_) and reads as idle -- $($Activity.Reason)."; NoPrefix = $false }
+            $r += @{ Level = 'ACTION'; Text = 'Press Start watching, leave NO idle for about a minute so the baseline is solid, then start your session.'; NoPrefix = $false }
+        }
+        default {
+            $r += @{ Level = 'WARN'; Text = "NO.exe is running (PID $pid_), but whether a session is under way could not be determined -- $($Activity.Reason)."; NoPrefix = $false }
+            $r += @{ Level = 'ACTION'; Text = 'If NO is idle, press Start watching, leave it idle about a minute, then start your session. If a session is already running, let it finish first.'; NoPrefix = $false }
+        }
+    }
+    return ,$r
+}
+
 function Get-GraphicsActivitySpans {
     <#
     .SYNOPSIS
@@ -1494,6 +1620,11 @@ function Get-GraphicsBenchSessionSummary {
         TickMs             = @{}
         SessionStartUtc    = $null
         SessionStartSource = 'none-detected'
+        # How the run BEGAN. A run with no split has two very different
+        # causes -- nothing ever happened, or a session was already running
+        # when watching started -- and they take opposite remedies.
+        StartActivity      = $null
+        StartedMidSession  = $false
         NoUiBaselineTitles = @()
         NoUiChanges        = @()
         Arms               = @{ Idle = @(); Session = @() }
@@ -1512,6 +1643,17 @@ function Get-GraphicsBenchSessionSummary {
     $states = @()
     foreach ($s in $Samples) {
         $states += @{ AtUtc = $s.AtUtc; State = (Get-GraphicsActivityState -Sample $s -VisualizerFloorPercent $VisualizerFloorPercent -MediaFloorPercent $MediaFloorPercent) }
+    }
+
+    # Read the opening of the run from the same classifier the pre-run check
+    # uses, over the first few samples, so "was NO already busy when we
+    # started?" is answered by the capture itself rather than by whether the
+    # operator remembered what they did.
+    $openingStates = @(@($states | Select-Object -First 3) | ForEach-Object { $_.State })
+    $measuredOpening = @($openingStates | Where-Object { $_ -ne 'Unmeasured' })
+    if ($measuredOpening.Count -gt 0) {
+        $summary.StartActivity = $measuredOpening[0]
+        $summary.StartedMidSession = [bool](@($measuredOpening | Where-Object { $_ -eq 'MediaOnly' -or $_ -eq 'Both' }).Count)
     }
     foreach ($sp in (Get-GraphicsActivitySpans -States $states)) {
         $sec = $null
@@ -1707,18 +1849,38 @@ function Get-GraphicsBenchFindings {
     # A run with no idle stretch cannot answer the question the tool exists to
     # answer. It is reported as SKIP, not as a clean PASS: the whole-run
     # numbers are real, but nothing in them is attributable to the session.
+    #
+    # The two causes are distinguished because their remedies are opposite. If
+    # NO was already busy when watching began, the operator did nothing wrong
+    # and simply started too late; telling them to "start watching first" is
+    # the advice they already followed.
     if ($Summary.SessionStartSource -eq 'none-detected') {
-        $candidates += @{
-            Rank       = 5
-            Id         = 'GFX-NO-SESSION-SPLIT'
-            Title      = 'No session start seen, so nothing is attributable to the session'
-            Result     = 'SKIP'
-            AppliesTo  = 'Measurement'
-            Evidence   = @(
-                "NO's window set never changed for $(Get-GfxUiChangeDwellSamples) consecutive samples, so the run has one arm and no deltas.",
-                'Butterchurn draws while NO is idle, so a whole-run percentage cannot be read as session cost.'
-            )
-            ActionHint = 'Start watching FIRST, leave NO idle about a minute, and only then start the session.'
+        if ($Summary.StartedMidSession) {
+            $candidates += @{
+                Rank       = 5
+                Id         = 'GFX-STARTED-MID-SESSION'
+                Title      = 'Watching began while NO was already busy, so there is no idle baseline'
+                Result     = 'SKIP'
+                AppliesTo  = 'Measurement'
+                Evidence   = @(
+                    "The very first samples of this run were already '$($Summary.StartActivity)' -- the video surface was decoding before watching started.",
+                    'The session cost is a difference against an idle stretch on this same box. With no idle stretch there is nothing to subtract, so this run reports totals only.'
+                )
+                ActionHint = 'Wait for the current session to end, then press Start watching BEFORE the next one begins. The totals below are still valid for the corpus.'
+            }
+        } else {
+            $candidates += @{
+                Rank       = 5
+                Id         = 'GFX-NO-SESSION-SPLIT'
+                Title      = 'No session start seen, so nothing is attributable to the session'
+                Result     = 'SKIP'
+                AppliesTo  = 'Measurement'
+                Evidence   = @(
+                    "NO's window set never changed for $(Get-GfxUiChangeDwellSamples) consecutive samples, so the run has one arm and no deltas.",
+                    'Butterchurn draws while NO is idle, so a whole-run percentage cannot be read as session cost.'
+                )
+                ActionHint = 'Start watching FIRST, leave NO idle about a minute, and only then start the session.'
+            }
         }
     }
 
@@ -2092,10 +2254,16 @@ function Format-GraphicsBenchReport {
     }
 
     if ($Summary.SessionStartSource -eq 'none-detected') {
-        $r += @{ Level = 'WARN'; Text = '  No session start was seen, so this run has no idle/session split and no deltas.'; NoPrefix = $true }
-        $r += @{ Level = 'WARN'; Text = '  The table above is the whole run and is still valid, but none of it is'; NoPrefix = $true }
-        $r += @{ Level = 'WARN'; Text = '  attributable to the session. Re-run: Start watching, leave NO idle about a'; NoPrefix = $true }
-        $r += @{ Level = 'WARN'; Text = '  minute, then start the session.'; NoPrefix = $true }
+        if ($Summary.StartedMidSession) {
+            $r += @{ Level = 'WARN'; Text = "  NO was ALREADY BUSY when watching began (first samples read '$($Summary.StartActivity)'),"; NoPrefix = $true }
+            $r += @{ Level = 'WARN'; Text = '  so this run has no idle baseline to subtract and reports totals only.'; NoPrefix = $true }
+            $r += @{ Level = 'WARN'; Text = '  Next time: wait for the session to end, then Start watching before the next one.'; NoPrefix = $true }
+        } else {
+            $r += @{ Level = 'WARN'; Text = '  No session start was seen, so this run has no idle/session split and no deltas.'; NoPrefix = $true }
+            $r += @{ Level = 'WARN'; Text = '  The table above is the whole run and is still valid, but none of it is'; NoPrefix = $true }
+            $r += @{ Level = 'WARN'; Text = '  attributable to the session. Re-run: Start watching, leave NO idle about a'; NoPrefix = $true }
+            $r += @{ Level = 'WARN'; Text = '  minute, then start the session.'; NoPrefix = $true }
+        }
     } else {
         $r += @{ Level = 'DIM'; Text = ("  {0,-13}{1,-17}{2,10}{3,12}{4,12}" -f 'surface', 'engine', 'idle', 'session', 'delta'); NoPrefix = $true }
         # On screen, an engine a surface never touched contributes three
@@ -2276,6 +2444,8 @@ Export-ModuleMember -Function @(
     'Get-NoOpenedMediaFile'
     'Get-GraphicsActivityState'
     'Get-GraphicsActivitySpans'
+    'Get-GraphicsPreRunActivity'
+    'Format-GraphicsPreRunReport'
     'Get-NoUiChangePoints'
     'Get-GfxRoleAggregate'
     'Get-GraphicsBenchSessionSummary'
