@@ -4508,7 +4508,7 @@ $buttonHandlers = @{
 
             # GUARD: the measurement module itself
             $gfxMissing = @()
-            foreach ($gfxFn in @('Start-GraphicsSampler', 'Get-GraphicsInventory', 'Get-GraphicsBenchSessionSummary', 'Format-GraphicsBenchReport', 'New-GraphicsBenchRunFolder')) {
+            foreach ($gfxFn in @('Start-GraphicsSampler', 'Get-GraphicsInventory', 'Get-GraphicsBenchSessionSummary', 'Format-GraphicsBenchReport', 'New-GraphicsBenchRunFolder', 'Get-GraphicsBenchGridRows', 'Get-GfxUiChangeDwellSamples', 'Resolve-GfxLuidName')) {
                 if (-not (Get-Command $gfxFn -ErrorAction SilentlyContinue)) { $gfxMissing += $gfxFn }
             }
             if ($gfxMissing.Count -gt 0) {
@@ -4634,16 +4634,20 @@ $buttonHandlers = @{
             $script:GfxList.HideSelection = $true
             $script:GfxList.Dock = [System.Windows.Forms.DockStyle]::Fill
             $script:GfxList.Font = New-Object System.Drawing.Font("Consolas", 9)
-            [void]$script:GfxList.Columns.Add("Surface", 110)
-            [void]$script:GfxList.Columns.Add("Role source", 100)
+            # Column order is the contract Get-GraphicsBenchGridRows renders
+            # into; the live repaint below fills the same cells from the
+            # latest sample. PIDs and role source left the grid for the
+            # package: they identify a process, they do not answer a
+            # question a tech asks while looking at the screen.
+            [void]$script:GfxList.Columns.Add("Surface", 105)
+            [void]$script:GfxList.Columns.Add("Rendered on", 230)
             [void]$script:GfxList.Columns.Add("3D", 70)
             [void]$script:GfxList.Columns.Add("Decode", 70)
             [void]$script:GfxList.Columns.Add("VideoProc", 80)
             [void]$script:GfxList.Columns.Add("CPU", 65)
             [void]$script:GfxList.Columns.Add("WS MB", 75)
             [void]$script:GfxList.Columns.Add("VRAM MB", 75)
-            [void]$script:GfxList.Columns.Add("Host PID", 70)
-            [void]$script:GfxList.Columns.Add("GPU PID", 70)
+            [void]$script:GfxList.Columns.Add("Present", 70)
             $gfxTable.Controls.Add($script:GfxList, 0, 3)
 
             # === LOG / RESULTS ===
@@ -4673,6 +4677,27 @@ $buttonHandlers = @{
             # runs in a background runspace and the rest of the app must stay
             # usable while a session is being watched.
             # -----------------------------------------------------------------
+            # Which media file did NO open? One scan block, called on a timer
+            # AND once more at Stop, so a run shorter than the interval still
+            # gets asked the question before the package claims an answer.
+            $script:GfxMediaScanIntervalSec = 10
+            $script:GfxMediaScan = {
+                if (-not $script:GfxWatchRoot) { return }
+                $script:GfxLastMediaScan = Get-Date
+                try {
+                    $changed = @(Get-ChildItem -LiteralPath $script:GfxWatchRoot -Recurse -File -ErrorAction SilentlyContinue |
+                        Where-Object { -not $script:GfxMediaBaseline.ContainsKey($_.FullName) -or $_.LastAccessTimeUtc -gt $script:GfxMediaBaseline[$_.FullName] } |
+                        Sort-Object LastAccessTimeUtc -Descending | Select-Object -First 1)
+                    if ($changed.Count -gt 0 -and $changed[0].FullName -ne $script:GfxMediaFile) {
+                        $script:GfxMediaFile = $changed[0].FullName
+                        $script:GfxMediaAt = $changed[0].LastAccessTimeUtc
+                        Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'MediaFileOpened' -Data @{ file = $script:GfxMediaFile; accessedUtc = $script:GfxMediaAt.ToString('o'); method = 'LastAccessTime diff vs pre-run baseline' }
+                        Write-WinConfigGuiDiagnostic -Level INFO -Message "Media opened by NO: $(Split-Path $script:GfxMediaFile -Leaf)" -Box $script:GfxLog
+                    }
+                    $script:GfxMediaScanCount++
+                } catch { }
+            }
+
             $script:GfxTickAction = {
                 if ($script:GfxLog.IsDisposed -or $null -eq $script:GfxSampler) { return }
 
@@ -4704,10 +4729,27 @@ $buttonHandlers = @{
                                     if ($null -eq $script:GfxUiBaseline) { $script:GfxUiBaseline = $titles }
                                     else { $script:GfxUiBaseline = @($script:GfxUiBaseline | Where-Object { $titles -contains $_ }) }
                                 } else {
+                                    # A change counts only once it has HELD for
+                                    # the dwell the summariser uses. Announcing
+                                    # every transition made this surface say
+                                    # "Session detected" over a one-sample blip
+                                    # that the report then scored
+                                    # 'none-detected' -- two views of one run
+                                    # disagreeing, which is the defect class
+                                    # this repo keeps paying for. One rule,
+                                    # read from the module, for both.
                                     $added = @($titles | Where-Object { $script:GfxUiBaseline -notcontains $_ } | Sort-Object -Unique)
-                                    if (($added -join '|') -ne (@($script:GfxUiAdded) -join '|')) {
+                                    $addedKey = ($added -join '|')
+                                    if ($addedKey -ne (@($script:GfxUiPendingAdded) -join '|')) {
+                                        $script:GfxUiPendingAdded = $added
+                                        $script:GfxUiPendingCount = 1
+                                    } else {
+                                        $script:GfxUiPendingCount++
+                                    }
+
+                                    if ($script:GfxUiPendingCount -ge $script:GfxUiDwell -and $addedKey -ne (@($script:GfxUiAdded) -join '|')) {
                                         $script:GfxUiAdded = $added
-                                        Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'NoWindowSetChange' -Data @{ added = $added; baseline = $script:GfxUiBaseline }
+                                        Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'NoWindowSetChange' -Data @{ added = $added; baseline = $script:GfxUiBaseline; heldSamples = $script:GfxUiPendingCount }
                                         if ($added.Count -gt 0) {
                                             Write-WinConfigGuiDiagnostic -Level OK -Message "Session detected -- NO opened: $($added -join ', ')" -Box $script:GfxLog
                                         }
@@ -4721,19 +4763,8 @@ $buttonHandlers = @{
 
                     # Which media file did NO open? Diffed against the pre-run
                     # baseline so this tool's own reads cannot be cited as NO's.
-                    if ($script:GfxWatchRoot -and ((Get-Date) - $script:GfxLastMediaScan).TotalSeconds -ge 30) {
-                        $script:GfxLastMediaScan = Get-Date
-                        try {
-                            $changed = @(Get-ChildItem -LiteralPath $script:GfxWatchRoot -Recurse -File -ErrorAction SilentlyContinue |
-                                Where-Object { -not $script:GfxMediaBaseline.ContainsKey($_.FullName) -or $_.LastAccessTimeUtc -gt $script:GfxMediaBaseline[$_.FullName] } |
-                                Sort-Object LastAccessTimeUtc -Descending | Select-Object -First 1)
-                            if ($changed.Count -gt 0 -and $changed[0].FullName -ne $script:GfxMediaFile) {
-                                $script:GfxMediaFile = $changed[0].FullName
-                                $script:GfxMediaAt = $changed[0].LastAccessTimeUtc
-                                Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'MediaFileOpened' -Data @{ file = $script:GfxMediaFile; accessedUtc = $script:GfxMediaAt.ToString('o'); method = 'LastAccessTime diff vs pre-run baseline' }
-                                Write-WinConfigGuiDiagnostic -Level INFO -Message "Media opened by NO: $(Split-Path $script:GfxMediaFile -Leaf)" -Box $script:GfxLog
-                            }
-                        } catch { }
+                    if ($script:GfxWatchRoot -and ((Get-Date) - $script:GfxLastMediaScan).TotalSeconds -ge $script:GfxMediaScanIntervalSec) {
+                        & $script:GfxMediaScan
                     }
 
                     # --- repaint the live grid ---
@@ -4749,16 +4780,24 @@ $buttonHandlers = @{
                                 if ($s.Engines.ContainsKey('VideoDecode')) { $gd = $s.Engines['VideoDecode'] }
                                 if ($s.Engines.ContainsKey('VideoProcessing')) { $gp = $s.Engines['VideoProcessing'] }
                             }
+                            # Name the adapter from the LUID the sample
+                            # measured. On a hybrid box this is the whole
+                            # question, and it stays absent when the map
+                            # cannot answer rather than naming a guess.
+                            $adapterName = $null
+                            foreach ($luid in @($s.AdapterLuids)) {
+                                $adapterName = Resolve-GfxLuidName -Luid $luid -LuidMap $script:GfxInventory.AdapterLuidMap
+                                if ($adapterName) { break }
+                            }
                             $item = New-Object System.Windows.Forms.ListViewItem((Format-GraphicsValue $s.Role))
-                            [void]$item.SubItems.Add((Format-GraphicsValue $s.RoleSource))
+                            [void]$item.SubItems.Add((Format-GraphicsValue $adapterName))
                             [void]$item.SubItems.Add((Format-GraphicsValue $g3 '%'))
                             [void]$item.SubItems.Add((Format-GraphicsValue $gd '%'))
                             [void]$item.SubItems.Add((Format-GraphicsValue $gp '%'))
                             [void]$item.SubItems.Add((Format-GraphicsValue $s.CpuPercent '%'))
                             [void]$item.SubItems.Add((Format-GraphicsValue $s.WorkingSetMB))
                             [void]$item.SubItems.Add((Format-GraphicsValue $s.GpuMemoryMB))
-                            [void]$item.SubItems.Add((Format-GraphicsValue $s.HostPid))
-                            [void]$item.SubItems.Add((Format-GraphicsValue $s.GpuPid))
+                            [void]$item.SubItems.Add("live")
                             # An unresolved surface is flagged, never relabelled:
                             # its numbers are real, only its identity is unproven.
                             if ($s.RoleSource -eq 'unresolved') { $item.ForeColor = [System.Drawing.Color]::FromArgb(180, 120, 20) }
@@ -4790,10 +4829,19 @@ $buttonHandlers = @{
                     $script:GfxMarkers = @()
                     $script:GfxUiBaseline = $null
                     $script:GfxUiAdded = @()
+                    $script:GfxUiPendingAdded = @()
+                    $script:GfxUiPendingCount = 0
+                    $script:GfxUiDwell = Get-GfxUiChangeDwellSamples
                     $script:GfxLastState = $null
                     $script:GfxMediaFile = $null
                     $script:GfxMediaAt = $null
-                    $script:GfxLastMediaScan = Get-Date
+                    $script:GfxMediaScanCount = 0
+                    # Back-dated so the first media scan lands early in the run
+                    # rather than one whole interval in: at a 30 s interval a
+                    # short run finished before the first scan ever ran, and
+                    # the package reported "no media opened" having never
+                    # looked. An unasked question must not read as an answer.
+                    $script:GfxLastMediaScan = (Get-Date).AddSeconds(-$script:GfxMediaScanIntervalSec)
                     $script:GfxRunStart = Get-Date
 
                     if (-not $script:GfxInventory) { $script:GfxInventory = Get-GraphicsInventory }
@@ -4841,7 +4889,7 @@ $buttonHandlers = @{
                 $script:GfxStopBtn.Enabled = $true
                 $script:GfxMarkerBtn.Enabled = $true
                 $script:GfxOpenBtn.Enabled = $false
-                Write-WinConfigGuiDiagnostic -Level STEP -Message "Watching. Leave NO idle for a few seconds, start your session, then press Stop when it ends." -Box $script:GfxLog
+                Write-WinConfigGuiDiagnostic -Level STEP -Message "Watching. Leave NO IDLE for about a minute -- that idle stretch is what the session is measured against -- then start your session and press Stop when it ends." -Box $script:GfxLog
             })
 
             # -----------------------------------------------------------------
@@ -4863,7 +4911,12 @@ $buttonHandlers = @{
 
                     Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'OperatorStop'
 
-                    $summary = Get-GraphicsBenchSessionSummary -Samples $script:GfxSamples -Markers $script:GfxMarkers
+                    # One last look before the package commits to an answer:
+                    # a run shorter than the scan interval otherwise reported
+                    # "no media opened" without ever having scanned.
+                    & $script:GfxMediaScan
+
+                    $summary = Get-GraphicsBenchSessionSummary -Samples $script:GfxSamples -Markers $script:GfxMarkers -AdapterLuidMap $script:GfxInventory.AdapterLuidMap
                     $findings = Get-GraphicsBenchFindings -Summary $summary
                     $mediaRecord = @{
                         root        = $script:GfxWatchRoot
@@ -4872,10 +4925,34 @@ $buttonHandlers = @{
                         accessedUtc = $(if ($script:GfxMediaAt) { $script:GfxMediaAt.ToString('o') } else { $null })
                         method      = 'LastAccessTime diff vs pre-run baseline'
                         labelled    = [bool]$script:GfxMediaFile
+                        scanCount   = $script:GfxMediaScanCount
                     }
 
+                    # The grid becomes the result: whole-run means, not the
+                    # last live sample. Same rows the package carries.
+                    $script:GfxList.BeginUpdate()
+                    try {
+                        $script:GfxList.Items.Clear()
+                        foreach ($row in (Get-GraphicsBenchGridRows -Summary $summary)) {
+                            $cells = @($row.Cells)
+                            $item = New-Object System.Windows.Forms.ListViewItem([string]$cells[0])
+                            for ($ci = 1; $ci -lt $cells.Count; $ci++) { [void]$item.SubItems.Add([string]$cells[$ci]) }
+                            if ($row.Unresolved) { $item.ForeColor = [System.Drawing.Color]::FromArgb(180, 120, 20) }
+                            [void]$script:GfxList.Items.Add($item)
+                        }
+                    } finally {
+                        $script:GfxList.EndUpdate()
+                    }
+
+                    # TWO renderings of one run: Compact on screen, Full into
+                    # the package. Both come from the same renderer, so the
+                    # screen can never say something the package does not.
+                    $reportCompact = Format-GraphicsBenchReport -Summary $summary -Findings $findings -MediaFile $mediaRecord -Detail Compact
+                    $reportFull    = Format-GraphicsBenchReport -Summary $summary -Findings $findings -MediaFile $mediaRecord -Detail Full
+                    $inventoryFull = Format-GraphicsInventoryReport -Inventory $script:GfxInventory -Nomp $script:GfxNomp
+
                     Write-WinConfigGuiDiagnostic -Level INFO -Message "" -Box $script:GfxLog -NoPrefix
-                    & $script:GfxWriteRecords (Format-GraphicsBenchReport -Summary $summary -Findings $findings -MediaFile $mediaRecord)
+                    & $script:GfxWriteRecords $reportCompact
 
                     $session = @{
                         schema      = 'graphics-bench-session/1'
@@ -4894,14 +4971,49 @@ $buttonHandlers = @{
                         summary     = $summary
                         findings    = $findings
                     }
-                    $saved = Save-GraphicsBenchRun -Run $script:GfxRun -Session $session
+                    # report.txt carries everything the compact screen dropped,
+                    # headed by the full inventory, so trimming the screen
+                    # moved detail rather than losing it.
+                    $reportRecords = @()
+                    $reportRecords += $inventoryFull
+                    $reportRecords += @{ Level = 'INFO'; Text = ''; NoPrefix = $true }
+                    $reportRecords += $reportFull
+                    $saved = Save-GraphicsBenchRun -Run $script:GfxRun -Session $session -ReportRecords $reportRecords
                     Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'RunEnd' -Data @{ sampleCount = $summary.SampleCount; durationSec = $summary.DurationSec }
 
                     Write-WinConfigGuiDiagnostic -Level INFO -Message "" -Box $script:GfxLog -NoPrefix
-                    Write-WinConfigGuiDiagnostic -Level STEP -Message "RUN PACKAGE" -Box $script:GfxLog -NoPrefix
-                    Write-WinConfigGuiDiagnostic -Level INFO -Message "  $($script:GfxRun.RunFolder)" -Box $script:GfxLog -NoPrefix
-                    if ($saved.ZipPath) { Write-WinConfigGuiDiagnostic -Level INFO -Message "  $($saved.ZipPath)" -Box $script:GfxLog -NoPrefix }
-                    if ($saved.ZipError) { Write-WinConfigGuiDiagnostic -Level WARN -Message "ZIP not written: $($saved.ZipError)" -Box $script:GfxLog }
+                    Write-WinConfigGuiDiagnostic -Level STEP -Message "PACKAGE" -Box $script:GfxLog -NoPrefix
+
+                    # Send it. A run that stays on one PC cannot be compared
+                    # against anything, and comparison is the whole point of
+                    # the corpus -- so the send is part of finishing a run,
+                    # not a step a tech has to remember. The banner says what
+                    # actually happened; a failed send never reads as sent.
+                    $gfxSendMsg = "  Kept on this PC only: $($script:GfxRun.RunFolder)"
+                    $gfxSendLevel = 'WARN'
+                    if (-not $saved.ZipPath) {
+                        $gfxSendMsg = "  Package could not be zipped ($($saved.ZipError)); the run folder is on this PC: $($script:GfxRun.RunFolder)"
+                        $gfxSendLevel = 'FAIL'
+                    } elseif (Get-Command Get-WinConfigDiagnosticsUploadConfig -ErrorAction SilentlyContinue) {
+                        $script:GfxStatus.Text = "Run complete. Sending the package..."
+                        $script:GfxForm.Refresh()
+                        $gfxCohortPrefix = 'unpooled'
+                        try { if ($script:GfxInventory.Cohort -and $script:GfxInventory.Cohort.Key) { $gfxCohortPrefix = ($script:GfxInventory.Cohort.Key -replace '[^A-Za-z0-9_\-\.]', '_') } } catch { }
+                        $gfxUpload = Send-WinConfigDiagnosticPackage -PackagePath $saved.ZipPath -Config (Get-WinConfigDiagnosticsUploadConfig) -Metadata @{ RunId = $script:GfxRun.RunId; ToolId = 'graphics-bench'; CohortKey = $gfxCohortPrefix } -FolderPrefix "graphics-bench/$gfxCohortPrefix"
+                        switch ($gfxUpload.Status) {
+                            'Uploaded' {
+                                $gfxSendLevel = 'OK'
+                                $gfxSendMsg = if ($gfxUpload.Provider -eq 'R2') { "  Sent for comparison: $(Split-Path $saved.ZipPath -Leaf)" } else { "  Saved to $($gfxUpload.RemotePath)" }
+                            }
+                            'LocalOnly' { $gfxSendMsg = "  NOT sent (upload failed: $($gfxUpload.Error)). File on this PC: $($gfxUpload.RemotePath)" }
+                            'Skipped'   { $gfxSendMsg = "  Not sent (sending is not configured on this PC). Package: $($saved.ZipPath)" }
+                            default     { $gfxSendMsg = "  NOT sent ($($gfxUpload.Error)). Package: $($saved.ZipPath)" }
+                        }
+                    } else {
+                        $gfxSendMsg = "  Not sent (upload module unavailable). Package: $($saved.ZipPath)"
+                    }
+                    Write-WinConfigGuiDiagnostic -Level $gfxSendLevel -Message $gfxSendMsg -Box $script:GfxLog -NoPrefix
+                    Write-WinConfigGuiDiagnostic -Level DIM -Message "  Full report, raw samples and system detail: report.txt in $($script:GfxRun.RunFolder)" -Box $script:GfxLog -NoPrefix
 
                     # Session ledger. ToolCategory has a sealed value set that
                     # has no Graphics member; extending it would touch
@@ -5011,7 +5123,7 @@ $buttonHandlers = @{
             try {
                 $script:GfxInventory = Get-GraphicsInventory
                 $script:GfxNomp = Get-NompConfigSnapshot
-                & $script:GfxWriteRecords (Format-GraphicsInventoryReport -Inventory $script:GfxInventory -Nomp $script:GfxNomp)
+                & $script:GfxWriteRecords (Format-GraphicsInventoryReport -Inventory $script:GfxInventory -Nomp $script:GfxNomp -Compact)
 
                 $pre = Test-GraphicsBenchPreconditions
                 foreach ($w in @($pre.Warnings)) { Write-WinConfigGuiDiagnostic -Level WARN -Message $w -Box $script:GfxLog }

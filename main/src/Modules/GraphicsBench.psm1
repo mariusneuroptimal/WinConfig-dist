@@ -787,6 +787,142 @@ function Stop-GraphicsSampler {
 # Inventory
 # ---------------------------------------------------------------------------
 
+# The dwell rule for "NO's window set changed" lives here, in ONE place.
+# The live surface announces the change and the summariser splits the arms on
+# it. While only the summariser applied a dwell filter, a one-sample blip made
+# the app say "Session detected" over a run the report scored 'none-detected' --
+# the channel-mismatch class this repo has hit repeatedly. Both read this.
+$script:GfxUiChangeDwellSamples = 3
+
+function Get-GfxUiChangeDwellSamples {
+    <#
+    .SYNOPSIS
+        Consecutive samples a change in NO's window set must hold to count as
+        a session start. The single source for both surfaces.
+    #>
+    [CmdletBinding()]
+    param()
+    return $script:GfxUiChangeDwellSamples
+}
+
+function ConvertTo-GfxLuidKey {
+    <#
+    .SYNOPSIS
+        Renders a 64-bit adapter LUID in the GPU Engine counter's own shape.
+    .DESCRIPTION
+        The performance counter names an adapter 'luid_0xHIGH_0xLOW'; the
+        registry stores the same value as one QWORD. Both sides are rendered
+        through this function so a map key and a measured key can never drift
+        apart in formatting -- which is the only reason the map resolves.
+
+        The mask is written as a decimal literal on purpose: PowerShell parses
+        0xFFFFFFFF as Int32 -1, and [uint64]-1 throws.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][uint64]$Luid)
+
+    $mask = [uint64]4294967295
+    $high = [uint32](($Luid -shr 32) -band $mask)
+    $low  = [uint32]($Luid -band $mask)
+    return ('0x{0:X8}_0x{1:X8}' -f $high, $low)
+}
+
+function Get-GfxAdapterLuidMap {
+    <#
+    .SYNOPSIS
+        Maps each adapter LUID to the adapter that owns it.
+    .DESCRIPTION
+        A surface's GPU cost is measured against a LUID, and on a hybrid
+        laptop the whole question is WHICH adapter that LUID names. Without
+        this map a package proves how much GPU was burned but not by which
+        GPU, which makes it useless for a cohort keyed on GPU.
+
+        HKLM\SOFTWARE\Microsoft\DirectX is the one place Windows publishes
+        LUID alongside a description; it is a read, and it is the same value
+        the counter instance carries.
+    .OUTPUTS
+        Hashtable keyed by LUID string -> @{ Description; VendorId; DeviceId }.
+        Empty when the key cannot be read: an unresolved LUID must render as
+        unresolved, never as a guess from the adapter list.
+    #>
+    [CmdletBinding()]
+    param([string]$RegistryPath = 'HKLM:\SOFTWARE\Microsoft\DirectX')
+
+    $map = @{}
+    try {
+        foreach ($key in @(Get-ChildItem -LiteralPath $RegistryPath -ErrorAction Stop)) {
+            try {
+                $props = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+                if ($null -eq $props.AdapterLuid) { continue }
+                $luidKey = ConvertTo-GfxLuidKey -Luid ([uint64]$props.AdapterLuid)
+                $map[$luidKey] = @{
+                    Description = [string]$props.Description
+                    VendorId    = $(if ($null -ne $props.VendorId) { ('0x{0:X4}' -f [int]$props.VendorId) } else { $null })
+                    DeviceId    = $(if ($null -ne $props.DeviceId) { ('0x{0:X4}' -f [int]$props.DeviceId) } else { $null })
+                }
+            } catch { }
+        }
+    } catch { }
+    return $map
+}
+
+function Resolve-GfxLuidName {
+    <#
+    .SYNOPSIS
+        Adapter name for a measured LUID, or $null when the map cannot answer.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Luid,
+        [hashtable]$LuidMap
+    )
+
+    if (-not $LuidMap -or [string]::IsNullOrWhiteSpace($Luid)) { return $null }
+    if (-not $LuidMap.ContainsKey($Luid)) { return $null }
+    $desc = $LuidMap[$Luid].Description
+    if ([string]::IsNullOrWhiteSpace($desc)) { return $null }
+    return $desc
+}
+
+function Get-GfxCohortKey {
+    <#
+    .SYNOPSIS
+        The comparison cohort this run belongs to: GPU set + display config.
+    .DESCRIPTION
+        Runs are only comparable against boxes with the same graphics story,
+        so the cohort is keyed on what actually moves the numbers -- the
+        adapters present and the display configuration -- NOT on machine
+        model, which splits identical hardware across vendor SKU names and
+        pools genuinely different GPUs under one laptop line.
+
+        Rendered as sorted, stable text so two machines of one cohort produce
+        one byte-identical key without a lookup table.
+    .OUTPUTS
+        Hashtable: Key, Adapters[], DisplayConfig, MonitorCount, Reason.
+        Key is $null when the inventory could not name an adapter; an
+        uncohorted run still uploads, it just cannot be pooled.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Inventory)
+
+    $venDevs = @(@($Inventory.Adapters) | ForEach-Object { $_.VenDev } | Where-Object { $_ } | Sort-Object -Unique)
+    if ($venDevs.Count -eq 0) {
+        return @{ Key = $null; Adapters = @(); DisplayConfig = $null; MonitorCount = $Inventory.MonitorCount; Reason = 'no adapter carried a VEN/DEV identifier' }
+    }
+
+    $modes = @(@($Inventory.Displays) | ForEach-Object { $_.Bounds } | Where-Object { $_ } | Sort-Object)
+    $displayConfig = if ($modes.Count -gt 0) { $modes -join '+' } else { 'unknown' }
+    $key = '{0}|{1}|{2}mon' -f ($venDevs -join ','), $displayConfig, [int]$Inventory.MonitorCount
+
+    return @{
+        Key           = $key
+        Adapters      = $venDevs
+        DisplayConfig = $displayConfig
+        MonitorCount  = $Inventory.MonitorCount
+        Reason        = $null
+    }
+}
+
 function Get-GraphicsInventory {
     <#
     .SYNOPSIS
@@ -804,6 +940,7 @@ function Get-GraphicsInventory {
         CollectedAtUtc = [datetime]::UtcNow.ToString('o')
         System         = @{}
         Adapters       = @()
+        AdapterLuidMap = @{}
         Displays       = @()
         Power          = @{}
         WebView2       = @{}
@@ -847,12 +984,14 @@ function Get-GraphicsInventory {
             }
         }
         # A hybrid laptop is the case where "which adapter did the pane use?"
-        # is a real question rather than a formality. Flag it as a fact; the
-        # per-host answer needs the ANGLE renderer string (CDP), and until
-        # that exists the run carries the LUID it measured, not a guess.
+        # is a real question rather than a formality. The per-surface answer
+        # is the measured LUID, and the LUID map below is what turns that
+        # number into an adapter name -- so the run reports which GPU
+        # rendered from evidence, without inferring it from the adapter list.
         $vendors = @($inv.Adapters | ForEach-Object { $_.VenDev } | Where-Object { $_ } | ForEach-Object { ($_ -split '&')[0] } | Sort-Object -Unique)
         $inv.HybridGpu = ($vendors.Count -gt 1)
         $inv.DisplayDrivingAdapters = @($inv.Adapters | Where-Object { $_.CurrentMode } | ForEach-Object { $_.Name })
+        $inv.AdapterLuidMap = Get-GfxAdapterLuidMap
     } catch { $inv.Errors += "adapters: $($_.Exception.Message)" }
 
     try {
@@ -908,6 +1047,10 @@ function Get-GraphicsInventory {
             $inv.No = @{ Pid = $null; Running = $false }
         }
     } catch { $inv.Errors += "no: $($_.Exception.Message)" }
+
+    # The cohort this box compares against. Computed here, once, so the app,
+    # the console and the package all carry the same key for one run.
+    try { $inv.Cohort = Get-GfxCohortKey -Inventory $inv } catch { $inv.Errors += "cohort: $($_.Exception.Message)" }
 
     return $inv
 }
@@ -1180,7 +1323,7 @@ function Get-NoUiChangePoints {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][array]$Samples,
         [int]$BaselineSamples = 3,
-        [int]$MinDwellSamples = 3
+        [int]$MinDwellSamples = $script:GfxUiChangeDwellSamples
     )
 
     $result = @{ BaselineTitles = @(); Changes = @(); FirstChangeIndex = $null; FirstChangeUtc = $null }
@@ -1285,6 +1428,7 @@ function Get-GfxRoleAggregate {
             HostPids                 = $r.HostPids
             GpuPids                  = $r.GpuPids
             AdapterLuids             = $r.AdapterLuids
+            AdapterNames             = @()
             SamplesPresent           = $r.Samples
             PresenceRatio            = $presence
             Engines                  = $engineStats
@@ -1332,7 +1476,8 @@ function Get-GraphicsBenchSessionSummary {
         [Parameter(Mandatory)][AllowEmptyCollection()][array]$Samples,
         [array]$Markers = @(),
         [double]$VisualizerFloorPercent = 1.0,
-        [double]$MediaFloorPercent = 0.3
+        [double]$MediaFloorPercent = 0.3,
+        [hashtable]$AdapterLuidMap = @{}
     )
 
     $summary = @{
@@ -1421,6 +1566,18 @@ function Get-GraphicsBenchSessionSummary {
         }
     }
 
+    # Name the adapter each surface actually rendered on. The LUID is the
+    # measurement; the name is a lookup on top of it, and stays absent when
+    # the map cannot answer rather than being inferred from the adapter list.
+    foreach ($surf in @($summary.Surfaces)) {
+        $names = @()
+        foreach ($luid in @($surf.AdapterLuids)) {
+            $name = Resolve-GfxLuidName -Luid $luid -LuidMap $AdapterLuidMap
+            if ($name) { $names += $name }
+        }
+        $surf.AdapterNames = @($names | Sort-Object -Unique)
+    }
+
     # A host or GPU pid changing mid-run means the process was replaced --
     # the pane-goes-blank failure class. Report the identities, not a count.
     foreach ($surf in @($summary.Surfaces)) {
@@ -1447,7 +1604,8 @@ function Get-GraphicsBenchFindings {
     param(
         [Parameter(Mandatory)][hashtable]$Summary,
         [int]$MemoryGrowthWarnMB = 250,
-        [double]$MemoryGrowthWarnMBPerMin = 15
+        [double]$MemoryGrowthWarnMBPerMin = 15,
+        [double]$MemoryGrowthMinSeconds = 180
     )
 
     $candidates = @()
@@ -1481,19 +1639,30 @@ function Get-GraphicsBenchFindings {
         }
     }
 
-    foreach ($surf in @($Summary.Surfaces)) {
-        if ($null -ne $surf.WorkingSetGrowthMB -and $surf.WorkingSetGrowthMB -ge $MemoryGrowthWarnMB) {
-            $candidates += @{
-                Rank       = 3
-                Id         = 'GFX-MEMORY-GROWTH'
-                Title      = "$($surf.Role) host tree grew $([int]$surf.WorkingSetGrowthMB) MB during the run"
-                Result     = 'WARN'
-                AppliesTo  = 'Memory'
-                Evidence   = @(
-                    "Working set went from $($surf.WorkingSetFirstMB) MB to $($surf.WorkingSetLastMB) MB over $($Summary.DurationSec) s ($($surf.WorkingSetGrowthMBPerMin) MB/min).",
-                    "Host PIDs $($surf.HostPids -join ', ')."
-                )
-                ActionHint = 'Re-run for a full-length session on the same box; sustained growth at this rate is the 8 GB-machine failure mode.'
+    # Memory growth is judged on the RATE, and only over a run long enough for
+    # a rate to mean anything. Judging it on absolute MB made the finding a
+    # function of run length: a short run could never trip it however fast the
+    # leak, and a long one trips on ordinary warm-up. Below the minimum the
+    # run is declared unable to answer, never quietly scored as clean.
+    $memoryJudged = ($null -ne $Summary.DurationSec -and [double]$Summary.DurationSec -ge $MemoryGrowthMinSeconds)
+    if ($memoryJudged) {
+        foreach ($surf in @($Summary.Surfaces)) {
+            $rate = $surf.WorkingSetGrowthMBPerMin
+            if ($null -ne $rate -and [double]$rate -ge $MemoryGrowthWarnMBPerMin -and
+                $null -ne $surf.WorkingSetGrowthMB -and [double]$surf.WorkingSetGrowthMB -ge $MemoryGrowthWarnMB) {
+                $candidates += @{
+                    Rank       = 3
+                    Id         = 'GFX-MEMORY-GROWTH'
+                    Title      = "$($surf.Role) host tree grew $([int]$surf.WorkingSetGrowthMB) MB during the run"
+                    Result     = 'WARN'
+                    AppliesTo  = 'Memory'
+                    Evidence   = @(
+                        "Working set went from $($surf.WorkingSetFirstMB) MB to $($surf.WorkingSetLastMB) MB over $($Summary.DurationSec) s ($rate MB/min).",
+                        "Sustained above both gates: $MemoryGrowthWarnMBPerMin MB/min and $MemoryGrowthWarnMB MB total.",
+                        "Host PIDs $($surf.HostPids -join ', ')."
+                    )
+                    ActionHint = 'Re-run for a full-length session on the same box; sustained growth at this rate is the 8 GB-machine failure mode.'
+                }
             }
         }
     }
@@ -1535,7 +1704,30 @@ function Get-GraphicsBenchFindings {
         }
     }
 
+    # A run with no idle stretch cannot answer the question the tool exists to
+    # answer. It is reported as SKIP, not as a clean PASS: the whole-run
+    # numbers are real, but nothing in them is attributable to the session.
+    if ($Summary.SessionStartSource -eq 'none-detected') {
+        $candidates += @{
+            Rank       = 5
+            Id         = 'GFX-NO-SESSION-SPLIT'
+            Title      = 'No session start seen, so nothing is attributable to the session'
+            Result     = 'SKIP'
+            AppliesTo  = 'Measurement'
+            Evidence   = @(
+                "NO's window set never changed for $(Get-GfxUiChangeDwellSamples) consecutive samples, so the run has one arm and no deltas.",
+                'Butterchurn draws while NO is idle, so a whole-run percentage cannot be read as session cost.'
+            )
+            ActionHint = 'Start watching FIRST, leave NO idle about a minute, and only then start the session.'
+        }
+    }
+
     if ($candidates.Count -eq 0) {
+        $memoryLine = if ($memoryJudged) {
+            "No memory growth above $MemoryGrowthWarnMBPerMin MB/min."
+        } else {
+            "Run shorter than $MemoryGrowthMinSeconds s, so memory growth was not judged either way."
+        }
         $candidates += @{
             Rank       = 9
             Id         = 'GFX-RUN-CLEAN'
@@ -1544,7 +1736,7 @@ function Get-GraphicsBenchFindings {
             AppliesTo  = 'Graphics'
             Evidence   = @(
                 "$($Summary.SampleCount) samples over $($Summary.DurationSec) s.",
-                'No host restart, no counter loss, no memory growth above threshold.'
+                "No host restart, no counter loss. $memoryLine"
             )
             ActionHint = 'Upload the package so this box joins the comparison corpus.'
         }
@@ -1684,20 +1876,42 @@ function Save-GraphicsBenchRun {
     param(
         [Parameter(Mandatory)][hashtable]$Run,
         [Parameter(Mandatory)][hashtable]$Session,
+        [array]$ReportRecords = @(),
         [switch]$NoZip
     )
 
     $Session | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Run.SessionPath -Encoding UTF8
+
+    # The full report goes in the package as text. The screen shows only what
+    # a tech acts on; everything trimmed off it has to survive somewhere a
+    # reader can open without parsing JSON, or trimming the screen would be
+    # deleting evidence rather than moving it.
+    $artifacts = @('events.jsonl', 'bench-session.json')
+    if (@($ReportRecords).Count -gt 0) {
+        try {
+            $reportPath = Join-Path $Run.RunFolder 'report.txt'
+            $lines = @(@($ReportRecords) | ForEach-Object { [string]$_.Text })
+            [System.IO.File]::WriteAllLines($reportPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+            $artifacts += 'report.txt'
+        } catch { }
+    }
+
+    $cohort = $null
+    try { $cohort = $Session.inventory.Cohort } catch { }
 
     $manifest = @{
         toolId        = 'graphics-bench'
         runId         = $Run.RunId
         runMode       = $Session.runMode
         createdUtc    = [datetime]::UtcNow.ToString('o')
-        artifacts     = @('events.jsonl', 'bench-session.json')
+        artifacts     = $artifacts
         sampleCount   = $Session.summary.SampleCount
         durationSec   = $Session.summary.DurationSec
         countersOk    = $Session.summary.CountersOk
+        # The cohort rides in the manifest so the ingest side can pool a
+        # package without opening the session file.
+        cohortKey     = $(if ($cohort) { $cohort.Key } else { $null })
+        cohort        = $cohort
         schemaVersion = 1
     }
     $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Run.ManifestPath -Encoding UTF8
@@ -1758,8 +1972,40 @@ function Format-GraphicsInventoryReport {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][hashtable]$Inventory,
-        [hashtable]$Nomp
+        [hashtable]$Nomp,
+        [switch]$Compact
     )
+
+    # COMPACT is what a tech reads on screen: the four facts that decide
+    # whether this run is comparable at all -- what the box is, which GPU is
+    # driving, whether it is on battery, and which cohort it will be pooled
+    # into. Everything else is in the package, which is where a number is
+    # looked up rather than glanced at.
+    if ($Compact) {
+        $r = @()
+        $machine = ("$($Inventory.System.Manufacturer) $($Inventory.System.Model)").Trim()
+        $onBattery = ($Inventory.Power.HasBattery -and $Inventory.Power.OnBattery)
+        $powerText = if (-not $Inventory.Power.HasBattery) { 'desktop' } elseif ($onBattery) { 'ON BATTERY' } else { 'on AC' }
+        $r += @{ Level = 'INFO'; Text = ("  {0,-10}{1}  |  {2} build {3}  |  NO {4}  |  {5}" -f 'SYSTEM', (Format-GraphicsValue $machine), (Format-GraphicsValue $Inventory.System.OsCaption), (Format-GraphicsValue $Inventory.System.OsBuild), (Format-GraphicsValue $Inventory.No.Version), $powerText); NoPrefix = $true }
+
+        $driving = @($Inventory.DisplayDrivingAdapters)
+        $drivingText = if ($driving.Count -gt 0) { $driving -join ', ' } else { [string][char]0x2014 }
+        $displayText = @(@($Inventory.Displays) | ForEach-Object { $_.Bounds }) -join ', '
+        if ([string]::IsNullOrWhiteSpace($displayText)) { $displayText = [string][char]0x2014 }
+        $r += @{ Level = 'INFO'; Text = ("  {0,-10}display driven by {1}  |  {2} on {3} monitor(s)  |  WebView2 {4}" -f 'GRAPHICS', $drivingText, $displayText, (Format-GraphicsValue $Inventory.MonitorCount), (Format-GraphicsValue $Inventory.WebView2.Version)); NoPrefix = $true }
+
+        if ($Inventory.HybridGpu) {
+            # Which adapter each pane used is in the grid's own column, so the
+            # panel only has to say that there is more than one to choose from.
+            $r += @{ Level = 'DIM'; Text = ("  {0,-10}hybrid GPU: {1}" -f '', ((@($Inventory.Adapters) | ForEach-Object { $_.Name }) -join ' + ')); NoPrefix = $true }
+        }
+        if ($onBattery) {
+            $r += @{ Level = 'WARN'; Text = ("  {0,-10}on battery -- GPU and CPU are throttled, so this run is NOT comparable." -f ''); NoPrefix = $true }
+        }
+        $cohortText = if ($Inventory.Cohort -and $Inventory.Cohort.Key) { $Inventory.Cohort.Key } else { 'unknown -- this run cannot be pooled' }
+        $r += @{ Level = 'DIM'; Text = ("  {0,-10}{1}" -f 'COHORT', $cohortText); NoPrefix = $true }
+        return ,$r
+    }
 
     $r = @()
     $r += @{ Level = 'STEP'; Text = 'SYSTEM'; NoPrefix = $true }
@@ -1792,6 +2038,19 @@ function Format-GraphicsInventoryReport {
         $r += @{ Level = 'DIM'; Text = ("  {0,-14}{1}  {2}{3}" -f 'Display', (Format-GraphicsValue $d.DeviceName), (Format-GraphicsValue $d.Bounds), $primary); NoPrefix = $true }
     }
     $r += @{ Level = 'INFO'; Text = ("  {0,-14}{1}  (NO fixed-version runtime)" -f 'WebView2', (Format-GraphicsValue $Inventory.WebView2.Version)); NoPrefix = $true }
+
+    # The LUID map is what lets a measured surface name its adapter. Printing
+    # it makes the resolution auditable instead of a claim.
+    foreach ($luid in @($Inventory.AdapterLuidMap.Keys | Sort-Object)) {
+        $r += @{ Level = 'DIM'; Text = ("  {0,-14}{1}  ->  {2}" -f 'LUID', $luid, (Format-GraphicsValue $Inventory.AdapterLuidMap[$luid].Description)); NoPrefix = $true }
+    }
+    if (@($Inventory.AdapterLuidMap.Keys).Count -eq 0) {
+        $r += @{ Level = 'WARN'; Text = ("  {0,-14}adapter LUID map unavailable -- surfaces will report a LUID with no adapter name" -f 'LUID'); NoPrefix = $true }
+    }
+    if ($Inventory.Cohort) {
+        $cohortText = if ($Inventory.Cohort.Key) { $Inventory.Cohort.Key } else { "unpooled ($($Inventory.Cohort.Reason))" }
+        $r += @{ Level = 'INFO'; Text = ("  {0,-14}{1}" -f 'Cohort', $cohortText); NoPrefix = $true }
+    }
     if ($Nomp) {
         $nompText = if ($Nomp.Exists) { "schema only: $(@($Nomp.SchemaKeysPresent).Count) known fields declared, no values stored" } else { 'not found' }
         $r += @{ Level = 'DIM'; Text = ("  {0,-14}{1}" -f 'NOMP config', $nompText); NoPrefix = $true }
@@ -1812,10 +2071,13 @@ function Format-GraphicsBenchReport {
     param(
         [Parameter(Mandatory)][hashtable]$Summary,
         [array]$Findings = @(),
-        [hashtable]$MediaFile
+        [hashtable]$MediaFile,
+        [ValidateSet('Full', 'Compact')]
+        [string]$Detail = 'Full'
     )
 
     $dash = [string][char]0x2014
+    $compact = ($Detail -eq 'Compact')
     $r = @()
 
     $r += @{ Level = 'STEP'; Text = ("RESULTS   {0}   {1} samples" -f (Format-GraphicsDuration $Summary.DurationSec), $Summary.SampleCount); NoPrefix = $true }
@@ -1823,20 +2085,33 @@ function Format-GraphicsBenchReport {
 
     # --- the headline: session minus this box's own idle arm ---
     $r += @{ Level = 'STEP'; Text = 'WHAT THE SESSION COST'; NoPrefix = $true }
-    $r += @{ Level = 'DIM'; Text = '  Session mean minus this box own idle baseline, measured minutes earlier on the'; NoPrefix = $true }
-    $r += @{ Level = 'DIM'; Text = '  same hardware, driver and NO launch. Butterchurn draws even when NO is idle,'; NoPrefix = $true }
-    $r += @{ Level = 'DIM'; Text = '  so the absolute percentage answers nothing on its own -- the delta does.'; NoPrefix = $true }
+    if (-not $compact) {
+        $r += @{ Level = 'DIM'; Text = '  Session mean minus this box own idle baseline, measured minutes earlier on the'; NoPrefix = $true }
+        $r += @{ Level = 'DIM'; Text = '  same hardware, driver and NO launch. Butterchurn draws even when NO is idle,'; NoPrefix = $true }
+        $r += @{ Level = 'DIM'; Text = '  so the absolute percentage answers nothing on its own -- the delta does.'; NoPrefix = $true }
+    }
 
     if ($Summary.SessionStartSource -eq 'none-detected') {
-        $r += @{ Level = 'WARN'; Text = '  No session start was detected: NO window set never changed for long enough,'; NoPrefix = $true }
-        $r += @{ Level = 'WARN'; Text = '  so this run has no idle/session split and no deltas. The whole-run numbers'; NoPrefix = $true }
-        $r += @{ Level = 'WARN'; Text = '  below are still valid. Re-run and start the session while the tool is up.'; NoPrefix = $true }
+        $r += @{ Level = 'WARN'; Text = '  No session start was seen, so this run has no idle/session split and no deltas.'; NoPrefix = $true }
+        $r += @{ Level = 'WARN'; Text = '  The table above is the whole run and is still valid, but none of it is'; NoPrefix = $true }
+        $r += @{ Level = 'WARN'; Text = '  attributable to the session. Re-run: Start watching, leave NO idle about a'; NoPrefix = $true }
+        $r += @{ Level = 'WARN'; Text = '  minute, then start the session.'; NoPrefix = $true }
     } else {
         $r += @{ Level = 'DIM'; Text = ("  {0,-13}{1,-17}{2,10}{3,12}{4,12}" -f 'surface', 'engine', 'idle', 'session', 'delta'); NoPrefix = $true }
-        if (@($Summary.Deltas).Count -eq 0) {
+        # On screen, an engine a surface never touched contributes three
+        # zeroes and no information. The package keeps every row; the compact
+        # rendering keeps the ones that moved.
+        $shown = @($Summary.Deltas)
+        if ($compact) {
+            $shown = @($shown | Where-Object {
+                ($null -ne $_.SessionMean -and [math]::Abs([double]$_.SessionMean) -ge 0.05) -or
+                ($null -ne $_.IdleMean -and [math]::Abs([double]$_.IdleMean) -ge 0.05)
+            })
+        }
+        if (@($shown).Count -eq 0) {
             $r += @{ Level = 'INFO'; Text = "  $dash"; NoPrefix = $true }
         }
-        foreach ($d in @($Summary.Deltas | Sort-Object Role, Engine)) {
+        foreach ($d in @($shown | Sort-Object Role, Engine)) {
             $deltaText = if ($null -eq $d.DeltaMean) { $dash } else { ('{0}{1}%' -f $(if ($d.DeltaMean -ge 0) { '+' } else { '' }), [math]::Round($d.DeltaMean, 1)) }
             $level = if ($null -eq $d.DeltaMean) { 'DIM' } elseif ($d.DeltaMean -ge 1) { 'WARN' } else { 'INFO' }
             $r += @{ Level = $level; Text = ("  {0,-13}{1,-17}{2,10}{3,12}{4,12}" -f $d.Role, $d.Engine, (Format-GraphicsValue $d.IdleMean '%'), (Format-GraphicsValue $d.SessionMean '%'), $deltaText); NoPrefix = $true }
@@ -1853,59 +2128,66 @@ function Format-GraphicsBenchReport {
     $r += @{ Level = 'INFO'; Text = ''; NoPrefix = $true }
 
     # --- media file, when the run could be labelled ---
-    if ($MediaFile) {
+    if ($MediaFile -and $compact -and $MediaFile.file) {
+        $r += @{ Level = 'INFO'; Text = ("  Media opened by NO: {0}" -f (Split-Path $MediaFile.file -Leaf)); NoPrefix = $true }
+        $r += @{ Level = 'INFO'; Text = ''; NoPrefix = $true }
+    }
+    if ($MediaFile -and -not $compact) {
         $mediaText = if ($MediaFile.file) { "$(Split-Path $MediaFile.file -Leaf)" } else { 'Unknown -- no media file was opened under the watched root' }
         $r += @{ Level = 'INFO'; Text = ("  Media opened by NO: {0}" -f $mediaText); NoPrefix = $true }
         $r += @{ Level = 'DIM'; Text = ("  watched root {0} ({1})" -f (Format-GraphicsValue $MediaFile.root), (Format-GraphicsValue $MediaFile.rootSource)); NoPrefix = $true }
         $r += @{ Level = 'INFO'; Text = ''; NoPrefix = $true }
     }
 
-    # --- time in each state ---
-    $r += @{ Level = 'STEP'; Text = 'TIME IN EACH STATE'; NoPrefix = $true }
-    $r += @{ Level = 'DIM'; Text = '  Quiet / VisualizerOnly / MediaOnly / Both, inferred from GPU engine load.'; NoPrefix = $true }
-    $byState = @{}
-    foreach ($sp in @($Summary.Spans)) {
-        if (-not $byState.ContainsKey($sp.State)) { $byState[$sp.State] = 0.0 }
-        $byState[$sp.State] += [double]$sp.DurationSec
-    }
-    if ($byState.Keys.Count -eq 0) { $r += @{ Level = 'INFO'; Text = "  $dash"; NoPrefix = $true } }
-    foreach ($st in @($byState.Keys | Sort-Object)) {
-        $pct = $null
-        if ($Summary.DurationSec -gt 0) { $pct = [math]::Round(100.0 * $byState[$st] / $Summary.DurationSec, 1) }
-        $r += @{ Level = 'INFO'; Text = ("  {0,-18}{1,-10}{2} of the run" -f $st, (Format-GraphicsDuration $byState[$st]), (Format-GraphicsValue $pct '%')); NoPrefix = $true }
-    }
-    $r += @{ Level = 'INFO'; Text = ''; NoPrefix = $true }
-
-    # --- per surface, whole run ---
-    $r += @{ Level = 'STEP'; Text = 'PER SURFACE, WHOLE RUN   (GPU engine load, percent of the adapter)'; NoPrefix = $true }
-    $r += @{ Level = 'DIM'; Text = ("  {0,-13}{1,-13}{2,-17}{3,9}{4,9}{5,9}{6,9}" -f 'surface', 'role source', 'engine', 'mean', 'p50', 'p95', 'max'); NoPrefix = $true }
-    if (@($Summary.Surfaces).Count -eq 0) {
-        $r += @{ Level = 'WARN'; Text = '  no WebView2 surface was seen during the run'; NoPrefix = $true }
-    }
-    foreach ($surf in @($Summary.Surfaces)) {
-        $printed = $false
-        foreach ($eng in @('3D', 'VideoDecode', 'VideoProcessing')) {
-            $st = $null
-            if ($surf.Engines -and $surf.Engines.ContainsKey($eng)) { $st = $surf.Engines[$eng] }
-            if ($null -eq $st) { continue }
-            $label = ''
-            $src = ''
-            if (-not $printed) { $label = $surf.Role; $src = $surf.RoleSource }
-            $r += @{ Level = 'INFO'; Text = ("  {0,-13}{1,-13}{2,-17}{3,9}{4,9}{5,9}{6,9}" -f $label, $src, $eng, (Format-GraphicsValue $st.Mean), (Format-GraphicsValue $st.P50), (Format-GraphicsValue $st.P95), (Format-GraphicsValue $st.Max)); NoPrefix = $true }
-            $printed = $true
+    # --- time in each state (package only: the live grid already shows it) ---
+    if (-not $compact) {
+        $r += @{ Level = 'STEP'; Text = 'TIME IN EACH STATE'; NoPrefix = $true }
+        $r += @{ Level = 'DIM'; Text = '  Quiet / VisualizerOnly / MediaOnly / Both, inferred from GPU engine load.'; NoPrefix = $true }
+        $byState = @{}
+        foreach ($sp in @($Summary.Spans)) {
+            if (-not $byState.ContainsKey($sp.State)) { $byState[$sp.State] = 0.0 }
+            $byState[$sp.State] += [double]$sp.DurationSec
         }
-        if (-not $printed) {
-            $r += @{ Level = 'WARN'; Text = ("  {0,-13}{1,-13}{2,-17}{3,9}" -f $surf.Role, $surf.RoleSource, 'no GPU counters', $dash); NoPrefix = $true }
+        if ($byState.Keys.Count -eq 0) { $r += @{ Level = 'INFO'; Text = "  $dash"; NoPrefix = $true } }
+        foreach ($st in @($byState.Keys | Sort-Object)) {
+            $pct = $null
+            if ($Summary.DurationSec -gt 0) { $pct = [math]::Round(100.0 * $byState[$st] / $Summary.DurationSec, 1) }
+            $r += @{ Level = 'INFO'; Text = ("  {0,-18}{1,-10}{2} of the run" -f $st, (Format-GraphicsDuration $byState[$st]), (Format-GraphicsValue $pct '%')); NoPrefix = $true }
         }
-        $luidText = if (@($surf.AdapterLuids).Count -gt 0) { @($surf.AdapterLuids) -join ', ' } else { $dash }
-        $presence = if ($null -eq $surf.PresenceRatio) { $dash } else { "$([math]::Round(100 * $surf.PresenceRatio, 0))%" }
-        $r += @{ Level = 'DIM'; Text = ("  {0,-13}host PID(s) {1} | GPU PID(s) {2} | adapter LUID {3} | present in {4} of samples" -f '', ($surf.HostPids -join ', '), ($surf.GpuPids -join ', '), $luidText, $presence); NoPrefix = $true }
-        $r += @{ Level = 'DIM'; Text = ("  {0,-13}CPU mean {1} | working set {2} -> {3} MB (growth {4} MB, {5} MB/min) | VRAM mean {6} MB" -f '', (Format-GraphicsValue $surf.Cpu.Mean '%'), (Format-GraphicsValue $surf.WorkingSetFirstMB), (Format-GraphicsValue $surf.WorkingSetLastMB), (Format-GraphicsValue $surf.WorkingSetGrowthMB), (Format-GraphicsValue $surf.WorkingSetGrowthMBPerMin), (Format-GraphicsValue $surf.GpuMemoryMB.Mean)); NoPrefix = $true }
         $r += @{ Level = 'INFO'; Text = ''; NoPrefix = $true }
+
+        # --- per surface, whole run ---
+        $r += @{ Level = 'STEP'; Text = 'PER SURFACE, WHOLE RUN   (GPU engine load, percent of the adapter)'; NoPrefix = $true }
+        $r += @{ Level = 'DIM'; Text = ("  {0,-13}{1,-13}{2,-17}{3,9}{4,9}{5,9}{6,9}" -f 'surface', 'role source', 'engine', 'mean', 'p50', 'p95', 'max'); NoPrefix = $true }
+        if (@($Summary.Surfaces).Count -eq 0) {
+            $r += @{ Level = 'WARN'; Text = '  no WebView2 surface was seen during the run'; NoPrefix = $true }
+        }
+        foreach ($surf in @($Summary.Surfaces)) {
+            $printed = $false
+            foreach ($eng in @('3D', 'VideoDecode', 'VideoProcessing')) {
+                $st = $null
+                if ($surf.Engines -and $surf.Engines.ContainsKey($eng)) { $st = $surf.Engines[$eng] }
+                if ($null -eq $st) { continue }
+                $label = ''
+                $src = ''
+                if (-not $printed) { $label = $surf.Role; $src = $surf.RoleSource }
+                $r += @{ Level = 'INFO'; Text = ("  {0,-13}{1,-13}{2,-17}{3,9}{4,9}{5,9}{6,9}" -f $label, $src, $eng, (Format-GraphicsValue $st.Mean), (Format-GraphicsValue $st.P50), (Format-GraphicsValue $st.P95), (Format-GraphicsValue $st.Max)); NoPrefix = $true }
+                $printed = $true
+            }
+            if (-not $printed) {
+                $r += @{ Level = 'WARN'; Text = ("  {0,-13}{1,-13}{2,-17}{3,9}" -f $surf.Role, $surf.RoleSource, 'no GPU counters', $dash); NoPrefix = $true }
+            }
+            $luidText = if (@($surf.AdapterLuids).Count -gt 0) { @($surf.AdapterLuids) -join ', ' } else { $dash }
+            $presence = if ($null -eq $surf.PresenceRatio) { $dash } else { "$([math]::Round(100 * $surf.PresenceRatio, 0))%" }
+            $adapterText = if (@($surf.AdapterNames).Count -gt 0) { @($surf.AdapterNames) -join ', ' } else { 'unresolved LUID' }
+            $r += @{ Level = 'DIM'; Text = ("  {0,-13}rendered on {1} (LUID {2}) | host PID(s) {3} | GPU PID(s) {4} | present in {5} of samples" -f '', $adapterText, $luidText, ($surf.HostPids -join ', '), ($surf.GpuPids -join ', '), $presence); NoPrefix = $true }
+            $r += @{ Level = 'DIM'; Text = ("  {0,-13}CPU mean {1} | working set {2} -> {3} MB (growth {4} MB, {5} MB/min) | VRAM mean {6} MB" -f '', (Format-GraphicsValue $surf.Cpu.Mean '%'), (Format-GraphicsValue $surf.WorkingSetFirstMB), (Format-GraphicsValue $surf.WorkingSetLastMB), (Format-GraphicsValue $surf.WorkingSetGrowthMB), (Format-GraphicsValue $surf.WorkingSetGrowthMBPerMin), (Format-GraphicsValue $surf.GpuMemoryMB.Mean)); NoPrefix = $true }
+            $r += @{ Level = 'INFO'; Text = ''; NoPrefix = $true }
+        }
     }
 
     # --- operator markers ---
-    if (@($Summary.Markers).Count -gt 0) {
+    if (-not $compact -and @($Summary.Markers).Count -gt 0) {
         $r += @{ Level = 'STEP'; Text = 'OPERATOR MARKERS'; NoPrefix = $true }
         foreach ($m in @($Summary.Markers)) {
             $at = $dash
@@ -1923,10 +2205,51 @@ function Format-GraphicsBenchReport {
         foreach ($e in @($f.Evidence)) { $r += @{ Level = 'DIM'; Text = ("         {0}" -f $e); NoPrefix = $true } }
         $r += @{ Level = 'ACTION'; Text = ("         -> {0}" -f $f.ActionHint); NoPrefix = $true }
     }
-    $r += @{ Level = 'INFO'; Text = ''; NoPrefix = $true }
-    $r += @{ Level = 'DIM'; Text = ("  Sampler cost: tick mean {0} ms, p95 {1} ms, max {2} ms." -f (Format-GraphicsValue $Summary.TickMs.Mean '' 0), (Format-GraphicsValue $Summary.TickMs.P95 '' 0), (Format-GraphicsValue $Summary.TickMs.Max '' 0)); NoPrefix = $true }
+    if (-not $compact) {
+        $r += @{ Level = 'INFO'; Text = ''; NoPrefix = $true }
+        $r += @{ Level = 'DIM'; Text = ("  Sampler cost: tick mean {0} ms, p95 {1} ms, max {2} ms." -f (Format-GraphicsValue $Summary.TickMs.Mean '' 0), (Format-GraphicsValue $Summary.TickMs.P95 '' 0), (Format-GraphicsValue $Summary.TickMs.Max '' 0)); NoPrefix = $true }
+    }
 
     return ,$r
+}
+
+function Get-GraphicsBenchGridRows {
+    <#
+    .SYNOPSIS
+        The result grid as ordered rows. THE one place a grid row is decided.
+    .DESCRIPTION
+        The app paints these into a ListView and the package carries the same
+        values; neither surface computes a cell of its own. Whole-run means,
+        because the grid IS the on-screen summary once a run has stopped --
+        the last live sample is not a result.
+    .OUTPUTS
+        Array of @{ Cells[]; Unresolved } in column order:
+        surface, adapter, 3D, decode, videoproc, CPU, working set, VRAM, present.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Summary)
+
+    $rows = @()
+    foreach ($surf in @($Summary.Surfaces)) {
+        $eng = { param($n) if ($surf.Engines -and $surf.Engines.ContainsKey($n)) { $surf.Engines[$n].Mean } else { $null } }
+        $adapter = if (@($surf.AdapterNames).Count -gt 0) { @($surf.AdapterNames) -join ', ' } else { [string][char]0x2014 }
+        $presence = if ($null -eq $surf.PresenceRatio) { [string][char]0x2014 } else { "$([math]::Round(100 * $surf.PresenceRatio, 0))%" }
+        $rows += @{
+            Cells = @(
+                (Format-GraphicsValue $surf.Role)
+                $adapter
+                (Format-GraphicsValue (& $eng '3D') '%')
+                (Format-GraphicsValue (& $eng 'VideoDecode') '%')
+                (Format-GraphicsValue (& $eng 'VideoProcessing') '%')
+                (Format-GraphicsValue $surf.Cpu.Mean '%')
+                (Format-GraphicsValue $surf.WorkingSetMB.Mean)
+                (Format-GraphicsValue $surf.GpuMemoryMB.Mean)
+                $presence
+            )
+            Unresolved = ($surf.RoleSource -eq 'unresolved')
+        }
+    }
+    return ,$rows
 }
 
 Export-ModuleMember -Function @(
@@ -1944,6 +2267,11 @@ Export-ModuleMember -Function @(
     'Receive-GraphicsSamples'
     'Stop-GraphicsSampler'
     'Get-GraphicsInventory'
+    'Get-GfxUiChangeDwellSamples'
+    'ConvertTo-GfxLuidKey'
+    'Get-GfxAdapterLuidMap'
+    'Resolve-GfxLuidName'
+    'Get-GfxCohortKey'
     'Get-NompConfigSnapshot'
     'Get-NoOpenedMediaFile'
     'Get-GraphicsActivityState'
@@ -1956,6 +2284,7 @@ Export-ModuleMember -Function @(
     'New-GraphicsBenchRunFolder'
     'Write-GraphicsBenchEvent'
     'Save-GraphicsBenchRun'
+    'Get-GraphicsBenchGridRows'
     'Format-GraphicsValue'
     'Format-GraphicsDuration'
     'Format-GraphicsInventoryReport'
