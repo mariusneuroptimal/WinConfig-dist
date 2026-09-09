@@ -4472,6 +4472,568 @@ $buttonHandlers = @{
         }
 
         # =========================================================================
+        # GRAPHICS SESSION BENCH (Read-only - no dry run needed)
+        # =========================================================================
+        # GRAPHICS-BENCH-001 section 11.2 ('Session' mode).
+        #
+        # WHAT IT IS. NO renders its visualizer and its media player in TWO
+        # independent WebView2 hosts, each with its own GPU process. This window
+        # watches a whole NeurOptimal session and reports what each of those
+        # panes cost, split by GPU engine, as a delta against this box's own
+        # idle baseline.
+        #
+        # IT IS PASSIVE. Nothing here starts or stops a NeurOptimal session,
+        # clicks anything in NO, injects input, or evaluates JavaScript in NO's
+        # renderers. Every number is process, window, performance-counter or
+        # file METADATA. The operator drives NO; this only watches. Read-only,
+        # so no ExecutionIntent gate: nothing is mutated.
+        #
+        # ONE SUMMARISER, ONE RENDERER. Every number and every line of the
+        # report comes from GraphicsBench.psm1 -- the same functions the console
+        # harness scripts\Invoke-GraphicsSessionBench.ps1 calls. This window
+        # decides only how a line is painted. Two live views of one run that
+        # compute their own numbers is this repo's channel-mismatch bug class,
+        # and it is designed out here rather than guarded against.
+        "Run Graphics Session Bench" = {
+            # GUARD: Console module (RichTextBox diagnostic contract)
+            if (-not (Get-Command Initialize-WinConfigGuiDiagnosticBox -ErrorAction SilentlyContinue)) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Graphics Session Bench cannot start: Console module failed to load.",
+                    "Module Load Error",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                ) | Out-Null
+                return
+            }
+
+            # GUARD: the measurement module itself
+            $gfxMissing = @()
+            foreach ($gfxFn in @('Start-GraphicsSampler', 'Get-GraphicsInventory', 'Get-GraphicsBenchSessionSummary', 'Format-GraphicsBenchReport', 'New-GraphicsBenchRunFolder')) {
+                if (-not (Get-Command $gfxFn -ErrorAction SilentlyContinue)) { $gfxMissing += $gfxFn }
+            }
+            if ($gfxMissing.Count -gt 0) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Graphics Session Bench cannot start: GraphicsBench module is not loaded.`r`n`r`nMissing: $($gfxMissing -join ', ')",
+                    "Module Load Error",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                ) | Out-Null
+                return
+            }
+
+            # One window at a time: a second sampler over the same NO would
+            # contend for the same counters and split the evidence in two.
+            if ($script:GfxForm -and -not $script:GfxForm.IsDisposed) {
+                $script:GfxForm.Activate()
+                return
+            }
+
+            $script:GfxForm = New-Object System.Windows.Forms.Form
+            $script:GfxForm.Text = "Graphics Session Bench"
+            $script:GfxForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+            $script:GfxForm.Size = New-Object System.Drawing.Size(1120, 780)
+            $script:GfxForm.MinimumSize = New-Object System.Drawing.Size(900, 600)
+            $script:GfxForm.BackColor = [System.Drawing.Color]::White
+
+            $gfxTable = New-Object System.Windows.Forms.TableLayoutPanel
+            $gfxTable.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $gfxTable.ColumnCount = 1
+            $gfxTable.RowCount = 5
+            $gfxTable.BackColor = [System.Drawing.Color]::White
+            $gfxTable.Padding = New-Object System.Windows.Forms.Padding(16, 12, 16, 12)
+            [void]$gfxTable.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))          # header
+            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))          # buttons
+            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))          # status
+            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 132)))     # live grid
+            [void]$gfxTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))      # log
+            $script:GfxForm.Controls.Add($gfxTable)
+
+            # === HEADER ===
+            $gfxHeader = New-Object System.Windows.Forms.FlowLayoutPanel
+            $gfxHeader.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+            $gfxHeader.WrapContents = $false
+            $gfxHeader.AutoSize = $true
+            $gfxHeader.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $gfxHeader.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $gfxHeader.BackColor = [System.Drawing.Color]::White
+
+            $gfxTitle = New-Object System.Windows.Forms.Label
+            $gfxTitle.Text = "Graphics Session Bench"
+            $gfxTitle.Font = New-Object System.Drawing.Font("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
+            $gfxTitle.ForeColor = [System.Drawing.Color]::FromArgb(0, 90, 140)
+            $gfxTitle.AutoSize = $true
+            $gfxTitle.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 2)
+            $gfxHeader.Controls.Add($gfxTitle)
+
+            $gfxSubtitle = New-Object System.Windows.Forms.Label
+            $gfxSubtitle.Text = "What NO's butterchurn visualizer and video.js player cost across one real session. Passive: it watches, it never drives NO."
+            $gfxSubtitle.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+            $gfxSubtitle.ForeColor = [System.Drawing.Color]::FromArgb(100, 100, 100)
+            $gfxSubtitle.AutoSize = $true
+            $gfxSubtitle.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 10)
+            $gfxHeader.Controls.Add($gfxSubtitle)
+            $gfxTable.Controls.Add($gfxHeader, 0, 0)
+
+            # === CONTROLS ===
+            $gfxButtonRow = New-Object System.Windows.Forms.FlowLayoutPanel
+            $gfxButtonRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+            $gfxButtonRow.WrapContents = $true
+            $gfxButtonRow.AutoSize = $true
+            $gfxButtonRow.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+            $gfxButtonRow.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $gfxButtonRow.BackColor = [System.Drawing.Color]::White
+            $gfxButtonRow.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
+
+            # BackColor is AMBIENT in WinForms: a button with no explicit colour
+            # renders invisible on a non-default panel. Every button sets its own.
+            $gfxMakeButton = {
+                param([string]$Text, [bool]$Enabled)
+                $b = New-Object System.Windows.Forms.Button
+                $b.Text = $Text
+                $b.AutoSize = $true
+                $b.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+                $b.Padding = New-Object System.Windows.Forms.Padding(12, 5, 12, 5)
+                $b.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0)
+                $b.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
+                $b.ForeColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+                $b.FlatStyle = [System.Windows.Forms.FlatStyle]::System
+                $b.Enabled = $Enabled
+                return $b
+            }
+
+            $script:GfxStartBtn  = & $gfxMakeButton "Start watching" $true
+            $script:GfxStopBtn   = & $gfxMakeButton "Stop and show results" $false
+            $script:GfxMarkerBtn = & $gfxMakeButton "Add marker" $false
+            $script:GfxOpenBtn   = & $gfxMakeButton "Open run folder" $false
+            $gfxCloseBtn         = & $gfxMakeButton "Close" $true
+            $gfxButtonRow.Controls.Add($script:GfxStartBtn)
+            $gfxButtonRow.Controls.Add($script:GfxStopBtn)
+            $gfxButtonRow.Controls.Add($script:GfxMarkerBtn)
+            $gfxButtonRow.Controls.Add($script:GfxOpenBtn)
+            $gfxButtonRow.Controls.Add($gfxCloseBtn)
+            $gfxTable.Controls.Add($gfxButtonRow, 0, 1)
+
+            # === STATUS ===
+            $script:GfxStatus = New-Object System.Windows.Forms.Label
+            $script:GfxStatus.Text = "Reading this machine's graphics stack..."
+            $script:GfxStatus.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+            $script:GfxStatus.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+            $script:GfxStatus.AutoSize = $true
+            $script:GfxStatus.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
+            $gfxTable.Controls.Add($script:GfxStatus, 0, 2)
+
+            # === LIVE GRID ===
+            # One row per WebView2 surface. Columns are the ENGINE SPLIT,
+            # because a single "GPU %" would hide that the visualizer and the
+            # player draw concurrently -- measured, not assumed.
+            $script:GfxList = New-Object System.Windows.Forms.ListView
+            $script:GfxList.View = [System.Windows.Forms.View]::Details
+            $script:GfxList.FullRowSelect = $true
+            $script:GfxList.GridLines = $true
+            $script:GfxList.HideSelection = $true
+            $script:GfxList.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $script:GfxList.Font = New-Object System.Drawing.Font("Consolas", 9)
+            [void]$script:GfxList.Columns.Add("Surface", 110)
+            [void]$script:GfxList.Columns.Add("Role source", 100)
+            [void]$script:GfxList.Columns.Add("3D", 70)
+            [void]$script:GfxList.Columns.Add("Decode", 70)
+            [void]$script:GfxList.Columns.Add("VideoProc", 80)
+            [void]$script:GfxList.Columns.Add("CPU", 65)
+            [void]$script:GfxList.Columns.Add("WS MB", 75)
+            [void]$script:GfxList.Columns.Add("VRAM MB", 75)
+            [void]$script:GfxList.Columns.Add("Host PID", 70)
+            [void]$script:GfxList.Columns.Add("GPU PID", 70)
+            $gfxTable.Controls.Add($script:GfxList, 0, 3)
+
+            # === LOG / RESULTS ===
+            $script:GfxLog = New-Object System.Windows.Forms.RichTextBox
+            $script:GfxLog.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $script:GfxLog.Multiline = $true
+            $script:GfxLog.WordWrap = $false
+            $script:GfxLog.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Both
+            $script:GfxLog.Margin = New-Object System.Windows.Forms.Padding(0, 8, 0, 0)
+            Initialize-WinConfigGuiDiagnosticBox -Box $script:GfxLog
+            $gfxTable.Controls.Add($script:GfxLog, 0, 4)
+
+            # -----------------------------------------------------------------
+            # Paints a report record list. The records come from the module; the
+            # only thing decided here is the colour, via the sealed level set.
+            # -----------------------------------------------------------------
+            $script:GfxWriteRecords = {
+                param($Records)
+                foreach ($rec in @($Records)) {
+                    if ($script:GfxLog.IsDisposed) { return }
+                    Write-WinConfigGuiDiagnostic -Level $rec.Level -Message ([string]$rec.Text) -Box $script:GfxLog -NoPrefix
+                }
+            }
+
+            # -----------------------------------------------------------------
+            # Live tick. A Timer, deliberately, not a DoEvents pump: the sampler
+            # runs in a background runspace and the rest of the app must stay
+            # usable while a session is being watched.
+            # -----------------------------------------------------------------
+            $script:GfxTickAction = {
+                if ($script:GfxLog.IsDisposed -or $null -eq $script:GfxSampler) { return }
+
+                try {
+                    foreach ($rec in (Receive-GraphicsSamples -Sampler $script:GfxSampler)) {
+                        switch ($rec.Kind) {
+                            'Sample' {
+                                $script:GfxSamples += $rec
+                                $state = Get-GraphicsActivityState -Sample $rec
+                                if ($state -ne $script:GfxLastState) {
+                                    Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'ActivityState' -Data @{ state = $state; previous = $script:GfxLastState; source = 'inferred-from-engine-load' }
+                                    $script:GfxLastState = $state
+                                }
+                                $surfRows = @()
+                                foreach ($s in @($rec.Surfaces)) {
+                                    $surfRows += @{ role = $s.Role; roleSource = $s.RoleSource; hostPid = $s.HostPid; gpuPid = $s.GpuPid; adapterLuids = $s.AdapterLuids; engines = $s.Engines; cpuPercent = $s.CpuPercent; workingSetMB = $s.WorkingSetMB; gpuMemoryMB = $s.GpuMemoryMB }
+                                }
+                                Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'Sample' -Data @{ tickMs = $rec.TickMs; state = $state; noCpuPercent = $rec.NoCpuPercent; noWorkingSetMB = $rec.NoWorkingSetMB; surfaces = $surfRows }
+
+                                # NO's own visible window titles. The titles
+                                # common to the first few samples are this box's
+                                # idle look; anything appearing later is what
+                                # makes the idle arm and the session arm
+                                # separable, and it is shown live so the
+                                # operator sees the tool notice rather than
+                                # trusting it afterwards.
+                                $titles = @($rec.NoVisibleWindows)
+                                if ($script:GfxSamples.Count -le 3) {
+                                    if ($null -eq $script:GfxUiBaseline) { $script:GfxUiBaseline = $titles }
+                                    else { $script:GfxUiBaseline = @($script:GfxUiBaseline | Where-Object { $titles -contains $_ }) }
+                                } else {
+                                    $added = @($titles | Where-Object { $script:GfxUiBaseline -notcontains $_ } | Sort-Object -Unique)
+                                    if (($added -join '|') -ne (@($script:GfxUiAdded) -join '|')) {
+                                        $script:GfxUiAdded = $added
+                                        Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'NoWindowSetChange' -Data @{ added = $added; baseline = $script:GfxUiBaseline }
+                                        if ($added.Count -gt 0) {
+                                            Write-WinConfigGuiDiagnostic -Level OK -Message "Session detected -- NO opened: $($added -join ', ')" -Box $script:GfxLog
+                                        }
+                                    }
+                                }
+                            }
+                            'CounterRefresh' { Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'CounterRefresh' -Data @{ durationMs = $rec.DurationMs; trackedPids = $rec.TrackedPids; boundPids = $rec.BoundPids } }
+                            'SamplerError'   { Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'SamplerError' -Data @{ message = $rec.Message } }
+                        }
+                    }
+
+                    # Which media file did NO open? Diffed against the pre-run
+                    # baseline so this tool's own reads cannot be cited as NO's.
+                    if ($script:GfxWatchRoot -and ((Get-Date) - $script:GfxLastMediaScan).TotalSeconds -ge 30) {
+                        $script:GfxLastMediaScan = Get-Date
+                        try {
+                            $changed = @(Get-ChildItem -LiteralPath $script:GfxWatchRoot -Recurse -File -ErrorAction SilentlyContinue |
+                                Where-Object { -not $script:GfxMediaBaseline.ContainsKey($_.FullName) -or $_.LastAccessTimeUtc -gt $script:GfxMediaBaseline[$_.FullName] } |
+                                Sort-Object LastAccessTimeUtc -Descending | Select-Object -First 1)
+                            if ($changed.Count -gt 0 -and $changed[0].FullName -ne $script:GfxMediaFile) {
+                                $script:GfxMediaFile = $changed[0].FullName
+                                $script:GfxMediaAt = $changed[0].LastAccessTimeUtc
+                                Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'MediaFileOpened' -Data @{ file = $script:GfxMediaFile; accessedUtc = $script:GfxMediaAt.ToString('o'); method = 'LastAccessTime diff vs pre-run baseline' }
+                                Write-WinConfigGuiDiagnostic -Level INFO -Message "Media opened by NO: $(Split-Path $script:GfxMediaFile -Leaf)" -Box $script:GfxLog
+                            }
+                        } catch { }
+                    }
+
+                    # --- repaint the live grid ---
+                    $latest = $null
+                    if ($script:GfxSamples.Count -gt 0) { $latest = $script:GfxSamples[$script:GfxSamples.Count - 1] }
+                    $script:GfxList.BeginUpdate()
+                    try {
+                        $script:GfxList.Items.Clear()
+                        foreach ($s in @($latest.Surfaces)) {
+                            $g3 = $null; $gd = $null; $gp = $null
+                            if ($null -ne $s.Engines) {
+                                if ($s.Engines.ContainsKey('3D')) { $g3 = $s.Engines['3D'] }
+                                if ($s.Engines.ContainsKey('VideoDecode')) { $gd = $s.Engines['VideoDecode'] }
+                                if ($s.Engines.ContainsKey('VideoProcessing')) { $gp = $s.Engines['VideoProcessing'] }
+                            }
+                            $item = New-Object System.Windows.Forms.ListViewItem((Format-GraphicsValue $s.Role))
+                            [void]$item.SubItems.Add((Format-GraphicsValue $s.RoleSource))
+                            [void]$item.SubItems.Add((Format-GraphicsValue $g3 '%'))
+                            [void]$item.SubItems.Add((Format-GraphicsValue $gd '%'))
+                            [void]$item.SubItems.Add((Format-GraphicsValue $gp '%'))
+                            [void]$item.SubItems.Add((Format-GraphicsValue $s.CpuPercent '%'))
+                            [void]$item.SubItems.Add((Format-GraphicsValue $s.WorkingSetMB))
+                            [void]$item.SubItems.Add((Format-GraphicsValue $s.GpuMemoryMB))
+                            [void]$item.SubItems.Add((Format-GraphicsValue $s.HostPid))
+                            [void]$item.SubItems.Add((Format-GraphicsValue $s.GpuPid))
+                            # An unresolved surface is flagged, never relabelled:
+                            # its numbers are real, only its identity is unproven.
+                            if ($s.RoleSource -eq 'unresolved') { $item.ForeColor = [System.Drawing.Color]::FromArgb(180, 120, 20) }
+                            [void]$script:GfxList.Items.Add($item)
+                        }
+                    } finally {
+                        $script:GfxList.EndUpdate()
+                    }
+
+                    $elapsed = ((Get-Date) - $script:GfxRunStart).TotalSeconds
+                    $phase = if (@($script:GfxUiAdded).Count -gt 0) { "session under way" } else { "idle baseline -- start your session when ready" }
+                    $counters = if ($latest -and -not $latest.CountersOk) { "  |  GPU counters UNAVAILABLE" } else { "" }
+                    $script:GfxStatus.Text = ("Watching {0}  |  {1} samples  |  activity {2}  |  {3}{4}" -f (Format-GraphicsDuration $elapsed), $script:GfxSamples.Count, (Format-GraphicsValue $script:GfxLastState), $phase, $counters)
+                } catch {
+                    # A tick failure must not kill the run: the sampler keeps
+                    # collecting and the next tick may well succeed. Surface it
+                    # on the status line and keep going.
+                    $script:GfxStatus.Text = "Sampler error: $($_.Exception.Message)"
+                }
+            }
+
+            # -----------------------------------------------------------------
+            # Start
+            # -----------------------------------------------------------------
+            $script:GfxStartBtn.Add_Click({
+                try {
+                    $script:GfxRun = New-GraphicsBenchRunFolder
+                    $script:GfxSamples = @()
+                    $script:GfxMarkers = @()
+                    $script:GfxUiBaseline = $null
+                    $script:GfxUiAdded = @()
+                    $script:GfxLastState = $null
+                    $script:GfxMediaFile = $null
+                    $script:GfxMediaAt = $null
+                    $script:GfxLastMediaScan = Get-Date
+                    $script:GfxRunStart = Get-Date
+
+                    if (-not $script:GfxInventory) { $script:GfxInventory = Get-GraphicsInventory }
+                    if (-not $script:GfxNomp) { $script:GfxNomp = Get-NompConfigSnapshot }
+
+                    # Media-file baseline BEFORE the run, so the file NO opens
+                    # can be told apart from files this tool's own enumeration
+                    # touched. Provenance before citation.
+                    $script:GfxMediaBaseline = @{}
+                    $script:GfxWatchRoot = $null
+                    $script:GfxMediaRootSource = 'none'
+                    if (Test-Path -LiteralPath 'C:\zengar\media') {
+                        $script:GfxWatchRoot = 'C:\zengar\media'
+                        $script:GfxMediaRootSource = 'default-path'
+                        try {
+                            Assert-GfxPathAllowed -Path $script:GfxWatchRoot
+                            foreach ($f in @(Get-ChildItem -LiteralPath $script:GfxWatchRoot -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 5000)) {
+                                $script:GfxMediaBaseline[$f.FullName] = $f.LastAccessTimeUtc
+                            }
+                        } catch {
+                            $script:GfxWatchRoot = $null
+                            $script:GfxMediaRootSource = 'refused'
+                        }
+                    }
+
+                    Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'RunStart' -Data @{
+                        runId = $script:GfxRun.RunId; intervalMs = 1000; runMode = 'Session'; surface = 'app'
+                        visualizerFloorPercent = 1.0; mediaFloorPercent = 0.3
+                        inventory = $script:GfxInventory
+                    }
+
+                    $script:GfxSampler = Start-GraphicsSampler -IntervalMs 1000
+
+                    $script:GfxTimer = New-Object System.Windows.Forms.Timer
+                    $script:GfxTimer.Interval = 1000
+                    $script:GfxTimer.Add_Tick({ & $script:GfxTickAction })
+                    $script:GfxTimer.Start()
+                } catch {
+                    Write-WinConfigGuiDiagnostic -Level FAIL -Message "Could not start [$($_.Exception.GetType().Name)]: $($_.Exception.Message)" -Box $script:GfxLog
+                    Write-WinConfigGuiDiagnostic -Level DIM -Message $_.ScriptStackTrace -Box $script:GfxLog -NoPrefix
+                    return
+                }
+
+                $script:GfxStartBtn.Enabled = $false
+                $script:GfxStopBtn.Enabled = $true
+                $script:GfxMarkerBtn.Enabled = $true
+                $script:GfxOpenBtn.Enabled = $false
+                Write-WinConfigGuiDiagnostic -Level STEP -Message "Watching. Leave NO idle for a few seconds, start your session, then press Stop when it ends." -Box $script:GfxLog
+            })
+
+            # -----------------------------------------------------------------
+            # Stop
+            # -----------------------------------------------------------------
+            $script:GfxStopBtn.Add_Click({
+                $script:GfxStopBtn.Enabled = $false
+                $script:GfxMarkerBtn.Enabled = $false
+
+                try {
+                    if ($script:GfxTimer) { $script:GfxTimer.Stop(); $script:GfxTimer.Dispose(); $script:GfxTimer = $null }
+                    if ($script:GfxSampler) {
+                        Stop-GraphicsSampler -Sampler $script:GfxSampler
+                        foreach ($rec in (Receive-GraphicsSamples -Sampler $script:GfxSampler)) {
+                            if ($rec.Kind -eq 'Sample') { $script:GfxSamples += $rec }
+                        }
+                        $script:GfxSampler = $null
+                    }
+
+                    Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'OperatorStop'
+
+                    $summary = Get-GraphicsBenchSessionSummary -Samples $script:GfxSamples -Markers $script:GfxMarkers
+                    $findings = Get-GraphicsBenchFindings -Summary $summary
+                    $mediaRecord = @{
+                        root        = $script:GfxWatchRoot
+                        rootSource  = $script:GfxMediaRootSource
+                        file        = $script:GfxMediaFile
+                        accessedUtc = $(if ($script:GfxMediaAt) { $script:GfxMediaAt.ToString('o') } else { $null })
+                        method      = 'LastAccessTime diff vs pre-run baseline'
+                        labelled    = [bool]$script:GfxMediaFile
+                    }
+
+                    Write-WinConfigGuiDiagnostic -Level INFO -Message "" -Box $script:GfxLog -NoPrefix
+                    & $script:GfxWriteRecords (Format-GraphicsBenchReport -Summary $summary -Findings $findings -MediaFile $mediaRecord)
+
+                    $session = @{
+                        schema      = 'graphics-bench-session/1'
+                        runId       = $script:GfxRun.RunId
+                        runMode     = 'Session'
+                        surface     = 'app'
+                        toolId      = 'graphics-session-bench'
+                        startedUtc  = $script:GfxRunStart.ToUniversalTime().ToString('o')
+                        endedUtc    = [datetime]::UtcNow.ToString('o')
+                        intervalMs  = 1000
+                        thresholds  = @{ visualizerFloorPercent = 1.0; mediaFloorPercent = 0.3 }
+                        cdpAttached = $false
+                        inventory   = $script:GfxInventory
+                        nompConfig  = @{ Path = $script:GfxNomp.Path; Exists = $script:GfxNomp.Exists; Sha256 = $script:GfxNomp.Sha256; SchemaKeysPresent = $script:GfxNomp.SchemaKeysPresent; ValuesReadable = $script:GfxNomp.ValuesReadable; ValuesReason = $script:GfxNomp.ValuesReason }
+                        mediaFile   = $mediaRecord
+                        summary     = $summary
+                        findings    = $findings
+                    }
+                    $saved = Save-GraphicsBenchRun -Run $script:GfxRun -Session $session
+                    Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'RunEnd' -Data @{ sampleCount = $summary.SampleCount; durationSec = $summary.DurationSec }
+
+                    Write-WinConfigGuiDiagnostic -Level INFO -Message "" -Box $script:GfxLog -NoPrefix
+                    Write-WinConfigGuiDiagnostic -Level STEP -Message "RUN PACKAGE" -Box $script:GfxLog -NoPrefix
+                    Write-WinConfigGuiDiagnostic -Level INFO -Message "  $($script:GfxRun.RunFolder)" -Box $script:GfxLog -NoPrefix
+                    if ($saved.ZipPath) { Write-WinConfigGuiDiagnostic -Level INFO -Message "  $($saved.ZipPath)" -Box $script:GfxLog -NoPrefix }
+                    if ($saved.ZipError) { Write-WinConfigGuiDiagnostic -Level WARN -Message "ZIP not written: $($saved.ZipError)" -Box $script:GfxLog }
+
+                    # Session ledger. ToolCategory has a sealed value set that
+                    # has no Graphics member; extending it would touch
+                    # SessionOperationLedger's own taxonomy and its invariants
+                    # tests, which is a separate deliberate change. 'Other' is
+                    # the honest value here, and the action name carries the
+                    # domain.
+                    if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                        $topFinding = @($findings) | Select-Object -First 1
+                        $ledgerResult = 'PASS'
+                        if ($topFinding -and $topFinding.Result -in @('FAIL', 'WARN')) { $ledgerResult = $topFinding.Result }
+                        Register-WinConfigSessionAction -Action "Graphics Session Bench" -Detail "Run $($script:GfxRun.RunId): $($summary.SampleCount) samples over $($summary.DurationSec)s; package at $($script:GfxRun.RunFolder)" -Category "Diagnostics" -ToolCategory "Other" -Result $ledgerResult -Tier 0 -Summary $(if ($topFinding) { $topFinding.Title } else { 'Graphics run complete' })
+                    }
+                    if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
+                } catch {
+                    Write-WinConfigGuiDiagnostic -Level FAIL -Message "Stop failed [$($_.Exception.GetType().Name)]: $($_.Exception.Message)" -Box $script:GfxLog
+                    Write-WinConfigGuiDiagnostic -Level DIM -Message $_.ScriptStackTrace -Box $script:GfxLog -NoPrefix
+                }
+
+                if ($script:GfxRun) {
+                    $script:GfxOpenBtn.Tag = $script:GfxRun.RunFolder
+                    $script:GfxOpenBtn.Enabled = $true
+                }
+                $script:GfxStartBtn.Enabled = $true
+                $script:GfxStatus.Text = "Run complete. Results are below; the package is on disk."
+            })
+
+            # -----------------------------------------------------------------
+            # Marker / Open folder / Close
+            # -----------------------------------------------------------------
+            $script:GfxMarkerBtn.Add_Click({
+                # Microsoft.VisualBasic is not one of the assemblies this app
+                # loads, so InputBox is unavailable; a small modal is cheaper
+                # than a new assembly dependency on every field box.
+                $dlg = New-Object System.Windows.Forms.Form
+                $dlg.Text = "Add marker"
+                $dlg.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+                $dlg.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+                $dlg.MinimizeBox = $false
+                $dlg.MaximizeBox = $false
+                $dlg.ClientSize = New-Object System.Drawing.Size(470, 124)
+
+                $lbl = New-Object System.Windows.Forms.Label
+                $lbl.Text = "What happened? (e.g. 'started session', 'video began')"
+                $lbl.AutoSize = $true
+                $lbl.Location = New-Object System.Drawing.Point(12, 14)
+                $dlg.Controls.Add($lbl)
+
+                # RichTextBox, not TextBox: the diagnostic output contract in
+                # this file forbids TextBox outright.
+                $inputBox = New-Object System.Windows.Forms.RichTextBox
+                $inputBox.Multiline = $false
+                $inputBox.Location = New-Object System.Drawing.Point(12, 40)
+                $inputBox.Size = New-Object System.Drawing.Size(446, 26)
+                $inputBox.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+                $dlg.Controls.Add($inputBox)
+
+                $okBtn = New-Object System.Windows.Forms.Button
+                $okBtn.Text = "Add"
+                $okBtn.DialogResult = [System.Windows.Forms.DialogResult]::OK
+                $okBtn.Location = New-Object System.Drawing.Point(286, 84)
+                $okBtn.Size = New-Object System.Drawing.Size(84, 28)
+                $dlg.Controls.Add($okBtn)
+
+                $cancelBtn = New-Object System.Windows.Forms.Button
+                $cancelBtn.Text = "Cancel"
+                $cancelBtn.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+                $cancelBtn.Location = New-Object System.Drawing.Point(374, 84)
+                $cancelBtn.Size = New-Object System.Drawing.Size(84, 28)
+                $dlg.Controls.Add($cancelBtn)
+
+                $dlg.AcceptButton = $okBtn
+                $dlg.CancelButton = $cancelBtn
+
+                $note = $null
+                try {
+                    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $note = $inputBox.Text }
+                } finally { $dlg.Dispose() }
+
+                if ([string]::IsNullOrWhiteSpace($note)) { return }
+                $script:GfxMarkers += @{ AtUtc = [datetime]::UtcNow.ToString('o'); Text = $note }
+                Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'Marker' -Data @{ text = $note }
+                Write-WinConfigGuiDiagnostic -Level ACTION -Message "Marker: $note" -Box $script:GfxLog
+            })
+
+            $script:GfxOpenBtn.Add_Click({
+                $folder = $this.Tag
+                if ($folder -and (Test-Path $folder)) { Start-Process explorer.exe -ArgumentList "`"$folder`"" }
+            })
+
+            $gfxCloseBtn.Add_Click({ $script:GfxForm.Close() })
+
+            # Teardown: a timer still ticking against a disposed log box is the
+            # exact race that killed the recorder on the packaging path once,
+            # and a sampler runspace left running would hold counters open.
+            $script:GfxForm.Add_FormClosing({
+                try { if ($script:GfxTimer) { $script:GfxTimer.Stop(); $script:GfxTimer.Dispose(); $script:GfxTimer = $null } } catch { }
+                try { if ($script:GfxSampler) { Stop-GraphicsSampler -Sampler $script:GfxSampler; $script:GfxSampler = $null } } catch { }
+            })
+
+            $script:GfxForm.Show()
+            [System.Windows.Forms.Application]::DoEvents()
+
+            # Inventory AFTER the window is up, so the operator sees the surface
+            # immediately rather than waiting on CIM queries behind a blank
+            # screen.
+            try {
+                $script:GfxInventory = Get-GraphicsInventory
+                $script:GfxNomp = Get-NompConfigSnapshot
+                & $script:GfxWriteRecords (Format-GraphicsInventoryReport -Inventory $script:GfxInventory -Nomp $script:GfxNomp)
+
+                $pre = Test-GraphicsBenchPreconditions
+                foreach ($w in @($pre.Warnings)) { Write-WinConfigGuiDiagnostic -Level WARN -Message $w -Box $script:GfxLog }
+                foreach ($b in @($pre.Blocking)) { Write-WinConfigGuiDiagnostic -Level FAIL -Message $b -Box $script:GfxLog }
+                if (-not $pre.Ok) { $script:GfxStartBtn.Enabled = $false }
+
+                Write-WinConfigGuiDiagnostic -Level INFO -Message "" -Box $script:GfxLog -NoPrefix
+                if ($script:GfxInventory.No.Pid) {
+                    Write-WinConfigGuiDiagnostic -Level OK -Message "NO.exe is running (PID $($script:GfxInventory.No.Pid)). Press Start watching, leave NO idle a few seconds, then start your session." -Box $script:GfxLog
+                    $script:GfxStatus.Text = "Ready. Press Start watching, then start your NeurOptimal session."
+                } else {
+                    Write-WinConfigGuiDiagnostic -Level WARN -Message "NO.exe is not running. You can still press Start watching -- the sampler picks NO up as soon as it appears." -Box $script:GfxLog
+                    $script:GfxStatus.Text = "Ready. NO.exe is not running yet; the sampler will pick it up when it starts."
+                }
+            } catch {
+                Write-WinConfigGuiDiagnostic -Level FAIL -Message "Could not read the graphics inventory [$($_.Exception.GetType().Name)]: $($_.Exception.Message)" -Box $script:GfxLog
+                Write-WinConfigGuiDiagnostic -Level DIM -Message $_.ScriptStackTrace -Box $script:GfxLog -NoPrefix
+                $script:GfxStatus.Text = "Inventory failed; see the log."
+            }
+        }
+
+        # =========================================================================
         # BLUETOOTH DIAGNOSTICS TOOL (Read-only - no dry run needed)
         # =========================================================================
         "Run Bluetooth Diagnostics" = {
@@ -12712,6 +13274,7 @@ foreach ($tabPage in $tabControl.TabPages) {
             "Support",
             "Network",
             "Bluetooth",
+            "Graphics",
             "Updates",
             "NO Shortcuts",
             "Disk",
@@ -14462,6 +15025,14 @@ No system changes were made.
                 SupportsDryRun = $false
                 MutatesSystem = $false
             }
+            # Graphics tools
+            "Run Graphics Session Bench" = @{
+                Description = "Measure what NO's visualizer and media player cost across one session (read-only)"
+                Group = "Diagnostics"
+                ToolId = "graphics-session-bench"
+                SupportsDryRun = $false
+                MutatesSystem = $false
+            }
             # NO Shortcuts tools
             "%programdata%"            = @{ Description = "Open ProgramData folder"; Group = "Shortcuts" }
             "%localappdata%"           = @{ Description = "Open LocalAppData folder"; Group = "Shortcuts" }
@@ -14474,6 +15045,7 @@ No system changes were made.
             "Network"      = @("Run Network Test", "Domain, IP && Ports Test", "Network Reset", "Flush DNS Cache", "Open Speedtest.net")
             "Audio"        = @("Remove Intel SST Audio Driver", "Restart Audio Service", "Sound Panel", "Run Bluetooth Diagnostics")
             "Bluetooth"    = @("Run Bluetooth Diagnostics", "Reset COM Port Numbers", "Clean Bluetooth Ports", "Full Bluetooth Stack Reset", "Disable USB Suspend")
+            "Graphics"     = @("Run Graphics Session Bench")
             "System"       = @("Copy System Info", "Copy Device Name", "Copy Serial Number", "Machine Identifiers", "Device Manager", "Task Manager", "Control Panel")
             "zAmp"         = @("Uninstall zAmp Drivers", "Repair zAmp Driver Trust")
             "Zengar UI"    = @("Apply Win 11 Start Menu", "Apply branding colors", "Pin Taskbar Icons", "Apply Win Update Icon")

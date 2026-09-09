@@ -23,6 +23,7 @@
         "Support"
         "Network"
         "Bluetooth"
+        "Graphics"
         "Updates"
         "NO Shortcuts"
         "Disk"
@@ -53,6 +54,12 @@
             "Clean Bluetooth Ports"
             "Full Bluetooth Stack Reset"
             "Disable USB Suspend"
+        )
+        # GRAPHICS-BENCH-001 section 11.2. One long-running, read-only tool:
+        # the operator starts it, runs a whole NeurOptimal session, and stops
+        # it, and the results window stays up for the duration.
+        "Graphics" = @(
+            "Run Graphics Session Bench"
         )
         "System" = @(
             "Copy System Info"
@@ -287,6 +294,8 @@
     Presets = @()
 
     # Expected tab structure
+    # Sealed 2-tab shape. New surfaces are CATEGORIES inside Tools, not tabs:
+    # see Categories above and GRAPHICS-BENCH-001 section 1.
     Tabs = @(
         "Tools"
         "Details"

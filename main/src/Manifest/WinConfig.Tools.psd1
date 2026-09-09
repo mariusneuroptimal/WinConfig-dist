@@ -188,6 +188,19 @@
             SupportsDryRun = $false  # Read-only diagnostic
             Description    = "Runs Bluetooth probe and records findings via analytics callback"
         }
+
+        # =========================================================================
+        # GRAPHICS TOOLS
+        # =========================================================================
+        @{
+            Id             = "graphics-session-bench"
+            Name           = "Run Graphics Session Bench"
+            Category       = "Graphics"
+            ToolCategory   = "Other"   # the sealed ToolCategory set has no Graphics member
+            MutatesSystem  = $false
+            SupportsDryRun = $false  # Read-only observation; there is nothing to plan
+            Description    = "Watches one NeurOptimal session and reports what the butterchurn visualizer and video.js player cost, split by GPU engine"
+        }
         @{
             Id             = "bt-reset-com-ports"
             Name           = "Reset COM Port Numbers"
