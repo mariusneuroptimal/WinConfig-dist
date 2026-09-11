@@ -617,6 +617,32 @@ function Get-LowDiskChunkSizes {
     return @($sizes)
 }
 
+function Get-LowDiskMaxReachableFreeBytes {
+    <#
+    .SYNOPSIS
+        The highest free space this tool can produce on a volume. Pure arithmetic.
+    .DESCRIPTION
+        THE CEILING IS THE ONE NUMBER THE TESTER NEEDS AND NEVER HAD. This tool
+        only ever takes free space away and hands back what it took, so the most
+        it can leave free is what is free now plus what it is holding. Every
+        target at or below this number is reachable; every target above it is
+        not, and no amount of retrying changes that.
+
+        It exists as a named function because the window and the planner must
+        agree about it. A window that offers a target the planner will refuse is
+        the defect this closes: the refusal arrived in a modal AFTER the click,
+        phrased as what the tool cannot do rather than what the tester can pick.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [long]$FreeBytes,
+        [Parameter(Mandatory = $false)] [long]$AllocatedBytes = 0
+    )
+
+    if ($AllocatedBytes -lt 0) { $AllocatedBytes = 0L }
+    return [long]($FreeBytes + $AllocatedBytes)
+}
+
 function New-LowDiskAllocationPlan {
     <#
     .SYNOPSIS
@@ -631,6 +657,15 @@ function New-LowDiskAllocationPlan {
         Blocked is the honest answer to "leave 50 GB free" on a box that has
         20 GB free and no filler to give back: this tool takes space, it cannot
         manufacture it. Saying so beats silently doing nothing.
+
+        BLOCKED SAYS WHAT IS TRUE AND WHAT TO PICK. The first wording of this
+        refusal was correct and useless: "this tool consumes space; it cannot
+        create it" tells a tester who asked for 25 % free on a disk sitting at
+        5 % nothing they can act on. Two facts turn it into an answer -- the
+        disk is ALREADY below the level they wanted to test, and the highest
+        target reachable here is MaxReachableFreeBytes. Both ride on every plan
+        shape, not just this one, so the window can render the ceiling without
+        re-deriving it.
     #>
     [CmdletBinding()]
     param(
@@ -642,6 +677,7 @@ function New-LowDiskAllocationPlan {
     )
 
     $delta = $FreeBytes - $TargetFreeBytes
+    $maxReachable = Get-LowDiskMaxReachableFreeBytes -FreeBytes $FreeBytes -AllocatedBytes $AllocatedBytes
 
     if ([Math]::Abs($delta) -le $ToleranceBytes) {
         return [PSCustomObject]@{
@@ -653,6 +689,8 @@ function New-LowDiskAllocationPlan {
             FreeBytes       = $FreeBytes
             TargetFreeBytes = $TargetFreeBytes
             ProjectedFree   = $FreeBytes
+            MaxReachableFreeBytes = $maxReachable
+            ShortfallBytes  = 0L
             Reason          = 'Free space is already at the requested level'
         }
     }
@@ -668,6 +706,8 @@ function New-LowDiskAllocationPlan {
             FreeBytes       = $FreeBytes
             TargetFreeBytes = $TargetFreeBytes
             ProjectedFree   = $TargetFreeBytes
+            MaxReachableFreeBytes = $maxReachable
+            ShortfallBytes  = 0L
             Reason          = ('Allocate {0} in {1} chunk(s)' -f (Format-LowDiskBytes -Bytes $delta), @($sizes).Count)
         }
     }
@@ -683,7 +723,9 @@ function New-LowDiskAllocationPlan {
             FreeBytes       = $FreeBytes
             TargetFreeBytes = $TargetFreeBytes
             ProjectedFree   = $FreeBytes
-            Reason          = ('Target is {0} above current free space and there is no filler to release. This tool consumes space; it cannot create it.' -f (Format-LowDiskBytes -Bytes $wanted))
+            MaxReachableFreeBytes = $maxReachable
+            ShortfallBytes  = $wanted
+            Reason          = ('Already below the target: {0} free now, {1} asked for, and this tool is holding no filler to give back. It can only take free space away, never create it, so the most it can leave free here is {0}. Pick {0} or less, or free up real space first.' -f (Format-LowDiskBytes -Bytes $maxReachable), (Format-LowDiskBytes -Bytes $TargetFreeBytes))
         }
     }
 
@@ -702,6 +744,8 @@ function New-LowDiskAllocationPlan {
         FreeBytes       = $FreeBytes
         TargetFreeBytes = $TargetFreeBytes
         ProjectedFree   = [long]($FreeBytes + $release)
+        MaxReachableFreeBytes = $maxReachable
+        ShortfallBytes  = [long]($wanted - $release)
         Reason          = $reason
     }
 }
@@ -795,6 +839,9 @@ function Get-LowDiskPlan {
         BytesToRelease  = $(if ($core) { $core.BytesToRelease } else { 0L })
         ChunkSizes      = $(if ($core) { $core.ChunkSizes } else { @() })
         ProjectedFree   = $(if ($core) { $core.ProjectedFree } else { $null })
+        # The ceiling rides on the plan so the window never re-derives it.
+        MaxReachableFreeBytes = $(if ($core) { [long]$core.MaxReachableFreeBytes } else { $null })
+        ShortfallBytes  = $(if ($core) { [long]$core.ShortfallBytes } else { $null })
         Reason          = $(if ($core) { $core.Reason } else { 'No plan: volume unavailable' })
         Warnings        = @($warnings)
         Blockers        = @($blockers)
@@ -1268,6 +1315,7 @@ Export-ModuleMember -Function @(
     'Save-LowDiskFillerState'
     'Write-LowDiskEscapeHatch'
     'Get-LowDiskChunkSizes'
+    'Get-LowDiskMaxReachableFreeBytes'
     'New-LowDiskAllocationPlan'
     'Get-LowDiskPlan'
     'New-LowDiskChunkFile'

@@ -13173,7 +13173,7 @@ namespace WinConfigDiag {
 
     # GUARD: the measurement module itself
     $ldMissing = @()
-    foreach ($ldFn in @('Get-LowDiskVolume', 'Get-LowDiskFillerState', 'Get-LowDiskPlan', 'Invoke-LowDiskFill', 'Restore-LowDiskFreeSpace', 'Find-LowDiskLeftovers', 'Get-LowDiskTargetPresets', 'Format-LowDiskBytes')) {
+    foreach ($ldFn in @('Get-LowDiskVolume', 'Get-LowDiskFillerState', 'Get-LowDiskPlan', 'Invoke-LowDiskFill', 'Restore-LowDiskFreeSpace', 'Find-LowDiskLeftovers', 'Get-LowDiskTargetPresets', 'Get-LowDiskMaxReachableFreeBytes', 'Format-LowDiskBytes')) {
         if (-not (Get-Command $ldFn -ErrorAction SilentlyContinue)) { $ldMissing += $ldFn }
     }
     if ($ldMissing.Count -gt 0) {
@@ -13403,6 +13403,15 @@ namespace WinConfigDiag {
     $script:LowDiskApplyBtn.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
     $ldActionPanel.Controls.Add($script:LowDiskApplyBtn)
 
+    # A DISABLED BUTTON MUST SAY WHY IT IS DISABLED. The tooltip carries the
+    # full sentence; the target readout above carries the short one. Neither
+    # is a modal, which is the point: the tester finds out while choosing,
+    # not after committing.
+    $script:LowDiskToolTip = New-Object System.Windows.Forms.ToolTip
+    $script:LowDiskToolTip.AutoPopDelay = 20000
+    $script:LowDiskToolTip.InitialDelay = 250
+    $script:LowDiskToolTip.ReshowDelay = 100
+
     $script:LowDiskRestoreBtn = New-Object System.Windows.Forms.Button
     $script:LowDiskRestoreBtn.Text = "Restore Free Space"
     $script:LowDiskRestoreBtn.Width = $ldM.BtnW
@@ -13471,10 +13480,16 @@ namespace WinConfigDiag {
             return @{ Unit = 'Percent'; Bytes = $null; Percent = [double]$percent[$index - $absolute.Count].Percent }
         }
 
+        # A REFUSAL SAYS WHICH REFUSAL IT IS. Every bad entry used to come
+        # back as $null and render as "enter a number", which is wrong twice
+        # over when the box holds "500" in percent mode: a number IS entered,
+        # and the problem is the range. The reason travels with the refusal so
+        # the readout can state it.
         $raw = $script:LowDiskCustomBox.Text.Trim()
         $parsed = 0.0
-        if (-not [double]::TryParse($raw, [ref]$parsed)) { return $null }
-        if ($parsed -lt 0) { return $null }
+        if ($raw.Length -eq 0) { return @{ Unit = 'Invalid'; Bytes = $null; Percent = $null; Reason = 'enter a number' } }
+        if (-not [double]::TryParse($raw, [ref]$parsed)) { return @{ Unit = 'Invalid'; Bytes = $null; Percent = $null; Reason = ("'{0}' is not a number" -f $raw) } }
+        if ($parsed -lt 0) { return @{ Unit = 'Invalid'; Bytes = $null; Percent = $null; Reason = 'free space to leave cannot be negative' } }
 
         if ($index -eq ($absolute.Count + $percent.Count)) {
             return @{ Unit = 'Bytes'; Bytes = [long]($parsed * 1MB); Percent = $null }
@@ -13482,7 +13497,7 @@ namespace WinConfigDiag {
         # Custom percentage. Above 100 is not a low-disk test, it is a
         # typo, and it is refused rather than clamped into something the
         # tester never asked for.
-        if ($parsed -gt 100) { return $null }
+        if ($parsed -gt 100) { return @{ Unit = 'Invalid'; Bytes = $null; Percent = $null; Reason = 'a percentage must be between 0 and 100' } }
         return @{ Unit = 'Percent'; Bytes = $null; Percent = [double]$parsed }
     }
 
@@ -13537,7 +13552,15 @@ namespace WinConfigDiag {
             $vol = @(Get-LowDiskVolume -DriveLetter $letter) | Select-Object -First 1
             $state = Get-LowDiskFillerState -DriveLetter $letter
 
-            $script:LowDiskFreeLabel.Text = ("Free on {0}: {1}" -f $letter, (Format-LowDiskBytes -Bytes $vol.FreeBytes))
+            # FREE SPACE IS SHOWN IN BOTH UNITS, BECAUSE THE TARGETS ARE
+            # OFFERED IN BOTH. "25 % free" is impossible on a disk sitting at
+            # 5 %, and the only way to see that at a glance is to read the
+            # current level in the same unit the target was asked in.
+            $freePercentText = ""
+            if ($vol.SizeBytes -gt 0) {
+                $freePercentText = (" ({0:0.#} %)" -f (100.0 * $vol.FreeBytes / $vol.SizeBytes))
+            }
+            $script:LowDiskFreeLabel.Text = ("Free on {0}: {1}{2}" -f $letter, (Format-LowDiskBytes -Bytes $vol.FreeBytes), $freePercentText)
             $script:LowDiskFreeLabel.ForeColor = if ($vol.FreeBytes -lt (Get-LowDiskMinRecommendedFreeBytes)) {
                 [System.Drawing.Color]::FromArgb(190, 30, 30)
             } else {
@@ -13556,18 +13579,72 @@ namespace WinConfigDiag {
             # percentage is turned into this volume's bytes here, so the
             # tester sees what "5 % free" costs on the machine in front of
             # them before committing to it.
+            #
+            # AND AN UNREACHABLE TARGET IS REFUSED HERE, NOT IN A MODAL AFTER
+            # THE CLICK. This tool only takes free space away and gives back
+            # what it took, so the highest level it can leave is free + held.
+            # Asking for more used to be accepted by the window and refused by
+            # the planner, in a dialog that said what the tool cannot do rather
+            # than what the tester can pick. Now the ceiling is on screen, the
+            # button is disabled, and the reason is in the readout beside it.
+            $maxReachable = Get-LowDiskMaxReachableFreeBytes -FreeBytes $vol.FreeBytes -AllocatedBytes $state.AllocatedBytes
             $request = & $script:LowDiskSelectedTarget
-            if ($null -eq $request) {
-                $script:LowDiskTargetLabel.Text = "Target: enter a number"
+            $resolvedTarget = $null
+            $unreachable = $false
+            $usable = (($null -ne $request) -and ($request.Unit -ne 'Invalid'))
+
+            if (-not $usable) {
+                $script:LowDiskTargetLabel.Text = ("Target: {0}" -f $(if ($request -and $request.Reason) { $request.Reason } else { 'pick a level' }))
                 $script:LowDiskTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(190, 30, 30)
             } else {
-                $script:LowDiskTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 70)
                 if ($request.Unit -eq 'Percent') {
-                    $resolved = ConvertTo-LowDiskFreeBytesFromPercent -SizeBytes $vol.SizeBytes -Percent $request.Percent
-                    $script:LowDiskTargetLabel.Text = ("Target: {0:0.##} % = {1}" -f $request.Percent, (Format-LowDiskBytes -Bytes $resolved))
+                    $resolvedTarget = [long](ConvertTo-LowDiskFreeBytesFromPercent -SizeBytes $vol.SizeBytes -Percent $request.Percent)
+                    $targetText = ("Target: {0:0.##} % = {1}" -f $request.Percent, (Format-LowDiskBytes -Bytes $resolvedTarget))
                 } else {
-                    $script:LowDiskTargetLabel.Text = ("Target: {0}" -f (Format-LowDiskBytes -Bytes $request.Bytes))
+                    $resolvedTarget = [long]$request.Bytes
+                    $targetText = ("Target: {0}" -f (Format-LowDiskBytes -Bytes $resolvedTarget))
                 }
+
+                $unreachable = ($resolvedTarget -gt $maxReachable)
+                if ($unreachable) {
+                    $script:LowDiskTargetLabel.Text = ("{0} -- unreachable: {1} has only {2} free" -f $targetText, ($letter + ":"), (Format-LowDiskBytes -Bytes $maxReachable))
+                    $script:LowDiskTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(160, 90, 0)
+                } else {
+                    $script:LowDiskTargetLabel.Text = $targetText
+                    $script:LowDiskTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 70)
+                }
+            }
+
+            $script:LowDiskApplyBtn.Enabled = ($usable -and -not $unreachable)
+
+            # A BUTTON WITH AN EXPLICIT BACKCOLOR DOES NOT LOOK DISABLED.
+            # WinForms greys the TEXT of a disabled button and leaves the
+            # colour it was given, so the accent-blue Apply stayed bright blue
+            # while refusing every click -- read as "the tool does nothing",
+            # which is the failure this whole change exists to end. The colour
+            # is set from the same state as Enabled, in the same place.
+            if ($script:LowDiskApplyBtn.Enabled) {
+                $script:LowDiskApplyBtn.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+                $script:LowDiskApplyBtn.ForeColor = [System.Drawing.Color]::White
+            } else {
+                $script:LowDiskApplyBtn.BackColor = [System.Drawing.Color]::FromArgb(224, 224, 224)
+                $script:LowDiskApplyBtn.ForeColor = [System.Drawing.Color]::FromArgb(130, 130, 130)
+            }
+            if ($unreachable) {
+                $hint = ("{0} already has only {1} free. This tool takes free space away and gives back what it took, so the most it can leave free here is {1} -- it cannot create space it never took. Pick {1} or less, or free up real space first." -f ($letter + ":"), (Format-LowDiskBytes -Bytes $maxReachable))
+                $script:LowDiskToolTip.SetToolTip($script:LowDiskApplyBtn, $hint)
+
+                # Said ONCE per distinct situation. This refresh runs on every
+                # keystroke in the custom box, and a log line per keystroke is
+                # noise that buries the run it is meant to explain.
+                $key = ("{0}|{1}|{2}" -f $letter, $resolvedTarget, $maxReachable)
+                if ($script:LowDiskUnreachableNoticeKey -ne $key) {
+                    $script:LowDiskUnreachableNoticeKey = $key
+                    & $script:LowDiskWrite 'WARN' $hint
+                }
+            } else {
+                $script:LowDiskUnreachableNoticeKey = $null
+                $script:LowDiskToolTip.SetToolTip($script:LowDiskApplyBtn, "Allocate filler until this drive reports the target free space.")
             }
 
             # The banner states only what is true right now, and says what
@@ -13655,9 +13732,9 @@ namespace WinConfigDiag {
         $letter = & $script:LowDiskSelectedLetter
         $request = & $script:LowDiskSelectedTarget
         if (-not $letter) { return }
-        if ($null -eq $request) {
+        if ($null -eq $request -or $request.Unit -eq 'Invalid') {
             [System.Windows.Forms.MessageBox]::Show(
-                "Enter the free space to leave: megabytes, or a percentage between 0 and 100.",
+                ("Enter the free space to leave: megabytes, or a percentage between 0 and 100.`r`n`r`n{0}" -f $(if ($request -and $request.Reason) { $request.Reason } else { 'No level is selected.' })),
                 "Low Disk Space Testing",
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Warning
