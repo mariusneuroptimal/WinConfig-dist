@@ -13138,6 +13138,730 @@ namespace WinConfigDiag {
 
     [System.Windows.Forms.MessageBox]::Show($resultMessage, "Backup Cleanup Complete", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
 }
+# ===== LOW DISK SPACE TESTING (LOW-DISK-001) =====
+#
+# WHAT THIS REPLACES. The field procedure was: save createdummy.bat to
+# Downloads, open an ADMIN command prompt, run it with a megabyte count,
+# and remember that C:\test.txt now exists. It works, and every part of
+# it is a place to get the test wrong: the tester computes "how many MB
+# do I consume to leave 500 MB free" by hand on every machine, the
+# artefact is an unlabelled file at the volume root, and cleanup is
+# whoever remembers.
+#
+# This window is sized in FREE SPACE TO LEAVE, because that is what a
+# test case is written against. It reports what it actually took, not
+# what it intended to take. And it is undoable from three directions:
+# this window, the RESTORE-FREE-SPACE.cmd it drops beside the filler,
+# or deleting one obviously-named folder -- which matters because the
+# state this tool creates is one where applications, including this
+# one, can fail to start.
+#
+# THE FILL SURVIVES A REBOOT. That is a requirement, not a side effect:
+# real filler files, allocated and flushed to the volume, so a box that
+# is booted for a low-disk test comes back still low on disk.
+"Low Disk Space Testing" = {
+    # GUARD: Console module (RichTextBox diagnostic contract)
+    if (-not (Get-Command Initialize-WinConfigGuiDiagnosticBox -ErrorAction SilentlyContinue)) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Low Disk Space Testing cannot start: Console module failed to load.",
+            "Module Load Error",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+        return
+    }
+
+    # GUARD: the measurement module itself
+    $ldMissing = @()
+    foreach ($ldFn in @('Get-LowDiskVolume', 'Get-LowDiskFillerState', 'Get-LowDiskPlan', 'Invoke-LowDiskFill', 'Restore-LowDiskFreeSpace', 'Find-LowDiskLeftovers', 'Get-LowDiskTargetPresets', 'Format-LowDiskBytes')) {
+        if (-not (Get-Command $ldFn -ErrorAction SilentlyContinue)) { $ldMissing += $ldFn }
+    }
+    if ($ldMissing.Count -gt 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Low Disk Space Testing cannot start: LowDiskSpace module is not loaded.`r`n`r`nMissing: $($ldMissing -join ', ')",
+            "Module Load Error",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+        return
+    }
+
+    # One window at a time: two of these would fight over the same
+    # volume and each would report a number the other had moved.
+    if ($script:LowDiskForm -and -not $script:LowDiskForm.IsDisposed) {
+        $script:LowDiskForm.Activate()
+        return
+    }
+
+    # ── DISPLAY SCALE ────────────────────────────────────────────────
+    # Fonts scale with DPI, hand-written pixels do not. One factor, one
+    # table, every constant below read from here -- the defect the
+    # Flight Recorder and the graphics window were both rebuilt to end.
+    $ldScale = 1.0
+    if ($script:LowDiskViewScaleOverride) {
+        $ldScale = [double]$script:LowDiskViewScaleOverride
+    } elseif ($script:DpiScale) {
+        $ldScale = [double]$script:DpiScale
+    }
+    if ($ldScale -lt 1.0) { $ldScale = 1.0 }
+    $ldPx = { param($v) [int][Math]::Round($v * $ldScale) }
+
+    $script:LowDiskMetrics = @{
+        FormW    = (& $ldPx 940)
+        FormH    = (& $ldPx 680)
+        Pad      = (& $ldPx 12)
+        LogH     = (& $ldPx 230)
+        ComboW   = (& $ldPx 330)
+        PresetW  = (& $ldPx 250)
+        CustomW  = (& $ldPx 90)
+        BtnW     = (& $ldPx 150)
+        BtnH     = (& $ldPx 32)
+    }
+    $ldM = $script:LowDiskMetrics
+
+    # ── FORM ─────────────────────────────────────────────────────────
+    $script:LowDiskForm = New-Object System.Windows.Forms.Form
+    $script:LowDiskForm.Text = "Low Disk Space Testing"
+    $script:LowDiskForm.Size = New-Object System.Drawing.Size($ldM.FormW, $ldM.FormH)
+    $script:LowDiskForm.MinimumSize = New-Object System.Drawing.Size($ldM.FormW, $ldM.FormH)
+    $script:LowDiskForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $script:LowDiskForm.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
+
+    $ldRoot = New-Object System.Windows.Forms.TableLayoutPanel
+    $ldRoot.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $ldRoot.ColumnCount = 1
+    $ldRoot.RowCount = 7
+    $ldRoot.Padding = New-Object System.Windows.Forms.Padding($ldM.Pad)
+    $ldRoot.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
+    # AutoSize rows for everything except the log: a row that sizes to
+    # its content cannot clip its content when the font grows.
+    foreach ($i in 0..5) {
+        $ldRoot.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) | Out-Null
+    }
+    $ldRoot.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
+    $script:LowDiskForm.Controls.Add($ldRoot)
+
+    # ── ROW 0: what this is ──────────────────────────────────────────
+    $ldHeader = New-Object System.Windows.Forms.Label
+    $ldHeader.Text = "Hold this PC at a chosen amount of free disk space, then give it back."
+    $ldHeader.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+    $ldHeader.ForeColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+    $ldHeader.AutoSize = $true
+    $ldHeader.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, (& $ldPx 2))
+    $ldRoot.Controls.Add($ldHeader, 0, 0)
+
+    $ldSubHeader = New-Object System.Windows.Forms.Label
+    $ldSubHeader.Text = "The filler is real files and survives a reboot. Nothing else on this PC is touched, and Restore Free Space undoes all of it."
+    $ldSubHeader.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $ldSubHeader.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 110)
+    $ldSubHeader.AutoSize = $true
+    $ldSubHeader.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, (& $ldPx 8))
+    $ldRoot.Controls.Add($ldSubHeader, 0, 1)
+
+    # ── ROW 2: volume picker ─────────────────────────────────────────
+    $ldVolRow = New-Object System.Windows.Forms.FlowLayoutPanel
+    $ldVolRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+    $ldVolRow.WrapContents = $false
+    $ldVolRow.AutoSize = $true
+    $ldVolRow.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $ldVolRow.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, (& $ldPx 6))
+
+    $ldVolLabel = New-Object System.Windows.Forms.Label
+    $ldVolLabel.Text = "Drive:"
+    $ldVolLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $ldVolLabel.AutoSize = $true
+    $ldVolLabel.Margin = New-Object System.Windows.Forms.Padding(0, (& $ldPx 6), (& $ldPx 6), 0)
+    $ldVolRow.Controls.Add($ldVolLabel)
+
+    $script:LowDiskVolumeCombo = New-Object System.Windows.Forms.ComboBox
+    $script:LowDiskVolumeCombo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $script:LowDiskVolumeCombo.Width = $ldM.ComboW
+    $script:LowDiskVolumeCombo.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $ldVolRow.Controls.Add($script:LowDiskVolumeCombo)
+
+    $ldRefreshBtn = New-Object System.Windows.Forms.Button
+    $ldRefreshBtn.Text = "Refresh"
+    $ldRefreshBtn.Width = (& $ldPx 90)
+    $ldRefreshBtn.Height = $ldM.BtnH
+    $ldRefreshBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Standard
+    $ldRefreshBtn.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
+    $ldRefreshBtn.ForeColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+    $ldRefreshBtn.Margin = New-Object System.Windows.Forms.Padding((& $ldPx 8), 0, 0, 0)
+    $ldVolRow.Controls.Add($ldRefreshBtn)
+
+    $ldRoot.Controls.Add($ldVolRow, 0, 2)
+
+    # ── ROW 3: the three numbers that must never scroll away ─────────
+    $ldStatePanel = New-Object System.Windows.Forms.FlowLayoutPanel
+    $ldStatePanel.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+    $ldStatePanel.WrapContents = $true
+    $ldStatePanel.AutoSize = $true
+    $ldStatePanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $ldStatePanel.BackColor = [System.Drawing.Color]::FromArgb(255, 255, 255)
+    $ldStatePanel.Padding = New-Object System.Windows.Forms.Padding((& $ldPx 10))
+    $ldStatePanel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, (& $ldPx 6))
+
+    $script:LowDiskFreeLabel = New-Object System.Windows.Forms.Label
+    $script:LowDiskFreeLabel.Font = New-Object System.Drawing.Font("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
+    $script:LowDiskFreeLabel.ForeColor = [System.Drawing.Color]::FromArgb(20, 20, 20)
+    $script:LowDiskFreeLabel.AutoSize = $true
+    $script:LowDiskFreeLabel.Text = "Free: --"
+    $ldStatePanel.Controls.Add($script:LowDiskFreeLabel)
+
+    $script:LowDiskHeldLabel = New-Object System.Windows.Forms.Label
+    $script:LowDiskHeldLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $script:LowDiskHeldLabel.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 70)
+    $script:LowDiskHeldLabel.AutoSize = $true
+    $script:LowDiskHeldLabel.Margin = New-Object System.Windows.Forms.Padding((& $ldPx 16), (& $ldPx 8), 0, 0)
+    $script:LowDiskHeldLabel.Text = "Held by this tool: --"
+    $ldStatePanel.Controls.Add($script:LowDiskHeldLabel)
+
+    # A PERCENTAGE MEANS NOTHING UNTIL IT IS RESOLVED AGAINST THIS
+    # VOLUME. "10 % free" is 95 GB on this box and 24 GB on a 256 GB
+    # laptop, so the absolute figure is pinned next to the live free
+    # space rather than being discovered in a confirmation dialog.
+    $script:LowDiskTargetLabel = New-Object System.Windows.Forms.Label
+    $script:LowDiskTargetLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $script:LowDiskTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 70)
+    $script:LowDiskTargetLabel.AutoSize = $true
+    $script:LowDiskTargetLabel.Margin = New-Object System.Windows.Forms.Padding((& $ldPx 16), (& $ldPx 8), 0, 0)
+    $script:LowDiskTargetLabel.Text = "Target: --"
+    $ldStatePanel.Controls.Add($script:LowDiskTargetLabel)
+
+    $ldRoot.Controls.Add($ldStatePanel, 0, 3)
+
+    # ── ROW 4: banner. Empty unless something is actually true. ──────
+    $script:LowDiskBanner = New-Object System.Windows.Forms.Label
+    $script:LowDiskBanner.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $script:LowDiskBanner.AutoSize = $true
+    $script:LowDiskBanner.MaximumSize = New-Object System.Drawing.Size(($ldM.FormW - (& $ldPx 60)), 0)
+    $script:LowDiskBanner.BackColor = [System.Drawing.Color]::FromArgb(255, 244, 206)
+    $script:LowDiskBanner.ForeColor = [System.Drawing.Color]::FromArgb(120, 80, 0)
+    $script:LowDiskBanner.Padding = New-Object System.Windows.Forms.Padding((& $ldPx 8))
+    $script:LowDiskBanner.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, (& $ldPx 6))
+    $script:LowDiskBanner.Text = ""
+    $script:LowDiskBanner.Visible = $false
+    $ldRoot.Controls.Add($script:LowDiskBanner, 0, 4)
+
+    # ── ROW 5: target + actions ──────────────────────────────────────
+    $ldActionPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+    $ldActionPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+    $ldActionPanel.WrapContents = $true
+    $ldActionPanel.AutoSize = $true
+    $ldActionPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $ldActionPanel.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, (& $ldPx 8))
+
+    $ldTargetLabel = New-Object System.Windows.Forms.Label
+    $ldTargetLabel.Text = "Leave free:"
+    $ldTargetLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $ldTargetLabel.AutoSize = $true
+    $ldTargetLabel.Margin = New-Object System.Windows.Forms.Padding(0, (& $ldPx 6), (& $ldPx 6), 0)
+    $ldActionPanel.Controls.Add($ldTargetLabel)
+
+    $script:LowDiskPresetCombo = New-Object System.Windows.Forms.ComboBox
+    $script:LowDiskPresetCombo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $script:LowDiskPresetCombo.Width = $ldM.PresetW
+    $script:LowDiskPresetCombo.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    # ONE LIST, BOTH UNITS. A tester picks a LEVEL; whether it is
+    # written in gigabytes or as a share of the disk is a detail of the
+    # test case, not a different tool. Absolute levels first, then the
+    # same question as a percentage, then the two custom entries.
+    foreach ($preset in (Get-LowDiskTargetPresets)) {
+        $script:LowDiskPresetCombo.Items.Add($preset.Label) | Out-Null
+    }
+    foreach ($preset in (Get-LowDiskPercentPresets)) {
+        $script:LowDiskPresetCombo.Items.Add($preset.Label) | Out-Null
+    }
+    $script:LowDiskPresetCombo.Items.Add("Custom (MB)...") | Out-Null
+    $script:LowDiskPresetCombo.Items.Add("Custom (%)...") | Out-Null
+    $script:LowDiskPresetCombo.SelectedIndex = 3
+    $ldActionPanel.Controls.Add($script:LowDiskPresetCombo)
+
+    $script:LowDiskCustomBox = New-Object System.Windows.Forms.TextBox
+    $script:LowDiskCustomBox.Width = $ldM.CustomW
+    $script:LowDiskCustomBox.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $script:LowDiskCustomBox.Text = "500"
+    $script:LowDiskCustomBox.Enabled = $false
+    $script:LowDiskCustomBox.Margin = New-Object System.Windows.Forms.Padding((& $ldPx 6), 0, (& $ldPx 2), 0)
+    $ldActionPanel.Controls.Add($script:LowDiskCustomBox)
+
+    $script:LowDiskUnitLabel = New-Object System.Windows.Forms.Label
+    $script:LowDiskUnitLabel.Text = "MB"
+    $script:LowDiskUnitLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $script:LowDiskUnitLabel.AutoSize = $true
+    $script:LowDiskUnitLabel.MinimumSize = New-Object System.Drawing.Size((& $ldPx 26), 0)
+    $script:LowDiskUnitLabel.Margin = New-Object System.Windows.Forms.Padding(0, (& $ldPx 6), (& $ldPx 12), 0)
+    $ldActionPanel.Controls.Add($script:LowDiskUnitLabel)
+
+    $script:LowDiskApplyBtn = New-Object System.Windows.Forms.Button
+    $script:LowDiskApplyBtn.Text = "Apply Low Disk Space"
+    $script:LowDiskApplyBtn.Width = (& $ldPx 190)
+    $script:LowDiskApplyBtn.Height = $ldM.BtnH
+    $script:LowDiskApplyBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Standard
+    $script:LowDiskApplyBtn.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+    $script:LowDiskApplyBtn.ForeColor = [System.Drawing.Color]::White
+    $script:LowDiskApplyBtn.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $ldActionPanel.Controls.Add($script:LowDiskApplyBtn)
+
+    $script:LowDiskRestoreBtn = New-Object System.Windows.Forms.Button
+    $script:LowDiskRestoreBtn.Text = "Restore Free Space"
+    $script:LowDiskRestoreBtn.Width = $ldM.BtnW
+    $script:LowDiskRestoreBtn.Height = $ldM.BtnH
+    $script:LowDiskRestoreBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Standard
+    $script:LowDiskRestoreBtn.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
+    $script:LowDiskRestoreBtn.ForeColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+    $script:LowDiskRestoreBtn.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $script:LowDiskRestoreBtn.Margin = New-Object System.Windows.Forms.Padding((& $ldPx 8), 0, 0, 0)
+    $ldActionPanel.Controls.Add($script:LowDiskRestoreBtn)
+
+    $ldOpenFolderBtn = New-Object System.Windows.Forms.Button
+    $ldOpenFolderBtn.Text = "Open Filler Folder"
+    $ldOpenFolderBtn.Width = $ldM.BtnW
+    $ldOpenFolderBtn.Height = $ldM.BtnH
+    $ldOpenFolderBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Standard
+    $ldOpenFolderBtn.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
+    $ldOpenFolderBtn.ForeColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+    $ldOpenFolderBtn.Margin = New-Object System.Windows.Forms.Padding((& $ldPx 8), 0, 0, 0)
+    $ldActionPanel.Controls.Add($ldOpenFolderBtn)
+
+    $ldRoot.Controls.Add($ldActionPanel, 0, 5)
+
+    # ── ROW 6: log ───────────────────────────────────────────────────
+    $script:LowDiskLog = New-Object System.Windows.Forms.RichTextBox
+    $script:LowDiskLog.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $script:LowDiskLog.Multiline = $true
+    $script:LowDiskLog.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Vertical
+    $script:LowDiskLog.MinimumSize = New-Object System.Drawing.Size(0, $ldM.LogH)
+    Initialize-WinConfigGuiDiagnosticBox -Box $script:LowDiskLog
+    $ldRoot.Controls.Add($script:LowDiskLog, 0, 6)
+
+    # ── SHARED BEHAVIOUR ─────────────────────────────────────────────
+
+    $script:LowDiskWrite = {
+        param($Level, $Message)
+        Write-WinConfigGuiDiagnostic -Level $Level -Message $Message -Box $script:LowDiskLog
+    }
+
+    # The selected drive letter, or $null. One reader, so the buttons
+    # and the readouts can never disagree about which volume they mean.
+    $script:LowDiskSelectedLetter = {
+        if ($script:LowDiskVolumeCombo.SelectedIndex -lt 0) { return $null }
+        $key = $script:LowDiskVolumeCombo.SelectedItem.ToString()
+        if ($key -match '^([A-Za-z]):') { return $Matches[1].ToUpperInvariant() }
+        return $null
+    }
+
+    # What the tester asked for, in the unit they asked for it:
+    # @{ Unit = 'Bytes'|'Percent'; Bytes; Percent }, or $null when the
+    # custom box does not hold a usable number. NEVER guesses a default
+    # for bad input -- silently testing a level nobody asked for is
+    # worse than refusing. The percentage is NOT resolved here: one
+    # resolution, in Get-LowDiskPlan, against the selected volume.
+    $script:LowDiskSelectedTarget = {
+        $index = $script:LowDiskPresetCombo.SelectedIndex
+        if ($index -lt 0) { return $null }
+
+        $absolute = @(Get-LowDiskTargetPresets)
+        $percent  = @(Get-LowDiskPercentPresets)
+
+        if ($index -lt $absolute.Count) {
+            return @{ Unit = 'Bytes'; Bytes = [long]$absolute[$index].FreeBytes; Percent = $null }
+        }
+        if ($index -lt ($absolute.Count + $percent.Count)) {
+            return @{ Unit = 'Percent'; Bytes = $null; Percent = [double]$percent[$index - $absolute.Count].Percent }
+        }
+
+        $raw = $script:LowDiskCustomBox.Text.Trim()
+        $parsed = 0.0
+        if (-not [double]::TryParse($raw, [ref]$parsed)) { return $null }
+        if ($parsed -lt 0) { return $null }
+
+        if ($index -eq ($absolute.Count + $percent.Count)) {
+            return @{ Unit = 'Bytes'; Bytes = [long]($parsed * 1MB); Percent = $null }
+        }
+        # Custom percentage. Above 100 is not a low-disk test, it is a
+        # typo, and it is refused rather than clamped into something the
+        # tester never asked for.
+        if ($parsed -gt 100) { return $null }
+        return @{ Unit = 'Percent'; Bytes = $null; Percent = [double]$parsed }
+    }
+
+    # ONE PLANNER FOR BOTH UNITS. Apply and Dry Run both come through
+    # here, so a percentage cannot mean one thing in the preview and
+    # another in the execution.
+    $script:LowDiskPlanFor = {
+        param($Letter, $Request)
+        if ($Request.Unit -eq 'Percent') {
+            return Get-LowDiskPlan -DriveLetter $Letter -TargetPercent $Request.Percent
+        }
+        return Get-LowDiskPlan -DriveLetter $Letter -TargetFreeBytes $Request.Bytes
+    }
+
+    $script:LowDiskRefreshView = {
+        # RE-ENTRANCY, AND A FAILURE THAT IS ALLOWED TO BE SEEN.
+        #
+        # Repopulating the drive list changes SelectedIndex, which fires the
+        # handler that called this refresh, which repopulates the list again.
+        # That recursion ran until PowerShell aborted it on call depth, and a
+        # WinForms handler swallows that -- so the window kept showing the free
+        # space and "Held by this tool: nothing" from BEFORE a fill that had
+        # just taken 2 GB. A window that lies about the disk is worse than one
+        # that says it could not read it, so the guard stops the recursion and
+        # the catch puts any other failure in the log where it can be read.
+        if ($script:LowDiskRefreshing) { return }
+        $script:LowDiskRefreshing = $true
+        try {
+            $letter = & $script:LowDiskSelectedLetter
+            $volumes = @(Get-LowDiskVolume)
+
+            # Rebuild the list, keeping the current selection if it survives.
+            $script:LowDiskVolumeCombo.Items.Clear()
+            foreach ($vol in $volumes) {
+                $label = if ($vol.Label) { " (" + $vol.Label + ")" } else { "" }
+                $script:LowDiskVolumeCombo.Items.Add(
+                    ("{0}:{1}  {2} free of {3}" -f $vol.DriveLetter, $label, (Format-LowDiskBytes -Bytes $vol.FreeBytes), (Format-LowDiskBytes -Bytes $vol.SizeBytes))
+                ) | Out-Null
+            }
+            if ($script:LowDiskVolumeCombo.Items.Count -gt 0) {
+                $wanted = 0
+                for ($i = 0; $i -lt $volumes.Count; $i++) {
+                    if ($letter -and $volumes[$i].DriveLetter -eq $letter) { $wanted = $i }
+                    elseif (-not $letter -and $volumes[$i].IsSystemVolume) { $wanted = $i }
+                }
+                $script:LowDiskVolumeCombo.SelectedIndex = $wanted
+            }
+
+            $letter = & $script:LowDiskSelectedLetter
+            if (-not $letter) { return }
+
+            $vol = @(Get-LowDiskVolume -DriveLetter $letter) | Select-Object -First 1
+            $state = Get-LowDiskFillerState -DriveLetter $letter
+
+            $script:LowDiskFreeLabel.Text = ("Free on {0}: {1}" -f $letter, (Format-LowDiskBytes -Bytes $vol.FreeBytes))
+            $script:LowDiskFreeLabel.ForeColor = if ($vol.FreeBytes -lt (Get-LowDiskMinRecommendedFreeBytes)) {
+                [System.Drawing.Color]::FromArgb(190, 30, 30)
+            } else {
+                [System.Drawing.Color]::FromArgb(20, 20, 20)
+            }
+
+            if ($state.Present) {
+                $script:LowDiskHeldLabel.Text = ("Held by this tool: {0} in {1} file(s)" -f (Format-LowDiskBytes -Bytes $state.AllocatedBytes), $state.ChunkCount)
+            } else {
+                $script:LowDiskHeldLabel.Text = "Held by this tool: nothing"
+            }
+
+            $script:LowDiskRestoreBtn.Enabled = $state.Present
+
+            # THE TARGET IS RESOLVED ON SCREEN, NOT IN A DIALOG. A
+            # percentage is turned into this volume's bytes here, so the
+            # tester sees what "5 % free" costs on the machine in front of
+            # them before committing to it.
+            $request = & $script:LowDiskSelectedTarget
+            if ($null -eq $request) {
+                $script:LowDiskTargetLabel.Text = "Target: enter a number"
+                $script:LowDiskTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(190, 30, 30)
+            } else {
+                $script:LowDiskTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 70)
+                if ($request.Unit -eq 'Percent') {
+                    $resolved = ConvertTo-LowDiskFreeBytesFromPercent -SizeBytes $vol.SizeBytes -Percent $request.Percent
+                    $script:LowDiskTargetLabel.Text = ("Target: {0:0.##} % = {1}" -f $request.Percent, (Format-LowDiskBytes -Bytes $resolved))
+                } else {
+                    $script:LowDiskTargetLabel.Text = ("Target: {0}" -f (Format-LowDiskBytes -Bytes $request.Bytes))
+                }
+            }
+
+            # The banner states only what is true right now, and says what
+            # to do about it. A permanent warning is wallpaper.
+            $leftovers = @(Find-LowDiskLeftovers)
+            if ($leftovers.Count -gt 0) {
+                $parts = @($leftovers | ForEach-Object { "{0}: {1}" -f $_.DriveLetter, (Format-LowDiskBytes -Bytes $_.AllocatedBytes) })
+                $script:LowDiskBanner.Text = ("LOW DISK SPACE IS CURRENTLY SIMULATED on " + ($parts -join ', ') + ". This survives reboots. Click Restore Free Space when the test is finished.")
+                $script:LowDiskBanner.Visible = $true
+            } else {
+                $script:LowDiskBanner.Text = ""
+                $script:LowDiskBanner.Visible = $false
+            }
+        } catch {
+            & $script:LowDiskWrite 'FAIL' ("Could not refresh the view: {0}" -f $_.Exception.Message)
+        } finally {
+            $script:LowDiskRefreshing = $false
+        }
+    }
+
+    # ── EVENTS ───────────────────────────────────────────────────────
+
+    $script:LowDiskPresetCombo.Add_SelectedIndexChanged({
+        $index = $script:LowDiskPresetCombo.SelectedIndex
+        $absolute = @(Get-LowDiskTargetPresets)
+        $percent  = @(Get-LowDiskPercentPresets)
+        $customMbIndex = $absolute.Count + $percent.Count
+        $customPctIndex = $customMbIndex + 1
+
+        # The box and its unit follow the list: one field, and the label
+        # beside it says which unit the number in it is being read as.
+        $script:LowDiskCustomBox.Enabled = ($index -ge $customMbIndex)
+        if ($index -eq $customPctIndex) {
+            $script:LowDiskUnitLabel.Text = "%"
+        } else {
+            $script:LowDiskUnitLabel.Text = "MB"
+        }
+
+        if ($index -ge 0 -and $index -lt $customMbIndex) {
+            $preset = $(if ($index -lt $absolute.Count) { $absolute[$index] } else { $percent[$index - $absolute.Count] })
+            & $script:LowDiskWrite 'DIM' ("{0} - {1}" -f $preset.Label, $preset.Note)
+        }
+        & $script:LowDiskRefreshView
+    })
+
+    # The resolved target has to keep up with typing, or the number on
+    # screen belongs to the previous keystroke.
+    $script:LowDiskCustomBox.Add_TextChanged({ & $script:LowDiskRefreshView })
+
+    $script:LowDiskVolumeCombo.Add_SelectedIndexChanged({ & $script:LowDiskRefreshView })
+    $ldRefreshBtn.Add_Click({ & $script:LowDiskRefreshView; & $script:LowDiskWrite 'INFO' 'Refreshed.' })
+
+    $ldOpenFolderBtn.Add_Click({
+        $letter = & $script:LowDiskSelectedLetter
+        if (-not $letter) { return }
+        $root = Get-LowDiskFillerRoot -DriveLetter $letter
+        if (Test-Path -LiteralPath $root) {
+            Start-Process "explorer.exe" $root
+        } else {
+            & $script:LowDiskWrite 'INFO' ("Nothing to open: {0} does not exist yet." -f $root)
+        }
+    })
+
+    $script:LowDiskApplyBtn.Add_Click({
+        # SAFETY: mutations are gated on a healthy audit trail. Restore
+        # deliberately is NOT gated below -- undoing must always be
+        # possible, even on a box whose ledger is broken.
+        #
+        # THE GATE IS RESOLVED, NOT ASSUMED. Logger.psm1 is imported with
+        # -Prefix WinConfig, so at runtime the function is called
+        # Assert-WinConfigAuditTrailHealthyForMutation and the bare name does
+        # not exist. Calling a name that is not there throws CommandNotFound
+        # inside a WinForms click handler, where it is swallowed and the click
+        # reads as "nothing happened" -- the same shape as the dead
+        # Invoke-GuiSafe. Both spellings are tried, and a gate that cannot be
+        # found is reported in the log rather than passing silently.
+        $ldAuditGate = Get-Command Assert-WinConfigAuditTrailHealthyForMutation -ErrorAction SilentlyContinue
+        if (-not $ldAuditGate) { $ldAuditGate = Get-Command Assert-AuditTrailHealthyForMutation -ErrorAction SilentlyContinue }
+        if ($ldAuditGate) {
+            if (-not (& $ldAuditGate)) { return }
+        } else {
+            & $script:LowDiskWrite 'WARN' 'Audit-trail health check is unavailable in this build; continuing without it.'
+        }
+
+        $letter = & $script:LowDiskSelectedLetter
+        $request = & $script:LowDiskSelectedTarget
+        if (-not $letter) { return }
+        if ($null -eq $request) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Enter the free space to leave: megabytes, or a percentage between 0 and 100.",
+                "Low Disk Space Testing",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return
+        }
+
+        # Remember the choice so the Dry Run button previews THIS work rather
+        # than a default the tester never selected -- including the unit it was
+        # asked in, because "5 %" and "47.59 GB" are the same plan on this box
+        # and different plans on the next one.
+        $script:LowDiskLastLetter = $letter
+        $script:LowDiskLastTargetPercent = $(if ($request.Unit -eq 'Percent') { [double]$request.Percent } else { $null })
+        if ($request.Unit -eq 'Bytes') { $script:LowDiskLastTargetBytes = [long]$request.Bytes }
+
+        # PLAN FIRST, ALWAYS. The same read-only plan the Dry Run button
+        # renders is what the confirmation prompt is built from, so the tester
+        # agrees to the numbers that will actually be used. It is also where a
+        # percentage becomes bytes -- once.
+        $plan = & $script:LowDiskPlanFor $letter $request
+        $target = [long]$plan.TargetFreeBytes
+
+        & $script:LowDiskWrite 'STEP' ("PLAN for {0}: leave {1} free -- {2}" -f $letter, $plan.TargetLabel, $plan.Reason)
+        foreach ($warning in $plan.Warnings) { & $script:LowDiskWrite 'WARN' $warning }
+        foreach ($blocker in $plan.Blockers) { & $script:LowDiskWrite 'FAIL' $blocker }
+
+        if (-not $plan.Executable) {
+            [System.Windows.Forms.MessageBox]::Show(
+                ("This cannot run here:`r`n`r`n" + ($plan.Blockers -join "`r`n")),
+                "Low Disk Space Testing",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+            return
+        }
+
+        if ($plan.Action -eq 'None') {
+            & $script:LowDiskWrite 'OK' 'Already at the requested level; nothing to do.'
+            return
+        }
+        if ($plan.Action -eq 'Blocked') {
+            [System.Windows.Forms.MessageBox]::Show(
+                $plan.Reason,
+                "Low Disk Space Testing",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return
+        }
+        if ($plan.Action -eq 'Release') {
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                ("{0}`r`n`r`nFree space on {1} will go UP to about {2}.`r`n`r`nContinue?" -f $plan.Reason, ($letter + ":"), (Format-LowDiskBytes -Bytes $plan.ProjectedFree)),
+                "Release filler",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Question
+            )
+            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+            $script:LowDiskForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            try {
+                $released = Restore-LowDiskFreeSpace -DriveLetter $letter -ReleaseBytes $plan.BytesToRelease -OnProgress {
+                    param($e)
+                    & $script:LowDiskWrite $e.Level $e.Message
+                    [System.Windows.Forms.Application]::DoEvents()
+                }
+                & $script:LowDiskWrite $(if ($released.Succeeded) { 'OK' } else { 'WARN' }) $released.Reason
+            } finally {
+                $script:LowDiskForm.Cursor = [System.Windows.Forms.Cursors]::Default
+                & $script:LowDiskRefreshView
+            }
+            return
+        }
+
+        $confirmLines = @(
+            ("Drive {0} will be held at about {1} free." -f ($letter + ":"), $plan.TargetLabel)
+            ("This allocates {0} of placeholder files in:" -f (Format-LowDiskBytes -Bytes $plan.BytesToFill))
+            ("    {0}" -f $plan.Root)
+            ""
+            "The filler is real files, so it stays in place across reboots until it is removed."
+            "Restore Free Space in this window (or RESTORE-FREE-SPACE.cmd in that folder) undoes all of it."
+        )
+        foreach ($warning in $plan.Warnings) { $confirmLines += ("! " + $warning) }
+        $confirmLines += ""
+        $confirmLines += "Continue?"
+
+        $icon = if ($target -lt (Get-LowDiskMinRecommendedFreeBytes)) {
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        } else {
+            [System.Windows.Forms.MessageBoxIcon]::Question
+        }
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            ($confirmLines -join "`r`n"),
+            "Simulate low disk space",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            $icon
+        )
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+            & $script:LowDiskWrite 'INFO' 'Cancelled; nothing was allocated.'
+            return
+        }
+
+        $script:LowDiskForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $script:LowDiskApplyBtn.Enabled = $false
+        try {
+            & $script:LowDiskWrite 'STEP' 'ALLOCATING'
+            $fill = Invoke-LowDiskFill -DriveLetter $letter -TargetFreeBytes $plan.TargetFreeBytes -OnProgress {
+                param($e)
+                & $script:LowDiskWrite $e.Level $e.Message
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+
+            foreach ($warning in $fill.Warnings) { & $script:LowDiskWrite 'WARN' $warning }
+            & $script:LowDiskWrite $(if ($fill.Succeeded) { 'OK' } else { 'FAIL' }) $fill.Reason
+            & $script:LowDiskWrite 'INFO' ("Took {0} in {1} file(s) by {2}, in {3} ms." -f (Format-LowDiskBytes -Bytes $fill.AllocatedBytes), $fill.ChunksCreated, $fill.Method.ToLower(), $fill.DurationMs)
+            if ($fill.PersistsAcrossReboot) {
+                & $script:LowDiskWrite 'OK' 'Verified durable: this free-space level will still be in place after a reboot.'
+            } elseif ($fill.ChunksCreated -gt 0) {
+                & $script:LowDiskWrite 'WARN' 'The filler on this volume may not survive a reboot -- re-check free space after restarting.'
+            }
+            & $script:LowDiskWrite 'INFO' ("Undo: Restore Free Space here, or {0} in {1}" -f 'RESTORE-FREE-SPACE.cmd', $fill.Root)
+
+            if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                Register-WinConfigSessionAction `
+                    -Action "Low Disk Space Testing" `
+                    -Detail ("Held {0} at {1} free, asked as {2} ({3} allocated, {4})" -f ($letter + ":"), (Format-LowDiskBytes -Bytes $fill.FreeAfter), $plan.TargetLabel, (Format-LowDiskBytes -Bytes $fill.AllocatedBytes), $fill.Method.ToLower()) `
+                    -Category "Maintenance" `
+                    -Result $(if ($fill.Succeeded) { "PASS" } else { "FAIL" }) `
+                    -Tier 0 `
+                    -Summary $fill.Reason
+            }
+            if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
+        } catch {
+            & $script:LowDiskWrite 'FAIL' ("Allocation failed: {0}" -f $_.Exception.Message)
+        } finally {
+            $script:LowDiskApplyBtn.Enabled = $true
+            $script:LowDiskForm.Cursor = [System.Windows.Forms.Cursors]::Default
+            & $script:LowDiskRefreshView
+        }
+    })
+
+    $script:LowDiskRestoreBtn.Add_Click({
+        $letter = & $script:LowDiskSelectedLetter
+        if (-not $letter) { return }
+
+        $state = Get-LowDiskFillerState -DriveLetter $letter
+        if (-not $state.Present) {
+            & $script:LowDiskWrite 'INFO' 'No filler on this drive; nothing to restore.'
+            return
+        }
+
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            ("Remove {0} of filler from {1} and give the space back?" -f (Format-LowDiskBytes -Bytes $state.AllocatedBytes), ($letter + ":")),
+            "Restore free space",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question
+        )
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        $script:LowDiskForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $script:LowDiskRestoreBtn.Enabled = $false
+        try {
+            & $script:LowDiskWrite 'STEP' 'RESTORING'
+            $restore = Restore-LowDiskFreeSpace -DriveLetter $letter -OnProgress {
+                param($e)
+                & $script:LowDiskWrite $e.Level $e.Message
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+            & $script:LowDiskWrite $(if ($restore.Succeeded) { 'OK' } else { 'WARN' }) $restore.Reason
+            foreach ($skipped in $restore.FilesSkipped) { & $script:LowDiskWrite 'WARN' ("Left in place: {0}" -f $skipped) }
+
+            if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+                Register-WinConfigSessionAction `
+                    -Action "Low Disk Space Testing" `
+                    -Detail ("Restored {0} on {1}" -f (Format-LowDiskBytes -Bytes $restore.ReclaimedBytes), ($letter + ":")) `
+                    -Category "Maintenance" `
+                    -Result $(if ($restore.Succeeded) { "PASS" } else { "WARN" }) `
+                    -Tier 0 `
+                    -Summary $restore.Reason
+            }
+            if (Get-Command Update-ResultsDiagnosticsView -ErrorAction SilentlyContinue) { Update-ResultsDiagnosticsView }
+        } catch {
+            & $script:LowDiskWrite 'FAIL' ("Restore failed: {0}" -f $_.Exception.Message)
+        } finally {
+            $script:LowDiskRestoreBtn.Enabled = $true
+            $script:LowDiskForm.Cursor = [System.Windows.Forms.Cursors]::Default
+            & $script:LowDiskRefreshView
+        }
+    })
+
+    # ── OPEN ─────────────────────────────────────────────────────────
+    $script:LowDiskForm.Add_Shown({
+        & $script:LowDiskRefreshView
+        & $script:LowDiskWrite 'STEP' 'LOW DISK SPACE TESTING'
+        & $script:LowDiskWrite 'INFO' 'Pick a drive and the free space to leave, then Apply. Restore Free Space puts it back.'
+
+        # A box left filled on someone else's shift announces itself,
+        # rather than being rediscovered as "the disk is full".
+        foreach ($leftover in (Find-LowDiskLeftovers)) {
+            & $script:LowDiskWrite 'WARN' ("Existing filler on {0}: {1} in {2} file(s), created {3} by {4}" -f $leftover.DriveLetter, (Format-LowDiskBytes -Bytes $leftover.AllocatedBytes), $leftover.ChunkCount, $(if ($leftover.CreatedUtc) { $leftover.CreatedUtc } else { 'unknown' }), $(if ($leftover.CreatedBy) { $leftover.CreatedBy } else { 'unknown' }))
+        }
+    })
+
+    $script:LowDiskForm.Show()
+}
 "Disk Cleanup" = {
     if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
         Register-WinConfigSessionAction -Action "Disk Cleanup" -Detail "Windows Disk Cleanup utility launched" -Category "Maintenance" -Result "PASS" -Tier 0 -Summary "Disk Cleanup launched"
@@ -14064,6 +14788,116 @@ foreach ($tabPage in $tabControl.TabPages) {
                             Findings = @{
                                 DriversFound = $driversFound
                                 DriverCount = $driversFound.Count
+                            }
+                        }
+                }
+                "low-disk-space-test" = {
+                    # === PLAN PHASE: pure, read-only system inspection ===
+                    # This never creates the folder it is planning to write
+                    # into, and never allocates a byte. Get-LowDiskPlan is the
+                    # SAME function the window's Apply button plans with, so
+                    # the preview and the execution cannot describe different
+                    # work -- a second planner would be this repo's
+                    # channel-mismatch bug class in a new place.
+                    if (-not (Get-Command Get-LowDiskPlan -ErrorAction SilentlyContinue)) {
+                        return New-DryRunPlan `
+                            -ToolId "low-disk-space-test" `
+                            -ToolName "Low Disk Space Testing" `
+                            -Steps @("PLAN FAILED: Cannot proceed") `
+                            -AffectedResources @("Unknown - planning aborted") `
+                            -RequiresAdmin $false `
+                            -Reversible $true `
+                            -EstimatedImpact "Unknown" `
+                            -Preconditions @("LowDiskSpace module: NOT LOADED") `
+                            -Evidence @{
+                                PlanFailed = $true
+                                FailureReason = "The LowDiskSpace module is not loaded, so no plan can be read from this machine."
+                            }
+                    }
+
+                    # The tester's last choice in the window, when there is one.
+                    # Otherwise the system volume at 1 GB free -- and the plan
+                    # SAYS which of those it used rather than presenting a
+                    # default as if it were a decision.
+                    $ldLetter = $(if ($script:LowDiskLastLetter) { $script:LowDiskLastLetter } else { ($env:SystemDrive).TrimEnd(':', '\') })
+                    # A target asked for as a PERCENTAGE is previewed as one.
+                    # Re-planning it from the bytes it happened to resolve to
+                    # on some other volume would preview the wrong work here.
+                    if ($null -ne $script:LowDiskLastTargetPercent) {
+                        $ldSource = "last selection in the tool window (percentage)"
+                        $ldPlan = Get-LowDiskPlan -DriveLetter $ldLetter -TargetPercent ([double]$script:LowDiskLastTargetPercent)
+                    } else {
+                        $ldTarget = $(if ($script:LowDiskLastTargetBytes) { [long]$script:LowDiskLastTargetBytes } else { [long]1GB })
+                        $ldSource = $(if ($script:LowDiskLastTargetBytes) { "last selection in the tool window" } else { "default (no selection made yet)" })
+                        $ldPlan = Get-LowDiskPlan -DriveLetter $ldLetter -TargetFreeBytes $ldTarget
+                    }
+                    $ldTarget = [long]$ldPlan.TargetFreeBytes
+
+                    $ldSteps = @()
+                    $ldResources = @()
+
+                    if ($ldPlan.Action -eq 'Fill') {
+                        if (-not $ldPlan.State.RootExists) {
+                            $ldSteps += (New-DryRunStep -Verb WOULD_CREATE -Target "folder $($ldPlan.Root)").Summary
+                        }
+                        $ldChunkCount = @($ldPlan.ChunkSizes).Count
+                        $ldFirst = $(if ($ldChunkCount -gt 0) { Format-LowDiskBytes -Bytes @($ldPlan.ChunkSizes)[0] } else { '0 bytes' })
+                        $ldSteps += (New-DryRunStep -Verb WOULD_CREATE -Target "$ldChunkCount placeholder file(s) totalling $(Format-LowDiskBytes -Bytes $ldPlan.BytesToFill)" -Detail "up to $ldFirst each, allocated not written").Summary
+                        $ldSteps += (New-DryRunStep -Verb WOULD_CREATE -Target "RESTORE-FREE-SPACE.cmd and README-FIRST.txt" -Detail "undo without WinConfig").Summary
+                        $ldSteps += (New-DryRunStep -Verb WOULD_SET -Target "free space on ${ldLetter}:" -Detail "$(Format-LowDiskBytes -Bytes $ldPlan.Volume.FreeBytes) -> about $(Format-LowDiskBytes -Bytes $ldPlan.TargetFreeBytes), persisting across reboots").Summary
+                        $ldResources += "Folder:$($ldPlan.Root)"
+                        $ldResources += "Volume:${ldLetter}: free space"
+                    } elseif ($ldPlan.Action -eq 'Release') {
+                        $ldSteps += (New-DryRunStep -Verb WOULD_DELETE -Target "placeholder files totalling $(Format-LowDiskBytes -Bytes $ldPlan.BytesToRelease)" -Detail "in $($ldPlan.Root)").Summary
+                        $ldSteps += (New-DryRunStep -Verb WOULD_SET -Target "free space on ${ldLetter}:" -Detail "$(Format-LowDiskBytes -Bytes $ldPlan.Volume.FreeBytes) -> about $(Format-LowDiskBytes -Bytes $ldPlan.ProjectedFree)").Summary
+                        $ldResources += "Folder:$($ldPlan.Root)"
+                        $ldResources += "Volume:${ldLetter}: free space"
+                    } else {
+                        $ldSteps += $ldPlan.Reason
+                        $ldResources += "None"
+                    }
+
+                    foreach ($ldWarning in $ldPlan.Warnings) { $ldSteps += "NOTE: $ldWarning" }
+
+                    New-DryRunPlan `
+                        -ToolId "low-disk-space-test" `
+                        -ToolName "Low Disk Space Testing" `
+                        -Steps $ldSteps `
+                        -AffectedResources $ldResources `
+                        -RequiresAdmin $false `
+                        -Reversible $true `
+                        -EstimatedImpact $(if ($ldPlan.Action -eq 'None') { "None" } elseif ($ldTarget -lt (Get-LowDiskMinRecommendedFreeBytes)) { "High" } else { "Medium" }) `
+                        -Preconditions @(
+                            "Target: $($ldPlan.TargetLabel) free on ${ldLetter}: (from $ldSource)"
+                            "Admin: $($ldPlan.IsAdmin)"
+                            "Volume: $($ldPlan.Volume.FileSystem), $(Format-LowDiskBytes -Bytes $ldPlan.Volume.FreeBytes) free of $(Format-LowDiskBytes -Bytes $ldPlan.Volume.SizeBytes)"
+                            "Existing filler: $(Format-LowDiskBytes -Bytes $ldPlan.State.AllocatedBytes) in $($ldPlan.State.ChunkCount) file(s)"
+                        ) `
+                        -Evidence @{
+                            TargetSource = $ldSource
+                            TargetUnit = $ldPlan.TargetUnit
+                            TargetPercent = $ldPlan.TargetPercent
+                            Preconditions = @{
+                                IsAdmin = $ldPlan.IsAdmin
+                                DriveLetter = $ldLetter
+                                FileSystem = $ldPlan.Volume.FileSystem
+                                FreeBytes = $ldPlan.Volume.FreeBytes
+                                SizeBytes = $ldPlan.Volume.SizeBytes
+                                FillerRoot = $ldPlan.Root
+                                ExistingFillerBytes = $ldPlan.State.AllocatedBytes
+                                ExistingChunkCount = $ldPlan.State.ChunkCount
+                            }
+                            Findings = @{
+                                Action = $ldPlan.Action
+                                Reason = $ldPlan.Reason
+                                TargetFreeBytes = $ldPlan.TargetFreeBytes
+                                BytesToFill = $ldPlan.BytesToFill
+                                BytesToRelease = $ldPlan.BytesToRelease
+                                ChunkCount = @($ldPlan.ChunkSizes).Count
+                                ProjectedFreeBytes = $ldPlan.ProjectedFree
+                                PersistsAcrossReboot = $true
+                                Warnings = @($ldPlan.Warnings)
+                                Blockers = @($ldPlan.Blockers)
                             }
                         }
                 }
@@ -15635,6 +16469,13 @@ No system changes were made.
                 SupportsDryRun = $true
                 MutatesSystem = $true
             }
+            "Low Disk Space Testing"   = @{
+                Description = "Hold this PC at a chosen free space, then restore it"
+                Group = "Testing"
+                ToolId = "low-disk-space-test"
+                SupportsDryRun = $true
+                MutatesSystem = $true
+            }
             # System tools
             "Copy System Info"         = @{ Description = "Copy system details to clipboard"; Group = "Info" }
             "Copy Device Name"         = @{ Description = "Copy computer name"; Group = "Info" }
@@ -15707,7 +16548,7 @@ No system changes were made.
             "zAmp"         = @("Uninstall zAmp Drivers", "Repair zAmp Driver Trust")
             "Zengar UI"    = @("Apply Win 11 Start Menu", "Apply branding colors", "Pin Taskbar Icons", "Apply Win Update Icon")
             "Updates"      = @("MS Store Updates", "Update Surface Drivers", "Microsoft Update Catalog", "Windows Insider")
-            "Disk"         = @("DISM Restore Health", "/sfc scannow", "Defrag && Optimize", "Delete old backups", "Disk Cleanup", "Empty Recycle Bin")
+            "Disk"         = @("DISM Restore Health", "/sfc scannow", "Defrag && Optimize", "Delete old backups", "Disk Cleanup", "Empty Recycle Bin", "Low Disk Space Testing")
             "NO Shortcuts" = @("%programdata%", "%localappdata%", "C:\zengar", "Documents\ScreenConnect")
             "Support"      = @("Collect Support Bundle")
         }

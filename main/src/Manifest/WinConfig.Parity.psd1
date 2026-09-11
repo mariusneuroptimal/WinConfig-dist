@@ -93,6 +93,7 @@
             "Delete old backups"
             "Disk Cleanup"
             "Empty Recycle Bin"
+            "Low Disk Space Testing"
         )
         "NO Shortcuts" = @(
             "%programdata%"
@@ -263,6 +264,10 @@
         "Empty Recycle Bin" = @{
             Description = "Clear recycle bin contents"
             Group = "Cleanup"
+        }
+        "Low Disk Space Testing" = @{
+            Description = "Hold this PC at a chosen free space, then restore it"
+            Group = "Testing"
         }
 
         # Support tools

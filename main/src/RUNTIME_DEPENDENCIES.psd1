@@ -57,6 +57,7 @@
         @{ Path = "src/Modules/BluetoothProbe.psm1" }       # Bluetooth diagnostics probe (bundled from winconfig-bluetooth)
         @{ Path = "src/Modules/TargetDeviceWatch.psm1" }    # Target device state machine (from winconfig-bluetooth)
         @{ Path = "src/Modules/BluetoothDeviceProbe.psm1" } # Deep device probe: Win32 BT API, streaming, patterns
+        @{ Path = "src/Modules/LowDiskSpace.psm1" }     # LOW-DISK-001: reversible low-disk-space simulation (Disk tab)
         @{ Path = "src/Modules/GraphicsBench.psm1" }        # GRAPHICS-BENCH-001: NO WebView2 surface measurement (Graphics tab)
     )
 

@@ -277,6 +277,16 @@
             RequiresAdmin  = $false
         }
         @{
+            Id             = "low-disk-space-test"
+            Name           = "Low Disk Space Testing"
+            Category       = "Maintenance"
+            ToolCategory   = "Maintenance"
+            MutatesSystem  = $true
+            SupportsDryRun = $true   # REQUIRED: allocates real disk space, and can take a volume to zero free
+            Description    = "Hold a volume at a chosen amount of free space for testing, and give it back"
+            RequiresAdmin  = $false  # Allocation uses the file system API, not fsutil; only creating the folder at a volume root may need elevation
+        }
+        @{
             Id             = "empty-recycle-bin"
             Name           = "Empty Recycle Bin"
             Category       = "Maintenance"

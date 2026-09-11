@@ -1,4 +1,8 @@
 {
+  "build_id": "34621723689-1",
+  "event": "push",
+  "branch": "main",
+  "schema_version": "2.0",
   "artifacts": [
     {
       "sha256": "d1278321cdcd5c0759d3dfa773e964cda8d254ccdfd7f08dce12f878d317fff9",
@@ -6,9 +10,9 @@
       "size": 2001
     },
     {
-      "sha256": "fd65ed5f9c2f00d980acce5ee88ef25a1ba7c43c212b8665fd199c32629cdd28",
+      "sha256": "7f20d18012b0a598e1b380f930fbd751eaee194ac1ed76a6b1bf32c644d71567",
       "path": "src/Win11Config.App.ps1",
-      "size": 1030812
+      "size": 1078603
     },
     {
       "sha256": "ff6ee1fdba00afd4e7713d356ed92d752ac386a4528909aa02e29e5c68778622",
@@ -16,19 +20,19 @@
       "size": 330
     },
     {
-      "sha256": "8cadb89d04d9037ede161390ef574c755db15b51ac4b2829968c503c5b992161",
+      "sha256": "b2a22a0c69cfffe046c6cb759bbabbe66bc50a192cdf910a3e3201d1e452847f",
       "path": "src/RUNTIME_DEPENDENCIES.psd1",
-      "size": 4575
+      "size": 4695
     },
     {
-      "sha256": "fbc47854b1fd3a3f43f50031e92f3b9154719ad11026a81165065fdc11c1c010",
+      "sha256": "80f3c11e1c481707852492b54f36457a4fd26608e864fa55b52705f8c298e29c",
       "path": "src/Manifest/WinConfig.Tools.psd1",
-      "size": 15335
+      "size": 15950
     },
     {
-      "sha256": "e76544ab07112b7a250af997b8b20f344e11402939c6ce8b0934edfd7355eba4",
+      "sha256": "e9e51c4fea4b52602f0442caa4093773d8ab80ab88ad842532170290ecb118c5",
       "path": "src/Manifest/WinConfig.Parity.psd1",
-      "size": 9270
+      "size": 9466
     },
     {
       "sha256": "68e26cfc587e4d808fbcc98e89a88dcc3c0dd1b342029e3c9c1c8cf31170680f",
@@ -156,15 +160,16 @@
       "size": 509328
     },
     {
+      "sha256": "5504cba08ab4672d9e4ce811a85e202940412ed8de131e5fc2458e967f9bec7e",
+      "path": "src/Modules/LowDiskSpace.psm1",
+      "size": 53687
+    },
+    {
       "sha256": "d59cb6958e05577d01156fe38d9f21fceaab205a8ad280b5c1c5fbeebf6f6c89",
       "path": "src/Modules/GraphicsBench.psm1",
       "size": 135178
     }
   ],
-  "timestamp": "2026-09-09T14:38:24.3403392Z",
-  "branch": "main",
-  "source_ref": "53576ee16df7ec8d641cc32fc61841028beca8bf",
-  "event": "push",
-  "build_id": "34364894815-1",
-  "schema_version": "2.0"
+  "source_ref": "55f53c0742a7507a8360f5c58c88eae5ac01e797",
+  "timestamp": "2026-09-11T16:23:56.7392220Z"
 }
