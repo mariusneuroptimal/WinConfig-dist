@@ -13556,9 +13556,16 @@ namespace WinConfigDiag {
             # OFFERED IN BOTH. "25 % free" is impossible on a disk sitting at
             # 5 %, and the only way to see that at a glance is to read the
             # current level in the same unit the target was asked in.
+            #
+            # AND THE BASE IS NAMED EVERY TIME. A percentage here is ALWAYS of
+            # TOTAL VOLUME SIZE, never of current free space -- that is what
+            # Windows' low-disk warning, Storage Sense and application checks
+            # written as "less than N % free" all mean. A bare "5.2 %" invites
+            # the reader to supply the other base, so the size it is a
+            # percentage OF is printed beside it.
             $freePercentText = ""
             if ($vol.SizeBytes -gt 0) {
-                $freePercentText = (" ({0:0.#} %)" -f (100.0 * $vol.FreeBytes / $vol.SizeBytes))
+                $freePercentText = (" ({0:0.#} % of {1})" -f (100.0 * $vol.FreeBytes / $vol.SizeBytes), (Format-LowDiskBytes -Bytes $vol.SizeBytes))
             }
             $script:LowDiskFreeLabel.Text = ("Free on {0}: {1}{2}" -f $letter, (Format-LowDiskBytes -Bytes $vol.FreeBytes), $freePercentText)
             $script:LowDiskFreeLabel.ForeColor = if ($vol.FreeBytes -lt (Get-LowDiskMinRecommendedFreeBytes)) {
@@ -13588,6 +13595,12 @@ namespace WinConfigDiag {
             # than what the tester can pick. Now the ceiling is on screen, the
             # button is disabled, and the reason is in the readout beside it.
             $maxReachable = Get-LowDiskMaxReachableFreeBytes -FreeBytes $vol.FreeBytes -AllocatedBytes $state.AllocatedBytes
+            # The ceiling in the other unit, so a percentage target is refused
+            # in the unit it was asked in.
+            $ceilingPercentText = ""
+            if ($vol.SizeBytes -gt 0) {
+                $ceilingPercentText = (" ({0:0.#} % of the disk)" -f (100.0 * $maxReachable / $vol.SizeBytes))
+            }
             $request = & $script:LowDiskSelectedTarget
             $resolvedTarget = $null
             $unreachable = $false
@@ -13599,7 +13612,10 @@ namespace WinConfigDiag {
             } else {
                 if ($request.Unit -eq 'Percent') {
                     $resolvedTarget = [long](ConvertTo-LowDiskFreeBytesFromPercent -SizeBytes $vol.SizeBytes -Percent $request.Percent)
-                    $targetText = ("Target: {0:0.##} % = {1}" -f $request.Percent, (Format-LowDiskBytes -Bytes $resolvedTarget))
+                    # Spelled the same way the plan spells it: percent, OF WHAT,
+                    # equals bytes. The window and the plan must not describe
+                    # the same target in two different phrasings.
+                    $targetText = ("Target: {0:0.##} % of {1} = {2}" -f $request.Percent, (Format-LowDiskBytes -Bytes $vol.SizeBytes), (Format-LowDiskBytes -Bytes $resolvedTarget))
                 } else {
                     $resolvedTarget = [long]$request.Bytes
                     $targetText = ("Target: {0}" -f (Format-LowDiskBytes -Bytes $resolvedTarget))
@@ -13607,7 +13623,7 @@ namespace WinConfigDiag {
 
                 $unreachable = ($resolvedTarget -gt $maxReachable)
                 if ($unreachable) {
-                    $script:LowDiskTargetLabel.Text = ("{0} -- unreachable: {1} has only {2} free" -f $targetText, ($letter + ":"), (Format-LowDiskBytes -Bytes $maxReachable))
+                    $script:LowDiskTargetLabel.Text = ("{0} -- unreachable: {1} has {2}{3} free" -f $targetText, ($letter + ":"), (Format-LowDiskBytes -Bytes $maxReachable), $ceilingPercentText)
                     $script:LowDiskTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(160, 90, 0)
                 } else {
                     $script:LowDiskTargetLabel.Text = $targetText
@@ -13631,7 +13647,7 @@ namespace WinConfigDiag {
                 $script:LowDiskApplyBtn.ForeColor = [System.Drawing.Color]::FromArgb(130, 130, 130)
             }
             if ($unreachable) {
-                $hint = ("{0} already has only {1} free. This tool takes free space away and gives back what it took, so the most it can leave free here is {1} -- it cannot create space it never took. Pick {1} or less, or free up real space first." -f ($letter + ":"), (Format-LowDiskBytes -Bytes $maxReachable))
+                $hint = ("{0} has {1}{2} free right now. Percentages here are of TOTAL disk size, not of free space, so this target asks for more available space than the disk has. This tool takes free space away and gives back what it took, so the most it can leave free is {1}{2} -- pick that or less, or free up real space first." -f ($letter + ":"), (Format-LowDiskBytes -Bytes $maxReachable), $ceilingPercentText)
                 $script:LowDiskToolTip.SetToolTip($script:LowDiskApplyBtn, $hint)
 
                 # Said ONCE per distinct situation. This refresh runs on every

@@ -147,19 +147,24 @@ function Get-LowDiskPercentPresets {
         Windows' own low-disk warning, Storage Sense, and any application check
         phrased as "less than N % free".
 
-        The percentage is of TOTAL VOLUME SIZE, which is what those checks use,
-        not of currently free space.
+        THE PERCENTAGE IS OF TOTAL VOLUME SIZE, NEVER OF CURRENTLY FREE
+        SPACE, which is what those checks use -- "10 % free" on a 1 TB disk
+        means the volume reports 100 GB available, not a tenth of whatever
+        happens to be free at the moment. Every label says "of the disk" out
+        loud, because a bare "10 % free" is the one place a reader can
+        silently substitute the other base and be wrong by an order of
+        magnitude.
     #>
     [CmdletBinding()]
     param()
 
     return @(
-        [PSCustomObject]@{ Label = '25 % free'; Percent = 25.0; Note = 'Comfortable, but past the point updates and defragmentation prefer' }
-        [PSCustomObject]@{ Label = '15 % free'; Percent = 15.0; Note = 'Windows Update and servicing start to feel it' }
-        [PSCustomObject]@{ Label = '10 % free'; Percent = 10.0; Note = 'The classic low-disk threshold applications test against' }
-        [PSCustomObject]@{ Label = '5 % free';  Percent = 5.0;  Note = 'Storage Sense territory; warnings expected' }
-        [PSCustomObject]@{ Label = '2 % free';  Percent = 2.0;  Note = 'Sustained writes begin to fail, even on a large volume' }
-        [PSCustomObject]@{ Label = '1 % free';  Percent = 1.0;  Note = 'Severe; on a small disk this is already hostile' }
+        [PSCustomObject]@{ Label = '25 % of the disk free'; Percent = 25.0; Note = 'Comfortable, but past the point updates and defragmentation prefer' }
+        [PSCustomObject]@{ Label = '15 % of the disk free'; Percent = 15.0; Note = 'Windows Update and servicing start to feel it' }
+        [PSCustomObject]@{ Label = '10 % of the disk free'; Percent = 10.0; Note = 'The classic low-disk threshold applications test against' }
+        [PSCustomObject]@{ Label = '5 % of the disk free';   Percent = 5.0;  Note = 'Storage Sense territory; warnings expected' }
+        [PSCustomObject]@{ Label = '2 % of the disk free';   Percent = 2.0;  Note = 'Sustained writes begin to fail, even on a large volume' }
+        [PSCustomObject]@{ Label = '1 % of the disk free';   Percent = 1.0;  Note = 'Severe; on a small disk this is already hostile' }
     )
 }
 
