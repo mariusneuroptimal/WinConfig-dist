@@ -13324,6 +13324,10 @@ namespace WinConfigDiag {
     $script:LowDiskTargetLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
     $script:LowDiskTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 70)
     $script:LowDiskTargetLabel.AutoSize = $true
+    # A LONG REFUSAL HAS TO WRAP, NOT RUN OFF THE WINDOW. An AutoSize label
+    # with no maximum grows past the form edge, and the part that gets
+    # clipped is the end of the sentence -- which is where the next step is.
+    $script:LowDiskTargetLabel.MaximumSize = New-Object System.Drawing.Size(($ldM.FormW - (& $ldPx 60)), 0)
     $script:LowDiskTargetLabel.Margin = New-Object System.Windows.Forms.Padding((& $ldPx 16), (& $ldPx 8), 0, 0)
     $script:LowDiskTargetLabel.Text = "Target: --"
     $ldStatePanel.Controls.Add($script:LowDiskTargetLabel)
@@ -13373,7 +13377,10 @@ namespace WinConfigDiag {
         $script:LowDiskPresetCombo.Items.Add($preset.Label) | Out-Null
     }
     $script:LowDiskPresetCombo.Items.Add("Custom (MB)...") | Out-Null
-    $script:LowDiskPresetCombo.Items.Add("Custom (%)...") | Out-Null
+    # "% of disk", not a bare "%". The one ambiguity this window keeps paying
+    # for is a percentage read as a share of FREE space, and the custom entry
+    # was the last place the base was not named.
+    $script:LowDiskPresetCombo.Items.Add("Custom (% of disk)...") | Out-Null
     $script:LowDiskPresetCombo.SelectedIndex = 3
     $ldActionPanel.Controls.Add($script:LowDiskPresetCombo)
 
@@ -13623,7 +13630,16 @@ namespace WinConfigDiag {
 
                 $unreachable = ($resolvedTarget -gt $maxReachable)
                 if ($unreachable) {
-                    $script:LowDiskTargetLabel.Text = ("{0} -- unreachable: {1} has {2}{3} free" -f $targetText, ($letter + ":"), (Format-LowDiskBytes -Bytes $maxReachable), $ceilingPercentText)
+                    # NOT "C: has 50.00 GB free". The ceiling is free space
+                    # PLUS what this tool is already holding, so on a volume
+                    # with 10 GB free and 40 GB held that sentence claimed
+                    # 50 GB was currently available -- false, and exactly the
+                    # number a tester would go and check. Say what the
+                    # ceiling IS (the most this tool can leave free) and
+                    # leave "what is free now" to the Free readout beside it.
+                    # The next step goes here too, not only in a tooltip that
+                    # has to be found by hovering a disabled button.
+                    $script:LowDiskTargetLabel.Text = ("{0} -- unreachable. The most this tool can leave free on {1} is {2}{3}. Choose {2} or less, or free up real space first." -f $targetText, ($letter + ":"), (Format-LowDiskBytes -Bytes $maxReachable), $ceilingPercentText)
                     $script:LowDiskTargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(160, 90, 0)
                 } else {
                     $script:LowDiskTargetLabel.Text = $targetText
@@ -13632,6 +13648,11 @@ namespace WinConfigDiag {
             }
 
             $script:LowDiskApplyBtn.Enabled = ($usable -and -not $unreachable)
+
+            # READ BY THE PRESET HANDLER. Selecting a level cannot know
+            # whether that level is reachable until this refresh has decided,
+            # so the verdict is published here rather than re-derived there.
+            $script:LowDiskLastUnreachable = $unreachable
 
             # A BUTTON WITH AN EXPLICIT BACKCOLOR DOES NOT LOOK DISABLED.
             # WinForms greys the TEXT of a disabled button and leaves the
@@ -13647,7 +13668,21 @@ namespace WinConfigDiag {
                 $script:LowDiskApplyBtn.ForeColor = [System.Drawing.Color]::FromArgb(130, 130, 130)
             }
             if ($unreachable) {
-                $hint = ("{0} has {1}{2} free right now. Percentages here are of TOTAL disk size, not of free space, so this target asks for more available space than the disk has. This tool takes free space away and gives back what it took, so the most it can leave free is {1}{2} -- pick that or less, or free up real space first." -f ($letter + ":"), (Format-LowDiskBytes -Bytes $maxReachable), $ceilingPercentText)
+                # The arithmetic behind the ceiling, spelled out only when
+                # there is filler to spell out. With nothing held the ceiling
+                # IS the free space and the extra clause is noise.
+                $ceilingWhy = "This tool takes free space away and gives back what it took, so the most it can leave free is what is free now."
+                if ($state.AllocatedBytes -gt 0) {
+                    $ceilingWhy = ("This tool takes free space away and gives back what it took, so the most it can leave free is the {0} free now plus the {1} it is already holding." -f (Format-LowDiskBytes -Bytes $vol.FreeBytes), (Format-LowDiskBytes -Bytes $state.AllocatedBytes))
+                }
+                # The percentage base is supporting text for a PERCENTAGE
+                # request. Beside an absolute target in MB it explains a
+                # mistake the tester did not make.
+                $percentBase = ""
+                if ($request.Unit -eq 'Percent') {
+                    $percentBase = " Percentages here are of TOTAL disk size, not of free space, so this target asks for more available space than the disk has."
+                }
+                $hint = ("The most this tool can leave free on {0} is {1}{2} -- pick that or less, or free up real space first.{3} {4}" -f ($letter + ":"), (Format-LowDiskBytes -Bytes $maxReachable), $ceilingPercentText, $percentBase, $ceilingWhy)
                 $script:LowDiskToolTip.SetToolTip($script:LowDiskApplyBtn, $hint)
 
                 # Said ONCE per distinct situation. This refresh runs on every
@@ -13694,16 +13729,21 @@ namespace WinConfigDiag {
         # beside it says which unit the number in it is being read as.
         $script:LowDiskCustomBox.Enabled = ($index -ge $customMbIndex)
         if ($index -eq $customPctIndex) {
-            $script:LowDiskUnitLabel.Text = "%"
+            $script:LowDiskUnitLabel.Text = "% of disk"
         } else {
             $script:LowDiskUnitLabel.Text = "MB"
         }
 
-        if ($index -ge 0 -and $index -lt $customMbIndex) {
+        # REFRESH FIRST, THEN THE NOTE. The note used to be logged before the
+        # refresh had decided anything, so picking an unreachable level printed
+        # its sales pitch ("Comfortable, but past the point updates and
+        # defragmentation prefer") immediately above the WARN refusing that
+        # very level. A note is advice about a level the tester can run.
+        & $script:LowDiskRefreshView
+        if ($index -ge 0 -and $index -lt $customMbIndex -and -not $script:LowDiskLastUnreachable) {
             $preset = $(if ($index -lt $absolute.Count) { $absolute[$index] } else { $percent[$index - $absolute.Count] })
             & $script:LowDiskWrite 'DIM' ("{0} - {1}" -f $preset.Label, $preset.Note)
         }
-        & $script:LowDiskRefreshView
     })
 
     # The resolved target has to keep up with typing, or the number on
