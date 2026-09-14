@@ -8667,6 +8667,9 @@ function Get-NoDeviceManagerConfigSnapshot {
         DeviceTable      = $null
         CurrentAlias     = $null
         CurrentAliasMac  = $null
+        # The name string NO stored for the current device ('NeurOptimal
+        # Arc - 000019' on 4.0.0.6/4.0.0.7; 'Arc 1' seen on 4.0.0.9).
+        CurrentLabel     = $null
         RawBase64        = $null
         RawOmittedReason = $null
         ReadStatus       = 'Missing'
@@ -8687,6 +8690,28 @@ function Get-NoDeviceManagerConfigSnapshot {
         $text = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
         $r.ComPorts     = @([regex]::Matches($text, 'COM\d{1,3}') | ForEach-Object { $_.Value } | Select-Object -Unique)
         $r.MacAddresses = @([regex]::Matches($text, '(?i)\b(?:[0-9A-F]{2}:){5}[0-9A-F]{2}\b') | ForEach-Object { $_.Value.ToUpper() } | Select-Object -Unique)
+        # LabVIEW flattened strings: 4-byte big-endian length, then the
+        # bytes. Walking them gives every string WITH its offset, which is
+        # what the label and current-alias reads below need -- a label is
+        # whatever free text NO stored, not a pattern we can predict. First
+        # seen on NO 4.0.0.9 (MMEVOLD_06, capture FE14326F3A56, 2026-09-14):
+        # the device name was 'Arc 1', and the 'NeurOptimal Arc - NNNNNN'
+        # pattern that had held on 4.0.0.6/4.0.0.7 matched nothing, so the
+        # default-device check went Undecidable on a healthy box.
+        $lvStrings = New-Object System.Collections.Generic.List[object]
+        for ($i = 0; $i -le $bytes.Length - 5; $i++) {
+            if ($bytes[$i] -ne 0 -or $bytes[$i + 1] -ne 0 -or $bytes[$i + 2] -ne 0) { continue }
+            $n = [int]$bytes[$i + 3]
+            if ($n -lt 1 -or $n -gt 64 -or ($i + 4 + $n) -gt $bytes.Length) { continue }
+            $ok = $true
+            for ($j = $i + 4; $j -lt $i + 4 + $n; $j++) { if ($bytes[$j] -lt 32 -or $bytes[$j] -gt 126) { $ok = $false; break } }
+            if (-not $ok) { continue }
+            $lvStrings.Add([pscustomobject]@{ Offset = $i; End = $i + 4 + $n; Value = $text.Substring($i + 4, $n) })
+            $i = $i + 3 + $n
+        }
+        $isTupleField = { param($v) ($v -match '^\d{6}$') -or ($v -match '^COM\d{1,3}$') -or ($v -match '(?i)^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$') }
+        # Legacy label pattern (4.0.0.6/4.0.0.7 layouts and the old
+        # space-separated fixtures) kept as-is; structural labels are added.
         $r.DeviceLabels = @([regex]::Matches($text, 'NeurOptimal Arc - \d{6}') | ForEach-Object { $_.Value } | Select-Object -Unique)
         # Per-device tuples. In the flattened blob each device record's strings
         # appear in schema order (alias digits, COM port(s), MAC) separated only
@@ -8694,25 +8719,54 @@ function Get-NoDeviceManagerConfigSnapshot {
         # bounded gap keeps a tuple from being stitched together across records.
         # The full "NeurOptimal Arc - NNNNNN" labels never match: no COM string
         # follows them within the gap.
+        $lastTupleEnd = -1
         $r.DeviceTable = @([regex]::Matches($text,
             '(\d{6})[\s\S]{1,16}?(COM\d{1,3})(?:[\s\S]{1,16}?(COM\d{1,3}))?[\s\S]{1,16}?((?i:(?:[0-9A-F]{2}:){5}[0-9A-F]{2}))') |
             ForEach-Object {
+                $m = $_
+                if ($m.Index + $m.Length -gt $lastTupleEnd) { $lastTupleEnd = $m.Index + $m.Length }
+                # The record's name field is flattened just BEFORE its serial
+                # (schema: Aliases, Type, SN, COM Port(s), MAC Address): the
+                # nearest length-prefixed free-text string ending within a
+                # few bytes of the serial's own length word. Null when the
+                # blob carries no such string (older layouts, plain fixtures).
+                $label = $null
+                $snPrefix = $m.Groups[1].Index - 4
+                foreach ($s in $lvStrings) {
+                    if ($s.End -le $snPrefix -and ($snPrefix - $s.End) -le 8 -and -not (& $isTupleField $s.Value)) { $label = $s.Value }
+                }
                 [ordered]@{
-                    Alias    = $_.Groups[1].Value
-                    ComPorts = @(@($_.Groups[2].Value, $_.Groups[3].Value) | Where-Object { $_ })
-                    Mac      = $_.Groups[4].Value.ToUpper()
+                    Alias    = $m.Groups[1].Value
+                    Label    = $label
+                    ComPorts = @(@($m.Groups[2].Value, $m.Groups[3].Value) | Where-Object { $_ })
+                    Mac      = $m.Groups[4].Value.ToUpper()
                 }
             })
+        $r.DeviceLabels = @(@($r.DeviceLabels) + @(@($r.DeviceTable) | ForEach-Object { $_.Label } | Where-Object { $_ }) | Select-Object -Unique)
         # NO's default device. HEURISTIC: the schema flattens "Current Alias"
-        # after the Devices array, so the LAST full label in the byte stream is
-        # the current one (verified against live ground truth on MMEVOLD_06,
-        # 2026-08-20). The MAC comes from the device table above, never from
-        # decimal-label -> hex-suffix arithmetic.
+        # after the Devices array, so the LAST name in the byte stream is the
+        # current one (verified against live ground truth on MMEVOLD_06,
+        # 2026-08-20 with 'NeurOptimal Arc - NNNNNN' names; 2026-09-14 on
+        # 4.0.0.9 with 'Arc 1'). The MAC comes from the device table above,
+        # never from decimal-label -> hex-suffix arithmetic. Legacy pattern
+        # first (it is the proven read on 4.0.0.6/4.0.0.7), structural read
+        # second: the last length-prefixed string after the last device
+        # tuple that equals one of the table's own labels.
         $curMatches = @([regex]::Matches($text, 'NeurOptimal Arc - (\d{6})'))
         if ($curMatches.Count -gt 0) {
             $r.CurrentAlias = $curMatches[$curMatches.Count - 1].Groups[1].Value
+            $r.CurrentLabel = $curMatches[$curMatches.Count - 1].Value
             $curRow = @($r.DeviceTable) | Where-Object { $_.Alias -eq $r.CurrentAlias } | Select-Object -First 1
             if ($curRow) { $r.CurrentAliasMac = $curRow.Mac }
+        } elseif ($lastTupleEnd -ge 0) {
+            $labels = @(@($r.DeviceTable) | ForEach-Object { $_.Label } | Where-Object { $_ })
+            $curName = $null
+            foreach ($s in $lvStrings) { if ($s.Offset -ge $lastTupleEnd -and $labels -contains $s.Value) { $curName = $s.Value } }
+            if ($curName) {
+                $r.CurrentLabel = $curName
+                $curRow = @($r.DeviceTable) | Where-Object { $_.Label -eq $curName } | Select-Object -First 1
+                if ($curRow) { $r.CurrentAlias = $curRow.Alias; $r.CurrentAliasMac = $curRow.Mac }
+            }
         }
         if ($bytes.Length -le $MaxRawBytes) {
             $r.RawBase64 = [System.Convert]::ToBase64String($bytes)

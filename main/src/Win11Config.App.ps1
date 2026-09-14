@@ -6796,7 +6796,7 @@ namespace WinConfigDiag {
                         if ($Snapshot.CurrentAlias -and $Snapshot.DeviceTable -and @($Snapshot.DeviceTable).Count -gt 0) {
                             'DefaultAliasNotInTable', "NO's current alias ($($Snapshot.CurrentAlias)) has no row in NO's own device table -- NO's cached table is stale for its default device, and NO may be opening the wrong COM ports until its Device Panel re-detects."
                         } else {
-                            'Undecidable', 'No current-alias MAC could be extracted from the config (older NO layout, or the config carries no parsed device table).'
+                            'Undecidable', 'No current-alias MAC could be extracted from the config (a NO layout the parser does not read -- 4.0.0.9 changed the name strings once already -- or the config carries no parsed device table). Read DeviceManagerConfig.RawBase64 in no-application-evidence.json before treating this as an empty table.'
                         }
                     } elseif (-not $tgtMac) {
                         'Undecidable', 'The recording has no resolved target MAC to compare against.'
@@ -7142,58 +7142,97 @@ namespace WinConfigDiag {
             # runspace calls the one vetted scan method -- top-level title +
             # enabled flag, never child windows, never content -- and adds no
             # P/Invoke surface of its own.
+            # THE title lexicon -- one table, two readers. Get-BtNoWindowClass
+            # gives the sampler its class; Get-BtNoImpliedCode gives the
+            # events row its inferred NO code. Until 2026-09-14 these were two
+            # hand-maintained if-chains that had drifted: the code table
+            # lacked the three Wake Up Arc codes and every VI-path fallback
+            # the class table had, so a VI-titled 12005 classified as an
+            # error but implied no code. First match wins; order matters.
+            #
+            # Lexicon from the 08-20..08-26 field work. 'Arc Not Detected' =
+            # 12005; 'Arc Connection Lost' = 12006 (NO holding both ports --
+            # the danger window); 'Wake Up Arc' = the normal link-raise step
+            # on a fresh Get Details (three flavours share the phrase, so the
+            # phrase alone implies no code); 'Device Details' = the Get
+            # Details success result; 'Pair Device with Retry' = the panel
+            # re-pair marker. Match on the leading phrase, never a substring
+            # of a longer unrelated title.
+            #
+            # 'Bluetooth Error' = 12012, a PAIRING-stage failure (Device Panel
+            # path, recovered by Try Again) -- proven on 3 boxes in the
+            # 2026-08-27 HS-124 campaign, where every collision-minting
+            # re-pair FIRST failed with this dialog.
+            #
+            # Discovery banner: "A new Arc device has been discovered and is
+            # ready to be paired!" with the device name + MAC in the BODY
+            # (screenshot-only) and Pair Device / Ignore this Device buttons.
+            # Fires when NO's background discovery hears an unpaired-to-this-
+            # box Arc; an Arc is discoverable for ~5 min after power-on or a
+            # button press (measured 2026-08-27..31, SP6/MM06, both Arcs), so
+            # "random" appearances are any in-range Arc entering that window.
+            # Title PROVEN by capture 4291D2CC92E3 (the unknown-window net
+            # photographed the banner): the top-level title is the VI path
+            # 'zengar_NO_device_NO Device Manager.lvlib:New Headset Discovered
+            # Notification--dialog.vi', so the key is the distinctive VI name,
+            # not a leading phrase -- the lvlib prefix is shared by other
+            # Device Manager VIs.
+            #
+            # VI-name fallback net (2026-08-31). The CLEF error-email corpus
+            # tied each dialog VI to its NO code: 'Headset Not Detected--
+            # dialog.vi' = 12005, 'Headset Connection Lost (Session)--
+            # dialog.vi' = 12006, 'Bluetooth Error--dialog.vi' = 12012, and
+            # the three 'Wake Up Arc' prompt flavours 'Headset Button Prompt -
+            # Details' = 12013 / '- Flashing' = 12014 / '- Battery' = 14036.
+            # LabVIEW can title a top-level window as the VI path instead of
+            # the display phrase -- the discovery banner is the proven case --
+            # and a VI-path title defeats every ^-anchored phrase key, so each
+            # known dialog VI is matched by its distinctive VI name.
+            $script:BtNoWindowLexicon = @(
+                @{ Pattern = '^Arc Not Detected';                                    Class = 'ErrorDialog';     Code = 12005 }
+                @{ Pattern = '^Arc Connection Lost';                                 Class = 'ErrorDialog';     Code = 12006 }
+                @{ Pattern = '^Bluetooth Error';                                     Class = 'ErrorDialog';     Code = 12012 }
+                @{ Pattern = 'New Headset Discovered Notification';                  Class = 'DiscoveryPrompt'; Code = $null }
+                @{ Pattern = '^Wake Up Arc';                                         Class = 'WakeStep';        Code = $null }
+                @{ Pattern = '^Device Details';                                      Class = 'Result';          Code = $null }
+                @{ Pattern = 'Pair Device with Retry';                               Class = 'PairRetry';       Code = $null }
+                @{ Pattern = 'Headset Not Detected--dialog';                         Class = 'ErrorDialog';     Code = 12005 }
+                @{ Pattern = 'Headset Connection Lost \(Session\)--dialog';          Class = 'ErrorDialog';     Code = 12006 }
+                @{ Pattern = 'Bluetooth Error--dialog';                              Class = 'ErrorDialog';     Code = 12012 }
+                @{ Pattern = 'Headset Button Prompt - Details';                      Class = 'WakeStep';        Code = 12013 }
+                @{ Pattern = 'Headset Button Prompt - Flashing';                     Class = 'WakeStep';        Code = 12014 }
+                @{ Pattern = 'Headset Button Prompt - Battery';                      Class = 'WakeStep';        Code = 14036 }
+            )
+            # Build provenance. The NO.exe builds every key above was OBSERVED
+            # on (captures + the CLEF corpus). On any other build the lexicon
+            # is an inference: a title it does not key falls to 'Other'
+            # silently, so the manifest states this set beside the run's own
+            # NO version and the unclassified titles it saw -- that is how a
+            # reader tells "lexicon silent" from "nothing happened". Extend
+            # ONLY after a capture on the new build has been read title by
+            # title against this table (docs/NO-BUILD-REVALIDATION.md).
+            $script:BtNoWindowLexiconProvenBuilds = @('4.0.0.6', '4.0.0.7')
+
             function script:Get-BtNoWindowClass {
                 param([string]$Title)
-                # Lexicon from the 08-20..08-26 field work. 'Arc Not Detected'
-                # = 12005 class; 'Arc Connection Lost' = 12006 (NO holding both
-                # ports -- the danger window); 'Wake Up Arc' = the normal link
-                # raise step on a fresh Get Details; 'Device Details' = the
-                # Get Details success result; 'Pair Device with Retry' = the
-                # panel re-pair marker. Match on the leading phrase, never a
-                # substring of a longer unrelated title.
                 $t = [string]$Title
-                if ($t -match '^Arc Not Detected')        { return 'ErrorDialog' }
-                if ($t -match '^Arc Connection Lost')     { return 'ErrorDialog' }
-                # 'Bluetooth Error' = 12012, a PAIRING-stage failure (Device
-                # Panel path, recovered by Try Again) -- proven on 3 boxes in
-                # the 2026-08-27 HS-124 campaign, where every collision-minting
-                # re-pair FIRST failed with this dialog.
-                if ($t -match '^Bluetooth Error')         { return 'ErrorDialog' }
-                # Discovery banner: "A new Arc device has been discovered and
-                # is ready to be paired!" with the device name + MAC in the
-                # BODY (screenshot-only) and Pair Device / Ignore this Device
-                # buttons. Fires when NO's background discovery hears an
-                # unpaired-to-this-box Arc -- and since an Arc is only
-                # discoverable for ~3.5-6 min after power-on (measured
-                # 2026-08-27, SP6 soaks, both Arcs), "random" appearances are
-                # any in-range Arc entering that window, e.g. a neighbour
-                # power-cycling theirs. Title PROVEN by capture 4291D2CC92E3
-                # (the unknown-window net photographed the banner and the
-                # timeline row carried this): the top-level title is the VI
-                # path 'zengar_NO_device_NO Device Manager.lvlib:New Headset
-                # Discovered Notification--dialog.vi', so the key is the
-                # distinctive VI name, not a leading phrase -- the lvlib
-                # prefix is shared by other Device Manager VIs.
-                if ($t -match 'New Headset Discovered Notification') { return 'DiscoveryPrompt' }
-                if ($t -match '^Wake Up Arc')             { return 'WakeStep' }
-                if ($t -match '^Device Details')          { return 'Result' }
-                if ($t -match 'Pair Device with Retry')   { return 'PairRetry' }
-                # VI-name fallback net (2026-08-31). The CLEF error-email
-                # corpus tied each dialog VI to its NO code: 'Headset Not
-                # Detected--dialog.vi' = 12005, 'Headset Connection Lost
-                # (Session)--dialog.vi' = 12006, 'Bluetooth Error--dialog.vi'
-                # = 12012, and the three 'Wake Up Arc' prompt flavors
-                # 'Headset Button Prompt - Details' = 12013 / '- Flashing' =
-                # 12014 / '- Battery' = 14036. LabVIEW can title a top-level
-                # window as the VI path instead of the display phrase -- the
-                # discovery banner above is the proven case -- and a VI-path
-                # title defeats every ^-anchored phrase key, so each known
-                # dialog VI is matched here by its distinctive VI name.
-                if ($t -match 'Headset Not Detected--dialog')                 { return 'ErrorDialog' }
-                if ($t -match 'Headset Connection Lost \(Session\)--dialog')  { return 'ErrorDialog' }
-                if ($t -match 'Bluetooth Error--dialog')                      { return 'ErrorDialog' }
-                if ($t -match 'Headset Button Prompt - (Details|Flashing|Battery)') { return 'WakeStep' }
+                foreach ($row in $script:BtNoWindowLexicon) {
+                    if ($t -match $row.Pattern) { return [string]$row.Class }
+                }
                 return 'Other'
+            }
+
+            function script:Get-BtNoImpliedCode {
+                param([string]$Title)
+                # INFERRED from the title; a typed operator Mark stays the
+                # ground truth for any code the lexicon does not imply. Null
+                # when the title implies nothing (unknown title, or a phrase
+                # shared by several codes).
+                $t = [string]$Title
+                foreach ($row in $script:BtNoWindowLexicon) {
+                    if ($t -match $row.Pattern) { return $row.Code }
+                }
+                return $null
             }
 
             function script:Start-BtNoWindowSampler {
@@ -7313,6 +7352,11 @@ namespace WinConfigDiag {
                         # distinct unknown title, small per-run cap.
                         UnknownShotTitles     = @{}
                         UnknownShotCount      = 0
+                        # Distinct unclassified titles -> appearance count
+                        # (cap 40 distinct; overflow counted). Manifest field
+                        # UnknownWindowTitles -- the per-build audit trail.
+                        UnknownTitles         = @{}
+                        UnknownTitlesOverflow = 0
                     }
                     return $true
                 } catch {
@@ -7346,10 +7390,7 @@ namespace WinConfigDiag {
                         # INFERRED from the proven title lexicon (a typed Mark
                         # stays the ground truth for any OTHER code), and the
                         # machine state at the dialog, bound below.
-                        $impliedCode = $null
-                        if ($w.Title -match '^Arc Not Detected')        { $impliedCode = 12005 }
-                        elseif ($w.Title -match '^Arc Connection Lost') { $impliedCode = 12006 }
-                        elseif ($w.Title -match '^Bluetooth Error')     { $impliedCode = 12012 }
+                        $impliedCode = script:Get-BtNoImpliedCode -Title $w.Title
                         # Pairing context, tracked BEFORE the dialog rows read
                         # it: a dialog that appears while 'Pair Device with
                         # Retry.vi' is open is a PAIRING-stage failure, not a
@@ -7378,7 +7419,7 @@ namespace WinConfigDiag {
                         # A 12012 'Bluetooth Error' during an open pair episode
                         # marks it failed-then-retried -- the discriminator the
                         # 08-27 campaign found on every minting re-pair.
-                        if ($w.State -eq 'Appeared' -and $w.Title -match '^Bluetooth Error' -and $Session -and $Session.ContainsKey('PairEpisodes')) {
+                        if ($w.State -eq 'Appeared' -and $impliedCode -eq 12012 -and $Session -and $Session.ContainsKey('PairEpisodes')) {
                             foreach ($ep in @($Session.PairEpisodes | Where-Object { -not $_.EndUtc })) { $ep.FailedThenRetried = $true }
                         }
                         $dlgSnap = $null
@@ -7401,6 +7442,20 @@ namespace WinConfigDiag {
                                 if (-not $st.ErrorTitles.Contains($w.Title)) { $st.ErrorTitles[$w.Title] = 0 }
                                 $st.ErrorTitles[$w.Title] = [int]$st.ErrorTitles[$w.Title] + 1
                                 Write-BtLog "  $(([datetime]$w.AtUtc).ToLocalTime().ToString('HH:mm:ss'))  [NO-DLG ]  NeurOptimal error dialog appeared: '$($w.Title)'" -Level 'WARN'
+                            } elseif ($cls -eq 'Other') {
+                                # Every distinct title the lexicon could not
+                                # key, with its count, for the manifest. This
+                                # is the audit trail for a NEW NO build: a
+                                # dialog whose title changed lands here, not
+                                # in ErrorDialogTitles, and nothing else
+                                # records that it happened. Distinct-title cap
+                                # keeps a title-churning window (per-second
+                                # clocks, counters) from growing the record
+                                # without bound; the overflow is counted.
+                                $ut = [string]$w.Title
+                                if ($st.UnknownTitles.Contains($ut)) { $st.UnknownTitles[$ut] = [int]$st.UnknownTitles[$ut] + 1 }
+                                elseif ($st.UnknownTitles.Count -lt 40) { $st.UnknownTitles[$ut] = 1 }
+                                else { $st.UnknownTitlesOverflow = [int]$st.UnknownTitlesOverflow + 1 }
                             }
                         } elseif ($w.State -eq 'Gone' -and $cls -eq 'ErrorDialog' -and -not $w.Baseline -and $null -ne $w.LifetimeMs -and
                             ($null -eq $st.ShortestErrorDialogMs -or [int]$w.LifetimeMs -lt [int]$st.ShortestErrorDialogMs)) {
@@ -11368,6 +11423,24 @@ namespace WinConfigDiag {
                         ShotsFired            = [int]$btNwst.ShotsFired
                         EventLinesWritten     = [int]$btNwst.EventLinesWritten
                         EventLinesSuppressed  = [int]$btNwst.EventLinesSuppressed
+                        # Build provenance (audit 2026-09-14). The lexicon
+                        # was proven on LexiconProvenBuilds; on any other
+                        # NO.exe build a retitled dialog falls to 'Other'
+                        # silently, and UnknownWindowTitles is the only place
+                        # it shows. Null NoExeVersionInLexicon = version
+                        # unknown, not "unproven".
+                        LexiconProvenBuilds   = @($script:BtNoWindowLexiconProvenBuilds)
+                        NoExeVersionInLexicon = if ($btProbeSession -and $btProbeSession.NoExeVersion) { [bool](@($script:BtNoWindowLexiconProvenBuilds) -contains [string]$btProbeSession.NoExeVersion) } else { $null }
+                        UnknownWindowTitles   = $btNwst.UnknownTitles
+                        UnknownWindowTitlesOverflow = [int]$btNwst.UnknownTitlesOverflow
+                    }
+                    if ($btProbeSession -and $btProbeSession.NoExeVersion -and -not (@($script:BtNoWindowLexiconProvenBuilds) -contains [string]$btProbeSession.NoExeVersion)) {
+                        # Stated as a finding, not just a field: a reader
+                        # judging "no error dialogs" on an unproven build
+                        # must see that the lexicon's silence is inferred.
+                        $btNwUnkList = @($btNwst.UnknownTitles.Keys | Where-Object { $_ } | Sort-Object)
+                        $btNwUnkText = if ($btNwUnkList.Count -eq 0) { 'no unclassified titles appeared' } else { "$($btNwUnkList.Count) distinct unclassified title(s) appeared: '$(@($btNwUnkList | Select-Object -First 12) -join "', '")'$(if ($btNwUnkList.Count -gt 12) { ', ...' })" }
+                        $btProbeSummary.Findings = @($btProbeSummary.Findings) + "[i] NO.exe $($btProbeSession.NoExeVersion) is not a build the window lexicon was proven on (proven: $(@($script:BtNoWindowLexiconProvenBuilds) -join ', ')). Dialog classes and inferred NO codes on this run are INFERRED; a retitled dialog would land in the manifest's UnknownWindowTitles, not in the error-dialog rows. This run: $btNwUnkText. Read them against docs/NO-BUILD-REVALIDATION.md before trusting an absence of NOWINDOW error rows."
                     }
                     $btNwErrCount = 0
                     foreach ($v in $btNwst.ErrorTitles.Values) { $btNwErrCount += [int]$v }
