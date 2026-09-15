@@ -5126,19 +5126,58 @@ $buttonHandlers = @{
             # AND once more at Stop, so a run shorter than the interval still
             # gets asked the question before the package claims an answer.
             $script:GfxMediaScanIntervalSec = 10
+            # The PIDs whose open handles count as "NO is playing this":
+            # NO.exe and its WebView2 host trees, re-read from the latest
+            # sample so a replaced host is still attributed.
+            $script:GfxMediaHolderPids = {
+                $pids = @()
+                if ($script:GfxSamples.Count -gt 0) {
+                    $latest = $script:GfxSamples[$script:GfxSamples.Count - 1]
+                    if ($latest.NoPid) { $pids += [int]$latest.NoPid }
+                    foreach ($s in @($latest.Surfaces)) { foreach ($k in 'HostPid', 'GpuPid', 'RendererPid') { if ($s.$k) { $pids += [int]$s.$k } } }
+                } elseif ($script:GfxInventory -and $script:GfxInventory.No.Pid) {
+                    $pids += [int]$script:GfxInventory.No.Pid
+                }
+                try { foreach ($h in @((Get-NoWebViewHostTree).Hosts)) { if ($h.HostPid) { $pids += [int]$h.HostPid }; foreach ($c in @($h.Children)) { if ($c.Pid) { $pids += [int]$c.Pid } } } } catch { }
+                return ,@($pids | Sort-Object -Unique)
+            }
             $script:GfxMediaScan = {
                 if (-not $script:GfxWatchRoot) { return }
                 $script:GfxLastMediaScan = Get-Date
                 try {
-                    $changed = @(Get-ChildItem -LiteralPath $script:GfxWatchRoot -Recurse -File -ErrorAction SilentlyContinue |
-                        Where-Object { -not $script:GfxMediaBaseline.ContainsKey($_.FullName) -or $_.LastAccessTimeUtc -gt $script:GfxMediaBaseline[$_.FullName] } |
-                        Sort-Object LastAccessTimeUtc -Descending | Select-Object -First 1)
-                    if ($changed.Count -gt 0 -and $changed[0].FullName -ne $script:GfxMediaFile) {
-                        $script:GfxMediaFile = $changed[0].FullName
-                        $script:GfxMediaAt = $changed[0].LastAccessTimeUtc
-                        Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'MediaFileOpened' -Data @{ file = $script:GfxMediaFile; accessedUtc = $script:GfxMediaAt.ToString('o'); method = 'LastAccessTime diff vs pre-run baseline' }
-                        & $script:GfxAddEvent "Media opened: $(Split-Path $script:GfxMediaFile -Leaf)" 'OK'
-                        Write-WinConfigGuiDiagnostic -Level INFO -Message "Media opened by NO: $(Split-Path $script:GfxMediaFile -Leaf)" -Box $script:GfxLog
+                    # FIRST: an open handle. Run D5E1D5C7 played a 33-minute
+                    # .m4a that LastAccessTime never attributed (System
+                    # Managed volumes defer the update for a file touched in
+                    # the previous hour), while the video.js host held the
+                    # file open the whole time. A handle has no such lag.
+                    $held = @()
+                    try { $held = @(Get-NoHeldMediaFiles -MediaRoot $script:GfxWatchRoot -Pids ([int[]](& $script:GfxMediaHolderPids))) } catch { $held = @() }
+                    foreach ($h in $held) {
+                        if ($script:GfxMediaHeldAtStart.ContainsKey($h.File)) { continue }
+                        if ($h.File -eq $script:GfxMediaFile) { continue }
+                        $script:GfxMediaFile = $h.File
+                        $script:GfxMediaAt = [datetime]::UtcNow
+                        $script:GfxMediaMethod = 'restart-manager-open-handle'
+                        Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'MediaFileOpened' -Data @{ file = $h.File; seenUtc = $script:GfxMediaAt.ToString('o'); holderPids = $h.HolderPids; method = $script:GfxMediaMethod }
+                        & $script:GfxAddEvent "Media opened: $(Split-Path $h.File -Leaf)" 'OK'
+                        Write-WinConfigGuiDiagnostic -Level INFO -Message "Media opened by NO: $(Split-Path $h.File -Leaf) (held open by PID $($h.HolderPids -join ', '))" -Box $script:GfxLog
+                    }
+                    $script:GfxMediaHeldNow = @($held | ForEach-Object { $_.File })
+
+                    # FALLBACK: the access-time diff, which still answers on a
+                    # box where the Restart Manager is unavailable.
+                    if (-not $script:GfxMediaFile) {
+                        $changed = @(Get-ChildItem -LiteralPath $script:GfxWatchRoot -Recurse -File -ErrorAction SilentlyContinue |
+                            Where-Object { -not $script:GfxMediaBaseline.ContainsKey($_.FullName) -or $_.LastAccessTimeUtc -gt $script:GfxMediaBaseline[$_.FullName] } |
+                            Sort-Object LastAccessTimeUtc -Descending | Select-Object -First 1)
+                        if ($changed.Count -gt 0 -and $changed[0].FullName -ne $script:GfxMediaFile) {
+                            $script:GfxMediaFile = $changed[0].FullName
+                            $script:GfxMediaAt = $changed[0].LastAccessTimeUtc
+                            $script:GfxMediaMethod = 'LastAccessTime diff vs pre-run baseline'
+                            Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'MediaFileOpened' -Data @{ file = $script:GfxMediaFile; accessedUtc = $script:GfxMediaAt.ToString('o'); method = $script:GfxMediaMethod }
+                            & $script:GfxAddEvent "Media opened: $(Split-Path $script:GfxMediaFile -Leaf)" 'OK'
+                            Write-WinConfigGuiDiagnostic -Level INFO -Message "Media opened by NO: $(Split-Path $script:GfxMediaFile -Leaf)" -Box $script:GfxLog
+                        }
                     }
                     $script:GfxMediaScanCount++
                 } catch { }
@@ -5165,7 +5204,40 @@ $buttonHandlers = @{
                                 foreach ($s in @($rec.Surfaces)) {
                                     $surfRows += @{ role = $s.Role; roleSource = $s.RoleSource; hostPid = $s.HostPid; gpuPid = $s.GpuPid; adapterLuids = $s.AdapterLuids; engines = $s.Engines; cpuPercent = $s.CpuPercent; workingSetMB = $s.WorkingSetMB; gpuMemoryMB = $s.GpuMemoryMB }
                                 }
-                                Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'Sample' -Data @{ tickMs = $rec.TickMs; state = $state; noCpuPercent = $rec.NoCpuPercent; noWorkingSetMB = $rec.NoWorkingSetMB; surfaces = $surfRows }
+                                $sampleData = @{ tickMs = $rec.TickMs; state = $state; noPid = $rec.NoPid; noCpuPercent = $rec.NoCpuPercent; noWorkingSetMB = $rec.NoWorkingSetMB; surfaces = $surfRows; noWindow = $rec.NoWindow }
+                                # The window set and the surface titles ride
+                                # in the sample ONLY when they changed, so the
+                                # package can rebuild the per-second series
+                                # without carrying the same strings 2000 times.
+                                $setKey = (@($rec.NoVisibleWindows) -join '|') + '##' + (@(@($rec.Surfaces) | ForEach-Object { "$($_.Role)=$($_.DocumentTitle)" }) -join '|')
+                                if ($setKey -ne $script:GfxLastSampleSetKey) {
+                                    $sampleData.noVisibleWindows = @($rec.NoVisibleWindows)
+                                    $sampleData.surfaceTitles = @(@($rec.Surfaces) | ForEach-Object { @{ role = $_.Role; hostPid = $_.HostPid; documentTitle = $_.DocumentTitle } })
+                                    $script:GfxLastSampleSetKey = $setKey
+                                }
+                                Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'Sample' -Data $sampleData
+
+                                # The idle clock starts at the first sample
+                                # that saw NO, not at Start: watching can begin
+                                # before NO is launched, and that stretch is
+                                # nobody's idle baseline.
+                                if ($rec.NoPid -and -not $script:GfxIdleClockStart) { $script:GfxIdleClockStart = Get-Date }
+
+                                # NO's window placement, dwell-filtered with
+                                # the same rule the summariser uses, so a
+                                # one-tick blip cannot announce a mode change.
+                                $mode = 'Unknown'
+                                if ($rec.NoWindow -and $rec.NoWindow.Mode) { $mode = [string]$rec.NoWindow.Mode }
+                                if ($mode -ne $script:GfxWindowModePending) { $script:GfxWindowModePending = $mode; $script:GfxWindowModePendingCount = 1 } else { $script:GfxWindowModePendingCount++ }
+                                if ($script:GfxWindowModePendingCount -ge $script:GfxUiDwell -and $mode -ne $script:GfxWindowMode) {
+                                    $prev = $script:GfxWindowMode
+                                    $script:GfxWindowMode = $mode
+                                    $script:GfxWindowBounds = $rec.NoWindow.Bounds
+                                    if ($null -ne $prev) {
+                                        Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'NoWindowModeChange' -Data @{ mode = $mode; previous = $prev; bounds = $rec.NoWindow.Bounds; monitorBounds = $rec.NoWindow.MonitorBounds; heldSamples = $script:GfxWindowModePendingCount; source = 'window-placement' }
+                                        & $script:GfxAddEvent "Window: $prev -> $mode$(if ($rec.NoWindow.Bounds) { " ($($rec.NoWindow.Bounds))" })" 'INFO'
+                                    }
+                                }
 
                                 # NO's own visible window titles. The titles
                                 # common to the first few samples are this box's
@@ -5189,25 +5261,43 @@ $buttonHandlers = @{
                                     # this repo keeps paying for. One rule,
                                     # read from the module, for both.
                                     $added = @($titles | Where-Object { $script:GfxUiBaseline -notcontains $_ } | Sort-Object -Unique)
-                                    $addedKey = ($added -join '|')
-                                    if ($addedKey -ne (@($script:GfxUiPendingAdded) -join '|')) {
+                                    $removed = @($script:GfxUiBaseline | Where-Object { $titles -notcontains $_ } | Sort-Object -Unique)
+                                    $addedKey = ($added -join '|') + '##' + ($removed -join '|')
+                                    if ($addedKey -ne $script:GfxUiPendingKey) {
+                                        $script:GfxUiPendingKey = $addedKey
                                         $script:GfxUiPendingAdded = $added
                                         $script:GfxUiPendingCount = 1
                                     } else {
                                         $script:GfxUiPendingCount++
                                     }
 
-                                    if ($script:GfxUiPendingCount -ge $script:GfxUiDwell -and $addedKey -ne (@($script:GfxUiAdded) -join '|')) {
-                                        $script:GfxUiAdded = $added
-                                        Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'NoWindowSetChange' -Data @{ added = $added; baseline = $script:GfxUiBaseline; heldSamples = $script:GfxUiPendingCount }
+                                    if ($script:GfxUiPendingCount -ge $script:GfxUiDwell -and $addedKey -ne $script:GfxUiConfirmedKey) {
+                                        $script:GfxUiConfirmedKey = $addedKey
+                                        $returned = (($added.Count + $removed.Count) -eq 0)
+                                        if ($added.Count -gt 0) { $script:GfxUiAdded = $added }
+                                        Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'NoWindowSetChange' -Data @{ added = $added; removed = $removed; returnedToBaseline = $returned; baseline = $script:GfxUiBaseline; heldSamples = $script:GfxUiPendingCount }
                                         if ($added.Count -gt 0) {
                                             # The split instant is kept so the
                                             # coverage line can report the idle
                                             # arm it actually held, rather than
                                             # the whole elapsed run.
-                                            if (-not $script:GfxSessionSplitAt) { $script:GfxSessionSplitAt = Get-Date }
-                                            & $script:GfxAddEvent "Session detected: NO opened $($added -join ', ')" 'OK'
-                                            Write-WinConfigGuiDiagnostic -Level OK -Message "Session detected -- NO opened: $($added -join ', ')" -Box $script:GfxLog
+                                            if (-not $script:GfxSessionSplitAt) {
+                                                $script:GfxSessionSplitAt = Get-Date
+                                                & $script:GfxAddEvent "Session detected: NO opened $($added -join ', ')" 'OK'
+                                                Write-WinConfigGuiDiagnostic -Level OK -Message "Session detected -- NO opened: $($added -join ', ')" -Box $script:GfxLog
+                                            } elseif (-not $script:GfxSessionEndAt -and (@($added | Where-Object { $_ -imatch 'Session Complete' }).Count -gt 0)) {
+                                                # NO said the session is over.
+                                                # The session arm closes here;
+                                                # what follows is the operator
+                                                # reading the result.
+                                                $script:GfxSessionEndAt = Get-Date
+                                                & $script:GfxAddEvent 'Session complete (NO dialog)' 'OK'
+                                                Write-WinConfigGuiDiagnostic -Level OK -Message "Session complete -- NO opened: $($added -join ', '). Press Stop when you are ready." -Box $script:GfxLog
+                                            } else {
+                                                & $script:GfxAddEvent "NO opened $($added -join ', ')" 'INFO'
+                                            }
+                                        } elseif ($returned) {
+                                            & $script:GfxAddEvent 'NO window set back to baseline' 'INFO'
                                         }
                                     }
                                 }
@@ -5247,13 +5337,29 @@ $buttonHandlers = @{
                     # nowhere -- Get-GraphicsBenchCoverage owns every word.
                     $elapsed = ((Get-Date) - $script:GfxRunStart).TotalSeconds
                     $script:GfxClock.Text = Format-GraphicsDuration $elapsed
-                    $sessionSeen = (@($script:GfxUiAdded).Count -gt 0)
-                    $idleSec = $elapsed
-                    if ($sessionSeen -and $script:GfxSessionSplitAt) { $idleSec = ($script:GfxSessionSplitAt - $script:GfxRunStart).TotalSeconds }
+                    $sessionSeen = [bool]$script:GfxSessionSplitAt
+                    $noRunning = [bool]$script:GfxIdleClockStart
+                    $idleSec = $null
+                    if ($noRunning) {
+                        $idleSec = ((Get-Date) - $script:GfxIdleClockStart).TotalSeconds
+                        if ($sessionSeen) { $idleSec = [math]::Max(0, ($script:GfxSessionSplitAt - $script:GfxIdleClockStart).TotalSeconds) }
+                    }
                     $countersOk = $null
                     if ($latest) { $countersOk = [bool]$latest.CountersOk }
-                    & $script:GfxSetCoverage (Get-GraphicsBenchCoverage -Phase 'Watching' -IdleSec $idleSec -SessionDetected $sessionSeen -StartedMidSession ($script:GfxPreRun.SessionLikely -eq 'Yes') -CountersOk $countersOk)
-                    $script:GfxStatus.Text = ("{0} samples  |  activity {1}" -f $script:GfxSamples.Count, (Format-GraphicsValue $script:GfxLastState))
+                    $coverage = Get-GraphicsBenchCoverage -Phase 'Watching' -IdleSec $idleSec -SessionDetected $sessionSeen -StartedMidSession ($script:GfxPreRun.SessionLikely -eq 'Yes') -CountersOk $countersOk -NoRunning $noRunning
+                    & $script:GfxSetCoverage $coverage
+                    # The green line is announced ONCE in the log and the
+                    # timeline, for an operator whose eyes are on NO rather
+                    # than on this window.
+                    if ($coverage.State -eq 'BaselineReady' -and -not $script:GfxIdleFloorAnnounced) {
+                        $script:GfxIdleFloorAnnounced = $true
+                        Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'IdleBaselineReady' -Data @{ idleSec = [math]::Round($idleSec, 1); floorSec = (Get-GfxIdleFloorSec) }
+                        & $script:GfxAddEvent 'Idle baseline solid -- start your session' 'OK'
+                        Write-WinConfigGuiDiagnostic -Level OK -Message "Idle baseline solid -- start your session now." -Box $script:GfxLog
+                    }
+                    $windowText = ''
+                    if ($script:GfxWindowMode -and $script:GfxWindowMode -ne 'Unknown') { $windowText = "  |  window $($script:GfxWindowMode)$(if ($script:GfxWindowBounds) { " $($script:GfxWindowBounds)" })" }
+                    $script:GfxStatus.Text = ("{0} samples  |  activity {1}{2}" -f $script:GfxSamples.Count, (Format-GraphicsValue $script:GfxLastState), $windowText)
                 } catch {
                     # A tick failure must not kill the run: the sampler keeps
                     # collecting and the next tick may well succeed. Surface it
@@ -5274,12 +5380,25 @@ $buttonHandlers = @{
                     $script:GfxUiAdded = @()
                     $script:GfxUiPendingAdded = @()
                     $script:GfxUiPendingCount = 0
+                    $script:GfxUiPendingKey = $null
+                    $script:GfxUiConfirmedKey = ''
                     $script:GfxUiDwell = Get-GfxUiChangeDwellSamples
                     $script:GfxLastState = $null
                     $script:GfxSessionSplitAt = $null
+                    $script:GfxSessionEndAt = $null
+                    $script:GfxIdleClockStart = $null
+                    $script:GfxIdleFloorAnnounced = $false
+                    $script:GfxWindowMode = $null
+                    $script:GfxWindowBounds = $null
+                    $script:GfxWindowModePending = $null
+                    $script:GfxWindowModePendingCount = 0
+                    $script:GfxLastSampleSetKey = $null
                     $script:GfxEvents.Clear()
                     $script:GfxMediaFile = $null
                     $script:GfxMediaAt = $null
+                    $script:GfxMediaMethod = $null
+                    $script:GfxMediaHeldAtStart = @{}
+                    $script:GfxMediaHeldNow = @()
                     $script:GfxMediaScanCount = 0
                     # Back-dated so the first media scan lands early in the run
                     # rather than one whole interval in: at a 30 s interval a
@@ -5311,6 +5430,18 @@ $buttonHandlers = @{
                             $script:GfxMediaRootSource = 'refused'
                         }
                     }
+                    # Files NO's tree ALREADY holds open when watching begins
+                    # are not "opened during the run": after run D5E1D5C7 the
+                    # video.js host still held the played .m4a with NO idle.
+                    # They are recorded as held-at-start, never as the run's.
+                    if ($script:GfxWatchRoot) {
+                        try {
+                            foreach ($h in @(Get-NoHeldMediaFiles -MediaRoot $script:GfxWatchRoot -Pids ([int[]](& $script:GfxMediaHolderPids)))) { $script:GfxMediaHeldAtStart[$h.File] = @($h.HolderPids) }
+                        } catch { }
+                        if ($script:GfxMediaHeldAtStart.Count -gt 0) {
+                            Write-WinConfigGuiDiagnostic -Level DIM -Message "video.js already has loaded: $(@($script:GfxMediaHeldAtStart.Keys | ForEach-Object { Split-Path $_ -Leaf }) -join ', ') (held open before watching began; not counted as this run's media)" -Box $script:GfxLog
+                        }
+                    }
 
                     # The floors the classifiers will use, read from the
                     # module rather than restated here. A threshold recorded
@@ -5320,7 +5451,9 @@ $buttonHandlers = @{
 
                     Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'RunStart' -Data @{
                         runId = $script:GfxRun.RunId; intervalMs = 1000; runMode = 'Session'; surface = 'app'
-                        visualizerFloorPercent = $gfxFloors.VisualizerFloorPercent; mediaFloorPercent = $gfxFloors.MediaFloorPercent
+                        visualizerFloorPercent = $gfxFloors.VisualizerFloorPercent; mediaFloorPercent = $gfxFloors.MediaFloorPercent; audioUiFloorPercent = $gfxFloors.AudioUiFloorPercent
+                        idleFloorSec = (Get-GfxIdleFloorSec); uiChangeDwellSamples = $script:GfxUiDwell
+                        mediaHeldAtStart = @($script:GfxMediaHeldAtStart.Keys)
                         inventory = $script:GfxInventory
                         # What the tool believed about NO BEFORE it started.
                         # A reader of the package should not have to guess
@@ -5355,7 +5488,7 @@ $buttonHandlers = @{
                 try { if ($script:GfxInventory.Cohort -and $script:GfxInventory.Cohort.Key) { $gfxCohortText = "   cohort: $($script:GfxInventory.Cohort.Key)" } } catch { }
                 $script:GfxRunIdLabel.Text = "Run ID: $($script:GfxRun.RunId)$gfxCohortText"
                 & $script:GfxSetVerdict (Get-GraphicsBenchVerdict -Phase 'Watching')
-                & $script:GfxSetCoverage (Get-GraphicsBenchCoverage -Phase 'Watching' -IdleSec 0 -StartedMidSession ($script:GfxPreRun.SessionLikely -eq 'Yes'))
+                & $script:GfxSetCoverage (Get-GraphicsBenchCoverage -Phase 'Watching' -IdleSec 0 -StartedMidSession ($script:GfxPreRun.SessionLikely -eq 'Yes') -NoRunning ([bool]$script:GfxInventory.No.Pid))
                 & $script:GfxAddEvent 'Watching started' 'OK'
                 # The instruction follows the pre-run reading. Repeating "leave
                 # NO idle" at an operator whose session is already running is
@@ -5364,7 +5497,9 @@ $buttonHandlers = @{
                     Write-WinConfigGuiDiagnostic -Level WARN -Message "Watching, but NO was already busy when this started -- this run will have NO idle baseline and will report totals only." -Box $script:GfxLog
                     Write-WinConfigGuiDiagnostic -Level ACTION -Message "Press Stop when the session ends. For a run with a session cost in it, start watching before the NEXT session begins." -Box $script:GfxLog
                 } else {
-                    Write-WinConfigGuiDiagnostic -Level STEP -Message "Watching. Leave NO IDLE for about a minute -- that idle stretch is what the session is measured against -- then start your session and press Stop when it ends." -Box $script:GfxLog
+                    # The floor is the module's; the cue is the coverage line
+                    # turning green, which is what "about a minute" never gave.
+                    Write-WinConfigGuiDiagnostic -Level STEP -Message "Watching. Leave NO IDLE until the coverage line turns green (about $(Get-GfxIdleFloorSec) s) -- that idle stretch is what the session is measured against -- then start your session and press Stop when it ends." -Box $script:GfxLog
                 }
             })
 
@@ -5399,7 +5534,13 @@ $buttonHandlers = @{
                         rootSource  = $script:GfxMediaRootSource
                         file        = $script:GfxMediaFile
                         accessedUtc = $(if ($script:GfxMediaAt) { $script:GfxMediaAt.ToString('o') } else { $null })
-                        method      = 'LastAccessTime diff vs pre-run baseline'
+                        # Which channel answered. Absent when none did, so a
+                        # reader never sees a method named for a file it
+                        # did not find.
+                        method      = $script:GfxMediaMethod
+                        methodsTried = @('restart-manager-open-handle', 'LastAccessTime diff vs pre-run baseline')
+                        heldAtStart = @($script:GfxMediaHeldAtStart.Keys)
+                        heldAtStop  = @($script:GfxMediaHeldNow)
                         labelled    = [bool]$script:GfxMediaFile
                         scanCount   = $script:GfxMediaScanCount
                     }
@@ -5438,7 +5579,7 @@ $buttonHandlers = @{
                         startedUtc  = $script:GfxRunStart.ToUniversalTime().ToString('o')
                         endedUtc    = [datetime]::UtcNow.ToString('o')
                         intervalMs  = 1000
-                        thresholds  = @{ visualizerFloorPercent = $gfxFloors.VisualizerFloorPercent; mediaFloorPercent = $gfxFloors.MediaFloorPercent }
+                        thresholds  = @{ visualizerFloorPercent = $gfxFloors.VisualizerFloorPercent; mediaFloorPercent = $gfxFloors.MediaFloorPercent; audioUiFloorPercent = $gfxFloors.AudioUiFloorPercent; idleFloorSec = (Get-GfxIdleFloorSec) }
                         cdpAttached = $false
                         inventory   = $script:GfxInventory
                         nompConfig  = @{ Path = $script:GfxNomp.Path; Exists = $script:GfxNomp.Exists; Sha256 = $script:GfxNomp.Sha256; SchemaKeysPresent = $script:GfxNomp.SchemaKeysPresent; ValuesReadable = $script:GfxNomp.ValuesReadable; ValuesReason = $script:GfxNomp.ValuesReason }

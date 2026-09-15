@@ -47,6 +47,21 @@ $script:GfxDeniedPathRoots = @('C:\zengar\sessions', 'C:\zengar\BLT_data')
 $script:GfxVisualizerFloorPercent = 1.0
 $script:GfxMediaFloorPercent = 0.3
 
+# Audio playback has no decode engine to show up on. What it DOES show, on
+# run D5E1D5C7 (MMEVOLD_06, NO 4.0.0.9, 33-minute .m4a session): the video.js
+# surface's 3D engine sat at 0% through the idle arm and 1.1-1.3% for every
+# minute of playback -- the player's own control bar and progress redraw. That
+# step is the only passive graphics signal an audio-only session leaves, so it
+# is read against its own floor, well under the reading and well over noise.
+$script:GfxAudioUiFloorPercent = 0.5
+
+# How long the idle arm should be before a session starts. Every number the
+# tool reports is a difference against this stretch, so a short one makes the
+# deltas noisy. Sixty seconds is sixty samples at the 1 s tick; the coverage
+# line counts up to it and turns green when it is reached, so the operator is
+# never left guessing when "about a minute" has passed.
+$script:GfxIdleFloorSec = 60
+
 # ---------------------------------------------------------------------------
 # Guards and small helpers
 # ---------------------------------------------------------------------------
@@ -146,9 +161,9 @@ using System.Runtime.InteropServices;
 
 namespace WinConfigDiag {
     // Reads window METADATA only: handle, owning pid, class name, title bar
-    // text. Never window content, never child controls of a LabVIEW front
-    // panel, never a pixel. No window is created, moved, shown, hidden,
-    // activated or messaged.
+    // text, placement (rect, show state, style bits, nearest monitor). Never
+    // window content, never child controls of a LabVIEW front panel, never a
+    // pixel. No window is created, moved, shown, hidden, activated or messaged.
     public static class GfxWindowScan {
         [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc f, IntPtr l);
         [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr p, EnumWindowsProc f, IntPtr l);
@@ -156,11 +171,35 @@ namespace WinConfigDiag {
         [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder t, int m);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, System.Text.StringBuilder t, int m);
+        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+        [DllImport("user32.dll")] static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT p);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr m, ref MONITORINFO i);
+        // GetWindowLongW is present on both bitnesses and the style word is
+        // 32 bits wide, so the Ptr variant is not needed.
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLongW(IntPtr h, int i);
         delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
+
+        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+        [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+        [StructLayout(LayoutKind.Sequential)] public struct WINDOWPLACEMENT { public uint length, flags, showCmd; public POINT ptMin, ptMax; public RECT rcNormal; }
+        [StructLayout(LayoutKind.Sequential)] public struct MONITORINFO { public uint cbSize; public RECT rcMonitor, rcWork; public uint dwFlags; }
 
         static string Title(IntPtr h) { System.Text.StringBuilder sb = new System.Text.StringBuilder(512); GetWindowTextW(h, sb, 512); return sb.ToString(); }
         static string Cls(IntPtr h) { System.Text.StringBuilder sb = new System.Text.StringBuilder(256); GetClassNameW(h, sb, 256); return sb.ToString(); }
         static uint Pid(IntPtr h) { uint p; GetWindowThreadProcessId(h, out p); return p; }
+        static string Rect(RECT r) { return r.L + "," + r.T + "," + r.R + "," + r.B; }
+
+        // Placement of one top-level window, as one row. Every field is a
+        // read; a failed read leaves its field empty rather than zero.
+        static string Geom(IntPtr h, bool hasSurface) {
+            string show = ""; string rect = ""; string mon = ""; string style = "";
+            try { WINDOWPLACEMENT wp = new WINDOWPLACEMENT(); wp.length = (uint)Marshal.SizeOf(typeof(WINDOWPLACEMENT)); if (GetWindowPlacement(h, ref wp)) { show = wp.showCmd.ToString(); } } catch { }
+            try { RECT r; if (GetWindowRect(h, out r)) { rect = Rect(r); } } catch { }
+            try { IntPtr m = MonitorFromWindow(h, 2 /* MONITOR_DEFAULTTONEAREST */); MONITORINFO mi = new MONITORINFO(); mi.cbSize = (uint)Marshal.SizeOf(typeof(MONITORINFO)); if (m != IntPtr.Zero && GetMonitorInfoW(m, ref mi)) { mon = Rect(mi.rcMonitor); } } catch { }
+            try { style = GetWindowLongW(h, -16 /* GWL_STYLE */).ToString("X8"); } catch { }
+            return "NOGEOM|" + h.ToInt64() + "|" + show + "|" + rect + "|" + mon + "|" + style + "|" + (hasSurface ? "1" : "0");
+        }
 
         // One pass over the host process's top-level windows plus their
         // descendants. Rows are pipe-delimited; the caller parses.
@@ -174,19 +213,26 @@ namespace WinConfigDiag {
         //   D3DWIN|<owningPid>
         //       an "Intermediate D3D Window" descendant -- the compositing
         //       GPU process, corroborating process parentage
+        //   NOGEOM|<hwnd>|<showCmd>|<l,t,r,b>|<monitor l,t,r,b>|<style hex>|<hasSurface 0/1>
+        //       placement of every VISIBLE top-level window owned by hostPid;
+        //       hasSurface says a WebView2 visual host lives under it. A
+        //       separate row kind so the NOWIN contract is untouched.
         public static string[] Scan(int hostPid) {
             List<string> rows = new List<string>();
             EnumWindows(delegate(IntPtr top, IntPtr l) {
                 if (Pid(top) != (uint)hostPid) { return true; }
-                rows.Add("NOWIN|" + top.ToInt64() + "|" + (IsWindowVisible(top) ? "1" : "0") + "|" + Cls(top) + "|" + Title(top));
+                bool visible = IsWindowVisible(top);
+                bool hasSurface = false;
+                rows.Add("NOWIN|" + top.ToInt64() + "|" + (visible ? "1" : "0") + "|" + Cls(top) + "|" + Title(top));
                 EnumChildWindows(top, delegate(IntPtr c, IntPtr l2) {
                     uint cp = Pid(c);
                     if (cp == (uint)hostPid) { return true; }
                     string cls = Cls(c);
-                    if (cls == "Chrome_WidgetWin_1") { rows.Add("SURFACE|" + cp + "|" + c.ToInt64() + "|" + Title(c)); }
+                    if (cls == "Chrome_WidgetWin_1") { hasSurface = true; rows.Add("SURFACE|" + cp + "|" + c.ToInt64() + "|" + Title(c)); }
                     else if (cls == "Intermediate D3D Window") { rows.Add("D3DWIN|" + cp); }
                     return true;
                 }, IntPtr.Zero);
+                if (visible) { rows.Add(Geom(top, hasSurface)); }
                 return true;
             }, IntPtr.Zero);
             return rows.ToArray();
@@ -210,7 +256,9 @@ function ConvertFrom-GfxWindowScanRows {
         The raw pipe-delimited rows.
     .OUTPUTS
         Hashtable: Surfaces (HostPid/Hwnd/DocumentTitle/Role/RoleSource),
-        D3DPids, NoWindows (Hwnd/Visible/Class/Title).
+        D3DPids, NoWindows (Hwnd/Visible/Class/Title), Geometry
+        (Hwnd/ShowCmd/Rect/Monitor/Style/HasSurface) for the visible
+        top-level windows.
     #>
     [CmdletBinding()]
     param([string[]]$Rows)
@@ -218,6 +266,7 @@ function ConvertFrom-GfxWindowScanRows {
     $surfaces = @()
     $d3d = @()
     $noWindows = @()
+    $geometry = @()
 
     foreach ($row in @($Rows)) {
         if ([string]::IsNullOrEmpty($row)) { continue }
@@ -249,6 +298,10 @@ function ConvertFrom-GfxWindowScanRows {
                 if ($p.Count -lt 2) { break }
                 $d3d += [int]$p[1]
             }
+            'NOGEOM' {
+                $g = ConvertFrom-GfxGeometryRow -Row $row
+                if ($g) { $geometry += $g }
+            }
         }
     }
 
@@ -256,7 +309,126 @@ function ConvertFrom-GfxWindowScanRows {
         Surfaces  = $surfaces
         D3DPids   = @($d3d | Sort-Object -Unique)
         NoWindows = $noWindows
+        Geometry  = $geometry
     }
+}
+
+function ConvertFrom-GfxGeometryRow {
+    <#
+    .SYNOPSIS
+        Parses one NOGEOM row. Returns $null for a malformed row; a field the
+        scan could not read stays $null rather than 0.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Row)
+
+    $p = $Row -split '\|', 7
+    if ($p.Count -lt 7 -or $p[0] -ne 'NOGEOM') { return $null }
+    $hwnd = 0L
+    if (-not [long]::TryParse($p[1], [ref]$hwnd)) { return $null }
+    $rect = ConvertFrom-GfxRectText -Text $p[3]
+    $mon = ConvertFrom-GfxRectText -Text $p[4]
+    $show = $null
+    $tmp = 0
+    if ([int]::TryParse($p[2], [ref]$tmp)) { $show = $tmp }
+    $style = $null
+    try { if (-not [string]::IsNullOrWhiteSpace($p[5])) { $style = [Convert]::ToInt64($p[5], 16) } } catch { }
+    return @{ Hwnd = $hwnd; ShowCmd = $show; Rect = $rect; Monitor = $mon; Style = $style; HasSurface = ($p[6] -eq '1') }
+}
+
+function ConvertFrom-GfxRectText {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $q = $Text -split ','
+    if ($q.Count -ne 4) { return $null }
+    $v = @()
+    foreach ($x in $q) { $n = 0; if (-not [int]::TryParse($x, [ref]$n)) { return $null }; $v += $n }
+    return @{ L = $v[0]; T = $v[1]; R = $v[2]; B = $v[3] }
+}
+
+function Get-GfxWindowMode {
+    <#
+    .SYNOPSIS
+        Classifies one top-level window's placement as Minimized / Maximized /
+        FullScreen / Windowed, from its geometry row alone. Pure.
+    .DESCRIPTION
+        The GPU cost of a pane plausibly depends on how much of the screen it
+        covers, and an operator can toggle that mid-session. The classes:
+
+          Minimized   showCmd 2 (SW_SHOWMINIMIZED)
+          Maximized   showCmd 3 (SW_SHOWMAXIMIZED), or a captioned window whose
+                      rect exactly covers its monitor (a borderless-maximized
+                      LabVIEW panel reads the same as maximized -- documented
+                      edge, judged the same way)
+          FullScreen  rect covers the monitor (within 1 px) and the style has
+                      no WS_CAPTION -- the shape a "full screen" toggle leaves
+          Windowed    anything else
+
+        Bounds is the window's own WxH in physical pixels (the app is
+        DPI-aware, and so is the monitor rect it is compared against).
+    .OUTPUTS
+        Hashtable: Mode, Bounds ('WxH'), MonitorBounds ('WxH'), Hwnd,
+        HasSurface. Mode 'Unknown' when the row carried no usable rect.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Geometry)
+
+    $r = @{ Mode = 'Unknown'; Bounds = $null; MonitorBounds = $null; Hwnd = $Geometry.Hwnd; HasSurface = [bool]$Geometry.HasSurface }
+    $rect = $Geometry.Rect
+    $mon = $Geometry.Monitor
+    if ($rect) { $r.Bounds = "$($rect.R - $rect.L)x$($rect.B - $rect.T)" }
+    if ($mon) { $r.MonitorBounds = "$($mon.R - $mon.L)x$($mon.B - $mon.T)" }
+
+    if ($Geometry.ShowCmd -eq 2) { $r.Mode = 'Minimized'; return $r }
+    if ($Geometry.ShowCmd -eq 3) { $r.Mode = 'Maximized'; return $r }
+    if (-not $rect) { return $r }
+
+    $coversMonitor = $false
+    if ($mon) {
+        $coversMonitor = ([math]::Abs($rect.L - $mon.L) -le 1 -and [math]::Abs($rect.T - $mon.T) -le 1 -and
+                          [math]::Abs($rect.R - $mon.R) -le 1 -and [math]::Abs($rect.B - $mon.B) -le 1)
+    }
+    if ($coversMonitor) {
+        $hasCaption = $false
+        if ($null -ne $Geometry.Style) { $hasCaption = (([long]$Geometry.Style -band 0x00C00000) -eq 0x00C00000) }
+        $r.Mode = if ($hasCaption) { 'Maximized' } else { 'FullScreen' }
+        return $r
+    }
+    $r.Mode = 'Windowed'
+    return $r
+}
+
+function Select-GfxPrimaryNoWindow {
+    <#
+    .SYNOPSIS
+        Picks the one NO top-level window whose placement the run records:
+        the window hosting a WebView2 surface, else the largest visible one.
+    .OUTPUTS
+        The Get-GfxWindowMode record, or $null when there is no visible
+        top-level window.
+    #>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][array]$Geometry)
+
+    $best = $null
+    $bestArea = -1L
+    $bestSurface = $false
+    foreach ($g in @($Geometry)) {
+        if ($null -eq $g) { continue }
+        # A minimized window has a rect off-screen; treat its area as zero so
+        # a visible sibling wins, but keep it as a last resort.
+        $area = 0L
+        if ($g.Rect -and $g.ShowCmd -ne 2) { $area = [long]([math]::Max(0, $g.Rect.R - $g.Rect.L)) * [long]([math]::Max(0, $g.Rect.B - $g.Rect.T)) }
+        $surf = [bool]$g.HasSurface
+        $better = $false
+        if ($null -eq $best) { $better = $true }
+        elseif ($surf -and -not $bestSurface) { $better = $true }
+        elseif ($surf -eq $bestSurface -and $area -gt $bestArea) { $better = $true }
+        if ($better) { $best = $g; $bestArea = $area; $bestSurface = $surf }
+    }
+    if ($null -eq $best) { return $null }
+    return (Get-GfxWindowMode -Geometry $best)
 }
 
 function Get-GfxSurfaceRoleFromTitle {
@@ -553,12 +725,36 @@ function Start-GraphicsSampler {
 
                 $surfaces = @()
                 $noWindows = @()
+                $noWindow = @{ Mode = 'Unknown'; Bounds = $null; MonitorBounds = $null; Hwnd = $null }
+                $geomBest = $null; $geomBestArea = -1; $geomBestSurface = $false
                 if ($noPid -gt 0) {
                     $rows = @()
                     try { $rows = [WinConfigDiag.GfxWindowScan]::Scan($noPid) } catch { }
                     $seen = @{}
                     foreach ($row in $rows) {
                         $kind = ($row -split '\|', 2)[0]
+                        if ($kind -eq 'NOGEOM') {
+                            # Inline twin of Get-GfxWindowMode / Select-GfxPrimaryNoWindow
+                            # (the runspace is self-contained by design). Prefer
+                            # the window hosting a surface, then the largest.
+                            $g = $row -split '\|', 7
+                            if ($g.Count -lt 7) { continue }
+                            $rq = $g[3] -split ','; $mq = $g[4] -split ','
+                            $rect = $null; $mon = $null
+                            if ($rq.Count -eq 4) { try { $rect = @{ L = [int]$rq[0]; T = [int]$rq[1]; R = [int]$rq[2]; B = [int]$rq[3] } } catch { $rect = $null } }
+                            if ($mq.Count -eq 4) { try { $mon = @{ L = [int]$mq[0]; T = [int]$mq[1]; R = [int]$mq[2]; B = [int]$mq[3] } } catch { $mon = $null } }
+                            $show = -1; try { $show = [int]$g[2] } catch { }
+                            $style = $null; try { if ($g[5]) { $style = [Convert]::ToInt64($g[5], 16) } } catch { }
+                            $surf = ($g[6] -eq '1')
+                            $area = 0L
+                            if ($rect -and $show -ne 2) { $area = [long]([math]::Max(0, $rect.R - $rect.L)) * [long]([math]::Max(0, $rect.B - $rect.T)) }
+                            $better = $false
+                            if ($null -eq $geomBest) { $better = $true }
+                            elseif ($surf -and -not $geomBestSurface) { $better = $true }
+                            elseif ($surf -eq $geomBestSurface -and $area -gt $geomBestArea) { $better = $true }
+                            if ($better) { $geomBest = @{ Rect = $rect; Mon = $mon; Show = $show; Style = $style; Hwnd = [long]$g[1] }; $geomBestArea = $area; $geomBestSurface = $surf }
+                            continue
+                        }
                         if ($kind -eq 'SURFACE') {
                             $p2 = $row -split '\|', 4
                             if ($p2.Count -lt 4) { continue }
@@ -574,6 +770,25 @@ function Start-GraphicsSampler {
                             $p2 = $row -split '\|', 5
                             if ($p2.Count -lt 5) { continue }
                             if ($p2[2] -eq '1' -and -not [string]::IsNullOrWhiteSpace($p2[4])) { $noWindows += [string]$p2[4] }
+                        }
+                    }
+                    if ($geomBest) {
+                        $noWindow.Hwnd = $geomBest.Hwnd
+                        if ($geomBest.Rect) { $noWindow.Bounds = "$($geomBest.Rect.R - $geomBest.Rect.L)x$($geomBest.Rect.B - $geomBest.Rect.T)" }
+                        if ($geomBest.Mon) { $noWindow.MonitorBounds = "$($geomBest.Mon.R - $geomBest.Mon.L)x$($geomBest.Mon.B - $geomBest.Mon.T)" }
+                        if ($geomBest.Show -eq 2) { $noWindow.Mode = 'Minimized' }
+                        elseif ($geomBest.Show -eq 3) { $noWindow.Mode = 'Maximized' }
+                        elseif ($geomBest.Rect) {
+                            $covers = $false
+                            if ($geomBest.Mon) {
+                                $rr = $geomBest.Rect; $mm = $geomBest.Mon
+                                $covers = ([math]::Abs($rr.L - $mm.L) -le 1 -and [math]::Abs($rr.T - $mm.T) -le 1 -and [math]::Abs($rr.R - $mm.R) -le 1 -and [math]::Abs($rr.B - $mm.B) -le 1)
+                            }
+                            if ($covers) {
+                                $cap = $false
+                                if ($null -ne $geomBest.Style) { $cap = (([long]$geomBest.Style -band 0x00C00000) -eq 0x00C00000) }
+                                $noWindow.Mode = if ($cap) { 'Maximized' } else { 'FullScreen' }
+                            } else { $noWindow.Mode = 'Windowed' }
                         }
                     }
                 }
@@ -741,6 +956,7 @@ function Start-GraphicsSampler {
                     NoWorkingSetMB   = $noWs
                     NoCpuPercent     = $noCpu
                     NoVisibleWindows = $noWindows
+                    NoWindow         = $noWindow
                     Surfaces         = $sampleSurfaces
                     CountersOk       = $engineOk
                     CounterReason    = $counterReason
@@ -816,6 +1032,18 @@ function Get-GfxUiChangeDwellSamples {
     [CmdletBinding()]
     param()
     return $script:GfxUiChangeDwellSamples
+}
+
+function Get-GfxIdleFloorSec {
+    <#
+    .SYNOPSIS
+        Seconds of idle arm the coverage line asks for before it turns green.
+        The single source for the live line, the Start instruction and the
+        short-idle finding.
+    #>
+    [CmdletBinding()]
+    param()
+    return $script:GfxIdleFloorSec
 }
 
 function ConvertTo-GfxLuidKey {
@@ -1196,6 +1424,124 @@ function Get-NoOpenedMediaFile {
     return $result
 }
 
+function Initialize-GfxRestartManager {
+    <#
+    .SYNOPSIS
+        Compiles the inline Restart Manager helper (read-only: list, never
+        shut down).
+    .DESCRIPTION
+        Same discipline as Initialize-GfxWindowScan: Add-Type is AppDomain
+        wide, so the caller compiles once on the main thread. The dist ships
+        text only, hence inline C#.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ('WinConfigDiag.GfxRestartManager' -as [type]) { return $true }
+    try {
+        $source = @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace WinConfigDiag {
+    // Asks the Restart Manager which processes hold the given files open.
+    // RmGetList is a QUERY; RmShutdown / RmRestart are never referenced
+    // here, so nothing this type can do closes a handle or a process.
+    public static class GfxRestartManager {
+        [StructLayout(LayoutKind.Sequential)] struct RM_UNIQUE_PROCESS { public int dwProcessId; public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct RM_PROCESS_INFO {
+            public RM_UNIQUE_PROCESS Process;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string strServiceShortName;
+            public int ApplicationType; public uint AppStatus; public uint TSSessionId; [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+        }
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)] static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, System.Text.StringBuilder strSessionKey);
+        [DllImport("rstrtmgr.dll")] static extern int RmEndSession(uint pSessionHandle);
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)] static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames, uint nApplications, IntPtr rgApplications, uint nServices, IntPtr rgsServiceNames);
+        [DllImport("rstrtmgr.dll")] static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo, [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
+
+        // PIDs holding ANY of the files. Per-file attribution is done by
+        // the caller calling this once per file; the tree is small.
+        public static int[] HoldersOf(string[] files) {
+            List<int> pids = new List<int>();
+            uint handle; System.Text.StringBuilder key = new System.Text.StringBuilder(33);
+            if (RmStartSession(out handle, 0, key) != 0) { return pids.ToArray(); }
+            try {
+                if (RmRegisterResources(handle, (uint)files.Length, files, 0, IntPtr.Zero, 0, IntPtr.Zero) != 0) { return pids.ToArray(); }
+                uint needed = 0, count = 0, reasons = 0;
+                int rc = RmGetList(handle, out needed, ref count, null, ref reasons);
+                if (rc == 234 /* ERROR_MORE_DATA */ && needed > 0) {
+                    RM_PROCESS_INFO[] info = new RM_PROCESS_INFO[needed];
+                    count = needed;
+                    rc = RmGetList(handle, out needed, ref count, info, ref reasons);
+                    if (rc == 0) { for (int i = 0; i < count; i++) { pids.Add(info[i].Process.dwProcessId); } }
+                }
+            } finally { RmEndSession(handle); }
+            return pids.ToArray();
+        }
+    }
+}
+"@
+        Add-Type -TypeDefinition $source -ErrorAction Stop
+        return [bool]('WinConfigDiag.GfxRestartManager' -as [type])
+    } catch {
+        return $false
+    }
+}
+
+function Get-NoHeldMediaFiles {
+    <#
+    .SYNOPSIS
+        Which files under the media root NO's process tree holds open RIGHT
+        NOW. Passive, timestamp-free.
+    .DESCRIPTION
+        LastAccessTime failed on run D5E1D5C7: the 33-minute .m4a NO played
+        carried an access time inside the run, yet 207 scans saw nothing,
+        because a System Managed volume defers the update for a file touched
+        within the previous hour -- the ordinary demo case. An open handle
+        has no such lag. The Restart Manager is asked, per file, which
+        processes hold it; a file held by NO.exe or one of its WebView2
+        hosts is the media being played.
+
+        Reads names under the root only (deny-list checked); registers each
+        file with the Restart Manager, which does not open it. Capped so a
+        pathological root cannot stall the tick.
+    .OUTPUTS
+        Array of @{ File; HolderPids }, only for files a listed PID holds.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$MediaRoot,
+        [Parameter(Mandatory)][AllowEmptyCollection()][int[]]$Pids,
+        [int]$MaxFiles = 200
+    )
+
+    # An empty result must be EMPTY under the caller's @(): 'return ,@()'
+    # hands @() a one-element array holding an empty array.
+    if ([string]::IsNullOrWhiteSpace($MediaRoot) -or @($Pids).Count -eq 0) { return @() }
+    Assert-GfxPathAllowed -Path $MediaRoot
+    if (-not (Test-Path -LiteralPath $MediaRoot)) { return @() }
+    if (-not (Initialize-GfxRestartManager)) { return @() }
+
+    $files = @(Get-ChildItem -LiteralPath $MediaRoot -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First $MaxFiles | ForEach-Object { $_.FullName })
+    if ($files.Count -eq 0) { return @() }
+
+    $wanted = @{}
+    foreach ($p in $Pids) { $wanted[[int]$p] = $true }
+    $out = @()
+    foreach ($f in $files) {
+        $holders = @()
+        try { $holders = @([WinConfigDiag.GfxRestartManager]::HoldersOf(@($f))) } catch { $holders = @() }
+        $ours = @($holders | Where-Object { $wanted.ContainsKey([int]$_) })
+        if ($ours.Count -gt 0) { $out += @{ File = $f; HolderPids = @($ours | Sort-Object -Unique) } }
+    }
+    # Returned plainly: every caller enumerates or wraps in @(), and a
+    # ',$out' under @() would hand them ONE record that is the whole list.
+    return $out
+}
+
 # ---------------------------------------------------------------------------
 # Phase segmentation and summary -- pure functions
 # ---------------------------------------------------------------------------
@@ -1216,19 +1562,30 @@ function Get-GraphicsActivityState {
         whether or not a session is running. Whether a SESSION is running is a
         separate question, answered by NO's own window set (see
         Get-NoUiChangePoints), and the two are reported separately on purpose.
+        AUDIO IS INVISIBLE TO THE DECODE ENGINE. A 33-minute .m4a session on
+        MMEVOLD_06 (run D5E1D5C7) left VideoDecode at 0% throughout, so the
+        whole session classified as the visualizer drawing at rest. What
+        that session DID leave is the video.js surface's 3D engine stepping
+        from 0% (idle arm) to 1.1-1.3% (every minute of playback) -- the
+        player redrawing its own controls. 'AudioLikely' names exactly that
+        reading: video.js is drawing with nothing decoding. It is a proxy and
+        the name says so; a paused video with a visible control bar would
+        read the same way.
     .OUTPUTS
-        [string] Quiet | VisualizerOnly | MediaOnly | Both | Unmeasured
+        [string] Quiet | VisualizerOnly | MediaOnly | AudioLikely | Both | Unmeasured
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$Sample,
         [double]$VisualizerFloorPercent = $script:GfxVisualizerFloorPercent,
-        [double]$MediaFloorPercent = $script:GfxMediaFloorPercent
+        [double]$MediaFloorPercent = $script:GfxMediaFloorPercent,
+        [double]$AudioUiFloorPercent = $script:GfxAudioUiFloorPercent
     )
 
     $anyEngines = $false
     $vis = $false
     $media = $false
+    $audio = $false
     foreach ($s in @($Sample.Surfaces)) {
         if ($null -eq $s.Engines) { continue }
         $anyEngines = $true
@@ -1240,6 +1597,7 @@ function Get-GraphicsActivityState {
         }
         if ($s.Role -eq 'Butterchurn' -and $threeD -ge $VisualizerFloorPercent) { $vis = $true }
         if ($s.Role -eq 'VideoJs' -and $decode -ge $MediaFloorPercent) { $media = $true }
+        if ($s.Role -eq 'VideoJs' -and $decode -lt $MediaFloorPercent -and $threeD -ge $AudioUiFloorPercent) { $audio = $true }
         # An unresolved surface still counts toward media if it is decoding:
         # hardware decode is not something a visualizer does.
         if ($s.Role -eq 'Unknown' -and $decode -ge $MediaFloorPercent) { $media = $true }
@@ -1248,6 +1606,7 @@ function Get-GraphicsActivityState {
     if (-not $anyEngines) { return 'Unmeasured' }
     if ($vis -and $media) { return 'Both' }
     if ($media) { return 'MediaOnly' }
+    if ($audio) { return 'AudioLikely' }
     if ($vis) { return 'VisualizerOnly' }
     return 'Quiet'
 }
@@ -1316,12 +1675,19 @@ function Get-GraphicsPreRunActivity {
     # ANY sample decoding counts. Media that started a second ago is still
     # media; requiring every sample would hide a session that just began.
     $result.MediaActive = [bool](@($measured | Where-Object { $_ -eq 'MediaOnly' -or $_ -eq 'Both' }).Count)
+    $result.AudioLikely = [bool](@($measured | Where-Object { $_ -eq 'AudioLikely' }).Count)
     $result.VisualizerActive = [bool](@($measured | Where-Object { $_ -eq 'VisualizerOnly' -or $_ -eq 'Both' }).Count)
     $result.State = $measured[$measured.Count - 1]
 
     if ($result.MediaActive) {
         $result.SessionLikely = 'Yes'
         $result.Reason = 'the video.js surface is decoding video, which it does not do while NO sits at rest'
+    } elseif ($result.AudioLikely) {
+        # Audio-only playback: no decode, but the player is drawing its own
+        # controls. Read as a session for the same reason -- video.js does
+        # not draw while NO sits at rest.
+        $result.SessionLikely = 'Yes'
+        $result.Reason = 'the video.js surface is drawing with nothing decoding, which is what audio-only playback looks like from here'
     } else {
         $result.SessionLikely = 'No'
         $result.Reason = if ($result.VisualizerActive) {
@@ -1368,11 +1734,11 @@ function Format-GraphicsPreRunReport {
         }
         'No' {
             $r += @{ Level = 'OK'; Text = "NO.exe is running (PID $pid_) and reads as idle -- $($Activity.Reason)."; NoPrefix = $false }
-            $r += @{ Level = 'ACTION'; Text = 'Press Start watching, leave NO idle for about a minute so the baseline is solid, then start your session.'; NoPrefix = $false }
+            $r += @{ Level = 'ACTION'; Text = "Press Start watching, leave NO idle until the coverage line turns green (about $(Get-GfxIdleFloorSec) s), then start your session."; NoPrefix = $false }
         }
         default {
             $r += @{ Level = 'WARN'; Text = "NO.exe is running (PID $pid_), but whether a session is under way could not be determined -- $($Activity.Reason)."; NoPrefix = $false }
-            $r += @{ Level = 'ACTION'; Text = 'If NO is idle, press Start watching, leave it idle about a minute, then start your session. If a session is already running, let it finish first.'; NoPrefix = $false }
+            $r += @{ Level = 'ACTION'; Text = 'If NO is idle, press Start watching, leave it idle until the coverage line turns green, then start your session. If a session is already running, let it finish first.'; NoPrefix = $false }
         }
     }
     return $r
@@ -1456,7 +1822,15 @@ function Get-NoUiChangePoints {
         A change must persist this many samples before it counts, so a
         transient dialog does not open a session.
     .OUTPUTS
-        Hashtable: BaselineTitles, Changes[], FirstChangeIndex, FirstChangeUtc.
+        Hashtable: BaselineTitles, Changes[] (Index, AtUtc, Added, Removed,
+        ReturnedToBaseline), FirstChangeIndex, FirstChangeUtc.
+
+        EVERY sustained change is recorded, not only the first. Run D5E1D5C7
+        opened a session with two dialogs that closed seven seconds later,
+        and ended it with a 'Session Complete' dialog thirty-three minutes
+        on; with only the first change kept, the end was seen live and lost
+        from the package. A change back to the baseline set is recorded too,
+        flagged ReturnedToBaseline, so 'Added = []' never has to stand for it.
     #>
     [CmdletBinding()]
     param(
@@ -1479,25 +1853,148 @@ function Get-NoUiChangePoints {
     }
     $result.BaselineTitles = @($baseline | Sort-Object -Unique)
 
+    # The confirmed signature is what the window set has been proven to look
+    # like (initially: the baseline, an empty signature). A different
+    # signature must hold for the dwell before it is recorded and becomes
+    # the new confirmed one.
+    $confirmedKey = ''
+    $pendingKey = $null
     $pendingFrom = $null
     for ($i = $take; $i -lt $Samples.Count; $i++) {
         $titles = @($Samples[$i].NoVisibleWindows)
         $added = @($titles | Where-Object { $result.BaselineTitles -notcontains $_ } | Sort-Object -Unique)
         $removed = @($result.BaselineTitles | Where-Object { $titles -notcontains $_ } | Sort-Object -Unique)
-        $changed = (($added.Count + $removed.Count) -gt 0)
+        $key = (($added -join '|') + '||' + ($removed -join '|')).Trim('|')
 
-        if ($changed) {
-            if ($null -eq $pendingFrom) { $pendingFrom = $i }
-            if ((($i - $pendingFrom) + 1) -ge $MinDwellSamples -and $null -eq $result.FirstChangeIndex) {
+        if ($key -eq $confirmedKey) { $pendingKey = $null; $pendingFrom = $null; continue }
+        if ($key -ne $pendingKey) { $pendingKey = $key; $pendingFrom = $i }
+        if ((($i - $pendingFrom) + 1) -ge $MinDwellSamples) {
+            $confirmedKey = $key
+            $returned = (($added.Count + $removed.Count) -eq 0)
+            $result.Changes += @{ Index = $pendingFrom; AtUtc = $Samples[$pendingFrom].AtUtc; Added = $added; Removed = $removed; ReturnedToBaseline = $returned }
+            if (-not $returned -and $null -eq $result.FirstChangeIndex) {
                 $result.FirstChangeIndex = $pendingFrom
                 $result.FirstChangeUtc = $Samples[$pendingFrom].AtUtc
-                $result.Changes += @{ AtUtc = $Samples[$pendingFrom].AtUtc; Added = $added; Removed = $removed }
             }
-        } else {
-            $pendingFrom = $null
+            $pendingKey = $null; $pendingFrom = $null
         }
     }
     return $result
+}
+
+function Get-NoSessionEndIndex {
+    <#
+    .SYNOPSIS
+        The sample index at which NO announced the session over, or $null.
+    .DESCRIPTION
+        NO ends a session by opening its 'Session Complete' dialog
+        (zengar_vault_Session Complete--dialog.vi on 4.0.0.9; the failed
+        session variant reads 'Session Complete!'). It is a window-set
+        change like any other, already dwell-filtered by Get-NoUiChangePoints;
+        this only asks which sustained change after the split carries that
+        title. Title text only -- the same channel the Flight Recorder reads.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$UiChangePoints,
+        $SplitIndex,
+        [string]$SessionEndTitlePattern = 'Session Complete'
+    )
+    if ($null -eq $SplitIndex) { return $null }
+    foreach ($c in @($UiChangePoints.Changes)) {
+        if ($null -eq $c.Index -or [int]$c.Index -le [int]$SplitIndex) { continue }
+        foreach ($t in @($c.Added)) {
+            if ([string]$t -imatch $SessionEndTitlePattern) { return [int]$c.Index }
+        }
+    }
+    return $null
+}
+
+function Get-NoWindowModeSummary {
+    <#
+    .SYNOPSIS
+        How NO's window was placed across the run: dwell-filtered spans of
+        Windowed / Maximized / FullScreen / Minimized / Unknown, the mode the
+        session arm mostly ran in, and whether it changed DURING the session.
+    .DESCRIPTION
+        Reuses Get-GraphicsActivitySpans for the dwell so a one-sample
+        placement blip cannot mint a span. Changes before the split are the
+        operator arranging windows and are not a finding; a change inside
+        the session arm means the session numbers mix two modes.
+    .OUTPUTS
+        Hashtable: Dominant, Bounds, Spans[], SessionModes[], ChangedDuringSession.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$Samples,
+        $SplitIndex,
+        $EndIndex,
+        [int]$MinDwellSamples = $script:GfxUiChangeDwellSamples
+    )
+
+    $r = @{ Dominant = 'Unknown'; Bounds = $null; Spans = @(); SessionModes = @(); ChangedDuringSession = $false }
+    if ($Samples.Count -eq 0) { return $r }
+
+    $states = @()
+    $modeSamples = @()
+    for ($i = 0; $i -lt $Samples.Count; $i++) {
+        $s = $Samples[$i]
+        $mode = 'Unknown'
+        $bounds = $null
+        if ($s.NoWindow -and $s.NoWindow.Mode) { $mode = [string]$s.NoWindow.Mode; $bounds = $s.NoWindow.Bounds }
+        $states += @{ AtUtc = $s.AtUtc; State = $mode; Index = $i }
+        $modeSamples += @{ Mode = $mode; Bounds = $bounds; Index = $i }
+    }
+
+    # No @() here: the spans function returns ',$spans', and @() over that
+    # yields ONE element holding every span (the 86cfa77 defect class).
+    foreach ($sp in (Get-GraphicsActivitySpans -States $states -MinDwellSamples $MinDwellSamples)) {
+        $sec = $null
+        try { $sec = [math]::Round(([datetime]$sp.EndUtc - [datetime]$sp.StartUtc).TotalSeconds, 1) } catch { }
+        # The span's bounds: the most common WxH among its samples.
+        $r.Spans += @{ Mode = $sp.State; StartUtc = $sp.StartUtc; EndUtc = $sp.EndUtc; Samples = $sp.Samples; DurationSec = $sec; Source = 'window-placement' }
+    }
+
+    # Which samples are "the session"? split..end when a split exists, else
+    # the whole run -- the same choice the arms make.
+    $from = 0
+    $to = $Samples.Count - 1
+    if ($null -ne $SplitIndex) { $from = [int]$SplitIndex }
+    if ($null -ne $EndIndex -and [int]$EndIndex -gt $from) { $to = [int]$EndIndex - 1 }
+
+    $counts = @{}
+    $boundsByMode = @{}
+    for ($i = $from; $i -le $to; $i++) {
+        $m = $modeSamples[$i].Mode
+        if (-not $counts.ContainsKey($m)) { $counts[$m] = 0; $boundsByMode[$m] = @{} }
+        $counts[$m]++
+        $b = $modeSamples[$i].Bounds
+        if ($b) { if (-not $boundsByMode[$m].ContainsKey($b)) { $boundsByMode[$m][$b] = 0 }; $boundsByMode[$m][$b]++ }
+    }
+    $best = $null
+    foreach ($m in $counts.Keys) { if ($null -eq $best -or $counts[$m] -gt $counts[$best]) { $best = $m } }
+    if ($best) {
+        $r.Dominant = $best
+        $bb = $null
+        foreach ($b in $boundsByMode[$best].Keys) { if ($null -eq $bb -or $boundsByMode[$best][$b] -gt $boundsByMode[$best][$bb]) { $bb = $b } }
+        $r.Bounds = $bb
+    }
+
+    # Modes that held (per the dwell) inside the session window. A span
+    # overlaps the window if any of its samples fall inside it; spans carry
+    # times, so compare on the sample timestamps at the window's edges.
+    $winStart = [datetime]$Samples[$from].AtUtc
+    $winEnd = [datetime]$Samples[$to].AtUtc
+    $modes = @()
+    foreach ($sp in $r.Spans) {
+        $spStart = [datetime]$sp.StartUtc
+        $spEnd = [datetime]$sp.EndUtc
+        if ($spEnd -lt $winStart -or $spStart -gt $winEnd) { continue }
+        $modes += $sp.Mode
+    }
+    $r.SessionModes = @($modes | Where-Object { $_ -ne 'Unknown' } | Sort-Object -Unique)
+    $r.ChangedDuringSession = ($r.SessionModes.Count -gt 1)
+    return $r
 }
 
 function Get-GfxRoleAggregate {
@@ -1633,6 +2130,11 @@ function Get-GraphicsBenchSessionSummary {
         TickMs             = @{}
         SessionStartUtc    = $null
         SessionStartSource = 'none-detected'
+        # Where the session ENDED, when NO said so (its 'Session Complete'
+        # dialog). Samples after it are the operator reading the result, not
+        # the session, and are kept out of the session arm.
+        SessionEndUtc      = $null
+        SessionEndSource   = 'none-detected'
         # How the run BEGAN. A run with no split has two very different
         # causes -- nothing ever happened, or a session was already running
         # when watching started -- and they take opposite remedies.
@@ -1640,9 +2142,13 @@ function Get-GraphicsBenchSessionSummary {
         StartedMidSession  = $false
         NoUiBaselineTitles = @()
         NoUiChanges        = @()
-        Arms               = @{ Idle = @(); Session = @() }
-        ArmDurationSec     = @{ Idle = $null; Session = $null }
+        Arms               = @{ Idle = @(); Session = @(); After = @() }
+        ArmDurationSec     = @{ Idle = $null; Session = $null; After = $null }
         Deltas             = @()
+        # How NO's window was placed (Windowed / Maximized / FullScreen), as
+        # spans, because the cost of a pane plausibly follows its size and
+        # an operator can toggle it mid-session.
+        WindowMode         = @{ Dominant = 'Unknown'; Bounds = $null; Spans = @(); SessionModes = @(); ChangedDuringSession = $false }
     }
     if ($Samples.Count -eq 0) { return $summary }
 
@@ -1684,19 +2190,36 @@ function Get-GraphicsBenchSessionSummary {
         $summary.SessionStartSource = 'no-window-set-change'
     }
 
+    $endIndex = Get-NoSessionEndIndex -UiChangePoints $ui -SplitIndex $splitIndex
+    if ($null -ne $endIndex) {
+        $summary.SessionEndUtc = $Samples[$endIndex].AtUtc
+        $summary.SessionEndSource = 'no-window-set-change'
+    }
+
     $idleSamples = @()
     $sessionSamples = @()
+    $afterSamples = @()
     if ($null -ne $splitIndex -and $splitIndex -gt 0) {
         $idleSamples = @($Samples[0..($splitIndex - 1)])
-        $sessionSamples = @($Samples[$splitIndex..($Samples.Count - 1)])
+        $sessionLast = $Samples.Count - 1
+        if ($null -ne $endIndex -and $endIndex -gt $splitIndex) {
+            $sessionLast = $endIndex - 1
+            $afterSamples = @($Samples[$endIndex..($Samples.Count - 1)])
+        }
+        $sessionSamples = @($Samples[$splitIndex..$sessionLast])
     }
 
     $idleSec = $null
     if ($idleSamples.Count -ge 2) { try { $idleSec = [math]::Round(([datetime]$idleSamples[$idleSamples.Count - 1].AtUtc - [datetime]$idleSamples[0].AtUtc).TotalSeconds, 1) } catch { } }
     $sessionSec = $null
     if ($sessionSamples.Count -ge 2) { try { $sessionSec = [math]::Round(([datetime]$sessionSamples[$sessionSamples.Count - 1].AtUtc - [datetime]$sessionSamples[0].AtUtc).TotalSeconds, 1) } catch { } }
+    $afterSec = $null
+    if ($afterSamples.Count -ge 2) { try { $afterSec = [math]::Round(([datetime]$afterSamples[$afterSamples.Count - 1].AtUtc - [datetime]$afterSamples[0].AtUtc).TotalSeconds, 1) } catch { } }
     $summary.ArmDurationSec.Idle = $idleSec
     $summary.ArmDurationSec.Session = $sessionSec
+    $summary.ArmDurationSec.After = $afterSec
+
+    $summary.WindowMode = Get-NoWindowModeSummary -Samples $Samples -SplitIndex $splitIndex -EndIndex $endIndex
 
     $wholeSec = 0.0
     if ($null -ne $summary.DurationSec) { $wholeSec = [double]$summary.DurationSec }
@@ -1705,9 +2228,13 @@ function Get-GraphicsBenchSessionSummary {
     $sessionSecArg = 0.0
     if ($null -ne $sessionSec) { $sessionSecArg = [double]$sessionSec }
 
+    $afterSecArg = 0.0
+    if ($null -ne $afterSec) { $afterSecArg = [double]$afterSec }
+
     $summary.Surfaces = Get-GfxRoleAggregate -Samples $Samples -DurationSec $wholeSec
     $summary.Arms.Idle = Get-GfxRoleAggregate -Samples $idleSamples -DurationSec $idleSecArg
     $summary.Arms.Session = Get-GfxRoleAggregate -Samples $sessionSamples -DurationSec $sessionSecArg
+    $summary.Arms.After = Get-GfxRoleAggregate -Samples $afterSamples -DurationSec $afterSecArg
 
     foreach ($sessRole in @($summary.Arms.Session | Where-Object { $null -ne $_ })) {
         $idleRole = @($summary.Arms.Idle | Where-Object { $_.Role -eq $sessRole.Role }) | Select-Object -First 1
@@ -1760,7 +2287,8 @@ function Get-GraphicsBenchFindings {
         [Parameter(Mandatory)][hashtable]$Summary,
         [int]$MemoryGrowthWarnMB = 250,
         [double]$MemoryGrowthWarnMBPerMin = 15,
-        [double]$MemoryGrowthMinSeconds = 180
+        [double]$MemoryGrowthMinSeconds = 180,
+        [double]$IdleFloorSec = $script:GfxIdleFloorSec
     )
 
     $candidates = @()
@@ -1826,7 +2354,9 @@ function Get-GraphicsBenchFindings {
     foreach ($surf in $videoSurfaces) {
         $decodeMax = $null
         if ($surf.Engines -and $surf.Engines.ContainsKey('VideoDecode')) { $decodeMax = $surf.Engines['VideoDecode'].Max }
-        $mediaSpans = @($Summary.Spans | Where-Object { $_.State -eq 'Media' -or $_.State -eq 'Both' })
+        # 'MediaOnly' is the classifier's word; this used to look for 'Media'
+        # and so could never fire.
+        $mediaSpans = @($Summary.Spans | Where-Object { $_.State -eq 'MediaOnly' -or $_.State -eq 'Both' })
         if ($mediaSpans.Count -gt 0 -and $null -ne $decodeMax -and $decodeMax -le 0) {
             $candidates += @{
                 Rank       = 3
@@ -1840,6 +2370,28 @@ function Get-GraphicsBenchFindings {
                 )
                 ActionHint = 'Check the graphics driver version in this package against a known-good box with the same adapter.'
             }
+        }
+    }
+
+    # The window's placement changed while the session was running, so the
+    # session arm averages two shapes of pane. Changes before the split are
+    # the operator arranging the screen and are not raised.
+    if ($Summary.WindowMode -and $Summary.WindowMode.ChangedDuringSession) {
+        $spanLines = @()
+        foreach ($sp in @($Summary.WindowMode.Spans)) {
+            $spanLines += ("{0} for {1}" -f $sp.Mode, (Format-GraphicsDuration $sp.DurationSec))
+        }
+        $candidates += @{
+            Rank       = 4
+            Id         = 'GFX-WINDOW-MODE-CHANGED'
+            Title      = "NO's window changed between $(@($Summary.WindowMode.SessionModes) -join ' and ') during the session"
+            Result     = 'WARN'
+            AppliesTo  = 'Measurement'
+            Evidence   = @(
+                "Placement spans: $($spanLines -join '; ').",
+                'The session numbers above average across those shapes, so they are not comparable with a run held in one mode.'
+            )
+            ActionHint = 'Re-run keeping NO in one window mode, or read the per-mode spans in the package.'
         }
     }
 
@@ -1892,8 +2444,23 @@ function Get-GraphicsBenchFindings {
                     "NO's window set never changed for $(Get-GfxUiChangeDwellSamples) consecutive samples, so the run has one arm and no deltas.",
                     'Butterchurn draws while NO is idle, so a whole-run percentage cannot be read as session cost.'
                 )
-                ActionHint = 'Start watching FIRST, leave NO idle about a minute, and only then start the session.'
+                ActionHint = 'Start watching FIRST, leave NO idle until the coverage line turns green, and only then start the session.'
             }
+        }
+    } elseif ($null -ne $Summary.ArmDurationSec.Idle -and [double]$Summary.ArmDurationSec.Idle -lt $IdleFloorSec) {
+        # A split exists but the idle arm is shorter than the floor the live
+        # line asks for. The deltas are real; their baseline is thin.
+        $candidates += @{
+            Rank       = 5
+            Id         = 'GFX-IDLE-ARM-SHORT'
+            Title      = "Idle baseline was only $(Format-GraphicsDuration $Summary.ArmDurationSec.Idle), under the $([int]$IdleFloorSec) s floor"
+            Result     = 'WARN'
+            AppliesTo  = 'Measurement'
+            Evidence   = @(
+                "The session started $(Format-GraphicsDuration $Summary.ArmDurationSec.Idle) after watching began; the floor is $([int]$IdleFloorSec) s.",
+                'Every delta is session minus this idle mean, so a short idle arm makes every delta less certain.'
+            )
+            ActionHint = 'Next run, wait for the coverage line to turn green before starting the session.'
         }
     }
 
@@ -2087,6 +2654,11 @@ function Save-GraphicsBenchRun {
         # package without opening the session file.
         cohortKey     = $(if ($cohort) { $cohort.Key } else { $null })
         cohort        = $cohort
+        # Window placement rides along for the same reason: a pool of runs
+        # should be split by it without opening every session file. Additive;
+        # schemaVersion stays 1.
+        windowMode        = $(try { $Session.summary.WindowMode.Dominant } catch { $null })
+        windowModeChanged = $(try { [bool]$Session.summary.WindowMode.ChangedDuringSession } catch { $null })
         schemaVersion = 1
     }
     $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Run.ManifestPath -Encoding UTF8
@@ -2274,8 +2846,8 @@ function Format-GraphicsBenchReport {
         } else {
             $r += @{ Level = 'WARN'; Text = '  No session start was seen, so this run has no idle/session split and no deltas.'; NoPrefix = $true }
             $r += @{ Level = 'WARN'; Text = '  The table above is the whole run and is still valid, but none of it is'; NoPrefix = $true }
-            $r += @{ Level = 'WARN'; Text = '  attributable to the session. Re-run: Start watching, leave NO idle about a'; NoPrefix = $true }
-            $r += @{ Level = 'WARN'; Text = '  minute, then start the session.'; NoPrefix = $true }
+            $r += @{ Level = 'WARN'; Text = '  attributable to the session. Re-run: Start watching, leave NO idle until the'; NoPrefix = $true }
+            $r += @{ Level = 'WARN'; Text = '  coverage line turns green, then start the session.'; NoPrefix = $true }
         }
     } else {
         $r += @{ Level = 'DIM'; Text = ("  {0,-13}{1,-17}{2,10}{3,12}{4,12}" -f 'surface', 'engine', 'idle', 'session', 'delta'); NoPrefix = $true }
@@ -2299,7 +2871,20 @@ function Format-GraphicsBenchReport {
         }
         $split = $dash
         try { $split = ([datetime]$Summary.SessionStartUtc).ToLocalTime().ToString('HH:mm:ss') } catch { }
-        $r += @{ Level = 'DIM'; Text = ("  idle arm {0}  |  session arm {1}  |  split at {2} ({3})" -f (Format-GraphicsDuration $Summary.ArmDurationSec.Idle), (Format-GraphicsDuration $Summary.ArmDurationSec.Session), $split, $Summary.SessionStartSource); NoPrefix = $true }
+        $endText = 'ran to Stop'
+        if ($Summary.SessionEndSource -and $Summary.SessionEndSource -ne 'none-detected') {
+            $endAt = $dash
+            try { $endAt = ([datetime]$Summary.SessionEndUtc).ToLocalTime().ToString('HH:mm:ss') } catch { }
+            $endText = "ended at $endAt (Session Complete)"
+        }
+        $r += @{ Level = 'DIM'; Text = ("  idle arm {0}  |  session arm {1}, {2}  |  split at {3} ({4})" -f (Format-GraphicsDuration $Summary.ArmDurationSec.Idle), (Format-GraphicsDuration $Summary.ArmDurationSec.Session), $endText, $split, $Summary.SessionStartSource); NoPrefix = $true }
+        if ($Summary.WindowMode) {
+            $wm = $Summary.WindowMode
+            $wmText = "  NO window: {0}" -f (Format-GraphicsValue $wm.Dominant)
+            if ($wm.Bounds) { $wmText += " $($wm.Bounds)" }
+            if ($wm.ChangedDuringSession) { $wmText += "  CHANGED during the session ($(@($wm.SessionModes) -join ' / '))" }
+            $r += @{ Level = $(if ($wm.ChangedDuringSession) { 'WARN' } else { 'DIM' }); Text = $wmText; NoPrefix = $true }
+        }
         $addedTitles = @()
         foreach ($c in @($Summary.NoUiChanges)) { $addedTitles += @($c.Added) }
         if ($addedTitles.Count -gt 0) {
@@ -2323,7 +2908,8 @@ function Format-GraphicsBenchReport {
     # --- time in each state (package only: the live grid already shows it) ---
     if (-not $compact) {
         $r += @{ Level = 'STEP'; Text = 'TIME IN EACH STATE'; NoPrefix = $true }
-        $r += @{ Level = 'DIM'; Text = '  Quiet / VisualizerOnly / MediaOnly / Both, inferred from GPU engine load.'; NoPrefix = $true }
+        $r += @{ Level = 'DIM'; Text = '  Quiet / VisualizerOnly / MediaOnly / AudioLikely / Both, inferred from GPU engine load.'; NoPrefix = $true }
+        $r += @{ Level = 'DIM'; Text = '  AudioLikely = video.js drawing its controls with nothing decoding: what audio-only playback looks like from here.'; NoPrefix = $true }
         $byState = @{}
         foreach ($sp in @($Summary.Spans)) {
             if (-not $byState.ContainsKey($sp.State)) { $byState[$sp.State] = 0.0 }
@@ -2336,6 +2922,19 @@ function Format-GraphicsBenchReport {
             $r += @{ Level = 'INFO'; Text = ("  {0,-18}{1,-10}{2} of the run" -f $st, (Format-GraphicsDuration $byState[$st]), (Format-GraphicsValue $pct '%')); NoPrefix = $true }
         }
         $r += @{ Level = 'INFO'; Text = ''; NoPrefix = $true }
+
+        # --- window placement, as spans ---
+        if ($Summary.WindowMode) {
+            $r += @{ Level = 'STEP'; Text = 'WINDOW MODE'; NoPrefix = $true }
+            $r += @{ Level = 'DIM'; Text = '  How NO''s window was placed, read from its placement each sample (not from NO).'; NoPrefix = $true }
+            if (@($Summary.WindowMode.Spans).Count -eq 0) { $r += @{ Level = 'INFO'; Text = "  $dash"; NoPrefix = $true } }
+            foreach ($sp in @($Summary.WindowMode.Spans)) {
+                $from = $dash
+                try { $from = ([datetime]$sp.StartUtc).ToLocalTime().ToString('HH:mm:ss') } catch { }
+                $r += @{ Level = 'INFO'; Text = ("  {0,-12}{1,-10}from {2}" -f $sp.Mode, (Format-GraphicsDuration $sp.DurationSec), $from); NoPrefix = $true }
+            }
+            $r += @{ Level = 'INFO'; Text = ''; NoPrefix = $true }
+        }
 
         # --- per surface, whole run ---
         $r += @{ Level = 'STEP'; Text = 'PER SURFACE, WHOLE RUN   (GPU engine load, percent of the adapter)'; NoPrefix = $true }
@@ -2573,13 +3172,14 @@ function Get-GraphicsBenchFloors {
         the live screen and the report -- the same class of split this module
         already paid for in the grid.
     .OUTPUTS
-        Hashtable: VisualizerFloorPercent, MediaFloorPercent.
+        Hashtable: VisualizerFloorPercent, MediaFloorPercent, AudioUiFloorPercent.
     #>
     [CmdletBinding()]
     param()
     return @{
         VisualizerFloorPercent = $script:GfxVisualizerFloorPercent
         MediaFloorPercent      = $script:GfxMediaFloorPercent
+        AudioUiFloorPercent    = $script:GfxAudioUiFloorPercent
     }
 }
 
@@ -2691,10 +3291,17 @@ function Get-GraphicsBenchCoverage {
         $SessionSec,
         [bool]$SessionDetected = $false,
         [bool]$StartedMidSession = $false,
-        $CountersOk
+        $CountersOk,
+        # Whether NO.exe exists yet. The idle clock only means something once
+        # there is a NO to be idle; before that the line says so.
+        [bool]$NoRunning = $true,
+        [double]$IdleFloorSec = $script:GfxIdleFloorSec
     )
 
     $dash = [string][char]0x2014
+    $floorText = "$([int]$IdleFloorSec) s"
+    $shortClause = ''
+    if ($null -ne $IdleSec -and [double]$IdleSec -lt $IdleFloorSec) { $shortClause = " (shorter than the $floorText floor $dash deltas are less certain)" }
 
     $r = switch ($Phase) {
         'NotStarted' {
@@ -2707,16 +3314,25 @@ function Get-GraphicsBenchCoverage {
                    Text = "NO was already busy when watching began $dash no idle baseline, so this run will report totals only." }
             } elseif ($SessionDetected) {
                 @{ State = 'SessionUnderWay'; Marker = '[ok]'; Level = 'Healthy'
-                   Text = "Session under way. Idle baseline held: $(Format-GraphicsDuration $IdleSec)." }
+                   Text = "Session under way. Idle baseline held: $(Format-GraphicsDuration $IdleSec)$shortClause." }
+            } elseif (-not $NoRunning) {
+                @{ State = 'WaitingForNo'; Marker = '[~]'; Level = 'Unknown'
+                   Text = "NO.exe is not running yet $dash the idle clock starts when it appears." }
+            } elseif ($null -ne $IdleSec -and [double]$IdleSec -ge $IdleFloorSec) {
+                # The green line. This is the cue "about a minute" never gave.
+                @{ State = 'BaselineReady'; Marker = '[ok]'; Level = 'Healthy'
+                   Text = "Idle baseline solid ($(Format-GraphicsDuration $IdleSec)) $dash start your session now, then press Stop when it ends." }
             } else {
-                @{ State = 'Baseline'; Marker = '[~]'; Level = 'Unknown'
-                   Text = "No session seen yet. Idle baseline so far: $(Format-GraphicsDuration $IdleSec) $dash start your session when ready." }
+                $so = 0
+                if ($null -ne $IdleSec) { $so = [int][math]::Floor([double]$IdleSec) }
+                @{ State = 'BaselineBuilding'; Marker = '[~]'; Level = 'Unknown'
+                   Text = "Idle baseline $so s of $floorText $dash keep NO idle. Start your session when this line turns green." }
             }
         }
         'Stopped' {
             if ($SessionDetected) {
                 @{ State = 'Complete'; Marker = '[ok]'; Level = 'Healthy'
-                   Text = "Both arms measured: idle $(Format-GraphicsDuration $IdleSec), session $(Format-GraphicsDuration $SessionSec)." }
+                   Text = "Both arms measured: idle $(Format-GraphicsDuration $IdleSec)$shortClause, session $(Format-GraphicsDuration $SessionSec)." }
             } elseif ($StartedMidSession) {
                 @{ State = 'MidSessionComplete'; Marker = '[!]'; Level = 'Degraded'
                    Text = "Totals only. Watching began mid-session, so there is no idle arm to subtract." }
@@ -2830,6 +3446,14 @@ Export-ModuleMember -Function @(
     'Stop-GraphicsSampler'
     'Get-GraphicsInventory'
     'Get-GfxUiChangeDwellSamples'
+    'Get-GfxIdleFloorSec'
+    'ConvertFrom-GfxGeometryRow'
+    'Get-GfxWindowMode'
+    'Select-GfxPrimaryNoWindow'
+    'Get-NoSessionEndIndex'
+    'Get-NoWindowModeSummary'
+    'Initialize-GfxRestartManager'
+    'Get-NoHeldMediaFiles'
     'ConvertTo-GfxLuidKey'
     'Get-GfxAdapterLuidMap'
     'Resolve-GfxLuidName'
