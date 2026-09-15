@@ -1356,7 +1356,7 @@ function Format-GraphicsPreRunReport {
 
     if (-not $noRunning) {
         $r += @{ Level = 'WARN'; Text = 'NO.exe is not running. You can still press Start watching -- the sampler picks NO up as soon as it appears, and the stretch before the session becomes the idle baseline.'; NoPrefix = $false }
-        return ,$r
+        return $r
     }
 
     $pid_ = $Inventory.No.Pid
@@ -1375,7 +1375,7 @@ function Format-GraphicsPreRunReport {
             $r += @{ Level = 'ACTION'; Text = 'If NO is idle, press Start watching, leave it idle about a minute, then start your session. If a session is already running, let it finish first.'; NoPrefix = $false }
         }
     }
-    return ,$r
+    return $r
 }
 
 function Get-GraphicsActivitySpans {
@@ -2179,7 +2179,7 @@ function Format-GraphicsInventoryReport {
         }
         $cohortText = if ($Inventory.Cohort -and $Inventory.Cohort.Key) { $Inventory.Cohort.Key } else { 'unknown -- this run cannot be pooled' }
         $r += @{ Level = 'DIM'; Text = ("  {0,-10}{1}" -f 'COHORT', $cohortText); NoPrefix = $true }
-        return ,$r
+        return $r
     }
 
     $r = @()
@@ -2230,7 +2230,7 @@ function Format-GraphicsInventoryReport {
         $nompText = if ($Nomp.Exists) { "schema only: $(@($Nomp.SchemaKeysPresent).Count) known fields declared, no values stored" } else { 'not found' }
         $r += @{ Level = 'DIM'; Text = ("  {0,-14}{1}" -f 'NOMP config', $nompText); NoPrefix = $true }
     }
-    return ,$r
+    return $r
 }
 
 function Format-GraphicsBenchReport {
