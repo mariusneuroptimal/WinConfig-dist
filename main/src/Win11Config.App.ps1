@@ -1433,10 +1433,10 @@ $script:GetZampSetupapiTail = {
 $buttonHandlers = @{
     "Copy System Info" = {
         $machineInfo = Get-WinConfigMachineInfo
-        $clipboardText = "Device Name: $($machineInfo.DeviceName)`nSerial Number: $($machineInfo.SerialNumber)`nOS: $($machineInfo.FormattedVersion)"
+        $clipboardText = "Device Name: $($machineInfo.DeviceName)`nComputer Model: $($machineInfo.ComputerModel)`nSerial Number: $($machineInfo.SerialNumber)`nOS: $($machineInfo.FormattedVersion)"
         [System.Windows.Forms.Clipboard]::SetText($clipboardText)
 
-        $infoMessage = "The following Device Information was copied to the clipboard:`n`nDevice Name: $($machineInfo.DeviceName)`nSerial Number: $($machineInfo.SerialNumber)`nOS: $($machineInfo.FormattedVersion)"
+        $infoMessage = "The following Device Information was copied to the clipboard:`n`n$clipboardText"
         [System.Windows.Forms.MessageBox]::Show($infoMessage, "Device Information", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     }
     "Copy Device Name" = {
@@ -1448,6 +1448,20 @@ $buttonHandlers = @{
         $machineInfo = Get-WinConfigMachineInfo
         [System.Windows.Forms.Clipboard]::SetText($machineInfo.SerialNumber)
         [System.Windows.Forms.MessageBox]::Show("Serial Number copied to clipboard: $($machineInfo.SerialNumber)", "Serial Number", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+    }
+    "Copy Computer Model" = {
+        # Make/model as one line for a ticket's Test Environment field. The
+        # resolver (Env.psm1) falls back past OEM placeholders, so the dialog
+        # names the CIM source it landed on - a tech pasting "Unknown" into a
+        # ticket needs to know the box never reported one.
+        $machineInfo = Get-WinConfigMachineInfo
+        [System.Windows.Forms.Clipboard]::SetText($machineInfo.ComputerModel)
+
+        $detail = "Computer Model copied to clipboard: $($machineInfo.ComputerModel)`n`nManufacturer: $($machineInfo.Manufacturer)`nModel: $($machineInfo.Model)"
+        if ($machineInfo.SystemFamily) { $detail += "`nFamily: $($machineInfo.SystemFamily)" }
+        if ($machineInfo.SystemSku) { $detail += "`nSKU: $($machineInfo.SystemSku)" }
+        $detail += "`nSource: $($machineInfo.ComputerModelSource)"
+        [System.Windows.Forms.MessageBox]::Show($detail, "Computer Model", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     }
     "Copy Windows version" = {
         $machineInfo = Get-WinConfigMachineInfo
@@ -1863,8 +1877,59 @@ $buttonHandlers = @{
             })
             $sbButtonRow.Controls.Add($sbOpenFolderBtn)
 
+            # "Copy File Name" — support triage is keyed by the ZIP's name (it
+            # carries the case ID, host and RunId) and operators relay it by
+            # pasting it into a message or a ticket. Mirrors the Bluetooth probe
+            # window's copy action. A Label cannot be selected, so the name also
+            # gets a read-only field of its own (below) for manual selection.
+            $sbCopyNameBtn = New-Object System.Windows.Forms.Button
+            $sbCopyNameBtn.Text = "Copy File Name"
+            $sbCopyNameBtn.AutoSize = $true
+            $sbCopyNameBtn.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 4)
+            $sbCopyNameBtn.Visible = $false
+            $sbCopyNameBtn.Add_Click({
+                if ($this.Tag) {
+                    try {
+                        [System.Windows.Forms.Clipboard]::SetText([string]$this.Tag)
+                        $this.Text = "Copied!"
+                    } catch {
+                        # Clipboard can be held by another process; the name is
+                        # still selectable in the field above this button row.
+                        $this.Text = "Copy failed"
+                    }
+                }
+            })
+            $sbButtonRow.Controls.Add($sbCopyNameBtn)
+
+            # Name strip — its own docked row rather than a field in the button
+            # row, so the full name gets the window's width instead of competing
+            # with three buttons at the 560px minimum size.
+            $sbNameRow = New-Object System.Windows.Forms.Panel
+            $sbNameRow.Dock = [System.Windows.Forms.DockStyle]::Bottom
+            $sbNameRow.Height = 34
+            $sbNameRow.Padding = New-Object System.Windows.Forms.Padding(8, 4, 8, 0)
+            $sbNameRow.Visible = $false
+
+            # Value field (not diagnostic output) — read-only so the name cannot
+            # be edited before it is copied, but still selectable with Ctrl+C.
+            $txtValueSbZipName = New-Object System.Windows.Forms.TextBox
+            $txtValueSbZipName.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $txtValueSbZipName.ReadOnly = $true
+            $txtValueSbZipName.Font = New-Object System.Drawing.Font('Consolas', 9)
+
+            $sbNameLabel = New-Object System.Windows.Forms.Label
+            $sbNameLabel.Text = "File name:"
+            $sbNameLabel.Dock = [System.Windows.Forms.DockStyle]::Left
+            $sbNameLabel.AutoSize = $true
+            $sbNameLabel.Padding = New-Object System.Windows.Forms.Padding(0, 4, 8, 0)
+
+            # Fill is added before Left so the label docks outside it
+            $sbNameRow.Controls.Add($txtValueSbZipName)
+            $sbNameRow.Controls.Add($sbNameLabel)
+
             $sbForm.Controls.Add($sbLog)
             $sbForm.Controls.Add($sbStatusLabel)
+            $sbForm.Controls.Add($sbNameRow)
             $sbForm.Controls.Add($sbButtonRow)
             $sbForm.Show()
             [System.Windows.Forms.Application]::DoEvents()
@@ -1905,6 +1970,18 @@ $buttonHandlers = @{
                 "Collectors: $($sbBundle.Counts.ok) ok, $($sbBundle.Counts.skipped) skipped, $($sbBundle.Counts.error) error, $($sbBundle.Counts.timeout) timeout."
             } else { "Collection did not produce a manifest." }
             Write-WinConfigGuiDiagnostic -Level STEP -Message $sbSummary -Box $sbLog
+
+            # Expose the ZIP's name for copying in EVERY outcome that produced
+            # one — an uploaded bundle still has to be named in the ticket, so
+            # this is not a local-only affordance.
+            if ($sbBundle.ZipPath) {
+                $sbZipName = Split-Path $sbBundle.ZipPath -Leaf
+                $sbCopyNameBtn.Tag = $sbZipName
+                $sbCopyNameBtn.Visible = $true
+                $txtValueSbZipName.Text = $sbZipName
+                $sbNameRow.Visible = $true
+                Write-WinConfigGuiDiagnostic -Level INFO -Message "Bundle file name: $sbZipName" -Box $sbLog
+            }
 
             if (-not $sbBundle.ZipPath) {
                 $sbStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 50, 50)
@@ -14944,7 +15021,7 @@ $script:ToolsTabInitialized = $false  # UI-REWORK: Tools tab lazy load
 # Populate tab pages
 $tabContents = @{
     "System" = @(
-        @{headline="System"; buttons=@("Copy System Info", "Copy Device Name", "Copy Serial Number", "Copy Windows version")}
+        @{headline="System"; buttons=@("Copy System Info", "Copy Device Name", "Copy Serial Number", "Copy Computer Model", "Copy Windows version")}
         @{headline="NO Shortcuts"; buttons=@("%programdata%", "%localappdata%", "C:\zengar", "Documents\ScreenConnect")}
         @{headline="Windows Panels"; buttons=@("Device Manager", "Task Manager", "Control Panel", "Sound Panel")}
     )
@@ -16827,6 +16904,7 @@ No system changes were made.
             "Copy System Info"         = @{ Description = "Copy system details to clipboard"; Group = "Info" }
             "Copy Device Name"         = @{ Description = "Copy computer name"; Group = "Info" }
             "Copy Serial Number"       = @{ Description = "Copy BIOS serial number"; Group = "Info" }
+            "Copy Computer Model"      = @{ Description = "Copy make and model (Win32_ComputerSystem)"; Group = "Info" }
             "Machine Identifiers"      = @{
                 Description = "Show the MAC/ProcessorID/DiskID licensing reads, and why one is missing"
                 Group = "Diagnostics"
@@ -16891,7 +16969,7 @@ No system changes were made.
             "Audio"        = @("Remove Intel SST Audio Driver", "Restart Audio Service", "Sound Panel", "Run Bluetooth Diagnostics")
             "Bluetooth"    = @("Run Bluetooth Diagnostics", "Reset COM Port Numbers", "Clean Bluetooth Ports", "Full Bluetooth Stack Reset", "Disable USB Suspend")
             "Graphics"     = @("Run Graphics Session Bench")
-            "System"       = @("Copy System Info", "Copy Device Name", "Copy Serial Number", "Machine Identifiers", "Device Manager", "Task Manager", "Control Panel")
+            "System"       = @("Copy System Info", "Copy Device Name", "Copy Serial Number", "Copy Computer Model", "Machine Identifiers", "Device Manager", "Task Manager", "Control Panel")
             "zAmp"         = @("Uninstall zAmp Drivers", "Repair zAmp Driver Trust")
             "Zengar UI"    = @("Apply Win 11 Start Menu", "Apply branding colors", "Pin Taskbar Icons", "Apply Win Update Icon")
             "Updates"      = @("MS Store Updates", "Update Surface Drivers", "Microsoft Update Catalog", "Windows Insider")

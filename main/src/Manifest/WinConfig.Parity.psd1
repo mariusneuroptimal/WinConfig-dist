@@ -65,6 +65,7 @@
             "Copy System Info"
             "Copy Device Name"
             "Copy Serial Number"
+            "Copy Computer Model"
             "Machine Identifiers"
             "Device Manager"
             "Task Manager"
@@ -175,6 +176,10 @@
         }
         "Copy Serial Number" = @{
             Description = "Copy BIOS serial number"
+            Group = "Info"
+        }
+        "Copy Computer Model" = @{
+            Description = "Copy make and model (Win32_ComputerSystem)"
             Group = "Info"
         }
         "Machine Identifiers" = @{

@@ -57,6 +57,192 @@ function Assert-WinConfigIsAdmin {
     return $true
 }
 
+# Values OEMs leave in the SMBIOS model/manufacturer fields when nobody filled
+# them in. They read as data but carry none, so each one has to fall through to
+# the next source rather than land on a tech's clipboard.
+$script:ComputerModelPlaceholders = @(
+    'To Be Filled By O.E.M.', 'To be filled by O.E.M.', 'Default string',
+    'System Product Name', 'System manufacturer', 'System Version',
+    'Product Name', 'Not Applicable', 'Not Specified', 'Unknown', 'None',
+    'OEM', 'O.E.M.', 'INVALID', 'Chassis Manufacture', 'Type1ProductConfigId'
+)
+
+function Test-WinConfigModelValue {
+    <#
+    .SYNOPSIS
+        Returns $true when a CIM string is a real value, not an OEM placeholder.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $trimmed = $Value.Trim()
+    foreach ($placeholder in $script:ComputerModelPlaceholders) {
+        if ($trimmed -eq $placeholder) { return $false }
+    }
+    return $true
+}
+
+function Format-WinConfigComputerModel {
+    <#
+    .SYNOPSIS
+        Joins manufacturer and model into one line without repeating the brand.
+    .DESCRIPTION
+        'Dell Inc.' + 'Latitude 5420' reads as 'Dell Latitude 5420'; 'LENOVO'
+        becomes 'Lenovo'; and a model that already names its brand ('Surface
+        Laptop Studio' under 'Microsoft Corporation') is left alone rather than
+        doubled. The legal-entity tail is dropped because it is noise in a
+        ticket, and because it is what makes the repetition check below miss.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Manufacturer,
+        [AllowNull()][AllowEmptyString()][string]$Model
+    )
+
+    $hasVendor = (Test-WinConfigModelValue $Manufacturer) -and $Manufacturer -ne "Unknown"
+    $hasModel = (Test-WinConfigModelValue $Model) -and $Model -ne "Unknown"
+
+    if (-not $hasModel) {
+        if ($hasVendor) { return "$($Manufacturer.Trim()) (model not reported)" }
+        return "Unknown"
+    }
+    if (-not $hasVendor) { return $Model.Trim() }
+
+    $brand = ($Manufacturer -replace '(?i)\s*\b(corporation|corp|incorporated|inc|company|co|ltd|limited|llc|gmbh|technologies|technology|computer|computers|electronics|international)\b\.?', '').Trim()
+    $brand = ($brand -replace '[,\s]+$', '').Trim()
+    if (-not $brand) { $brand = $Manufacturer.Trim() }
+
+    # LENOVO / ASUSTEK arrive in shout case. Title-case anything longer than an
+    # acronym so the copied line reads as a name.
+    if ($brand -cmatch '^[A-Z][A-Z0-9\.\-]{3,}$') {
+        $brand = [System.Globalization.CultureInfo]::InvariantCulture.TextInfo.ToTitleCase($brand.ToLowerInvariant())
+    }
+
+    $modelTrimmed = $Model.Trim()
+    if ($modelTrimmed -match ('(?i)^' + [regex]::Escape($brand) + '\b')) { return $modelTrimmed }
+
+    return "$brand $modelTrimmed"
+}
+
+function Get-WinConfigComputerModel {
+    <#
+    .SYNOPSIS
+        Resolves this computer's make and model into one display string.
+    .DESCRIPTION
+        Win32_ComputerSystem.Model is the primary source - the same value
+        'Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object -Property Model'
+        returns - but it is not dependable on its own:
+
+        - Whitebox and some desktop OEMs leave it as an SMBIOS placeholder
+          ('To Be Filled By O.E.M.', 'System Product Name'), so it falls back to
+          Win32_ComputerSystemProduct.Name, then SystemFamily, then the
+          baseboard product.
+        - Lenovo puts the machine-type-model code in Model and the name a tech
+          would recognise ('ThinkPad X1 Carbon Gen 9') in
+          Win32_ComputerSystemProduct.Version, so Lenovo boxes prefer Version
+          and keep the MTM as the SKU.
+
+        The fallback classes are queried only when the primary value is unusable,
+        so the common case costs one CIM query. Callers holding a
+        Win32_ComputerSystem instance already can pass it in for zero.
+
+        Read-only: nothing here mutates, so there is no dry-run path.
+    .PARAMETER ComputerSystem
+        An existing Win32_ComputerSystem instance. Queried when omitted.
+    .PARAMETER ComputerSystemProduct
+        An existing Win32_ComputerSystemProduct instance. Queried only if needed.
+    .PARAMETER BaseBoard
+        An existing Win32_BaseBoard instance. Queried only if needed.
+    .OUTPUTS
+        PSObject with properties: Display, Manufacturer, Model, SystemFamily, SystemSku, Source
+    #>
+    [CmdletBinding()]
+    param(
+        [object]$ComputerSystem,
+        [object]$ComputerSystemProduct,
+        [object]$BaseBoard
+    )
+
+    $result = [PSCustomObject]@{
+        Display      = "Unknown"
+        Manufacturer = "Unknown"
+        Model        = "Unknown"
+        SystemFamily = $null
+        SystemSku    = $null
+        Source       = "None"
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('ComputerSystem')) {
+        try { $ComputerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop } catch { $ComputerSystem = $null }
+    }
+
+    $csModel  = if ($ComputerSystem) { [string]$ComputerSystem.Model } else { '' }
+    $csVendor = if ($ComputerSystem) { [string]$ComputerSystem.Manufacturer } else { '' }
+    $csFamily = if ($ComputerSystem) { [string]$ComputerSystem.SystemFamily } else { '' }
+    $csSku    = if ($ComputerSystem) { [string]$ComputerSystem.SystemSKUNumber } else { '' }
+
+    if (Test-WinConfigModelValue $csFamily) { $result.SystemFamily = $csFamily.Trim() }
+    if (Test-WinConfigModelValue $csSku) { $result.SystemSku = $csSku.Trim() }
+
+    # One lazy fetch, decided up front: the product class is only worth a query
+    # when a primary field is unusable, or when the vendor is Lenovo (whose
+    # readable name lives there by design, not by omission).
+    $needProduct = (-not (Test-WinConfigModelValue $csModel)) -or (-not (Test-WinConfigModelValue $csVendor)) -or ($csVendor -match '(?i)lenovo')
+    if ($needProduct -and -not $PSBoundParameters.ContainsKey('ComputerSystemProduct')) {
+        try { $ComputerSystemProduct = Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction Stop } catch { $ComputerSystemProduct = $null }
+    }
+
+    # --- Manufacturer -------------------------------------------------------
+    if (Test-WinConfigModelValue $csVendor) {
+        $result.Manufacturer = $csVendor.Trim()
+    } elseif ($ComputerSystemProduct -and (Test-WinConfigModelValue ([string]$ComputerSystemProduct.Vendor))) {
+        $result.Manufacturer = ([string]$ComputerSystemProduct.Vendor).Trim()
+    }
+
+    # --- Model --------------------------------------------------------------
+    if ($result.Manufacturer -match '(?i)lenovo' -and $ComputerSystemProduct -and (Test-WinConfigModelValue ([string]$ComputerSystemProduct.Version))) {
+        $result.Model = ([string]$ComputerSystemProduct.Version).Trim()
+        $result.Source = "Win32_ComputerSystemProduct.Version (Lenovo)"
+        if (-not $result.SystemSku -and (Test-WinConfigModelValue $csModel)) { $result.SystemSku = $csModel.Trim() }
+    }
+
+    if ($result.Source -eq "None" -and (Test-WinConfigModelValue $csModel)) {
+        $result.Model = $csModel.Trim()
+        $result.Source = "Win32_ComputerSystem.Model"
+    }
+
+    if ($result.Source -eq "None" -and $ComputerSystemProduct -and (Test-WinConfigModelValue ([string]$ComputerSystemProduct.Name))) {
+        $result.Model = ([string]$ComputerSystemProduct.Name).Trim()
+        $result.Source = "Win32_ComputerSystemProduct.Name"
+    }
+
+    if ($result.Source -eq "None" -and $result.SystemFamily) {
+        $result.Model = $result.SystemFamily
+        $result.Source = "Win32_ComputerSystem.SystemFamily"
+    }
+
+    # Last resort: the board. Only reached when every system-level field was a
+    # placeholder, which is exactly the whitebox case this exists for.
+    if ($result.Source -eq "None" -or $result.Manufacturer -eq "Unknown") {
+        if (-not $PSBoundParameters.ContainsKey('BaseBoard')) {
+            try { $BaseBoard = Get-CimInstance -ClassName Win32_BaseBoard -ErrorAction Stop } catch { $BaseBoard = $null }
+        }
+        if ($BaseBoard) {
+            if ($result.Source -eq "None" -and (Test-WinConfigModelValue ([string]$BaseBoard.Product))) {
+                $result.Model = ([string]$BaseBoard.Product).Trim()
+                $result.Source = "Win32_BaseBoard.Product"
+            }
+            if ($result.Manufacturer -eq "Unknown" -and (Test-WinConfigModelValue ([string]$BaseBoard.Manufacturer))) {
+                $result.Manufacturer = ([string]$BaseBoard.Manufacturer).Trim()
+            }
+        }
+    }
+
+    $result.Display = Format-WinConfigComputerModel -Manufacturer $result.Manufacturer -Model $result.Model
+    return $result
+}
+
 # PERF-001: CIM query cache - these values never change during a session
 $script:CimCache = $null
 
@@ -69,7 +255,9 @@ function Get-WinConfigMachineInfo {
         First call populates cache, subsequent calls return cached data instantly.
         Eliminates 500-1000ms delays from repeated WMI queries.
     .OUTPUTS
-        PSObject with properties: DeviceName, SerialNumber, WindowsCaption, BuildNumber, RevisionNumber, FormattedVersion
+        PSObject with properties: DeviceName, SerialNumber, Manufacturer, Model,
+        ComputerModel, ComputerModelSource, SystemFamily, SystemSku,
+        WindowsCaption, BuildNumber, RevisionNumber, FormattedVersion
     #>
     [CmdletBinding()]
     param()
@@ -81,7 +269,11 @@ function Get-WinConfigMachineInfo {
 
     # First call - populate cache
     try {
-        $deviceName = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).Name
+        # One Win32_ComputerSystem instance serves both the device name and the
+        # make/model resolution - no second query for the model.
+        $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        $deviceName = $computerSystem.Name
+        $modelInfo = Get-WinConfigComputerModel -ComputerSystem $computerSystem
         $serialNumber = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SerialNumber
         $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
         $windowsCaption = $osInfo.Caption
@@ -92,23 +284,35 @@ function Get-WinConfigMachineInfo {
         $formattedVersion = "$formattedCaption $buildNumber.$revisionNumber"
 
         $script:CimCache = [PSCustomObject]@{
-            DeviceName       = $deviceName
-            SerialNumber     = $serialNumber
-            WindowsCaption   = $windowsCaption
-            BuildNumber      = $buildNumber
-            RevisionNumber   = $revisionNumber
-            FormattedVersion = $formattedVersion
+            DeviceName          = $deviceName
+            SerialNumber        = $serialNumber
+            Manufacturer        = $modelInfo.Manufacturer
+            Model               = $modelInfo.Model
+            ComputerModel       = $modelInfo.Display
+            ComputerModelSource = $modelInfo.Source
+            SystemFamily        = $modelInfo.SystemFamily
+            SystemSku           = $modelInfo.SystemSku
+            WindowsCaption      = $windowsCaption
+            BuildNumber         = $buildNumber
+            RevisionNumber      = $revisionNumber
+            FormattedVersion    = $formattedVersion
         }
     }
     catch {
         # Graceful degradation - return placeholder on error
         $script:CimCache = [PSCustomObject]@{
-            DeviceName       = "Unknown"
-            SerialNumber     = "Unknown"
-            WindowsCaption   = "Unknown"
-            BuildNumber      = "Unknown"
-            RevisionNumber   = "Unknown"
-            FormattedVersion = "Unknown"
+            DeviceName          = "Unknown"
+            SerialNumber        = "Unknown"
+            Manufacturer        = "Unknown"
+            Model               = "Unknown"
+            ComputerModel       = "Unknown"
+            ComputerModelSource = "None"
+            SystemFamily        = $null
+            SystemSku           = $null
+            WindowsCaption      = "Unknown"
+            BuildNumber         = "Unknown"
+            RevisionNumber      = "Unknown"
+            FormattedVersion    = "Unknown"
         }
     }
 
@@ -516,6 +720,9 @@ Export-ModuleMember -Function @(
     'Test-WinConfigIsAdmin',
     'Assert-WinConfigIsAdmin',
     'Get-WinConfigMachineInfo',
+    'Get-WinConfigComputerModel',
+    'Format-WinConfigComputerModel',
+    'Test-WinConfigModelValue',
     'Get-SessionCountryInfo',
     'Get-ActiveUserSessions',
     'Test-WinConfigSafeToReboot',
