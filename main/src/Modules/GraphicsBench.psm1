@@ -47,6 +47,54 @@ $script:GfxDeniedPathRoots = @('C:\zengar\sessions', 'C:\zengar\BLT_data')
 $script:GfxVisualizerFloorPercent = 1.0
 $script:GfxMediaFloorPercent = 0.3
 
+# WHY 'APPLICATION FULL SCREEN' IS NEVER REPORTED AS VERIFIED.
+#
+# A window's placement says how big it is, not which control made it that big.
+# A window maximized from its title bar and one put full screen by
+# NeurOptimal's own control can both read showCmd 3, and no field capture has
+# yet established what NeurOptimal's control actually leaves behind. The
+# measurement this bench depends on is WINDOW AREA, which is read directly; the
+# control that produced it is a separate claim, and it stays unverified rather
+# than being inferred from a show state that does not carry it.
+#
+# ONE STRING, so the window, the report and the package cannot give three
+# different accounts of the same gap.
+$script:GfxAppFullScreenReason = "a window's placement does not record which control set it, so whether this is NeurOptimal's own full-screen state is not established"
+
+# NEUROPTIMAL'S MONITOR PICKER, by the title of its own window.
+#
+# Captured 2026-09-18 with the dialog on screen:
+#
+#   hwnd 722276  LVDChild  'Zengar Shared_lib.lvlib:Select Display Monitor--dialog.vi'
+#
+# It is MODAL and it BLOCKS: pressing the separate visualizer full-screen
+# button opens it, and the visuals do not move until a monitor is chosen and OK
+# is pressed. In that capture butterchurn was still hosted by NeurOptimal's own
+# panel while the dialog was up -- the detach had not happened yet.
+#
+# That makes the dialog an exact, passive bracket for the manual transition: it
+# appears when the operator starts and is gone once they have chosen. Matched on
+# the distinctive tail rather than the whole VI path, which carries a library
+# prefix that is not ours to depend on -- the same shape as the
+# 'Session Complete--dialog.vi' title this module already reads.
+$script:GfxMonitorPickerPattern = 'Select Display Monitor--dialog\.vi'
+
+# WHY 'THE VISUALS WERE DETACHED' IS NEVER REPORTED AS VERIFIED EITHER.
+#
+# Measured on NO 4.0.0.9, 2026-09-18, with nobody touching the visualizer
+# control: before the session butterchurn and video.js both hung under window
+# 461894; during it butterchurn moved to 397666 -- the main NeurOptimal window
+# -- while video.js stayed behind. NO relocates its panes between top-level
+# LabVIEW windows as a matter of course, so "the visualizer is in a different
+# window from the other pane" described 13 of 13 samples of an ordinary
+# session. A detector that fires on every clean run is worse than none.
+#
+# The window handles are recorded so the first capture taken WITH the separate
+# visualizer full-screen button pressed can be compared against them. Until
+# then this stays unverified, and the SCREEN -- which was never the doubtful
+# part -- is what gets scored.
+$script:GfxVisualizerAttachmentReason = "NeurOptimal moves its panes between windows on its own, so the window hosting the visuals does not establish whether the separate visualizer control was used"
+
 # Audio playback has no decode engine to show up on. What it DOES show, on
 # run D5E1D5C7 (MMEVOLD_06, NO 4.0.0.9, 33-minute .m4a session): the video.js
 # surface's 3D engine sat at 0% through the idle arm and 1.1-1.3% for every
@@ -176,7 +224,11 @@ namespace WinConfigDiag {
         [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
         [DllImport("user32.dll")] static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT p);
         [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr m, ref MONITORINFO i);
+        // MONITORINFOEX, not MONITORINFO: szDevice is the only reading that
+        // says WHICH display a window is on. Matching its rect against the
+        // display list instead would compare two APIs' coordinates, which a
+        // mixed-DPI desktop can make disagree.
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetMonitorInfoW")] static extern bool GetMonitorInfoEx(IntPtr m, ref MONITORINFOEX i);
         // GetWindowLongW is present on both bitnesses and the style word is
         // 32 bits wide, so the Ptr variant is not needed.
         [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLongW(IntPtr h, int i);
@@ -185,7 +237,7 @@ namespace WinConfigDiag {
         [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
         [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
         [StructLayout(LayoutKind.Sequential)] public struct WINDOWPLACEMENT { public uint length, flags, showCmd; public POINT ptMin, ptMax; public RECT rcNormal; }
-        [StructLayout(LayoutKind.Sequential)] public struct MONITORINFO { public uint cbSize; public RECT rcMonitor, rcWork; public uint dwFlags; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] public struct MONITORINFOEX { public uint cbSize; public RECT rcMonitor, rcWork; public uint dwFlags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szDevice; }
 
         static string Title(IntPtr h) { System.Text.StringBuilder sb = new System.Text.StringBuilder(512); GetWindowTextW(h, sb, 512); return sb.ToString(); }
         static string Cls(IntPtr h) { System.Text.StringBuilder sb = new System.Text.StringBuilder(256); GetClassNameW(h, sb, 256); return sb.ToString(); }
@@ -195,12 +247,12 @@ namespace WinConfigDiag {
         // Placement of one top-level window, as one row. Every field is a
         // read; a failed read leaves its field empty rather than zero.
         static string Geom(IntPtr h, bool hasSurface) {
-            string show = ""; string rect = ""; string mon = ""; string style = "";
+            string show = ""; string rect = ""; string mon = ""; string style = ""; string dev = "";
             try { WINDOWPLACEMENT wp = new WINDOWPLACEMENT(); wp.length = (uint)Marshal.SizeOf(typeof(WINDOWPLACEMENT)); if (GetWindowPlacement(h, ref wp)) { show = wp.showCmd.ToString(); } } catch { }
             try { RECT r; if (GetWindowRect(h, out r)) { rect = Rect(r); } } catch { }
-            try { IntPtr m = MonitorFromWindow(h, 2 /* MONITOR_DEFAULTTONEAREST */); MONITORINFO mi = new MONITORINFO(); mi.cbSize = (uint)Marshal.SizeOf(typeof(MONITORINFO)); if (m != IntPtr.Zero && GetMonitorInfoW(m, ref mi)) { mon = Rect(mi.rcMonitor); } } catch { }
+            try { IntPtr m = MonitorFromWindow(h, 2 /* MONITOR_DEFAULTTONEAREST */); MONITORINFOEX mi = new MONITORINFOEX(); mi.cbSize = (uint)Marshal.SizeOf(typeof(MONITORINFOEX)); mi.szDevice = ""; if (m != IntPtr.Zero && GetMonitorInfoEx(m, ref mi)) { mon = Rect(mi.rcMonitor); dev = mi.szDevice == null ? "" : mi.szDevice.Replace("|", "/"); } } catch { }
             try { style = GetWindowLongW(h, -16 /* GWL_STYLE */).ToString("X8"); } catch { }
-            return "NOGEOM|" + h.ToInt64() + "|" + show + "|" + rect + "|" + mon + "|" + style + "|" + (hasSurface ? "1" : "0");
+            return "NOGEOM|" + h.ToInt64() + "|" + show + "|" + rect + "|" + mon + "|" + style + "|" + (hasSurface ? "1" : "0") + "|" + dev;
         }
 
         // One pass over the host process's top-level windows plus their
@@ -212,13 +264,22 @@ namespace WinConfigDiag {
         //       a Chrome_WidgetWin_1 descendant owned by ANOTHER process --
         //       this is the WebView2 visual host, and its title IS the
         //       rendered document's title
+        //   SURFACETOP|<surfaceHwnd>|<topLevelHwnd>
+        //       which of NO's own top-level windows that surface hangs under.
+        //       A SEPARATE ROW KIND rather than a field on SURFACE, whose last
+        //       field is the title and cannot have anything appended after it.
+        //       This is what answers "is the visualizer on another screen?" --
+        //       the surface has no window rect of its own, its host window has.
         //   D3DWIN|<owningPid>
         //       an "Intermediate D3D Window" descendant -- the compositing
         //       GPU process, corroborating process parentage
-        //   NOGEOM|<hwnd>|<showCmd>|<l,t,r,b>|<monitor l,t,r,b>|<style hex>|<hasSurface 0/1>
+        //   NOGEOM|<hwnd>|<showCmd>|<l,t,r,b>|<monitor l,t,r,b>|<style hex>|<hasSurface 0/1>|<monitor device>
         //       placement of every VISIBLE top-level window owned by hostPid;
-        //       hasSurface says a WebView2 visual host lives under it. A
-        //       separate row kind so the NOWIN contract is untouched.
+        //       hasSurface says a WebView2 visual host lives under it, and the
+        //       monitor device (\\.\DISPLAY1) says which screen it is on. A
+        //       separate row kind so the NOWIN contract is untouched; the
+        //       device field was appended last so a parser written against the
+        //       seven-field row still reads every field it knew.
         public static string[] Scan(int hostPid) {
             List<string> rows = new List<string>();
             EnumWindows(delegate(IntPtr top, IntPtr l) {
@@ -230,7 +291,7 @@ namespace WinConfigDiag {
                     uint cp = Pid(c);
                     if (cp == (uint)hostPid) { return true; }
                     string cls = Cls(c);
-                    if (cls == "Chrome_WidgetWin_1") { hasSurface = true; rows.Add("SURFACE|" + cp + "|" + c.ToInt64() + "|" + Title(c)); }
+                    if (cls == "Chrome_WidgetWin_1") { hasSurface = true; rows.Add("SURFACE|" + cp + "|" + c.ToInt64() + "|" + Title(c)); rows.Add("SURFACETOP|" + c.ToInt64() + "|" + top.ToInt64()); }
                     else if (cls == "Intermediate D3D Window") { rows.Add("D3DWIN|" + cp); }
                     return true;
                 }, IntPtr.Zero);
@@ -257,10 +318,10 @@ function ConvertFrom-GfxWindowScanRows {
     .PARAMETER Rows
         The raw pipe-delimited rows.
     .OUTPUTS
-        Hashtable: Surfaces (HostPid/Hwnd/DocumentTitle/Role/RoleSource),
-        D3DPids, NoWindows (Hwnd/Visible/Class/Title), Geometry
-        (Hwnd/ShowCmd/Rect/Monitor/Style/HasSurface) for the visible
-        top-level windows.
+        Hashtable: Surfaces (HostPid/Hwnd/DocumentTitle/Role/RoleSource/
+        TopHwnd), D3DPids, NoWindows (Hwnd/Visible/Class/Title), Geometry
+        (Hwnd/ShowCmd/Rect/Monitor/Style/HasSurface/MonitorDevice) for the
+        visible top-level windows.
     #>
     [CmdletBinding()]
     param([string[]]$Rows)
@@ -269,6 +330,36 @@ function ConvertFrom-GfxWindowScanRows {
     $d3d = @()
     $noWindows = @()
     $geometry = @()
+    $topBySurface = @{}
+    # hwnd -> @{ Title; Visible } for every top-level window, visible or not.
+    # The HIDDEN ones matter: before a session the visualizer hangs under a
+    # window titled 'Closed', and that is what says the pane is not on screen
+    # rather than detached.
+    $windowByHwnd = @{}
+
+    # TWO PASSES. A SURFACETOP row can arrive before or after the SURFACE row
+    # it belongs to depending on enumeration order, so the map is built first
+    # and joined second -- a surface whose owning window is unknown keeps
+    # TopHwnd $null rather than borrowing its neighbour's.
+    foreach ($row in @($Rows)) {
+        if ([string]::IsNullOrEmpty($row)) { continue }
+        if (($row -split '\|', 2)[0] -ne 'SURFACETOP') { continue }
+        $p = $row -split '\|', 3
+        if ($p.Count -lt 3) { continue }
+        $sh = 0L; $th = 0L
+        if (-not [long]::TryParse($p[1], [ref]$sh)) { continue }
+        if (-not [long]::TryParse($p[2], [ref]$th)) { continue }
+        $topBySurface[$sh] = $th
+    }
+    foreach ($row in @($Rows)) {
+        if ([string]::IsNullOrEmpty($row)) { continue }
+        if (($row -split '\|', 2)[0] -ne 'NOWIN') { continue }
+        $q = $row -split '\|', 5
+        if ($q.Count -lt 5) { continue }
+        $wh = 0L
+        if (-not [long]::TryParse($q[1], [ref]$wh)) { continue }
+        $windowByHwnd[$wh] = @{ Title = [string]$q[4]; Visible = ($q[2] -eq '1') }
+    }
 
     foreach ($row in @($Rows)) {
         if ([string]::IsNullOrEmpty($row)) { continue }
@@ -284,9 +375,19 @@ function ConvertFrom-GfxWindowScanRows {
                 if ($p.Count -lt 4) { break }
                 $title = [string]$p[3]
                 $role = Get-GfxSurfaceRoleFromTitle -DocumentTitle $title
+                $sHwnd = [long]$p[2]
+                $topHwnd = $(if ($topBySurface.ContainsKey($sHwnd)) { $topBySurface[$sHwnd] } else { $null })
+                $topInfo = $null
+                if ($null -ne $topHwnd -and $windowByHwnd.ContainsKey([long]$topHwnd)) { $topInfo = $windowByHwnd[[long]$topHwnd] }
                 $surfaces += @{
                     HostPid       = [int]$p[1]
-                    Hwnd          = [long]$p[2]
+                    Hwnd          = $sHwnd
+                    TopHwnd       = $topHwnd
+                    # The host window's OWN title and visibility -- what tells
+                    # 'inside NeurOptimal' from 'in a window of its own' from
+                    # 'not on screen'. $null when the join did not land.
+                    HostWindowTitle   = $(if ($topInfo) { $topInfo.Title } else { $null })
+                    HostWindowVisible = $(if ($topInfo) { $topInfo.Visible } else { $null })
                     DocumentTitle = $title
                     Role          = $role
                     # 'window-title' is direct evidence: the WebView2 visual
@@ -324,7 +425,10 @@ function ConvertFrom-GfxGeometryRow {
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Row)
 
-    $p = $Row -split '\|', 7
+    # Split to EIGHT, accept SEVEN. The monitor-device field was appended in
+    # 2026-09-18; a row recorded before it, and every fixture written against
+    # the old shape, still parses and simply carries no device.
+    $p = $Row -split '\|', 8
     if ($p.Count -lt 7 -or $p[0] -ne 'NOGEOM') { return $null }
     $hwnd = 0L
     if (-not [long]::TryParse($p[1], [ref]$hwnd)) { return $null }
@@ -335,7 +439,9 @@ function ConvertFrom-GfxGeometryRow {
     if ([int]::TryParse($p[2], [ref]$tmp)) { $show = $tmp }
     $style = $null
     try { if (-not [string]::IsNullOrWhiteSpace($p[5])) { $style = [Convert]::ToInt64($p[5], 16) } } catch { }
-    return @{ Hwnd = $hwnd; ShowCmd = $show; Rect = $rect; Monitor = $mon; Style = $style; HasSurface = ($p[6] -eq '1') }
+    $device = $null
+    if ($p.Count -ge 8 -and -not [string]::IsNullOrWhiteSpace($p[7])) { $device = [string]$p[7] }
+    return @{ Hwnd = $hwnd; ShowCmd = $show; Rect = $rect; Monitor = $mon; Style = $style; HasSurface = ($p[6] -eq '1'); MonitorDevice = $device }
 }
 
 function ConvertFrom-GfxRectText {
@@ -369,21 +475,79 @@ function Get-GfxWindowMode {
 
         Bounds is the window's own WxH in physical pixels (the app is
         DPI-aware, and so is the monitor rect it is compared against).
+
+        COVERSSCREEN IS A SEPARATE READING FROM MODE, and it is the one the
+        test actually depends on. What confounds the measurement is window
+        AREA; whether the shell calls that state "maximized" or "full screen"
+        does not change a pixel of it. NeurOptimal's own pre-session full-screen
+        control is a LabVIEW front panel operation whose resulting placement
+        this tool has never had recorded from the field -- it may leave
+        showCmd 3 (indistinguishable from the shell's Maximize) or a borderless
+        rect. So the requirement is written against coverage, both readings are
+        recorded, and the report NAMES the one observed. That turns an
+        assumption into a field measurement instead of pinning the test to a
+        guess about which of the two NO produces.
+
+        ScreenFraction is how much of the monitor the window covers, so a
+        maximized window under a taskbar (~0.95) is legible next to a genuinely
+        full-screen one (1.00) without either being called the other.
+
+        APPFULLSCREEN IS A DIFFERENT QUESTION AND IS NOT ANSWERED HERE.
+        'CoversScreen' is a statement about PIXELS: this window is the size of
+        that monitor. It is not a statement about which control produced that
+        size. A window maximized from the title bar and a window put full screen
+        by NeurOptimal's own control can both read showCmd 3, and this scan
+        cannot separate them -- nothing observable in a window's placement says
+        which code path set it. So AppFullScreen is 'Unverified' on every
+        sample, with the reason attached, until a field package establishes what
+        NeurOptimal's control actually leaves behind. Guessing it from
+        showCmd 3 would be the tool reporting an inference as a reading, which
+        is the one thing this module does not do.
     .OUTPUTS
-        Hashtable: Mode, Bounds ('WxH'), MonitorBounds ('WxH'), Hwnd,
-        HasSurface. Mode 'Unknown' when the row carried no usable rect.
+        Hashtable: Mode, CoversScreen ($true/$false/$null), CoverageLabel,
+        ScreenFraction, HasCaption, AppFullScreen, AppFullScreenReason,
+        Bounds ('WxH'), MonitorBounds ('WxH'), MonitorDevice, Hwnd, HasSurface.
+        Mode 'Unknown' and CoversScreen $null when the row carried no usable
+        rect -- unread is never 'no'.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Geometry)
 
-    $r = @{ Mode = 'Unknown'; Bounds = $null; MonitorBounds = $null; Hwnd = $Geometry.Hwnd; HasSurface = [bool]$Geometry.HasSurface }
+    # THE RAW STYLE WORD IS KEPT, not just the caption bit derived from it.
+    # RECORD THE IDENTIFIER, NOT THE LABEL: measured on NO 4.0.0.9, the window
+    # reads 0x96070000 windowed and 0x97070000 full screen -- the ONLY
+    # difference is WS_MAXIMIZE, and WS_CAPTION is absent in BOTH because
+    # LVDChild never carries it. Anyone asking later which bit distinguishes
+    # NeurOptimal's own full-screen control needs the whole word, not the one
+    # flag this build happened to extract.
+    $r = @{ Mode = 'Unknown'; CoversScreen = $null; CoverageLabel = 'not read'; ScreenFraction = $null
+            HasCaption = $null; StyleHex = $null; Bounds = $null; MonitorBounds = $null
+            AppFullScreen = 'Unverified'; AppFullScreenReason = $script:GfxAppFullScreenReason
+            MonitorDevice = $Geometry.MonitorDevice; Hwnd = $Geometry.Hwnd; HasSurface = [bool]$Geometry.HasSurface }
     $rect = $Geometry.Rect
     $mon = $Geometry.Monitor
     if ($rect) { $r.Bounds = "$($rect.R - $rect.L)x$($rect.B - $rect.T)" }
     if ($mon) { $r.MonitorBounds = "$($mon.R - $mon.L)x$($mon.B - $mon.T)" }
+    if ($null -ne $Geometry.Style) {
+        $r.HasCaption = (([long]$Geometry.Style -band 0x00C00000) -eq 0x00C00000)
+        $r.StyleHex = ('{0:X8}' -f [long]$Geometry.Style)
+    }
+    if ($rect -and $mon) {
+        $monArea = [double]([math]::Max(0, $mon.R - $mon.L)) * [double]([math]::Max(0, $mon.B - $mon.T))
+        if ($monArea -gt 0) {
+            $winArea = [double]([math]::Max(0, $rect.R - $rect.L)) * [double]([math]::Max(0, $rect.B - $rect.T))
+            $r.ScreenFraction = [math]::Round($winArea / $monArea, 3)
+        }
+    }
 
-    if ($Geometry.ShowCmd -eq 2) { $r.Mode = 'Minimized'; return $r }
-    if ($Geometry.ShowCmd -eq 3) { $r.Mode = 'Maximized'; return $r }
+    $setCoverage = {
+        param([bool]$Covers)
+        $r.CoversScreen = $Covers
+        $r.CoverageLabel = if ($Covers) { 'covers the whole screen' } else { 'covers part of the screen' }
+    }
+
+    if ($Geometry.ShowCmd -eq 2) { $r.Mode = 'Minimized'; & $setCoverage $false; $r.CoverageLabel = 'minimized'; return $r }
+    if ($Geometry.ShowCmd -eq 3) { $r.Mode = 'Maximized'; & $setCoverage $true; return $r }
     if (-not $rect) { return $r }
 
     $coversMonitor = $false
@@ -392,12 +556,13 @@ function Get-GfxWindowMode {
                           [math]::Abs($rect.R - $mon.R) -le 1 -and [math]::Abs($rect.B - $mon.B) -le 1)
     }
     if ($coversMonitor) {
-        $hasCaption = $false
-        if ($null -ne $Geometry.Style) { $hasCaption = (([long]$Geometry.Style -band 0x00C00000) -eq 0x00C00000) }
+        $hasCaption = [bool]$r.HasCaption
         $r.Mode = if ($hasCaption) { 'Maximized' } else { 'FullScreen' }
+        & $setCoverage $true
         return $r
     }
     $r.Mode = 'Windowed'
+    & $setCoverage $false
     return $r
 }
 
@@ -405,17 +570,37 @@ function Select-GfxPrimaryNoWindow {
     <#
     .SYNOPSIS
         Picks the one NO top-level window whose placement the run records:
-        the window hosting a WebView2 surface, else the largest visible one.
+        NeurOptimal's own panel when it can be named, else the window hosting
+        a WebView2 surface, else the largest visible one.
+    .DESCRIPTION
+        THE TITLE COMES FIRST, BECAUSE THE SURFACE MOVES. Measured 2026-09-18
+        with the separate visualizer control pressed: the visualizer's surface
+        left NeurOptimal's panel for a new top-level window, and a selector
+        that preferred 'the window hosting a surface' followed it. Everything
+        the package labels 'NO window' then described the VISUALIZER's window
+        instead of NeurOptimal's.
+        In that capture both were maximized at the same size so nothing read
+        wrong, which is precisely why it would have gone unnoticed: detach the
+        visuals while NeurOptimal's own panel is a different size and the
+        report describes the wrong window under the right name.
+    .PARAMETER Titles
+        hwnd -> title, from the scan's NOWIN rows. Without it the old
+        surface-then-area order applies, which is what a caller with no title
+        map can do and is right whenever the panes have not moved.
     .OUTPUTS
         The Get-GfxWindowMode record, or $null when there is no visible
         top-level window.
     #>
     [CmdletBinding()]
-    param([AllowEmptyCollection()][array]$Geometry)
+    param(
+        [AllowEmptyCollection()][array]$Geometry,
+        [hashtable]$Titles = @{}
+    )
 
     $best = $null
     $bestArea = -1L
     $bestSurface = $false
+    $bestNamed = $false
     foreach ($g in @($Geometry)) {
         if ($null -eq $g) { continue }
         # A minimized window has a rect off-screen; treat its area as zero so
@@ -423,11 +608,19 @@ function Select-GfxPrimaryNoWindow {
         $area = 0L
         if ($g.Rect -and $g.ShowCmd -ne 2) { $area = [long]([math]::Max(0, $g.Rect.R - $g.Rect.L)) * [long]([math]::Max(0, $g.Rect.B - $g.Rect.T)) }
         $surf = [bool]$g.HasSurface
+        # Does this window name itself as NeurOptimal's panel? Matched on the
+        # ASCII stem: the live title carries a registered-trademark glyph and
+        # these files are read as ANSI on a field box.
+        $named = $false
+        if ($Titles -and $null -ne $g.Hwnd -and $Titles.ContainsKey([long]$g.Hwnd)) {
+            $named = ([string]$Titles[[long]$g.Hwnd] -match 'NeurOptimal')
+        }
         $better = $false
         if ($null -eq $best) { $better = $true }
-        elseif ($surf -and -not $bestSurface) { $better = $true }
-        elseif ($surf -eq $bestSurface -and $area -gt $bestArea) { $better = $true }
-        if ($better) { $best = $g; $bestArea = $area; $bestSurface = $surf }
+        elseif ($named -and -not $bestNamed) { $better = $true }
+        elseif ($named -eq $bestNamed -and $surf -and -not $bestSurface) { $better = $true }
+        elseif ($named -eq $bestNamed -and $surf -eq $bestSurface -and $area -gt $bestArea) { $better = $true }
+        if ($better) { $best = $g; $bestArea = $area; $bestSurface = $surf; $bestNamed = $named }
     }
     if ($null -eq $best) { return $null }
     return (Get-GfxWindowMode -Geometry $best)
@@ -727,20 +920,50 @@ function Start-GraphicsSampler {
 
                 $surfaces = @()
                 $noWindows = @()
-                $noWindow = @{ Mode = 'Unknown'; Bounds = $null; MonitorBounds = $null; Hwnd = $null }
-                $geomBest = $null; $geomBestArea = -1; $geomBestSurface = $false
+                # AppFullScreen is fixed at 'Unverified' here as it is in
+                # Get-GfxWindowMode: a placement does not record which control
+                # set it, and inferring NeurOptimal's own full-screen state from
+                # showCmd 3 would report a guess as a reading.
+                $noWindow = @{ Mode = 'Unknown'; CoversScreen = $null; CoverageLabel = 'not read'; ScreenFraction = $null
+                               HasCaption = $null; StyleHex = $null; Bounds = $null; MonitorBounds = $null; MonitorDevice = $null; Hwnd = $null
+                               AppFullScreen = 'Unverified' }
+                $geomBest = $null; $geomBestArea = -1; $geomBestSurface = $false; $geomBestNamed = $false
+                # Geometry rows arrive before the NOWIN titles that name them,
+                # so the rows are held and the pick is made after the pass --
+                # the same order Select-GfxPrimaryNoWindow uses, which is the
+                # point: two selectors that disagree are two answers to one
+                # question.
+                $geomRows = @()
+                # top-level hwnd -> the display it is on, so a surface can be
+                # located on a screen. The surface itself has no rect of its
+                # own: it is a child window of the LabVIEW panel that hosts it.
+                $monByTop = @{}
+                $topBySurfaceHwnd = @{}
+                # hwnd -> @{ Title; Visible } for EVERY top-level window,
+                # hidden ones included: before a session the visualizer hangs
+                # under a window titled 'Closed', and that is what separates
+                # 'not on screen' from 'in a window of its own'.
+                $winByHwnd = @{}
                 if ($noPid -gt 0) {
                     $rows = @()
                     try { $rows = [WinConfigDiag.GfxWindowScan]::Scan($noPid) } catch { }
                     $seen = @{}
                     foreach ($row in $rows) {
                         $kind = ($row -split '\|', 2)[0]
+                        if ($kind -eq 'SURFACETOP') {
+                            $pt = $row -split '\|', 3
+                            if ($pt.Count -lt 3) { continue }
+                            try { $topBySurfaceHwnd[[long]$pt[1]] = [long]$pt[2] } catch { }
+                            continue
+                        }
                         if ($kind -eq 'NOGEOM') {
                             # Inline twin of Get-GfxWindowMode / Select-GfxPrimaryNoWindow
                             # (the runspace is self-contained by design). Prefer
                             # the window hosting a surface, then the largest.
-                            $g = $row -split '\|', 7
+                            $g = $row -split '\|', 8
                             if ($g.Count -lt 7) { continue }
+                            $gDev = $(if ($g.Count -ge 8 -and -not [string]::IsNullOrWhiteSpace($g[7])) { [string]$g[7] } else { $null })
+                            try { $monByTop[[long]$g[1]] = $gDev } catch { }
                             $rq = $g[3] -split ','; $mq = $g[4] -split ','
                             $rect = $null; $mon = $null
                             if ($rq.Count -eq 4) { try { $rect = @{ L = [int]$rq[0]; T = [int]$rq[1]; R = [int]$rq[2]; B = [int]$rq[3] } } catch { $rect = $null } }
@@ -750,11 +973,7 @@ function Start-GraphicsSampler {
                             $surf = ($g[6] -eq '1')
                             $area = 0L
                             if ($rect -and $show -ne 2) { $area = [long]([math]::Max(0, $rect.R - $rect.L)) * [long]([math]::Max(0, $rect.B - $rect.T)) }
-                            $better = $false
-                            if ($null -eq $geomBest) { $better = $true }
-                            elseif ($surf -and -not $geomBestSurface) { $better = $true }
-                            elseif ($surf -eq $geomBestSurface -and $area -gt $geomBestArea) { $better = $true }
-                            if ($better) { $geomBest = @{ Rect = $rect; Mon = $mon; Show = $show; Style = $style; Hwnd = [long]$g[1] }; $geomBestArea = $area; $geomBestSurface = $surf }
+                            $geomRows += @{ Rect = $rect; Mon = $mon; Show = $show; Style = $style; Hwnd = [long]$g[1]; Dev = $gDev; Surf = $surf; Area = $area }
                             continue
                         }
                         if ($kind -eq 'SURFACE') {
@@ -767,19 +986,50 @@ function Start-GraphicsSampler {
                             $role = 'Unknown'
                             if ($title -match 'Butterchurn') { $role = 'Butterchurn' }
                             elseif ($title -match 'Video\.?js') { $role = 'VideoJs' }
-                            $surfaces += @{ HostPid = $hp; DocumentTitle = $title; Role = $role; RoleSource = $(if ($role -eq 'Unknown') { 'unresolved' } else { 'window-title' }) }
+                            $sHwnd = $null; try { $sHwnd = [long]$p2[2] } catch { }
+                            $surfaces += @{ HostPid = $hp; Hwnd = $sHwnd; DocumentTitle = $title; Role = $role; RoleSource = $(if ($role -eq 'Unknown') { 'unresolved' } else { 'window-title' }) }
                         } elseif ($kind -eq 'NOWIN') {
                             $p2 = $row -split '\|', 5
                             if ($p2.Count -lt 5) { continue }
+                            try { $winByHwnd[[long]$p2[1]] = @{ Title = [string]$p2[4]; Visible = ($p2[2] -eq '1') } } catch { }
                             if ($p2[2] -eq '1' -and -not [string]::IsNullOrWhiteSpace($p2[4])) { $noWindows += [string]$p2[4] }
                         }
                     }
+                    # THE PRIMARY WINDOW: NeurOptimal's own panel when a title
+                    # names it, then a surface host, then the largest. The
+                    # visualizer's surface LEAVES the panel for a window of its
+                    # own when the separate control is used, and a surface-first
+                    # pick follows it -- labelling the visualizer's window as
+                    # NO's for the whole run.
+                    foreach ($gr in $geomRows) {
+                        $named = $false
+                        if ($winByHwnd.ContainsKey($gr.Hwnd)) { $named = ([string]$winByHwnd[$gr.Hwnd].Title -match 'NeurOptimal') }
+                        $better = $false
+                        if ($null -eq $geomBest) { $better = $true }
+                        elseif ($named -and -not $geomBestNamed) { $better = $true }
+                        elseif ($named -eq $geomBestNamed -and $gr.Surf -and -not $geomBestSurface) { $better = $true }
+                        elseif ($named -eq $geomBestNamed -and $gr.Surf -eq $geomBestSurface -and $gr.Area -gt $geomBestArea) { $better = $true }
+                        if ($better) { $geomBest = $gr; $geomBestArea = $gr.Area; $geomBestSurface = $gr.Surf; $geomBestNamed = $named }
+                    }
+
                     if ($geomBest) {
                         $noWindow.Hwnd = $geomBest.Hwnd
+                        $noWindow.MonitorDevice = $geomBest.Dev
+                        if ($null -ne $geomBest.Style) {
+                            $noWindow.HasCaption = (([long]$geomBest.Style -band 0x00C00000) -eq 0x00C00000)
+                            $noWindow.StyleHex = ('{0:X8}' -f [long]$geomBest.Style)
+                        }
                         if ($geomBest.Rect) { $noWindow.Bounds = "$($geomBest.Rect.R - $geomBest.Rect.L)x$($geomBest.Rect.B - $geomBest.Rect.T)" }
                         if ($geomBest.Mon) { $noWindow.MonitorBounds = "$($geomBest.Mon.R - $geomBest.Mon.L)x$($geomBest.Mon.B - $geomBest.Mon.T)" }
-                        if ($geomBest.Show -eq 2) { $noWindow.Mode = 'Minimized' }
-                        elseif ($geomBest.Show -eq 3) { $noWindow.Mode = 'Maximized' }
+                        if ($geomBest.Rect -and $geomBest.Mon) {
+                            $ma = [double]([math]::Max(0, $geomBest.Mon.R - $geomBest.Mon.L)) * [double]([math]::Max(0, $geomBest.Mon.B - $geomBest.Mon.T))
+                            if ($ma -gt 0) {
+                                $wa = [double]([math]::Max(0, $geomBest.Rect.R - $geomBest.Rect.L)) * [double]([math]::Max(0, $geomBest.Rect.B - $geomBest.Rect.T))
+                                $noWindow.ScreenFraction = [math]::Round($wa / $ma, 3)
+                            }
+                        }
+                        if ($geomBest.Show -eq 2) { $noWindow.Mode = 'Minimized'; $noWindow.CoversScreen = $false; $noWindow.CoverageLabel = 'minimized' }
+                        elseif ($geomBest.Show -eq 3) { $noWindow.Mode = 'Maximized'; $noWindow.CoversScreen = $true; $noWindow.CoverageLabel = 'covers the whole screen' }
                         elseif ($geomBest.Rect) {
                             $covers = $false
                             if ($geomBest.Mon) {
@@ -787,10 +1037,34 @@ function Start-GraphicsSampler {
                                 $covers = ([math]::Abs($rr.L - $mm.L) -le 1 -and [math]::Abs($rr.T - $mm.T) -le 1 -and [math]::Abs($rr.R - $mm.R) -le 1 -and [math]::Abs($rr.B - $mm.B) -le 1)
                             }
                             if ($covers) {
-                                $cap = $false
-                                if ($null -ne $geomBest.Style) { $cap = (([long]$geomBest.Style -band 0x00C00000) -eq 0x00C00000) }
-                                $noWindow.Mode = if ($cap) { 'Maximized' } else { 'FullScreen' }
-                            } else { $noWindow.Mode = 'Windowed' }
+                                $noWindow.Mode = if ([bool]$noWindow.HasCaption) { 'Maximized' } else { 'FullScreen' }
+                                $noWindow.CoversScreen = $true
+                                $noWindow.CoverageLabel = 'covers the whole screen'
+                            } else {
+                                $noWindow.Mode = 'Windowed'
+                                $noWindow.CoversScreen = $false
+                                $noWindow.CoverageLabel = 'covers part of the screen'
+                            }
+                        }
+                    }
+                    # WHICH SCREEN EACH PANE IS ON. Joined here rather than at
+                    # summary time because the mapping is only true while the
+                    # windows exist -- and a visualizer that was dragged to a
+                    # second display is the difference between a comparable
+                    # recording and one that measured two screens at once.
+                    foreach ($s in $surfaces) {
+                        $s['WindowHwnd'] = $null
+                        $s['MonitorDevice'] = $null
+                        $s['HostWindowTitle'] = $null
+                        $s['HostWindowVisible'] = $null
+                        if ($null -ne $s.Hwnd -and $topBySurfaceHwnd.ContainsKey([long]$s.Hwnd)) {
+                            $top = $topBySurfaceHwnd[[long]$s.Hwnd]
+                            $s['WindowHwnd'] = $top
+                            if ($monByTop.ContainsKey($top)) { $s['MonitorDevice'] = $monByTop[$top] }
+                            if ($winByHwnd.ContainsKey($top)) {
+                                $s['HostWindowTitle'] = $winByHwnd[$top].Title
+                                $s['HostWindowVisible'] = $winByHwnd[$top].Visible
+                            }
                         }
                     }
                 }
@@ -923,6 +1197,17 @@ function Start-GraphicsSampler {
                         Role          = $s.Role
                         RoleSource    = $s.RoleSource
                         DocumentTitle = $s.DocumentTitle
+                        # The top-level NO window this pane is drawn inside and
+                        # the display that window is on. Both $null when the
+                        # join failed, so "not read" can never be mistaken for
+                        # "same window as the other pane".
+                        WindowHwnd    = $s.WindowHwnd
+                        MonitorDevice = $s.MonitorDevice
+                        # The host window's own title and whether it is on
+                        # screen: what tells the visuals drawn INSIDE
+                        # NeurOptimal from the same pane in a window of its own.
+                        HostWindowTitle   = $s.HostWindowTitle
+                        HostWindowVisible = $s.HostWindowVisible
                         HostPid       = $hp
                         GpuPid        = $gpuPid
                         RendererPid   = $renPid
@@ -1050,6 +1335,1038 @@ function Get-GfxIdleFloorSec {
 }
 
 # ---------------------------------------------------------------------------
+# THE DISPLAY ARRANGEMENT -- which screen the run was actually made on
+# ---------------------------------------------------------------------------
+#
+# COUNTING DISPLAYS WAS NEVER THE QUESTION. The first version of this bench
+# asked for "one monitor" and checked SystemInformation.MonitorCount, which is
+# satisfied identically by a 14" built-in laptop panel and by a 49" external
+# monitor with the lid closed. Those two runs are not comparable in any way
+# that matters: butterchurn renders the whole pane, so its cost follows the
+# number of pixels, and 5120x1440 is 3.2x the area of 1920x1200. A check that
+# passes both of them lets the largest confound through while reporting that it
+# was controlled, which is worse than not checking at all.
+#
+# So the arrangement is READ, not counted: every active display with its
+# identity, mode, refresh rate and scale factor, whether it is the machine's
+# built-in panel, and which of them NeurOptimal is on.
+#
+# WHAT IS MEASURED AND WHAT IS INFERRED ARE KEPT APART. The built-in panel of a
+# laptop running with its lid closed is not enumerated by Windows at all --
+# measured on a Surface Laptop Studio on 2026-09-18, where neither the active
+# nor the all-paths query returned an internal target. "Inactive" there is an
+# INFERENCE from the machine having a battery, and it is labelled as one; it is
+# never presented as a reading.
+
+function Initialize-GfxDisplayScan {
+    <#
+    .SYNOPSIS
+        Compiles the inline Win32 display-arrangement helper.
+    .DESCRIPTION
+        Same discipline as Initialize-GfxWindowScan: Add-Type assemblies are
+        AppDomain-wide, the dist ships text only, and this reads metadata and
+        changes nothing. No display is added, removed, moved, re-ordered,
+        re-scaled, or switched on or off.
+    .OUTPUTS
+        [bool] whether the type is available.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ('WinConfigDiag.GfxDisplayScan' -as [type]) { return $true }
+    try {
+        $source = @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace WinConfigDiag {
+    // Reads the DISPLAY ARRANGEMENT: which displays are active, what they are
+    // called, whether each is the machine's built-in panel, its mode, refresh
+    // rate and scale factor. Read-only throughout.
+    public static class GfxDisplayScan {
+        const uint QDC_ALL_PATHS = 1;
+        const uint QDC_ONLY_ACTIVE_PATHS = 2;
+        const int  ERROR_SUCCESS = 0;
+
+        [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPath, out uint numMode);
+        [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint numPath, [Out] PATH_INFO[] paths, ref uint numMode, [Out] MODE_BLOB[] modes, IntPtr topologyId);
+        [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref TARGET_DEVICE_NAME n);
+        [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref SOURCE_DEVICE_NAME n);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplayDevicesW(string dev, uint num, ref DISPLAY_DEVICE info, uint flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplaySettingsW(string dev, int mode, ref DEVMODE dm);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(POINT pt, uint flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr m, ref MONITORINFO i);
+        [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr hmon, int type, out uint dpiX, out uint dpiY);
+
+        [StructLayout(LayoutKind.Sequential)] struct LUID { public uint Low; public int High; }
+        [StructLayout(LayoutKind.Sequential)] struct RATIONAL { public uint Numerator, Denominator; }
+        [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
+        [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
+        [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public uint cbSize; public RECT rcMonitor, rcWork; public uint dwFlags; }
+        [StructLayout(LayoutKind.Sequential)] struct PATH_SOURCE_INFO { public LUID adapterId; public uint id, modeInfoIdx, statusFlags; }
+        [StructLayout(LayoutKind.Sequential)] struct PATH_TARGET_INFO {
+            public LUID adapterId; public uint id, modeInfoIdx, outputTechnology, rotation, scaling;
+            public RATIONAL refreshRate; public uint scanLineOrdering; public int targetAvailable; public uint statusFlags;
+        }
+        [StructLayout(LayoutKind.Sequential)] struct PATH_INFO { public PATH_SOURCE_INFO sourceInfo; public PATH_TARGET_INFO targetInfo; public uint flags; }
+        // DISPLAYCONFIG_MODE_INFO is 64 bytes and its payload is a union this
+        // scan never reads -- the refresh rate comes from the path's target and
+        // the mode from EnumDisplaySettings. Declared as a blob of exactly the
+        // right size so the array marshals without modelling the union.
+        [StructLayout(LayoutKind.Sequential)] struct MODE_BLOB { public uint a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p; }
+        [StructLayout(LayoutKind.Sequential)] struct DEVICE_INFO_HEADER { public uint type, size; public LUID adapterId; public uint id; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct TARGET_DEVICE_NAME {
+            public DEVICE_INFO_HEADER header; public uint flags; public uint outputTechnology;
+            public ushort edidManufactureId, edidProductCodeId; public uint connectorInstance;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string monitorFriendlyDeviceName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string monitorDevicePath;
+        }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct SOURCE_DEVICE_NAME {
+            public DEVICE_INFO_HEADER header;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string viewGdiDeviceName;
+        }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct DISPLAY_DEVICE {
+            public int cb;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+            public uint StateFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+        }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct DEVMODE {
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+            public ushort dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+            public uint dmFields;
+            public int dmPositionX, dmPositionY; public uint dmDisplayOrientation, dmDisplayFixedOutput;
+            public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+            public ushort dmLogPixels; public uint dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+            public uint dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+        }
+
+        static string San(string s) {
+            if (s == null) { return ""; }
+            return s.Replace("|", "/").Replace("\r", " ").Replace("\n", " ").Trim();
+        }
+
+        // Rows, pipe-delimited, one kind per line; the caller parses.
+        //
+        //   GFXDISPERR|<stage>|<message>
+        //       a stage that could not be read -- the caller renders the
+        //       affected field as unread, never as a zero or as a failure
+        //   GFXDISP|<gdiName>|<primary 0/1>|<w>|<h>|<hz>|<x>|<y>|<dpi>|<internal 0/1/?>|<tech>|<name>|<path>|<exactHz>|<desktopW>|<desktopH>
+        //       one ACTIVE display. <w>x<h> is the PHYSICAL mode;
+        //       <desktopW>x<desktopH> is the same monitor in desktop
+        //       coordinates, which this process sees virtualized. Their ratio
+        //       is the scale factor, and it is the only reading of it that
+        //       does not depend on the caller's DPI awareness. <devString> is
+        //       the adapter's own name for the display, which is what
+        //       NeurOptimal's monitor picker shows.
+        //   GFXDISPOFF|<internal 0/1>|<tech>|<name>|<path>
+        //       one target that is CONNECTED BUT NOT ACTIVE -- on the machines
+        //       that report it, this is what says the built-in panel is
+        //       switched off rather than absent
+        public static string[] Scan() {
+            List<string> rows = new List<string>();
+            Dictionary<string, string[]> bySource = new Dictionary<string, string[]>();
+            Dictionary<string, bool> activeTargets = new Dictionary<string, bool>();
+            try { ReadPaths(QDC_ONLY_ACTIVE_PATHS, bySource, activeTargets, rows, false); }
+            catch (Exception ex) { rows.Add("GFXDISPERR|active-paths|" + San(ex.Message)); }
+            try { ReadPaths(QDC_ALL_PATHS, null, activeTargets, rows, true); }
+            catch (Exception ex) { rows.Add("GFXDISPERR|all-paths|" + San(ex.Message)); }
+
+            uint n = 0;
+            while (true) {
+                DISPLAY_DEVICE dd = new DISPLAY_DEVICE();
+                dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+                if (!EnumDisplayDevicesW(null, n, ref dd, 0)) { break; }
+                n++;
+                if ((dd.StateFlags & 1) == 0) { continue; } // DISPLAY_DEVICE_ATTACHED_TO_DESKTOP
+                bool primary = (dd.StateFlags & 4) != 0;    // DISPLAY_DEVICE_PRIMARY_DEVICE
+                DEVMODE dm = new DEVMODE();
+                dm.dmSize = (ushort)Marshal.SizeOf(typeof(DEVMODE));
+                string w = "", h = "", hz = "", x = "", y = "";
+                if (EnumDisplaySettingsW(dd.DeviceName, -1 /* ENUM_CURRENT_SETTINGS */, ref dm)) {
+                    w = dm.dmPelsWidth.ToString(); h = dm.dmPelsHeight.ToString();
+                    hz = dm.dmDisplayFrequency.ToString();
+                    x = dm.dmPositionX.ToString(); y = dm.dmPositionY.ToString();
+                }
+                string dpi = "";
+                string deskW = "", deskH = "";
+                try {
+                    POINT pt = new POINT(); pt.X = dm.dmPositionX + 1; pt.Y = dm.dmPositionY + 1;
+                    IntPtr hm = MonitorFromPoint(pt, 2 /* MONITOR_DEFAULTTONEAREST */);
+                    if (hm != IntPtr.Zero) {
+                        uint dx, dy;
+                        if (GetDpiForMonitor(hm, 0 /* MDT_EFFECTIVE_DPI */, out dx, out dy) == ERROR_SUCCESS) { dpi = dx.ToString(); }
+                        // The monitor rect in DESKTOP coordinates. For a
+                        // process that is not per-monitor DPI aware this is
+                        // VIRTUALIZED -- the physical mode divided by the
+                        // scale factor -- while dmPelsWidth above is the real
+                        // mode. The ratio of the two IS the scale, and unlike
+                        // GetDpiForMonitor it does not depend on this
+                        // process's DPI awareness.
+                        MONITORINFO mi = new MONITORINFO();
+                        mi.cbSize = (uint)Marshal.SizeOf(typeof(MONITORINFO));
+                        if (GetMonitorInfoW(hm, ref mi)) {
+                            deskW = (mi.rcMonitor.R - mi.rcMonitor.L).ToString();
+                            deskH = (mi.rcMonitor.B - mi.rcMonitor.T).ToString();
+                        }
+                    }
+                } catch { }
+                string isInternal = "?", tech = "", name = "", path = "", exactHz = "";
+                string[] meta;
+                if (bySource.TryGetValue(dd.DeviceName, out meta)) { isInternal = meta[0]; tech = meta[1]; name = meta[2]; path = meta[3]; exactHz = meta[4]; }
+                // The MONITOR's own string, from the display's child device --
+                // NOT the adapter's, which is the graphics card's name. These
+                // are two different strings and only one of them is what
+                // NeurOptimal's monitor picker shows: measured 2026-09-18, the
+                // picker read 'Generic PnP Monitor' where the adapter string
+                // is 'Intel(R) Iris(R) Xe Graphics'. Kept separate from the
+                // EDID name ('PHL 499P9'), which is what identifies the screen.
+                string devString = "";
+                try {
+                    DISPLAY_DEVICE mon = new DISPLAY_DEVICE();
+                    mon.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+                    if (EnumDisplayDevicesW(dd.DeviceName, 0, ref mon, 0)) { devString = San(mon.DeviceString); }
+                } catch { }
+                if (devString.Length == 0) { devString = San(dd.DeviceString); }
+                if (name.Length == 0) { name = devString; }
+                rows.Add("GFXDISP|" + San(dd.DeviceName) + "|" + (primary ? "1" : "0") + "|" + w + "|" + h + "|" + hz + "|" + x + "|" + y + "|" + dpi + "|" + isInternal + "|" + tech + "|" + name + "|" + path + "|" + exactHz + "|" + deskW + "|" + deskH + "|" + devString);
+            }
+            return rows.ToArray();
+        }
+
+        static void ReadPaths(uint flags, Dictionary<string, string[]> bySource, Dictionary<string, bool> activeTargets, List<string> rows, bool inactiveOnly) {
+            uint pc = 0, mc = 0;
+            int rc = GetDisplayConfigBufferSizes(flags, out pc, out mc);
+            if (rc != ERROR_SUCCESS) { rows.Add("GFXDISPERR|buffer-sizes|win32 " + rc); return; }
+            PATH_INFO[] paths = new PATH_INFO[pc];
+            MODE_BLOB[] modes = new MODE_BLOB[mc];
+            rc = QueryDisplayConfig(flags, ref pc, paths, ref mc, modes, IntPtr.Zero);
+            if (rc != ERROR_SUCCESS) { rows.Add("GFXDISPERR|query|win32 " + rc); return; }
+            Dictionary<string, bool> emitted = new Dictionary<string, bool>();
+            for (int i = 0; i < pc; i++) {
+                bool active = (paths[i].flags & 1) != 0; // DISPLAYCONFIG_PATH_ACTIVE
+                if (inactiveOnly && active) { continue; }
+                TARGET_DEVICE_NAME tn = new TARGET_DEVICE_NAME();
+                tn.header.type = 2; // DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME
+                tn.header.size = (uint)Marshal.SizeOf(typeof(TARGET_DEVICE_NAME));
+                tn.header.adapterId = paths[i].targetInfo.adapterId;
+                tn.header.id = paths[i].targetInfo.id;
+                if (DisplayConfigGetDeviceInfo(ref tn) != ERROR_SUCCESS) { continue; }
+                uint tech = tn.outputTechnology;
+                // 0x80000000 INTERNAL, 11 DISPLAYPORT_EMBEDDED, 13 UDI_EMBEDDED.
+                string isInternal = (tech == 0x80000000u || tech == 11u || tech == 13u) ? "1" : "0";
+                string techName = TechName(tech);
+                string friendly = San(tn.monitorFriendlyDeviceName);
+                string devPath = San(tn.monitorDevicePath);
+                if (inactiveOnly) {
+                    if (paths[i].targetInfo.targetAvailable == 0) { continue; }
+                    // The all-paths query returns SEVERAL inactive paths per
+                    // target, including paths to a target that is currently
+                    // active on another connector. Measured on the reference
+                    // box: one external monitor produced three such rows while
+                    // it was the only display in use, and all three would have
+                    // read as "a display that is switched off".
+                    if (devPath.Length > 0 && (activeTargets.ContainsKey(devPath) || emitted.ContainsKey(devPath))) { continue; }
+                    if (devPath.Length > 0) { emitted[devPath] = true; }
+                    rows.Add("GFXDISPOFF|" + isInternal + "|" + techName + "|" + friendly + "|" + devPath);
+                    continue;
+                }
+                if (devPath.Length > 0) { activeTargets[devPath] = true; }
+                string exactHz = "";
+                if (paths[i].targetInfo.refreshRate.Denominator > 0) {
+                    exactHz = ((double)paths[i].targetInfo.refreshRate.Numerator / (double)paths[i].targetInfo.refreshRate.Denominator).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+                }
+                SOURCE_DEVICE_NAME sn = new SOURCE_DEVICE_NAME();
+                sn.header.type = 1; // DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME
+                sn.header.size = (uint)Marshal.SizeOf(typeof(SOURCE_DEVICE_NAME));
+                sn.header.adapterId = paths[i].sourceInfo.adapterId;
+                sn.header.id = paths[i].sourceInfo.id;
+                if (DisplayConfigGetDeviceInfo(ref sn) != ERROR_SUCCESS) { continue; }
+                string gdi = San(sn.viewGdiDeviceName);
+                if (gdi.Length > 0 && bySource != null && !bySource.ContainsKey(gdi)) {
+                    bySource[gdi] = new string[] { isInternal, techName, friendly, devPath, exactHz };
+                }
+            }
+        }
+
+        static string TechName(uint t) {
+            switch (t) {
+                case 0x80000000u: return "Internal";
+                case 0u: return "VGA";
+                case 1u: return "S-Video";
+                case 2u: return "Composite";
+                case 3u: return "Component";
+                case 4u: return "DVI";
+                case 5u: return "HDMI";
+                case 6u: return "LVDS";
+                case 8u: return "D-Jpn";
+                case 9u: return "SDI";
+                case 10u: return "DisplayPort";
+                case 11u: return "DisplayPort (embedded)";
+                case 12u: return "UDI";
+                case 13u: return "UDI (embedded)";
+                case 14u: return "SDTV dongle";
+                case 15u: return "Miracast";
+                case 16u: return "Indirect wired";
+                case 17u: return "Indirect virtual";
+                default: return "unknown (" + t + ")";
+            }
+        }
+    }
+}
+"@
+        Add-Type -TypeDefinition $source -ErrorAction Stop
+        return [bool]('WinConfigDiag.GfxDisplayScan' -as [type])
+    } catch {
+        return $false
+    }
+}
+
+function ConvertTo-GfxMonitorKey {
+    <#
+    .SYNOPSIS
+        The one key that joins a DisplayConfig target to its EDID record. Pure.
+    .DESCRIPTION
+        The two readings name the same monitor in two spellings:
+
+          DisplayConfig  \\?\DISPLAY#PHL092A#4&218c0622&0&UID20548#{e6f07b5f-...}
+          WMI            DISPLAY\PHL092A\4&218c0622&0&UID20548_0
+
+        Both are rendered through this function so a map key and a lookup key
+        can never drift apart in formatting -- the same discipline, and for the
+        same reason, as ConvertTo-GfxLuidKey.
+
+        Returns $null for anything it cannot reduce to the shared middle, which
+        renders as an absent physical size rather than a wrong one.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $t = $Text.Trim()
+    $t = $t -replace '^\\\\\?\\', ''       # interface prefix
+    $t = $t -replace '\{[0-9A-Fa-f\-]+\}$', ''
+    $t = $t -replace '#', '\'
+    $t = $t -replace '_\d+$', ''           # WMI's per-instance suffix
+    $t = $t.TrimEnd('\')
+    if ([string]::IsNullOrWhiteSpace($t)) { return $null }
+    return $t.ToUpperInvariant()
+}
+
+function Get-GfxDisplayPhysicalSize {
+    <#
+    .SYNOPSIS
+        Each monitor's physical panel size, from EDID, keyed by
+        ConvertTo-GfxMonitorKey.
+    .DESCRIPTION
+        ONE CIM CALL, CACHED. A panel's physical size does not change, and the
+        readiness checklist asks for the arrangement once a second -- so the
+        cache is rebuilt only when the SET of attached monitors changes, which
+        is exactly when the answer can have changed.
+
+        WHAT 'RELIABLY AVAILABLE' MEANS HERE. EDID states the image size in
+        whole centimetres, and a monitor that declines to state it reports 0.
+        A size is kept only when both dimensions are non-zero AND the diagonal
+        lands between 3 and 120 inches; anything else is dropped rather than
+        printed. A wrong diagonal beside a right resolution is worse than no
+        diagonal at all, and it is the kind of wrong a reader cannot detect.
+
+        Measured on the reference box: a 49-inch Philips 499P9 reports
+        119 x 34 cm -> 48.7 in, which is EDID's centimetre rounding and not an
+        error. The class is unreadable without elevation on some systems, in
+        which case every size is simply absent.
+    .OUTPUTS
+        Hashtable: key -> @{ WidthCm, HeightCm, DiagonalInch }. Empty when the
+        class could not be read.
+    #>
+    [CmdletBinding()]
+    param([string[]]$DevicePaths)
+
+    $keys = @(@($DevicePaths) | ForEach-Object { ConvertTo-GfxMonitorKey -Text $_ } | Where-Object { $_ } | Sort-Object -Unique)
+    $cacheKey = ($keys -join '|')
+    if ($script:GfxPhysicalSizeCacheKey -eq $cacheKey -and $null -ne $script:GfxPhysicalSizeCache) {
+        return $script:GfxPhysicalSizeCache
+    }
+
+    $map = @{}
+    try {
+        foreach ($m in @(Get-CimInstance -Namespace 'root\wmi' -ClassName 'WmiMonitorBasicDisplayParams' -ErrorAction Stop)) {
+            $key = ConvertTo-GfxMonitorKey -Text ([string]$m.InstanceName)
+            if (-not $key) { continue }
+            $w = 0; $h = 0
+            try { $w = [int]$m.MaxHorizontalImageSize; $h = [int]$m.MaxVerticalImageSize } catch { continue }
+            if ($w -le 0 -or $h -le 0) { continue }
+            $diag = [math]::Sqrt(($w * $w) + ($h * $h)) / 2.54
+            if ($diag -lt 3 -or $diag -gt 120) { continue }
+            $map[$key] = @{ WidthCm = $w; HeightCm = $h; DiagonalInch = [math]::Round($diag, 1) }
+        }
+    } catch {
+        # Unreadable -- every size stays absent, which is the honest answer and
+        # never a guessed one.
+        $map = @{}
+    }
+
+    $script:GfxPhysicalSizeCacheKey = $cacheKey
+    $script:GfxPhysicalSizeCache = $map
+    return $map
+}
+
+function ConvertFrom-GfxDisplayScanRows {
+    <#
+    .SYNOPSIS
+        Turns GfxDisplayScan.Scan rows into the arrangement record. PURE --
+        unit-testable against a fixture, with no display attached.
+    .DESCRIPTION
+        Every field a row left empty stays $null. A display whose mode could
+        not be read is still listed, with its mode absent: that a display is
+        there is a separate reading from what it is set to, and collapsing the
+        two would drop a display from the arrangement because one of its
+        numbers was unavailable.
+    .PARAMETER Rows
+        The raw pipe-delimited rows.
+    .PARAMETER HasBattery
+        Whether this machine has a battery, from the inventory. Used ONLY to
+        say whether an unenumerated built-in panel is likely to exist; never to
+        claim one is active. Omitted leaves the question open.
+    .PARAMETER PhysicalSizes
+        The EDID size map from Get-GfxDisplayPhysicalSize, joined on the
+        monitor's device path. PASSED IN rather than read here, so this stays
+        pure and testable; a display the map does not cover simply has no size,
+        which is how a monitor that declines to state one renders.
+    .OUTPUTS
+        See Get-GfxDisplayArrangement.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][string[]]$Rows,
+        $HasBattery,
+        [hashtable]$PhysicalSizes = @{}
+    )
+
+    $displays = @()
+    $inactive = @()
+    $errors = @()
+    $toInt = {
+        param([string]$Text)
+        if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+        $v = 0
+        if ([int]::TryParse($Text, [ref]$v)) { return $v }
+        return $null
+    }
+
+    foreach ($row in @($Rows)) {
+        if ([string]::IsNullOrEmpty($row)) { continue }
+        $kind = ($row -split '\|', 2)[0]
+        if ($kind -eq 'GFXDISPERR') {
+            $p = $row -split '\|', 3
+            if ($p.Count -ge 3) { $errors += "$($p[1]): $($p[2])" }
+            continue
+        }
+        if ($kind -eq 'GFXDISPOFF') {
+            $p = $row -split '\|', 5
+            if ($p.Count -lt 5) { continue }
+            $inactive += @{
+                Internal   = ($p[1] -eq '1')
+                Connection = [string]$p[2]
+                Name       = $(if ([string]::IsNullOrWhiteSpace($p[3])) { $null } else { [string]$p[3] })
+                DevicePath = $(if ([string]::IsNullOrWhiteSpace($p[4])) { $null } else { [string]$p[4] })
+            }
+            continue
+        }
+        if ($kind -ne 'GFXDISP') { continue }
+        $p = $row -split '\|', 17
+        if ($p.Count -lt 13) { continue }
+        $w = & $toInt $p[3]
+        $h = & $toInt $p[4]
+        $dpi = & $toInt $p[8]
+        $exactHz = $null
+        if ($p.Count -ge 14 -and -not [string]::IsNullOrWhiteSpace($p[13])) {
+            $d = 0.0
+            if ([double]::TryParse($p[13], [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { $exactHz = [math]::Round($d, 3) }
+        }
+        # THE SCALE FACTOR, DERIVED -- not taken from GetDpiForMonitor.
+        #
+        # MEASURED 2026-09-18: a Surface Laptop Studio panel running at 150%
+        # reported dpi 96 through GetDpiForMonitor, because this process is not
+        # per-monitor DPI aware and the API then answers for the caller rather
+        # than for the display. Read straight, that field says '100% scaling'
+        # on every machine in the fleet -- a false reading in the cohort key,
+        # which is exactly what this module refuses to emit.
+        #
+        # The physical mode (EnumDisplaySettings, 2400x1600) against the same
+        # monitor in desktop coordinates (GetMonitorInfo, 1600x1067) gives
+        # 1.5 -- and that ratio does not depend on anyone's DPI awareness. The
+        # reported DPI is kept beside it as an observation, never as the answer.
+        $deskW = & $toInt $(if ($p.Count -ge 15) { $p[14] } else { '' })
+        $deskH = & $toInt $(if ($p.Count -ge 16) { $p[15] } else { '' })
+        $scale = $null
+        if ($null -ne $w -and $null -ne $deskW -and $deskW -gt 0) {
+            $scale = [int][math]::Round(100.0 * $w / $deskW)
+        } elseif ($null -ne $dpi -and $dpi -gt 0) {
+            # No desktop rect: fall back to the reported DPI, which is right
+            # whenever the caller happens to be DPI aware and is all there is.
+            $scale = [int][math]::Round(100.0 * $dpi / 96.0)
+        }
+
+        # '?' IS A THIRD ANSWER. A display whose connector could not be read is
+        # neither internal nor external, and forcing it to $false would let a
+        # built-in panel be reported as an external monitor -- the one mistake
+        # this whole reader exists to prevent.
+        $isInternal = switch ([string]$p[9]) { '1' { $true } '0' { $false } default { $null } }
+        $devicePath = $(if ([string]::IsNullOrWhiteSpace($p[12])) { $null } else { [string]$p[12] })
+        $size = $null
+        if ($devicePath -and $PhysicalSizes) {
+            $mk = ConvertTo-GfxMonitorKey -Text $devicePath
+            if ($mk -and $PhysicalSizes.ContainsKey($mk)) { $size = $PhysicalSizes[$mk] }
+        }
+        $displays += @{
+            GdiName      = [string]$p[1]
+            Primary      = ($p[2] -eq '1')
+            Width        = $w
+            Height       = $h
+            Bounds       = $(if ($null -ne $w -and $null -ne $h) { "${w}x${h}" } else { $null })
+            RefreshHz    = & $toInt $p[5]
+            RefreshExact = $exactHz
+            PosX         = & $toInt $p[6]
+            PosY         = & $toInt $p[7]
+            Dpi          = $dpi
+            ScalePercent = $scale
+            # The same monitor as the desktop sees it. Kept because the window
+            # rects elsewhere in the package are in THESE coordinates, and a
+            # reader comparing 1614x1033 against a 2400x1600 display otherwise
+            # has no way to reconcile them.
+            DesktopWidth  = $deskW
+            DesktopHeight = $deskH
+            DesktopBounds = $(if ($null -ne $deskW -and $null -ne $deskH) { "${deskW}x${deskH}" } else { $null })
+            Internal     = $isInternal
+            Connection   = $(if ([string]::IsNullOrWhiteSpace($p[10])) { $null } else { [string]$p[10] })
+            Name         = $(if ([string]::IsNullOrWhiteSpace($p[11])) { $null } else { [string]$p[11] })
+            # WHAT NEUROPTIMAL CALLS THIS SCREEN. Its monitor picker lists
+            # 'Display <n> - <adapter string> - <w> x <h>', and 'Display 1'
+            # is '\.\DISPLAY1' -- confirmed 2026-09-18 by the resolution
+            # matching. A tester choosing a monitor in that dialog is reading
+            # these, not the EDID name this tool identifies screens by, so
+            # both are carried and the guide prints both.
+            DisplayNumber = $(if ([string]$p[1] -match 'DISPLAY(\d+)$') { [int]$Matches[1] } else { $null })
+            DeviceString  = $(if ($p.Count -ge 17 -and -not [string]::IsNullOrWhiteSpace($p[16])) { [string]$p[16] } else { $null })
+            DevicePath   = $devicePath
+            # From EDID, and ABSENT rather than approximated when the monitor
+            # did not state it or stated something implausible.
+            PhysicalWidthCm  = $(if ($size) { $size.WidthCm } else { $null })
+            PhysicalHeightCm = $(if ($size) { $size.HeightCm } else { $null })
+            DiagonalInch     = $(if ($size) { $size.DiagonalInch } else { $null })
+        }
+    }
+
+    return (New-GfxDisplayArrangement -Displays $displays -Inactive $inactive -Errors $errors -HasBattery $HasBattery)
+}
+
+function New-GfxDisplayArrangement {
+    <#
+    .SYNOPSIS
+        Classifies a parsed display list into the arrangement a test asks for.
+        PURE, so every layout below is testable without the hardware.
+    .DESCRIPTION
+        THE LAYOUT IS THE UNIT OF COMPARISON, NOT THE COUNT.
+
+          BuiltInOnly          one active display and it is the built-in panel
+          ExternalOnly         one active display and it is not the built-in
+                               panel -- the lid-closed, one-big-monitor case
+                               that the old "one monitor" check waved through
+          BuiltInPlusExternal  the built-in panel and at least one other
+          MultipleExternal     more than one, none of them built-in
+          NoDisplays           nothing active
+          Unknown              could not be read, or a display would not say
+                               which kind it is
+
+        A display whose connector is unreadable makes the WHOLE layout Unknown
+        rather than being assumed external: a guess there is a guess about the
+        one variable this check exists to control.
+
+        THE LAYOUT IS ABOUT DISPLAYS IN USE, AND THAT IS NOT THE SAME QUESTION
+        AS WHAT IS PLUGGED IN. 'BuiltInOnly' says the built-in panel is the only
+        display being DRAWN TO. An external monitor that is connected and
+        switched off satisfies it, and 'disconnect the external monitor' is a
+        different instruction from 'stop using it'. So the connected-but-unused
+        set is reported SEPARATELY, in ExternalConnected, and it has three
+        answers rather than two:
+
+          count > 0   an external target was enumerated as connected and not
+                      in use -- a reading, and a definite one
+          count = 0   NOTHING WAS ENUMERATED, WHICH IS NOT THE SAME AS NOTHING
+                      BEING THERE. Measured on the reference box: a laptop
+                      running with its lid shut enumerates no internal target
+                      at all, in either query. Windows does not reliably offer
+                      disconnected or sleeping displays, so absence here cannot
+                      be read as proof of absence.
+
+        ExternalConnectedKnown records which of those two it is, so a caller can
+        tell 'none connected' from 'none reported'. The readiness check turns
+        the second into an operator confirmation rather than a silent pass.
+    .OUTPUTS
+        Hashtable: Ok, ReadAtUtc, Displays[], Inactive[], Count, Layout,
+        LayoutText, BuiltIn (@{ State, StateText, Display, Inferred }),
+        ExternalConnected[], ExternalConnectedKnown, Primary, Signature,
+        Errors[].
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][array]$Displays = @(),
+        [AllowEmptyCollection()][array]$Inactive = @(),
+        [AllowEmptyCollection()][array]$Errors = @(),
+        $HasBattery
+    )
+
+    $dash = [string][char]0x2014
+    $active = @($Displays | Where-Object { $null -ne $_ })
+    $inactiveList = @($Inactive | Where-Object { $null -ne $_ })
+    $errorList = @($Errors | Where-Object { $_ })
+    $ok = ($active.Count -gt 0)
+
+    $internalActive = @($active | Where-Object { $_.Internal -eq $true })
+    $externalActive = @($active | Where-Object { $_.Internal -eq $false })
+    $unknownKind = @($active | Where-Object { $null -eq $_.Internal })
+
+    $layout = 'Unknown'
+    if (-not $ok) {
+        $layout = $(if ($errorList.Count -gt 0) { 'Unknown' } else { 'NoDisplays' })
+    } elseif ($unknownKind.Count -gt 0) {
+        $layout = 'Unknown'
+    } elseif ($active.Count -eq 1) {
+        $layout = $(if ($internalActive.Count -eq 1) { 'BuiltInOnly' } else { 'ExternalOnly' })
+    } elseif ($internalActive.Count -gt 0) {
+        $layout = 'BuiltInPlusExternal'
+    } else {
+        $layout = 'MultipleExternal'
+    }
+
+    $layoutText = switch ($layout) {
+        'BuiltInOnly'         { 'Built-in screen only' }
+        'ExternalOnly'        { 'External display only' }
+        'BuiltInPlusExternal' { "Built-in screen plus $($externalActive.Count) external display(s)" }
+        'MultipleExternal'    { "$($active.Count) external displays, no built-in screen" }
+        'NoDisplays'          { 'No active display' }
+        default               { 'Could not be read' }
+    }
+
+    # THE BUILT-IN PANEL. Five answers, and the difference between them is
+    # whether anything was actually read.
+    $builtIn = @{ State = 'Unknown'; StateText = 'Could not be read'; Display = $null; Inferred = $false }
+    $internalInactive = @($inactiveList | Where-Object { $_.Internal -eq $true })
+    if ($internalActive.Count -gt 0) {
+        $builtIn = @{ State = 'Active'; Display = $internalActive[0]; Inferred = $false; StateText = 'Active' }
+    } elseif ($internalInactive.Count -gt 0) {
+        $builtIn = @{ State = 'Inactive'; Display = $null; Inferred = $false
+                      StateText = 'Inactive (connected, not in use)' }
+    } elseif ($HasBattery -eq $true) {
+        # MEASURED ON A SURFACE LAPTOP STUDIO, 2026-09-18: with the lid closed
+        # the built-in panel is absent from BOTH the active and the all-paths
+        # query, so there is nothing at all to read. That the machine has one
+        # is an inference from it having a battery, and the text says so.
+        $builtIn = @{ State = 'NotOffered'; Display = $null; Inferred = $true
+                      StateText = "Inactive $dash Windows is not offering it (lid closed, or switched off)" }
+    } elseif ($HasBattery -eq $false) {
+        $builtIn = @{ State = 'None'; Display = $null; Inferred = $true
+                      StateText = "None $dash this machine has no built-in screen" }
+    }
+
+    # CONNECTED BUT NOT IN USE, external only. The internal panel showing up
+    # here is the ordinary lid-closed case and is already reported by BuiltIn;
+    # an EXTERNAL monitor here is a screen the operator believes they have
+    # removed from the test and has not.
+    $externalConnected = @($inactiveList | Where-Object { $_.Internal -eq $false })
+    # Whether the absence of such a target is a READING. It is only a reading
+    # when the all-paths query returned something -- anything -- so we know it
+    # is capable of answering. With nothing enumerated at all, and no error, the
+    # honest answer is that we cannot tell.
+    $externalConnectedKnown = ($externalConnected.Count -gt 0 -or $inactiveList.Count -gt 0)
+
+    $primary = @($active | Where-Object { $_.Primary }) | Select-Object -First 1
+
+    # THE SIGNATURE is what makes two arrangements comparable or not, and it is
+    # sorted so the same desktop always renders byte-identical text. Identity
+    # comes first, because two 1920x1080 external monitors are still two
+    # different screens and a run made on each is not the same run twice.
+    $parts = @()
+    foreach ($d in @($active | Sort-Object { [string]$_.GdiName })) {
+        $kind = if ($d.Internal -eq $true) { 'builtin' } elseif ($d.Internal -eq $false) { 'external' } else { 'unknown' }
+        $name = if ($d.Name) { $d.Name } else { 'unnamed' }
+        $mode = if ($d.Bounds) { $d.Bounds } else { 'nomode' }
+        $hz = if ($null -ne $d.RefreshHz) { "$($d.RefreshHz)Hz" } else { 'nohz' }
+        $scale = if ($null -ne $d.ScalePercent) { "$($d.ScalePercent)pct" } else { 'noscale' }
+        $parts += "$kind/$name/$mode@$hz@$scale"
+    }
+    $signature = if ($parts.Count -gt 0) { $parts -join ' + ' } else { $null }
+
+    return @{
+        Ok         = $ok
+        ReadAtUtc  = [datetime]::UtcNow.ToString('o')
+        Displays   = $active
+        Inactive   = $inactiveList
+        Count      = $(if ($ok -or $errorList.Count -eq 0) { $active.Count } else { $null })
+        Layout     = $layout
+        LayoutText = $layoutText
+        BuiltIn    = $builtIn
+        # Connected and NOT in use. Separate from Layout on purpose: 'in use'
+        # and 'plugged in' are different questions and only one of them is
+        # reliably answerable.
+        ExternalConnected      = $externalConnected
+        ExternalConnectedKnown = $externalConnectedKnown
+        Primary    = $primary
+        Signature  = $signature
+        Errors     = $errorList
+    }
+}
+
+function Get-GfxDisplayArrangement {
+    <#
+    .SYNOPSIS
+        The display arrangement RIGHT NOW: every active display with its
+        identity, mode, refresh rate and scale, whether the built-in panel is
+        in use, and what shape the desktop is in.
+    .DESCRIPTION
+        The live reader the readiness checklist asks once a second while a
+        tester is plugging and unplugging screens. NOTHING IS CACHED: the whole
+        value of the check is that it is true at the moment Start is pressed.
+
+        Cheap enough to ask at that rate -- measured at 12 ms for ten calls on
+        the reference box, against a 1 s tick.
+
+        Returns an arrangement with Ok = $false and an error when the helper
+        could not be compiled or the query failed, which every caller renders
+        as 'could not be read' -- never as a failed requirement, and never as
+        zero displays.
+    .PARAMETER HasBattery
+        From the inventory, for the built-in-panel inference only. Omit it and
+        the built-in state stays Unknown rather than being guessed.
+    #>
+    [CmdletBinding()]
+    param($HasBattery)
+
+    if (-not (Initialize-GfxDisplayScan)) {
+        return (New-GfxDisplayArrangement -Displays @() -Inactive @() -HasBattery $HasBattery `
+                    -Errors @('the display-arrangement helper could not be compiled on this machine'))
+    }
+    try {
+        $rows = [WinConfigDiag.GfxDisplayScan]::Scan()
+        # The device paths first, so the EDID lookup is only rebuilt when the
+        # set of attached monitors has actually changed. At one call a second
+        # an uncached CIM query here would cost more than everything else this
+        # window does put together.
+        $paths = @()
+        foreach ($row in @($rows)) {
+            if ($row -notlike 'GFXDISP|*') { continue }
+            $f = $row -split '\|', 14
+            if ($f.Count -ge 13 -and -not [string]::IsNullOrWhiteSpace($f[12])) { $paths += [string]$f[12] }
+        }
+        $sizes = Get-GfxDisplayPhysicalSize -DevicePaths $paths
+        return (ConvertFrom-GfxDisplayScanRows -Rows @($rows) -HasBattery $HasBattery -PhysicalSizes $sizes)
+    } catch {
+        return (New-GfxDisplayArrangement -Displays @() -Inactive @() -HasBattery $HasBattery `
+                    -Errors @("the display arrangement could not be read: $($_.Exception.Message)"))
+    }
+}
+
+function Format-GfxDisplayLabel {
+    <#
+    .SYNOPSIS
+        One display as a tester reads it: name, size when it is known,
+        resolution, refresh, scaling.
+    .DESCRIPTION
+        PHYSICAL SIZE IS PRINTED ONLY WHEN IT WAS READ AND IS PLAUSIBLE -- the
+        gate is in Get-GfxDisplayPhysicalSize, and a display that did not pass
+        it carries no size at all, so there is nothing here to suppress. A
+        wrong diagonal beside a right resolution is worse than no diagonal, and
+        it is the kind of wrong a reader cannot detect.
+
+        The NAME is what distinguishes two screens and is never omitted; the
+        resolution is what explains the numbers.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()]$Display)
+
+    $dash = [string][char]0x2014
+    if (-not $Display) { return $dash }
+    $bits = @()
+    $bits += $(if ($Display.Name) { [string]$Display.Name } else { 'unnamed display' })
+    if ($null -ne $Display.DiagonalInch) { $bits += "$($Display.DiagonalInch) in" }
+    if ($Display.Bounds) { $bits += [string]$Display.Bounds }
+    if ($null -ne $Display.RefreshHz) { $bits += "$($Display.RefreshHz) Hz" }
+    if ($null -ne $Display.ScalePercent) { $bits += "$($Display.ScalePercent)% scaling" }
+    return ($bits -join ', ')
+}
+
+function Resolve-GfxNoDisplay {
+    <#
+    .SYNOPSIS
+        Which of the arrangement's displays NeurOptimal's window is on.
+    .DESCRIPTION
+        Matched on the MONITOR DEVICE NAME the window scan reads from
+        MonitorFromWindow, not on rectangle arithmetic: the two readings come
+        from different APIs and a mixed-DPI desktop can make their coordinates
+        disagree. A window whose monitor could not be read resolves to $null
+        and renders as unread -- never as the primary display, which is exactly
+        how a two-screen run would come to look like a one-screen one.
+    .OUTPUTS
+        The display record, or $null.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()]$Arrangement, [AllowNull()]$NoWindow)
+
+    if (-not $Arrangement -or -not $NoWindow) { return $null }
+    $dev = [string]$NoWindow.MonitorDevice
+    if ([string]::IsNullOrWhiteSpace($dev)) { return $null }
+    foreach ($d in @($Arrangement.Displays)) {
+        if ([string]$d.GdiName -eq $dev) { return $d }
+    }
+    return $null
+}
+
+function Format-GfxDisplaySetupLines {
+    <#
+    .SYNOPSIS
+        The display block the guide and the report both print, as
+        @{ Key, Text, Level } rows.
+    .DESCRIPTION
+        ONE renderer for the arrangement, called by the bench window and by the
+        report, so the screen and the package can never describe the desktop
+        differently. Nothing is decided here that the arrangement did not
+        already say.
+    .PARAMETER NoDisplay
+        The display NeurOptimal's window is on, from Resolve-GfxNoDisplay.
+        $null renders as not read, never as "the primary one".
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Arrangement,
+        [AllowNull()]$NoDisplay,
+        [AllowNull()][string]$NoDisplayReason
+    )
+
+    $dash = [string][char]0x2014
+    if (-not $Arrangement) {
+        $rows = @(@{ Key = 'Setup'; Level = 'Unknown'; Text = 'Display setup: could not be read' })
+        return ,$rows
+    }
+
+    $rows = @()
+    $level = switch ($Arrangement.Layout) { 'Unknown' { 'Unknown' } 'NoDisplays' { 'Unknown' } default { 'Info' } }
+    $rows += @{ Key = 'Setup'; Level = $level; Text = "Display setup: $($Arrangement.LayoutText)" }
+
+    $active = @($Arrangement.Displays)
+    if ($active.Count -eq 0) {
+        $rows += @{ Key = 'Active'; Level = 'Unknown'; Text = "Active display: $dash" }
+    } else {
+        foreach ($d in $active) {
+            $kind = if ($d.Internal -eq $true) { 'built-in' } elseif ($d.Internal -eq $false) { 'external' } else { 'kind unknown' }
+            $tail = if ($d.Connection -and $d.Internal -eq $false) { ", $($d.Connection)" } else { '' }
+            $rows += @{ Key = 'Active'; Level = 'Info'
+                        Text = "Active display: $(Format-GfxDisplayLabel -Display $d) ($kind$tail)" }
+            # NEUROPTIMAL'S OWN LABEL FOR THE SAME SCREEN. Its monitor picker
+            # says 'Display 1 - Generic PnP Monitor - 3840 x 1080' where this
+            # tool says 'PHL 499P9'. A tester choosing a screen in that dialog
+            # is reading NeurOptimal's words, so both are printed and the
+            # tester is not left matching them by guesswork.
+            if ($null -ne $d.DisplayNumber) {
+                # THE PICKER LISTS THE PHYSICAL MODE, not the desktop size.
+                # Captured verbatim 2026-09-18 with the dropdown open:
+                #   Display 1 - Generic PnP Monitor - 3840 x 1080
+                #   Display 2 - Surface Panel - 2400 x 1600 (Main display)
+                # The second line settles it: that panel is 2400x1600 physical
+                # and 1600x1067 in desktop coordinates, and the picker shows
+                # the former. Printing the desktop size here would hand the
+                # tester a number that appears nowhere in the dialog they are
+                # looking at.
+                $asNo = "Display $($d.DisplayNumber)"
+                if ($d.DeviceString) { $asNo += " - $($d.DeviceString)" }
+                if ($d.Bounds) { $asNo += " - $(($d.Bounds -replace 'x', ' x '))" }
+                if ($d.Primary) { $asNo += ' (Main display)' }
+                $rows += @{ Key = 'ActiveAsNo'; Level = 'Info'
+                            Text = "   NeurOptimal calls it: $asNo" }
+            }
+        }
+    }
+
+    $bText = "Built-in display: $($Arrangement.BuiltIn.StateText)"
+    if ($Arrangement.BuiltIn.State -eq 'Active') {
+        $bText = "Built-in display: Active $dash $(Format-GfxDisplayLabel -Display $Arrangement.BuiltIn.Display)"
+    }
+    $rows += @{ Key = 'BuiltIn'; Level = $(if ($Arrangement.BuiltIn.State -eq 'Unknown') { 'Unknown' } else { 'Info' }); Text = $bText }
+
+    $noText = "NeurOptimal location: $dash"
+    $noLevel = 'Unknown'
+    if ($NoDisplay) {
+        $where = if ($NoDisplay.Internal -eq $true) { 'Built-in screen' } elseif ($NoDisplay.Internal -eq $false) { 'External display' } else { 'A display of unknown kind' }
+        $noText = "NeurOptimal location: $where $dash $(Format-GfxDisplayLabel -Display $NoDisplay)"
+        $noLevel = 'Info'
+    } elseif ($NoDisplayReason) {
+        $noText = "NeurOptimal location: $NoDisplayReason"
+    }
+    $rows += @{ Key = 'NoLocation'; Level = $noLevel; Text = $noText }
+
+    foreach ($e in @($Arrangement.Errors)) {
+        $rows += @{ Key = 'Error'; Level = 'Unknown'; Text = "Display arrangement, partly unread: $e" }
+    }
+    return ,$rows
+}
+
+function Test-GfxExternalDisconnected {
+    <#
+    .SYNOPSIS
+        Whether any external display is still CONNECTED -- a different question
+        from whether one is in use, and one Windows often cannot answer.
+    .DESCRIPTION
+        'Built-in screen only' is a statement about what is being DRAWN TO. An
+        external monitor that is plugged in and switched off satisfies it, and
+        a test whose point is to control the screen cannot let that through
+        silently.
+
+        THREE ANSWERS, AND THE MIDDLE ONE IS THE COMMON CASE.
+
+          NotYet   an external target was enumerated as connected and unused.
+                   A reading, and a definite one: unplug it.
+          Ok       either nothing is connected AND the query demonstrated it can
+                   answer, or the operator has confirmed it by hand.
+          Unknown  nothing was enumerated and nothing proved the query could
+                   have enumerated it. Measured on the reference box: a laptop
+                   with its lid shut reports no internal target in EITHER query,
+                   so silence here is not evidence. This is where the operator
+                   confirmation belongs -- a person can see the back of the
+                   machine and Windows cannot.
+
+        The confirmation is ATTESTED, never measured, and the distinction rides
+        into the package in the check's Detail so a reader can tell one from the
+        other later.
+    .PARAMETER OperatorConfirmed
+        The tester has stated, in the window, that no external display is
+        connected. Only ever upgrades Unknown to Ok; it can never overrule a
+        monitor the tool actually saw.
+    .OUTPUTS
+        Hashtable: State, Detail, Fix, Text.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Arrangement,
+        [bool]$OperatorConfirmed = $false
+    )
+
+    $text = 'No external display connected'
+    if (-not $Arrangement) {
+        return @{ State = 'Unknown'; Detail = 'not read'; Fix = $null; Text = $text }
+    }
+
+    $connected = @($Arrangement.ExternalConnected)
+    $inUse = @(@($Arrangement.Displays) | Where-Object { $_.Internal -eq $false })
+
+    # An external display that is IN USE is the layout check's business, not
+    # this one's. Reporting it twice would put one fault in a tester's list
+    # under two different instructions.
+    if ($connected.Count -gt 0) {
+        $names = @($connected | ForEach-Object { if ($_.Name) { $_.Name } else { 'an external display' } })
+        return @{ State  = 'NotYet'
+                  Detail = "$($connected.Count) connected but not in use: $($names -join ', ')"
+                  Text   = $text
+                  Fix    = "Unplug $($names -join ' and ') as well. It is connected but switched off, and this test compares recordings made with nothing else attached." }
+    }
+
+    if ($OperatorConfirmed) {
+        return @{ State = 'Ok'; Detail = 'confirmed by the operator, not measured'; Fix = $null; Text = $text }
+    }
+    if ($Arrangement.ExternalConnectedKnown) {
+        # The all-paths query DID return connected-but-unused targets, and none
+        # of them was external. That is the one case where silence is a reading:
+        # the query demonstrated it can answer and answered 'none'.
+        return @{ State = 'Ok'; Detail = 'none reported connected'; Fix = $null; Text = $text }
+    }
+    # EVERYTHING ELSE IS UNKNOWN, including a desktop already driving an
+    # external display. It is tempting to argue that a query which enumerated
+    # one external target can see them all -- but the target it enumerated was
+    # ACTIVE, and the question here is about targets that are not. A monitor
+    # connected and asleep is exactly the thing that goes unenumerated, so the
+    # argument proves nothing about the case it is being used on.
+    return @{ State  = 'Unknown'
+              Text   = $text
+              Detail = 'Windows did not report any disconnected display, which is not the same as none being attached'
+              Fix    = $null }
+}
+
+function Test-GfxDisplaySetupMatch {
+    <#
+    .SYNOPSIS
+        Whether an arrangement is the one a test asks for, and -- when it is
+        not -- the one sentence that tells a tester how to get there.
+    .DESCRIPTION
+        ONE PLACE, TWO CALLERS. The readiness checklist asks this before the
+        run, while it can still be fixed, and the deviation pass asks it again
+        afterwards from the arrangement recorded in the package. Splitting it
+        would be two opinions about the same desktop, which is how a checklist
+        comes to disagree with the report it produced.
+
+        THREE ANSWERS, not two: an arrangement that could not be read is not a
+        failed requirement, so State is 'Unknown' and there is no Fix -- there
+        is nothing for the tester to do about a reading that did not happen.
+    .PARAMETER Want
+        'BuiltInOnly' or 'ExternalOnly'.
+    .OUTPUTS
+        Hashtable: State ('Ok' | 'NotYet' | 'Unknown'), Detail, Fix, Text.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Want,
+        [AllowNull()]$Arrangement
+    )
+
+    $text = switch ($Want) {
+        'BuiltInOnly'  { "Built-in screen only" }
+        'ExternalOnly' { "One external display, built-in screen off" }
+        default        { "Display setup: $Want" }
+    }
+
+    if (-not $Arrangement -or $Arrangement.Layout -eq 'Unknown') {
+        $why = 'display setup not read'
+        if ($Arrangement -and @($Arrangement.Errors).Count -gt 0) { $why = 'display setup could not be read' }
+        elseif ($Arrangement -and $Arrangement.Layout -eq 'Unknown' -and @($Arrangement.Displays).Count -gt 0) {
+            $why = 'one display would not say whether it is the built-in screen'
+        }
+        return @{ State = 'Unknown'; Detail = $why; Fix = $null; Text = $text }
+    }
+
+    $have = [string]$Arrangement.Layout
+    $detail = [string]$Arrangement.LayoutText
+    if ($have -eq $Want) { return @{ State = 'Ok'; Detail = $detail; Fix = $null; Text = $text } }
+
+    # The fix names the SCREEN, not the count. "Disconnect the extra monitor"
+    # is unusable advice to someone running one external display with the lid
+    # shut: there is no extra monitor, and the one they have is the wrong one.
+    $fix = switch ($Want) {
+        'BuiltInOnly' {
+            switch ($have) {
+                'ExternalOnly'        { "This test measures the laptop's own screen. Disconnect the external display and open the lid, so the built-in screen is the only one in use." }
+                'BuiltInPlusExternal' { "Disconnect the external display, so the built-in screen is the only one in use. A recording made with two screens cannot be compared with the other baseline recordings." }
+                'MultipleExternal'    { "This test measures the laptop's own screen. Disconnect every external display and open the lid." }
+                'NoDisplays'          { 'No display is active. Open the lid, or switch the built-in screen back on.' }
+                default               { "Use the built-in screen only for this test." }
+            }
+        }
+        'ExternalOnly' {
+            switch ($have) {
+                'BuiltInOnly'         { 'This test measures an external display. Connect the external monitor and switch the built-in screen off -- close the lid, or press Windows+P and choose Second screen only.' }
+                'BuiltInPlusExternal' { 'Switch the built-in screen off so the external display is the only one in use -- close the lid, or press Windows+P and choose Second screen only.' }
+                'MultipleExternal'    { 'This test uses ONE external display. Disconnect the others, and leave the built-in screen off.' }
+                'NoDisplays'          { 'No display is active. Connect the external display.' }
+                default               { 'Use one external display, with the built-in screen off.' }
+            }
+        }
+        default { "Set the display setup to $Want." }
+    }
+    return @{ State = 'NotYet'; Detail = $detail; Fix = $fix; Text = $text }
+}
+
+# ---------------------------------------------------------------------------
 # TEST PROFILES -- the protocol a run was collected under
 # ---------------------------------------------------------------------------
 #
@@ -1104,38 +2421,135 @@ function Get-GraphicsBenchProfiles {
     # a string would arrive on a field box as mojibake.
     $dot = [string][char]0x00B7
 
+    # THE TWO FULL-SCREEN CONTROLS ARE DIFFERENT ACTIONS and are named
+    # separately everywhere below. NeurOptimal's own full-screen control is set
+    # BEFORE watching starts and decides the size of the pane both arms are
+    # measured at. The separate VISUALIZER full-screen button only exists once a
+    # session is running, detaches the visuals onto a display of their own, and
+    # is therefore a different experiment -- one whose manual transition lands
+    # in the middle of the measurement. Telling a tester "put it full screen"
+    # without saying which control is how a baseline recording turns into an
+    # unlabelled detached-visualizer recording.
+    $noFullScreenStep = "Put the NeurOptimal window full screen NOW, before the next step. The baseline and the session have to be the same size on the same screen, or the numbers measure the window instead of the session."
+    $leaveVisualizerStep = "Leave the visualizer inside NeurOptimal. Do NOT use the separate visualizer full-screen button -- that is a different test, with its own entry in this list."
+    $quietStep = 'Close everything else -- no browser, no screen recorder, no video call. Only NeurOptimal and this window.'
+    $launchStep = 'Launch NeurOptimal and leave it on its home screen, with no session started.'
+    $watchStep = 'Press Start watching, then leave NeurOptimal alone until it says Baseline collected.'
+    $sessionStep = 'Start an audio-only session (a music track, no video) and let it run for 15 minutes. Do not resize, move or minimize the NeurOptimal window, and do not connect or disconnect a screen, while it runs.'
+    $stopStep = 'When the session ends, press Stop and show results, then send the package.'
+
+    $audioPhrases = @{
+        Baseline = 'Leave NeurOptimal on its home screen.'
+        Ready    = 'Baseline collected. Start your audio-only session in NeurOptimal.'
+        Session  = 'Keep the window and the screens unchanged.'
+    }
+
     $profiles = @(
         @{
-            Id        = 'baseline-audio-15'
-            Name      = "Audio baseline $dot 15 minutes $dot 1 monitor"
-            Summary   = 'The first recording every machine makes, so results can be compared across machines.'
+            Id        = 'baseline-audio-15-builtin'
+            Name      = "Audio baseline $dot 15 minutes $dot Built-in screen"
+            Summary   = "The first recording a laptop makes on its own screen, so results can be compared across machines."
             IsDefault = $true
             Steps     = @(
-                'Disconnect any second monitor. This test uses one screen only; a recording made with two screens cannot be compared with the others.'
-                'Close everything else -- no browser, no screen recorder, no video call. Only NeurOptimal and this window.'
-                'Launch NeurOptimal and leave it on its home screen, with no session started.'
-                'Maximize the NeurOptimal window NOW, before the next step. The baseline and the session have to be the same size on screen, or the numbers measure the window instead of the session.'
-                'Start the recording -- press Start watching (the console script starts by itself) -- and leave NeurOptimal alone until it says Baseline collected.'
-                'Start an audio-only session (a music track, no video) and let it run for 15 minutes. Do not resize, move, minimize or full-screen the NeurOptimal window while it runs.'
-                'When the session ends, press Stop and show results, then send the package.'
+                "Disconnect every external monitor -- unplug it, do not just switch it off -- and open the lid, so the laptop's built-in screen is the only display in use."
+                $quietStep
+                $launchStep
+                "$noFullScreenStep It must be full screen on the built-in screen."
+                $leaveVisualizerStep
+                $watchStep
+                $sessionStep
+                $stopStep
             )
             # One short sentence per phase, in the tester's words. The phase
             # line on screen is composed from these plus live progress, so the
             # instruction a tester reads mid-run is never assembled in the
             # window -- the same discipline the numbers follow.
             Phrases   = @{
-                Prepare  = 'Maximize NeurOptimal before starting the recording.'
-                Baseline = 'Leave NeurOptimal on its home screen.'
-                Ready    = 'Baseline collected. Start your audio-only session in NeurOptimal.'
-                Session  = 'Keep the window unchanged.'
+                Prepare  = 'Put NeurOptimal full screen on the built-in screen before starting the recording.'
+                Baseline = $audioPhrases.Baseline
+                Ready    = $audioPhrases.Ready
+                Session  = $audioPhrases.Session
             }
             Requires  = @{
-                MonitorCount  = 1
-                WindowMode    = 'Maximized'
-                SessionKind   = 'Audio'
-                SessionMinSec = 900
+                DisplaySetup       = 'BuiltInOnly'
+                ScreenCoverage     = 'Full'
+                SessionKind        = 'Audio'
+                SessionMinSec      = 900
+                VisualizerAttached    = $true
+                VisualizerSameDisplay = $true
             }
         }
+        @{
+            Id        = 'baseline-audio-15-external'
+            Name      = "Audio baseline $dot 15 minutes $dot External screen"
+            Summary   = 'The same recording made on one external display with the built-in screen off. A separate test, because the screen it is made on changes the numbers.'
+            IsDefault = $false
+            Steps     = @(
+                'Use ONE external display, with the built-in screen off -- close the lid, or press Windows+P and choose Second screen only. Unplug any other monitor rather than leaving it connected and dark.'
+                $quietStep
+                $launchStep
+                "$noFullScreenStep It must be full screen on the external display."
+                $leaveVisualizerStep
+                $watchStep
+                $sessionStep
+                $stopStep
+            )
+            Phrases   = @{
+                Prepare  = 'Put NeurOptimal full screen on the external display before starting the recording.'
+                Baseline = $audioPhrases.Baseline
+                Ready    = $audioPhrases.Ready
+                Session  = $audioPhrases.Session
+            }
+            Requires  = @{
+                DisplaySetup       = 'ExternalOnly'
+                ScreenCoverage     = 'Full'
+                SessionKind        = 'Audio'
+                SessionMinSec      = 900
+                VisualizerAttached    = $true
+                VisualizerSameDisplay = $true
+            }
+        }
+        @{
+            Id        = 'visualizer-detached-15'
+            Name      = "Detached visualizer $dot 15 minutes"
+            Summary   = 'What the separate visualizer full-screen button costs. Its own test, because detaching the visuals is a manual step in the middle of the measurement -- so the recording is cut around it and the 15 minutes are counted from the moment the visuals settle.'
+            IsDefault = $false
+            Steps     = @(
+                'Set up the screens you want to test, and leave them alone for the whole recording.'
+                $quietStep
+                $launchStep
+                "$noFullScreenStep"
+                $watchStep
+                'Start an audio-only session (a music track, no video) and let it settle for a minute.'
+                'Press Mark transition start, then use the separate visualizer full-screen button. NeurOptimal asks which monitor to use -- pick it by the Display number this window shows beside each screen, then press OK. The recording waits for you; take as long as you need.'
+                'Press Mark visuals ready as soon as the visuals are settled on their display. The stretch between the two is reported on its own and is kept out of the comparison.'
+                'Let the session run for 15 minutes FROM the second mark, then press Stop and show results.'
+            )
+            Phrases   = @{
+                Prepare  = 'Put NeurOptimal full screen before starting the recording.'
+                Baseline = $audioPhrases.Baseline
+                Ready    = 'Baseline collected. Start your audio-only session, let it settle, then mark and detach the visualizer.'
+                Session  = 'Press Mark transition start, then detach the visualizer.'
+            }
+            # THE MARKERS ARE A REQUIREMENT, not a suggestion. Without them the
+            # recording has no boundary between the manual transition and the
+            # steady period, so the 15 minutes it claims to measure cannot be
+            # located -- which is exactly what the first version of this test
+            # shipped: instructions that promised a split nothing implemented.
+            #
+            # SessionMinSec is checked against the STEADY arm, which the
+            # summariser cuts at the second marker. No DisplaySetup and no
+            # No VisualizerAttached and no VisualizerSameDisplay: the detached,
+            # possibly two-screen arrangement is the POINT of this test, so it
+            # is recorded rather than demanded.
+            Requires  = @{
+                ScreenCoverage     = 'Full'
+                SessionKind        = 'Audio'
+                SessionMinSec      = 900
+                TransitionMarkers  = $true
+            }
+        }
+
         @{
             Id        = 'exploratory'
             Name      = 'Exploratory recording'
@@ -1157,6 +2571,36 @@ function Get-GraphicsBenchProfiles {
     )
     return ,$profiles
 }
+
+function Get-GraphicsBenchProfileForArrangement {
+    <#
+    .SYNOPSIS
+        The test that matches the machine's CURRENT display setup, so the
+        window opens on the one the tester is already set up for.
+    .DESCRIPTION
+        A convenience, never a decision: the tester can pick any test in the
+        dropdown, and an arrangement that matches nothing leaves the registry
+        default selected rather than guessing. It exists because the two
+        baseline tests differ only in the screen they are made on, and opening
+        on the wrong one puts a fixable-looking failure in front of someone
+        whose setup is already correct for the other test.
+    .OUTPUTS
+        The profile, or the registry default when nothing matches.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()]$Arrangement)
+
+    $all = Get-GraphicsBenchProfiles
+    if ($Arrangement -and $Arrangement.Layout -and $Arrangement.Layout -ne 'Unknown') {
+        foreach ($p in $all) {
+            if (-not $p.Requires) { continue }
+            if (-not $p.Requires.ContainsKey('DisplaySetup')) { continue }
+            if ([string]$p.Requires.DisplaySetup -eq [string]$Arrangement.Layout) { return $p }
+        }
+    }
+    return (Get-GraphicsBenchProfile)
+}
+
 
 function Get-GraphicsBenchProfile {
     <#
@@ -1184,11 +2628,20 @@ function Test-GraphicsBenchReadiness {
         Whether the machine is in the shape the selected test asks for, RIGHT
         NOW -- before the recording starts, while it can still be fixed.
     .DESCRIPTION
-        Checks only what is observable without touching anything: how many
-        displays are connected, whether NeurOptimal is running, and how its
+        Checks only what is observable without touching anything: what the
+        display arrangement is, whether NeurOptimal is running, and how its
         window is placed. SessionKind cannot be known before the session
         starts, so it is not checked here; it is judged after the run from the
-        decode engines.
+        decode engines. The screen the visuals land on is the same -- there is
+        nothing to read until a session has drawn something.
+
+        THE DISPLAY CHECK IS AN ARRANGEMENT, NOT A COUNT. "One monitor" is
+        satisfied identically by a laptop's own 14" panel and by a 49" external
+        monitor with the lid shut, and those two recordings are not comparable:
+        butterchurn renders the whole pane, so its cost follows pixel count.
+        The old count check therefore passed the largest confound while
+        reporting it as controlled. -MonitorCount is still accepted for a
+        profile that asks for a bare count, and no shipped profile does.
 
         EVERY INPUT IS PASSED IN AND NONE IS CACHED. The caller re-reads the
         display count and the window placement each time it asks, because both
@@ -1203,6 +2656,11 @@ function Test-GraphicsBenchReadiness {
     .PARAMETER MonitorCount
         Displays connected right now. Prefer Get-GfxLiveDisplayCount over the
         inventory's copy, which is a snapshot from when the window opened.
+    .PARAMETER Arrangement
+        The display arrangement RIGHT NOW, from Get-GfxDisplayArrangement.
+        Passed in for the same reason every other reading is: it changes while
+        the tester is preparing, and a cached copy is a check that congratulates
+        someone for a screen they just switched off.
     .PARAMETER NoWindow
         NO's primary window as Select-GfxPrimaryNoWindow returns it, or $null
         when NeurOptimal is not running yet.
@@ -1224,7 +2682,12 @@ function Test-GraphicsBenchReadiness {
         $Inventory,
         $NoWindow,
         $MonitorCount,
-        $NoRunning
+        $NoRunning,
+        $Arrangement,
+        # The operator has stated that nothing else is plugged in. ATTESTED,
+        # never measured -- it can only upgrade a reading that did not happen,
+        # never overrule a monitor the tool actually saw.
+        [bool]$NoOtherDisplaysConfirmed = $false
     )
 
     if (-not $BenchProfile) { $BenchProfile = Get-GraphicsBenchProfile }
@@ -1239,6 +2702,34 @@ function Test-GraphicsBenchReadiness {
     $checks = @()
     $unmet = @()
     $unverified = @()
+
+    # THE DISPLAY ARRANGEMENT, first, because it is the one the tester has to
+    # physically change and the one every other reading depends on: a window
+    # cannot be full screen on the right display until the right display is the
+    # one in use.
+    if ($req.ContainsKey('DisplaySetup')) {
+        $m = Test-GfxDisplaySetupMatch -Want ([string]$req.DisplaySetup) -Arrangement $Arrangement
+        $checks += @{ Key = 'DisplaySetup'; Text = $m.Text; State = $m.State; Label = $labelOf[$m.State]
+                      Detail = $m.Detail; Fix = $m.Fix }
+        if ($m.Fix) { $unmet += $m.Fix }
+        if ($m.State -eq 'Unknown') { $unverified += 'the display setup could not be read' }
+
+        # WHAT IS PLUGGED IN, which the layout above does not answer. A test
+        # that asks for one screen is asking about the machine, not only about
+        # the desktop, and an external monitor connected-but-off satisfies the
+        # layout exactly. Windows usually cannot prove absence here, so the
+        # third answer is a question for the operator rather than a silent pass.
+        $c = Test-GfxExternalDisconnected -Arrangement $Arrangement -OperatorConfirmed $NoOtherDisplaysConfirmed
+        $checks += @{ Key = 'ExternalDisconnected'; Text = $c.Text; State = $c.State; Label = $labelOf[$c.State]
+                      Detail = $c.Detail; Fix = $c.Fix
+                      # The window turns this into a confirmation the operator
+                      # can tick. Nothing else in the checklist can be answered
+                      # by a person, so nothing else carries it.
+                      OperatorCanConfirm = ($c.State -eq 'Unknown')
+                      OperatorConfirmed  = ($c.State -eq 'Ok' -and $NoOtherDisplaysConfirmed) }
+        if ($c.Fix) { $unmet += $c.Fix }
+        if ($c.State -eq 'Unknown') { $unverified += 'whether an external display is still connected could not be read -- confirm it by hand in the window' }
+    }
 
     if ($req.ContainsKey('MonitorCount')) {
         $want = [int]$req.MonitorCount
@@ -1326,6 +2817,53 @@ function Test-GraphicsBenchReadiness {
         if ($state -eq 'Unknown') { $unverified += "the NeurOptimal window's placement could not be read" }
     }
 
+    # SCREEN COVERAGE, not a shell mode name. What confounds the measurement is
+    # window AREA, and the requirement is written against the thing that
+    # matters so it holds whichever placement NeurOptimal's own full-screen
+    # control produces -- showCmd 3, which is indistinguishable from the shell's
+    # Maximize, or a borderless rect, which reads as FullScreen. The observed
+    # mode is carried in the DETAIL beside it, so the question of which one NO
+    # actually produces is answered by field readings instead of by this check
+    # having guessed.
+    if ($req.ContainsKey('ScreenCoverage')) {
+        $have = $null
+        if ($NoWindow) {
+            if ($null -ne $NoWindow.CoversScreen) {
+                $have = [bool]$NoWindow.CoversScreen
+            } elseif ($NoWindow.Mode -and [string]$NoWindow.Mode -ne 'Unknown') {
+                # A window record from before coverage was measured -- and any
+                # caller that passes a bare Mode -- still answers, from the
+                # mode alone. Derived, not invented: these are exactly the two
+                # modes Get-GfxWindowMode marks as covering the screen.
+                $have = (@('Maximized', 'FullScreen') -contains [string]$NoWindow.Mode)
+            }
+        }
+        $state = 'Unknown'
+        $detail = 'window not found'
+        $fix = $null
+        if ($null -ne $have) {
+            $modeText = if ($NoWindow.Mode -and [string]$NoWindow.Mode -ne 'Unknown') { [string]$NoWindow.Mode.ToLower() } else { 'unnamed placement' }
+            $sizeText = ''
+            if ($NoWindow.Bounds -and $NoWindow.MonitorBounds) { $sizeText = " ($($NoWindow.Bounds) of $($NoWindow.MonitorBounds))" }
+            $detail = if ($have) { "currently $modeText$sizeText" } else { "currently $modeText$sizeText, not covering the screen" }
+            $state = if ($have) { 'Ok' } else { 'NotYet' }
+            if (-not $have) {
+                $fix = 'Put the NeurOptimal window full screen now, using NeurOptimal''s own full-screen control -- not the separate visualizer one. Doing it after the recording starts is too late: the baseline is measured at whatever size the window is when you press Start.'
+            }
+        }
+        # WHAT THIS CHECK DOES AND DOES NOT ESTABLISH, said where it is read.
+        # The pixels are measured; which control produced them is not, and a
+        # tester who put the window full screen from the title bar instead of
+        # from NeurOptimal's own control would see the same Ready. So the
+        # instruction stays explicit in the steps, and the check says plainly
+        # that it cannot confirm which one was used.
+        $checks += @{ Key = 'ScreenCoverage'; Text = 'NeurOptimal fills the screen'; State = $state; Label = $labelOf[$state]
+                      Detail = $detail; Fix = $fix
+                      Caveat = $(if ($state -eq 'Ok') { "size measured; $script:GfxAppFullScreenReason" } else { $null }) }
+        if ($fix) { $unmet += $fix }
+        if ($state -eq 'Unknown') { $unverified += "the NeurOptimal window's placement could not be read" }
+    }
+
     # THREE ANSWERS, not two. 'Ok' used to mean only 'nothing explicitly
     # failed', so a check the tool could not read at all still let the guide
     # say everything was set. An unreadable requirement is not a passing one.
@@ -1408,7 +2946,9 @@ function Get-GfxLiveNoWindow {
         $rows = [WinConfigDiag.GfxWindowScan]::Scan($proc.Id)
         if (-not $rows) { return $null }
         $parsed = ConvertFrom-GfxWindowScanRows -Rows $rows
-        return (Select-GfxPrimaryNoWindow -Geometry @($parsed.Geometry))
+        $titles = @{}
+        foreach ($nw in @($parsed.NoWindows)) { if ($null -ne $nw.Hwnd) { $titles[[long]$nw.Hwnd] = [string]$nw.Title } }
+        return (Select-GfxPrimaryNoWindow -Geometry @($parsed.Geometry) -Titles $titles)
     } catch { return $null }
 }
 
@@ -1446,6 +2986,10 @@ function Get-GraphicsBenchPhase {
         # tells a tester the session is still running when it is not.
         [bool]$SessionEnded = $false,
         [bool]$StartedMidSession = $false,
+        # For a test that brackets a manual transition: which of its two marks
+        # the operator has pressed. The clock does not start until the second.
+        [bool]$TransitionStarted = $false,
+        [bool]$VisualsReady = $false,
         [string]$OutcomeText,
         [double]$IdleFloorSec = $script:GfxIdleFloorSec
     )
@@ -1497,6 +3041,25 @@ function Get-GraphicsBenchPhase {
     if ($SessionEnded) {
         return @{ Key = 'SessionEnded'; Title = 'SESSION COMPLETE'; Level = 'Healthy'
                   Instruction = 'Session ended. Press Stop and show results.' }
+    }
+
+    # A TEST WITH A BRACKETED TRANSITION HAS THREE INSTRUCTIONS INSIDE THE
+    # SESSION, not one, and the clock does not start until the last of them.
+    # Showing "Session recorded: 02:14 of 15:00" while the tester is still
+    # dragging a window between screens would be counting the wrong stretch --
+    # which is precisely what the summariser refuses to do, so the guide must
+    # not do it either.
+    if ($SessionDetected -and $BenchProfile.Requires -and $BenchProfile.Requires.ContainsKey('TransitionMarkers') -and [bool]$BenchProfile.Requires.TransitionMarkers) {
+        $kinds = Get-GfxTransitionMarkerKinds
+        if (-not $TransitionStarted) {
+            return @{ Key = 'MarkTransition'; Title = 'DETACH THE VISUALIZER'; Level = 'Unknown'
+                      Instruction = [string]$kinds[0].Instruction }
+        }
+        if (-not $VisualsReady) {
+            return @{ Key = 'InTransition'; Title = 'TRANSITION'; Level = 'Unknown'
+                      Instruction = [string]$kinds[1].Instruction }
+        }
+        # Past the second mark: the ordinary progress line, clocked from there.
     }
 
     if ($SessionDetected) {
@@ -1573,12 +3136,47 @@ function Get-GraphicsBenchProfileOutcome {
     if ($req.ContainsKey('MonitorCount') -and $null -eq $Summary.MonitorCount) {
         $unverifiable += 'the number of connected displays was not recorded'
     }
+    if ($req.ContainsKey('DisplaySetup')) {
+        $layout = $null
+        if ($Summary.DisplayArrangement) { $layout = [string]$Summary.DisplayArrangement.Layout }
+        if (-not $layout -or $layout -eq 'Unknown') { $unverifiable += 'the display setup was not recorded, so the screen this was measured on is unknown' }
+    }
+    if ($req.ContainsKey('ScreenCoverage')) {
+        $cov = $null
+        if ($Summary.WindowMode) { $cov = $Summary.WindowMode.SessionCoversScreen }
+        if ($null -eq $cov) { $unverifiable += "the NeurOptimal window's placement could not be read during the session" }
+        elseif ($Summary.WindowMode -and $null -eq $Summary.WindowMode.IdleCoversScreen) {
+            $unverifiable += "the NeurOptimal window's placement could not be read while the baseline was measured"
+        }
+    }
+    # ATTACHMENT, when it could not be read, is UNVERIFIED -- not passed, and
+    # not failed. A window handle that did not come through is no evidence that
+    # the tester pressed a button they were told not to press, so it never
+    # becomes a deviation; and it is not a reading either, so it cannot be
+    # counted as one. It blocks no recording: this is scored after the fact,
+    # and the run is already on disk by the time anyone reads it.
+    if ($req.ContainsKey('VisualizerAttached')) {
+        $att = $null
+        if ($Summary.Visualizer) { $att = [string]$Summary.Visualizer.Attachment }
+        # 'NotShown' for the whole run is not a pass: the pane was never on
+        # screen, so nothing was established about where it would have been.
+        if (-not $att -or $att -eq 'Unknown' -or $att -eq 'NotShown') {
+            $unverifiable += 'whether the visuals were left inside NeurOptimal could not be read'
+        }
+    }
+    if ($req.ContainsKey('VisualizerSameDisplay')) {
+        $od = $null
+        if ($Summary.Visualizer) { $od = $Summary.Visualizer.OnOtherDisplay }
+        if ($null -eq $od) { $unverifiable += 'the screen the visuals were drawn on could not be read' }
+    }
     if ($req.ContainsKey('WindowMode')) {
         $dom = $null; $idle = $null
         if ($Summary.WindowMode) { $dom = [string]$Summary.WindowMode.Dominant; $idle = [string]$Summary.WindowMode.IdleMode }
         if (-not $dom -or $dom -eq 'Unknown') { $unverifiable += "the NeurOptimal window's placement could not be read during the session" }
         elseif (-not $idle -or $idle -eq 'Unknown') { $unverifiable += "the NeurOptimal window's placement could not be read while the baseline was measured" }
     }
+
+
     if ($req.ContainsKey('SessionMinSec')) {
         $sec = $null
         if ($Summary.ArmDurationSec -and $null -ne $Summary.ArmDurationSec.Session) { $sec = [double]$Summary.ArmDurationSec.Session }
@@ -1640,12 +3238,131 @@ function Get-GraphicsBenchProfileDeviations {
     # no order. Writing them as 'saw 1, then 2' invented a chronology the data
     # does not have, and would have read backwards for the common case of
     # unplugging a monitor mid-run.
+    # THE SCREENS CHANGED while recording. A run that started on one screen and
+    # finished on another has no single arrangement to be compared against
+    # anything. The signatures are a SET -- sorted, de-duplicated -- so they
+    # carry no order, and the text does not invent one.
+    $sigs = @($Summary.DisplaySetupsObserved | Where-Object { $_ } | Sort-Object -Unique)
+    if ($sigs.Count -gt 1) {
+        $out += @{ Key    = 'DisplaySetupChanged'
+                   Text   = "The screens changed while recording. Setups seen: $($sigs -join ' / '). This recording cannot be compared with the other baseline recordings."
+                   Detail = "Display arrangement signature changed mid-run; the cohort key describes only the arrangement observed at the start." }
+    }
+
+    # The same event, told by COUNT. Raised only when the arrangement did NOT
+    # already say it: plugging a monitor in moves both readings, and two rows
+    # saying one thing in two vocabularies is a deviation list a tester reads as
+    # two problems. The count still stands alone for a package recorded before
+    # arrangements existed, which carries no signatures at all.
+    # The observed counts are a SET too -- writing them as 'saw 1, then 2'
+    # invented a chronology the data does not have, and read backwards for the
+    # ordinary case of unplugging a monitor part-way through.
     $seen = @($Summary.MonitorCountsObserved | Where-Object { $null -ne $_ } | Sort-Object -Unique)
-    if ($seen.Count -gt 1) {
+    if ($seen.Count -gt 1 -and $sigs.Count -le 1) {
         $seenText = if ($seen.Count -eq 2) { $seen -join ' and ' } else { (($seen[0..($seen.Count - 2)]) -join ', ') + ' and ' + $seen[-1] }
         $out += @{ Key    = 'MonitorCountChanged'
                    Text   = "A monitor was connected or disconnected while recording. Observed monitor counts: $seenText. This recording cannot be compared with the other baseline recordings."
                    Detail = "Display count changed mid-run; the cohort key describes only the layout observed at the start." }
+    }
+
+    if ($req.ContainsKey('DisplaySetup')) {
+        $want = [string]$req.DisplaySetup
+        $arr = $Summary.DisplayArrangement
+        if ($arr -and $arr.Layout -and $arr.Layout -ne 'Unknown') {
+            $m = Test-GfxDisplaySetupMatch -Want $want -Arrangement $arr
+            if ($m.State -eq 'NotYet') {
+                $wantText = switch ($want) {
+                    'BuiltInOnly'  { "the laptop's built-in screen" }
+                    'ExternalOnly' { 'one external display, with the built-in screen off' }
+                    default        { $want }
+                }
+                # NAMES THE SCREEN, not the number of them. The 49-inch case is
+                # the reason this deviation exists: it satisfies "one monitor"
+                # and is 3.2x the pixel area of a laptop panel, so the old
+                # check called it a clean baseline.
+                # EVERY screen, not the first one the sort happened to return:
+                # on a two-screen desktop, naming one of them tells a tester
+                # nothing about which one the tool objected to.
+                $labels = @(@($arr.Displays) | ForEach-Object { Format-GfxDisplayLabel -Display $_ })
+                $screenText = if ($labels.Count -gt 0) { $labels -join '; ' } else { 'not recorded' }
+                $out += @{ Key    = 'DisplaySetup'
+                           Text   = "This was recorded with $($arr.LayoutText.ToLower()) ($screenText); this test uses $wantText. A recording made on a different screen cannot be compared with the other baseline recordings."
+                           Detail = "Display arrangement was $($arr.Layout), not $want. The visuals are drawn across the whole window, so the pixel area of the screen sets the load; the cohort key carries the arrangement and this package pools with other $($arr.Layout) runs." }
+            }
+        }
+    }
+
+    if ($req.ContainsKey('ScreenCoverage')) {
+        $wm = $Summary.WindowMode
+        $sessionCovers = $null
+        $idleCovers = $null
+        if ($wm) { $sessionCovers = $wm.SessionCoversScreen; $idleCovers = $wm.IdleCoversScreen }
+        if ($sessionCovers -eq $false) {
+            $out += @{ Key    = 'ScreenCoverage'
+                       Text   = "The NeurOptimal window did not fill the screen during the session (it was $($wm.Dominant.ToLower())); this test needs it full screen."
+                       Detail = "Session-arm dominant placement $($wm.Dominant) does not cover the monitor." }
+        }
+        # Covered in BOTH arms but not by the SAME shape: a full-screen session
+        # measured against a maximized baseline differs by the taskbar strip,
+        # which is small -- and is still recorded, because the whole point of
+        # this test is that window area is the confound and nobody should have
+        # to guess whether it was held constant.
+        # THE AREA ITSELF, not the label. Both arms can answer 'covers the
+        # screen' and still differ by a taskbar strip: measured on NO 4.0.0.9,
+        # its own full-screen control leaves the window at 0.979 of the monitor
+        # because it maximizes to the WORK AREA. A one-point difference in
+        # covered area is a one-point difference in how much butterchurn has to
+        # draw, and that is the confound this whole test exists to control.
+        $idleFrac = $wm.IdleScreenFraction
+        $sessFrac = $wm.SessionScreenFraction
+        if ($null -ne $idleFrac -and $null -ne $sessFrac) {
+            $drift = [math]::Abs([double]$sessFrac - [double]$idleFrac)
+            if ($drift -ge 0.02) {
+                $out += @{ Key    = 'CoverageAreaChanged'
+                           Text   = "The NeurOptimal window covered $([math]::Round([double]$idleFrac * 100))% of the screen while the baseline was measured and $([math]::Round([double]$sessFrac * 100))% during the session, so the two were not the same size."
+                           Detail = "Mean covered fraction $idleFrac idle vs $sessFrac session, a $([math]::Round($drift * 100, 1)) point difference in drawn area." }
+            }
+        }
+        if ($sessionCovers -eq $true -and $idleCovers -eq $true -and
+            $wm.IdleMode -and $wm.Dominant -and $wm.IdleMode -ne 'Unknown' -and $wm.Dominant -ne 'Unknown' -and $wm.IdleMode -ne $wm.Dominant) {
+            $out += @{ Key    = 'CoverageShapeChanged'
+                       Text   = "The NeurOptimal window filled the screen for both the baseline and the session, but in two different ways ($($wm.IdleMode.ToLower()), then $($wm.Dominant.ToLower())), so the two are not exactly the same size."
+                       Detail = "Idle arm $($wm.IdleMode), session arm $($wm.Dominant): both cover the monitor, and they differ by the window chrome and any taskbar strip." }
+        }
+    }
+
+    # THE VISUALS ON A SCREEN OF THEIR OWN. Detected, not asked about: the
+    # separate visualizer full-screen button moves the visuals to another
+    # display, and a baseline recording made that way measured two screens at
+    # once. It is a DEVIATION for the baseline tests and no part of the
+    # detached-visualizer test, which declares no such requirement.
+    # SCORED ON THE SCREEN, which is observable. Whether the separate
+    # visualizer control was used is NOT -- see
+    # $script:GfxVisualizerAttachmentReason -- so it is recorded and not
+    # scored. A recording made on two screens is unusable for the baseline
+    # either way, which is the thing that actually had to be caught.
+    # THE VISUALS IN A WINDOW OF THEIR OWN. Captured with both controls on
+    # NO 4.0.0.9: attached, the pane is hosted by the window titled after
+    # NeurOptimal; detached, by a separate visible window -- and in the capture
+    # that window was MAXIMIZED ON THE SAME DISPLAY, so the screen comparison
+    # below read 'same screen' and would have passed the run.
+    if ($req.ContainsKey('VisualizerAttached') -and [bool]$req.VisualizerAttached) {
+        $v = $Summary.Visualizer
+        if ($v -and [string]$v.Attachment -eq 'OwnWindow') {
+            $also = if ($v.OnOtherDisplay -eq $true) { ' on another screen' } elseif ($v.OnOtherDisplay -eq $false) { ' on the same screen' } else { '' }
+            $out += @{ Key    = 'VisualizerDetached'
+                       Text   = "The visuals were drawn in a window of their own$also. This test asks for them to be left inside NeurOptimal -- use the separate visualizer test for that arrangement."
+                       Detail = "The visualizer surface was hosted by a separate visible window titled '$($v.HostWindowTitle)' on $($v.DetachedSamples) of $($v.AttachmentSamples) readable sample(s), while NeurOptimal's own panel was visible elsewhere." }
+        }
+    }
+
+    if ($req.ContainsKey('VisualizerSameDisplay') -and [bool]$req.VisualizerSameDisplay) {
+        $v = $Summary.Visualizer
+        if ($v -and $v.OnOtherDisplay -eq $true) {
+            $out += @{ Key    = 'VisualizerOtherDisplay'
+                       Text   = 'The visuals were drawn on a different screen from the main NeurOptimal window, so this recording measured two screens at once. This test asks for one.'
+                       Detail = "Visualizer window reported monitor $($v.MonitorDevice); NO's main window reported $($v.MainMonitorDevice). Which control put it there is not established." }
+        }
     }
 
     if ($req.ContainsKey('MonitorCount')) {
@@ -1671,10 +3388,28 @@ function Get-GraphicsBenchProfileDeviations {
                        Text   = "NeurOptimal was $($dominant.ToLower()) during the session; this test needs it $($want.ToLower())."
                        Detail = "Session-arm dominant window mode was $dominant, not $want." }
         }
+    }
+
+    # THE CAMPAIGN DEFECT, raised for EITHER shape of window requirement. It
+    # lived inside the WindowMode branch, so moving the shipped tests onto
+    # ScreenCoverage silently stopped it firing -- which is the whole finding
+    # the 2026-09-18 campaign was rebuilt around, and the suite caught it.
+    if ($req.ContainsKey('WindowMode') -or $req.ContainsKey('ScreenCoverage')) {
+        $dominant = $null
+        $idleMode = $null
+        if ($Summary.WindowMode) {
+            $dominant = [string]$Summary.WindowMode.Dominant
+            $idleMode = [string]$Summary.WindowMode.IdleMode
+        }
         if ($idleMode -and $dominant -and $idleMode -ne 'Unknown' -and $dominant -ne 'Unknown' -and $idleMode -ne $dominant) {
-            $out += @{ Key    = 'BaselineMode'
-                       Text   = "The NeurOptimal window was $($idleMode.ToLower()) while the baseline was measured and $($dominant.ToLower()) during the session, so the numbers below include that size change as well as the session."
-                       Detail = "Idle arm dominant mode $idleMode, session arm dominant mode $dominant; every delta is the sum of the size change and the session." }
+            # A change BETWEEN two screen-covering shapes is reported by
+            # CoverageShapeChanged instead, with its own, much milder wording.
+            $bothCover = ($Summary.WindowMode.IdleCoversScreen -eq $true -and $Summary.WindowMode.SessionCoversScreen -eq $true)
+            if (-not $bothCover) {
+                $out += @{ Key    = 'BaselineMode'
+                           Text   = "The NeurOptimal window was $($idleMode.ToLower()) while the baseline was measured and $($dominant.ToLower()) during the session, so the numbers below include that size change as well as the session."
+                           Detail = "Idle arm dominant mode $idleMode, session arm dominant mode $dominant; every delta is the sum of the size change and the session." }
+            }
         }
     }
 
@@ -1702,13 +3437,35 @@ function Get-GraphicsBenchProfileDeviations {
                    Detail = "Session arm spans more than one placement mode: $($modes -join ', ')." }
     }
 
+    # THE TRANSITION THE TEST ASKED THE OPERATOR TO BRACKET. Without both
+    # marks the recording has no boundary between someone dragging a window
+    # between screens and the steady period, so the length check below is
+    # measuring the wrong stretch and says so rather than passing quietly.
+    if ($req.ContainsKey('TransitionMarkers') -and [bool]$req.TransitionMarkers) {
+        $span = $Summary.TransitionSpan
+        if (-not $span) {
+            $out += @{ Key    = 'TransitionNotMarked'
+                       Text   = 'The two marks around detaching the visualizer are missing, so the time spent detaching could not be separated from the recording. The numbers below cover both.'
+                       Detail = 'No TransitionStart/VisualsReady marker pair; the session arm was not cut and every delta spans the manual transition.' }
+        } elseif ($span.Applied -eq $false) {
+            $out += @{ Key    = 'TransitionOutsideSession'
+                       Text   = 'The two marks around detaching the visualizer fall outside the recorded session, so the recording could not be cut around them.'
+                       Detail = "Transition span $($span.StartUtc) -> $($span.EndUtc) does not land inside the session arm; the arms were left uncut." }
+        }
+    }
+
     if ($req.ContainsKey('SessionMinSec')) {
         $sec = $null
         if ($Summary.ArmDurationSec -and $null -ne $Summary.ArmDurationSec.Session) { $sec = [double]$Summary.ArmDurationSec.Session }
         if ($null -ne $sec -and $sec -gt 0 -and $sec -lt [double]$req.SessionMinSec) {
+            # NAMES WHERE THE CLOCK STARTED. On a test with a bracketed
+            # transition this is the steady period after the second mark, not
+            # the whole session, and a tester who ran 15 minutes end to end
+            # needs to know that is not what was measured.
+            $fromText = if ($Summary.TransitionSpan -and $Summary.TransitionSpan.Applied) { ' after the visuals settled' } else { '' }
             $out += @{ Key    = 'SessionLength'
-                       Text   = "The session ran $(Format-GraphicsClock $sec); this test needs $(Format-GraphicsClock ([double]$req.SessionMinSec))."
-                       Detail = "Session arm $(Format-GraphicsDuration $sec) against a $(Format-GraphicsDuration ([double]$req.SessionMinSec)) floor; memory growth and the visualizer's plateau are only judgeable over a full-length session." }
+                       Text   = "The session ran $(Format-GraphicsClock $sec)$fromText; this test needs $(Format-GraphicsClock ([double]$req.SessionMinSec))."
+                       Detail = "Session arm $(Format-GraphicsDuration $sec) against a $(Format-GraphicsDuration ([double]$req.SessionMinSec)) floor$(if ($fromText) { ', measured from the VisualsReady marker' }); memory growth and the visualizer's plateau are only judgeable over a full-length session." }
         }
     }
 
@@ -1819,17 +3576,52 @@ function Get-GfxCohortKey {
 
         Rendered as sorted, stable text so two machines of one cohort produce
         one byte-identical key without a lookup table.
+
+        VERSION 2 CARRIES THE ARRANGEMENT. Version 1 keyed on the display
+        RESOLUTIONS and a count, which pooled a laptop's own panel with an
+        external monitor of the same resolution, and pooled two different
+        external monitors as one screen. The visuals are drawn across the whole
+        window, so the screen they are drawn on is the largest single term in
+        every number this tool reports. The key now names the arrangement
+        (BuiltInOnly / ExternalOnly / ...) and, when the arrangement was read,
+        the identity, mode, refresh and scale of each display.
+
+        A KEY OF A DIFFERENT SHAPE DOES NOT POOL WITH ONE OF THE OLD SHAPE, and
+        that is the correct outcome rather than a migration problem: the runs it
+        would have pooled were not comparable, which is the defect.
+    .PARAMETER Arrangement
+        The display arrangement, from Get-GfxDisplayArrangement. Absent, the
+        key falls back to the resolution list, and Version stays 1 rather than
+        claiming a reading that did not happen.
     .OUTPUTS
-        Hashtable: Key, Adapters[], DisplayConfig, MonitorCount, Reason.
-        Key is $null when the inventory could not name an adapter; an
-        uncohorted run still uploads, it just cannot be pooled.
+        Hashtable: Key, Version, Adapters[], DisplayConfig, DisplaySetup,
+        MonitorCount, Reason. Key is $null when the inventory could not name an
+        adapter; an uncohorted run still uploads, it just cannot be pooled.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$Inventory)
+    param(
+        [Parameter(Mandatory)][hashtable]$Inventory,
+        $Arrangement
+    )
 
     $venDevs = @(@($Inventory.Adapters) | ForEach-Object { $_.VenDev } | Where-Object { $_ } | Sort-Object -Unique)
     if ($venDevs.Count -eq 0) {
-        return @{ Key = $null; Adapters = @(); DisplayConfig = $null; MonitorCount = $Inventory.MonitorCount; Reason = 'no adapter carried a VEN/DEV identifier' }
+        return @{ Key = $null; Version = 1; Adapters = @(); DisplayConfig = $null; DisplaySetup = $null
+                  MonitorCount = $Inventory.MonitorCount; Reason = 'no adapter carried a VEN/DEV identifier' }
+    }
+
+    $useArrangement = ($Arrangement -and $Arrangement.Signature -and $Arrangement.Layout -and $Arrangement.Layout -ne 'Unknown')
+    if ($useArrangement) {
+        $key = '{0}|{1}|{2}' -f ($venDevs -join ','), [string]$Arrangement.Layout, [string]$Arrangement.Signature
+        return @{
+            Key           = $key
+            Version       = 2
+            Adapters      = $venDevs
+            DisplayConfig = [string]$Arrangement.Signature
+            DisplaySetup  = [string]$Arrangement.Layout
+            MonitorCount  = $Arrangement.Count
+            Reason        = $null
+        }
     }
 
     $modes = @(@($Inventory.Displays) | ForEach-Object { $_.Bounds } | Where-Object { $_ } | Sort-Object)
@@ -1838,10 +3630,12 @@ function Get-GfxCohortKey {
 
     return @{
         Key           = $key
+        Version       = 1
         Adapters      = $venDevs
         DisplayConfig = $displayConfig
+        DisplaySetup  = $null
         MonitorCount  = $Inventory.MonitorCount
-        Reason        = $null
+        Reason        = 'the display arrangement was not read, so this run is pooled on display resolutions only'
     }
 }
 
@@ -1864,6 +3658,7 @@ function Get-GraphicsInventory {
         Adapters       = @()
         AdapterLuidMap = @{}
         Displays       = @()
+        DisplayArrangement = $null
         Power          = @{}
         WebView2       = @{}
         No             = @{}
@@ -1972,7 +3767,15 @@ function Get-GraphicsInventory {
 
     # The cohort this box compares against. Computed here, once, so the app,
     # the console and the package all carry the same key for one run.
-    try { $inv.Cohort = Get-GfxCohortKey -Inventory $inv } catch { $inv.Errors += "cohort: $($_.Exception.Message)" }
+    # The display ARRANGEMENT, read after Power so the built-in-panel inference
+    # has the battery to reason from. This copy is a snapshot from when the
+    # inventory was taken; the run records its own, read at the moment Start was
+    # pressed, and the caller re-keys the cohort from that one.
+    try {
+        $inv.DisplayArrangement = Get-GfxDisplayArrangement -HasBattery $inv.Power.HasBattery
+    } catch { $inv.Errors += "display arrangement: $($_.Exception.Message)" }
+
+    try { $inv.Cohort = Get-GfxCohortKey -Inventory $inv -Arrangement $inv.DisplayArrangement } catch { $inv.Errors += "cohort: $($_.Exception.Message)" }
 
     return $inv
 }
@@ -2305,11 +4108,17 @@ function Get-GraphicsPreRunActivity {
         mid-session yields a run with one arm and no deltas, which is only
         discovered at Stop, after the session is over and unrepeatable.
 
-        WHAT COUNTS AS EVIDENCE. Butterchurn's render loop is unconditional --
-        it draws while NO sits idle -- so 3D load says nothing about whether a
-        session is running. Hardware video decode is different: the video.js
-        surface decodes only when NO is playing media, which it does not do at
-        rest. So MEDIA DECODE IS THE SIGNAL and visualizer load is not.
+        WHAT COUNTS AS EVIDENCE. On the boxes captured so far butterchurn's
+        render loop is unconditional -- it draws while NO sits idle -- so 3D
+        load says nothing about whether a session is running. On a box where
+        the visuals are NOT on screen until a session starts, 3D load is
+        evidence of a session, but of the WRONG KIND: it would make the signal
+        depend on which of the two behaviours the box has, and the tool would
+        have to know that in advance. Hardware video decode is free of it: the
+        video.js surface decodes only when NO is playing media, which it does
+        not do at rest. So MEDIA DECODE IS THE SIGNAL and visualizer load is
+        not -- and what the baseline arm actually contained is reported
+        separately, from Get-GfxBaselineVisualizerState.
 
         This is inference from GPU engine load, not a statement out of NO, and
         the record says so. It can be wrong in one direction worth naming: a
@@ -2398,9 +4207,20 @@ function Format-GraphicsPreRunReport {
     )
 
     $r = @()
-    $noRunning = $false
-    if ($Inventory -and $Inventory.No -and $Inventory.No.Pid) { $noRunning = $true }
 
+    # THREE ANSWERS, because an absent inventory is not a reading. Without one
+    # this used to print 'NO.exe is not running' -- a positive claim built from
+    # a missing input, and flatly wrong next to a SessionLikely of Yes, which
+    # is how it was caught.
+    $noRunning = $null
+    if ($Inventory -and $Inventory.No) {
+        $noRunning = [bool]$Inventory.No.Pid
+    }
+
+    if ($null -eq $noRunning) {
+        $r += @{ Level = 'WARN'; Text = 'Whether NeurOptimal is running could not be read here. The measurements below stand on their own; the advice that usually follows them does not.'; NoPrefix = $false }
+        return $r
+    }
     if (-not $noRunning) {
         $r += @{ Level = 'WARN'; Text = 'NO.exe is not running. You can still press Start watching -- the sampler picks NO up as soon as it appears, and the stretch before the session becomes the idle baseline.'; NoPrefix = $false }
         return $r
@@ -2619,7 +4439,46 @@ function Get-NoWindowModeSummary {
     # session maximized, and the resulting "+21 to +28 points" was mostly the
     # pane growing. A delta across two window sizes is not a session cost, and
     # nothing downstream could say so while only the session's mode was kept.
-    $r = @{ Dominant = 'Unknown'; IdleMode = 'Unknown'; Bounds = $null; Spans = @(); SessionModes = @(); ChangedDuringSession = $false }
+    $r = @{ Dominant = 'Unknown'; IdleMode = 'Unknown'; Bounds = $null; Spans = @(); SessionModes = @(); ChangedDuringSession = $false
+            # COVERAGE PER ARM, beside the mode names. The mode is a label; the
+            # coverage is the physical fact the comparison rests on, and the two
+            # are recorded separately so a test can require the fact without
+            # having to guess which label NeurOptimal's own full-screen control
+            # produces. $null means unread, never 'no'.
+            IdleCoversScreen = $null; SessionCoversScreen = $null
+            # HOW MUCH of the monitor each arm actually covered, as a mean.
+            # 'Covers the screen' is a yes/no; the confound is AREA, and two
+            # windows that both answer yes can differ by the taskbar strip.
+            # Measured on NO 4.0.0.9: its own full-screen control leaves the
+            # window at 0.979 of the monitor -- maximized to the WORK AREA,
+            # with the taskbar still showing. A box with an auto-hiding taskbar
+            # would read 1.000 for the same operator action, and nothing else
+            # in the package would say why its numbers ran higher.
+            IdleScreenFraction = $null; SessionScreenFraction = $null
+            # THE QUANTITY THE NUMBERS ACTUALLY FOLLOW: the window's area in
+            # DESKTOP pixels. Measured 2026-09-18 on one box, two displays,
+            # same session type, same adapter:
+            #
+            #   external 5134x1406 desktop px (100% scale) -> butterchurn 64.0% 3D, 290 MB VRAM
+            #   built-in 1614x1033 desktop px (150% scale) -> butterchurn 17.7% 3D,  85 MB VRAM
+            #
+            # Fitting cost = fixed + k*area to those two points:
+            #   DESKTOP pixels   fixed = +3.8%   (plausible)
+            #   PHYSICAL pixels  fixed = -32.4%  (impossible)
+            #
+            # So the render target is sized in DESKTOP pixels and upscaled by
+            # the compositor, and the physical-pixel model is refuted rather
+            # than merely unsupported. VRAM agrees independently: 0.294 of the
+            # external reading against a desktop-area ratio of 0.231 and a
+            # physical-area ratio of 0.520.
+            #
+            # THE CONSEQUENCE IS THAT DISPLAY SCALING CHANGES THE COST. The
+            # same panel at 150% draws 2.25x fewer pixels than at 100%, which
+            # is why the scale factor is in the cohort key -- and why reading it
+            # wrong, as GetDpiForMonitor does for this process, would have
+            # pooled two genuinely different setups.
+            IdleWindowDesktopPixels = $null; SessionWindowDesktopPixels = $null
+            MonitorDevice = $null; StyleHex = $null }
     if ($Samples.Count -eq 0) { return $r }
 
     $states = @()
@@ -2628,9 +4487,24 @@ function Get-NoWindowModeSummary {
         $s = $Samples[$i]
         $mode = 'Unknown'
         $bounds = $null
-        if ($s.NoWindow -and $s.NoWindow.Mode) { $mode = [string]$s.NoWindow.Mode; $bounds = $s.NoWindow.Bounds }
+        $covers = $null
+        $fraction = $null
+        $pixels = $null
+        if ($s.NoWindow) {
+            if ($s.NoWindow.Mode) { $mode = [string]$s.NoWindow.Mode; $bounds = $s.NoWindow.Bounds }
+            if ($null -ne $s.NoWindow.CoversScreen) { $covers = [bool]$s.NoWindow.CoversScreen }
+            elseif ($mode -ne 'Unknown') { $covers = (@('Maximized', 'FullScreen') -contains $mode) }
+            if ($null -ne $s.NoWindow.ScreenFraction) { $fraction = [double]$s.NoWindow.ScreenFraction }
+            # From the window's own WxH, which is already in desktop
+            # coordinates -- the same space the monitor rect is read in.
+            if ($s.NoWindow.Bounds -and [string]$s.NoWindow.Bounds -match '^(\d+)x(\d+)$') {
+                $pixels = [double]$Matches[1] * [double]$Matches[2]
+            }
+            if (-not $r.MonitorDevice -and $s.NoWindow.MonitorDevice) { $r.MonitorDevice = [string]$s.NoWindow.MonitorDevice }
+            if (-not $r.StyleHex -and $s.NoWindow.StyleHex) { $r.StyleHex = [string]$s.NoWindow.StyleHex }
+        }
         $states += @{ AtUtc = $s.AtUtc; State = $mode; Index = $i }
-        $modeSamples += @{ Mode = $mode; Bounds = $bounds; Index = $i }
+        $modeSamples += @{ Mode = $mode; Bounds = $bounds; Covers = $covers; Fraction = $fraction; Pixels = $pixels; Index = $i }
     }
 
     # No @() here: the spans function returns ',$spans', and @() over that
@@ -2695,6 +4569,60 @@ function Get-NoWindowModeSummary {
         $idleBest = $null
         foreach ($m in $idleCounts.Keys) { if ($null -eq $idleBest -or $idleCounts[$m] -gt $idleCounts[$idleBest]) { $idleBest = $m } }
         if ($idleBest) { $r.IdleMode = $idleBest }
+    }
+
+    # Coverage per arm, by majority of the samples that HAD a reading. A sample
+    # whose placement could not be read is left out of the vote rather than
+    # counted as not covering: an unread window is not a small one.
+    $coverVote = {
+        param([int]$From, [int]$To)
+        $yes = 0; $no = 0
+        for ($i = $From; $i -le $To -and $i -lt $modeSamples.Count; $i++) {
+            if ($i -lt 0) { continue }
+            $c = $modeSamples[$i].Covers
+            if ($null -eq $c) { continue }
+            if ($c) { $yes++ } else { $no++ }
+        }
+        if ($yes -eq 0 -and $no -eq 0) { return $null }
+        return ($yes -ge $no)
+    }
+    $r.SessionCoversScreen = & $coverVote $from $to
+    if ($null -ne $SplitIndex -and [int]$SplitIndex -gt 0) {
+        $r.IdleCoversScreen = & $coverVote 0 ([int]$SplitIndex - 1)
+    }
+
+    # The mean covered fraction per arm, over the samples that HAD a reading.
+    # $null when none did -- an unread window is not a zero-area one.
+    $fractionMean = {
+        param([int]$From, [int]$To)
+        $vals = @()
+        for ($i = $From; $i -le $To -and $i -lt $modeSamples.Count; $i++) {
+            if ($i -lt 0) { continue }
+            $f = $modeSamples[$i].Fraction
+            if ($null -ne $f) { $vals += [double]$f }
+        }
+        if ($vals.Count -eq 0) { return $null }
+        return [math]::Round(($vals | Measure-Object -Average).Average, 3)
+    }
+    $r.SessionScreenFraction = & $fractionMean $from $to
+    if ($null -ne $SplitIndex -and [int]$SplitIndex -gt 0) {
+        $r.IdleScreenFraction = & $fractionMean 0 ([int]$SplitIndex - 1)
+    }
+
+    $pixelMean = {
+        param([int]$From, [int]$To)
+        $vals = @()
+        for ($i = $From; $i -le $To -and $i -lt $modeSamples.Count; $i++) {
+            if ($i -lt 0) { continue }
+            $v = $modeSamples[$i].Pixels
+            if ($null -ne $v) { $vals += [double]$v }
+        }
+        if ($vals.Count -eq 0) { return $null }
+        return [int][math]::Round(($vals | Measure-Object -Average).Average)
+    }
+    $r.SessionWindowDesktopPixels = & $pixelMean $from $to
+    if ($null -ne $SplitIndex -and [int]$SplitIndex -gt 0) {
+        $r.IdleWindowDesktopPixels = & $pixelMean 0 ([int]$SplitIndex - 1)
     }
 
     return $r
@@ -2783,6 +4711,397 @@ function Get-GfxRoleAggregate {
     return ,$out
 }
 
+function Get-GfxTransitionMarkerKinds {
+    <#
+    .SYNOPSIS
+        The two typed markers that bound a manual transition, in order.
+    .DESCRIPTION
+        ONE DEFINITION. The window's marker button, the phase line, the arm
+        split and the deviation all read this, so a marker the operator pressed
+        and a marker the summariser looks for can never be two different things.
+
+        They are KINDS, not free text. The first version of the detached test
+        told the tester to type "detaching" into the marker box and the
+        summariser had no way to find it again -- a marker whose meaning lives
+        in prose is a marker nothing downstream can use.
+    .OUTPUTS
+        Array of @{ Kind, Label, Instruction }.
+    #>
+    [CmdletBinding()]
+    param()
+    $kinds = @(
+        @{ Kind = 'TransitionStart'
+           Label = 'Mark transition start'
+           Instruction = 'Press Mark transition start, then use the separate visualizer full-screen button and choose the display for it.' }
+        @{ Kind = 'VisualsReady'
+           Label = 'Mark visuals ready'
+           Instruction = 'Press Mark visuals ready as soon as the visuals are settled on their display. The 15 minutes are measured from here.' }
+    )
+    return ,$kinds
+}
+
+function Get-GfxTransitionSpan {
+    <#
+    .SYNOPSIS
+        The manual transition the operator bracketed, from the typed markers.
+    .DESCRIPTION
+        The stretch between 'TransitionStart' and 'VisualsReady' is someone
+        dragging a window between screens. It is not steady state, it is not
+        the session's cost, and averaging it into either makes both wrong. So
+        it is bounded, reported on its own, and kept out of the arm the deltas
+        are taken from.
+
+        THE FIRST OF EACH KIND WINS. A tester who pressed the button twice has
+        given us one transition and one accident, and taking the earliest start
+        with the earliest ready after it is the reading that cannot straddle a
+        second attempt.
+
+        WITH NO MARKS, THE DIALOG ANSWERS INSTEAD. NeurOptimal's monitor
+        picker is modal and blocks the detach until a screen is chosen, so the
+        stretch it is on screen IS the manual transition. It is matched by the
+        title of its own window and needs nothing from the operator. Captured
+        2026-09-18: 'Zengar Shared_lib.lvlib:Select Display Monitor--dialog.vi',
+        with the visuals still in NeurOptimal's panel the whole time it was up.
+
+        MARKS WIN WHEN THEY EXIST. A mark is a statement of intent about what
+        the operator was doing; the dialog is evidence about what the software
+        was doing, and they bracket slightly different things -- the operator
+        may start before the dialog opens. Preferring the marks keeps the
+        recording scored on what the test asked for, and the source says which
+        of the two produced the span.
+
+        Returns $null when neither is available -- a run that did not follow
+        the test, not a run with a zero-length transition.
+    .OUTPUTS
+        Hashtable: StartUtc, EndUtc, DurationSec, Source; or $null.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][array]$Markers = @(),
+        [AllowEmptyCollection()][array]$Samples = @()
+    )
+
+    $start = $null
+    $ready = $null
+    foreach ($m in @($Markers | Where-Object { $_ })) {
+        $kind = [string]$m.Kind
+        $at = $null
+        try { $at = [datetime]$m.AtUtc } catch { continue }
+        if ($kind -eq 'TransitionStart') {
+            if ($null -eq $start -or $at -lt $start) { $start = $at }
+        } elseif ($kind -eq 'VisualsReady') {
+            if ($null -eq $ready -or $at -lt $ready) { $ready = $at }
+        }
+    }
+    if ($null -ne $start -and $null -ne $ready -and $ready -ge $start) {
+        return @{
+            StartUtc    = $start.ToUniversalTime().ToString('o')
+            EndUtc      = $ready.ToUniversalTime().ToString('o')
+            DurationSec = [math]::Round(($ready - $start).TotalSeconds, 1)
+            Source      = 'operator-markers'
+        }
+    }
+
+    # No usable pair of marks. The dialog, then -- the stretch NeurOptimal's
+    # own monitor picker was on screen, which is the detach waiting on a person.
+    $first = $null
+    $last = $null
+    foreach ($s in @($Samples)) {
+        $open = $false
+        foreach ($t in @($s.NoVisibleWindows)) {
+            if ($t -and $t -match $script:GfxMonitorPickerPattern) { $open = $true; break }
+        }
+        if (-not $open) { continue }
+        $at = $null
+        try { $at = [datetime]$s.AtUtc } catch { continue }
+        if ($null -eq $first) { $first = $at }
+        $last = $at
+    }
+    if ($null -eq $first) { return $null }
+    # THE TRANSITION ENDS WHEN THE DIALOG IS GONE, not on the last sample that
+    # still showed it. Ending on the last visible sample leaves that sample --
+    # still mid-transition -- inside the steady arm, which pulled a measured
+    # 52.0 down to 51.978. One sample is not much and it is still wrong.
+    $after = $null
+    foreach ($s in @($Samples)) {
+        $at = $null
+        try { $at = [datetime]$s.AtUtc } catch { continue }
+        if ($at -le $last) { continue }
+        $after = $at
+        break
+    }
+    $end = $(if ($null -ne $after) { $after } else { $last })
+    return @{
+        StartUtc    = $first.ToUniversalTime().ToString('o')
+        EndUtc      = $end.ToUniversalTime().ToString('o')
+        DurationSec = [math]::Round(($end - $first).TotalSeconds, 1)
+        Source      = 'monitor-picker-dialog'
+    }
+}
+
+function Get-GfxVisualizerAttachmentState {
+    <#
+    .SYNOPSIS
+        Whether the visuals are drawn inside NeurOptimal's own window, in a
+        window of their own, or not on screen at all. PURE.
+    .DESCRIPTION
+        CAPTURED WITH BOTH CONTROLS, NO 4.0.0.9, 2026-09-18, the operator
+        stating each state as they produced it:
+
+          before the session   host window 461894, title 'Closed', NOT visible
+          session, ATTACHED    host window 397666, title
+                               'NeurOptimal(R) development - VAULT', visible
+          session, DETACHED    host window 3413942, title
+                               'System Audio Visualizer', visible, maximized,
+                               AND ON THE SAME DISPLAY as the main window
+
+        That last line is why this function exists. The detached visualizer sat
+        on the very monitor NeurOptimal was on, so the screen comparison read
+        'same display' and would have called the run clean. Which WINDOW hosts
+        the pane is the discriminator; which SCREEN is a separate question.
+
+        THE RULE IS STRUCTURAL, WITH ONE TITLE MATCH AND A CONTROL.
+
+          NotShown      the host window is not visible -- the pane exists but
+                        is not on screen. This is the ordinary pre-session
+                        state, not a fault.
+          InMainWindow  the host window's own title names NeurOptimal, so the
+                        pane is drawn inside NeurOptimal's panel.
+          OwnWindow     the host is visible, is NOT the NeurOptimal panel, AND
+                        a DIFFERENT visible window IS the NeurOptimal panel.
+                        The control matters: without seeing the panel
+                        elsewhere, 'not the panel' could just mean the panel
+                        was not recognised, and a build whose title does not
+                        say 'NeurOptimal' would read every run as detached.
+          Unknown       anything else, including no reading at all.
+
+        NOT matched on the detached window's own title. 'System Audio
+        Visualizer' is what this build calls it; the next build may not, and a
+        rule that fires only on a literal string silently stops working. The
+        title is RECORDED so an unrecognised one can be read out of a package,
+        the way the Bluetooth lexicon carries UnknownWindowTitles.
+    .PARAMETER HostTitle
+        The title of the top-level window hosting the visualizer surface.
+    .PARAMETER HostVisible
+        Whether that window is visible. $null when it was not read.
+    .PARAMETER VisibleTitles
+        Every visible top-level window title in the same sample -- the control
+        that establishes NeurOptimal's own panel is on screen somewhere else.
+    .OUTPUTS
+        One of 'NotShown', 'InMainWindow', 'OwnWindow', 'Unknown'.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$HostTitle,
+        $HostVisible,
+        [AllowEmptyCollection()][string[]]$VisibleTitles = @()
+    )
+
+    if ($null -eq $HostVisible) { return 'Unknown' }
+    if (-not [bool]$HostVisible) { return 'NotShown' }
+    if ([string]::IsNullOrWhiteSpace($HostTitle)) { return 'Unknown' }
+
+    # The panel's own name. Matched on the ASCII stem only: the live title
+    # carries a registered-trademark glyph, and these files are BOM-less UTF-8
+    # read as ANSI on a field box, so a literal (R) in the pattern would arrive
+    # as mojibake and never match.
+    if ($HostTitle -match 'NeurOptimal') { return 'InMainWindow' }
+
+    $panelElsewhere = @(@($VisibleTitles) | Where-Object { $_ -and $_ -match 'NeurOptimal' })
+    if ($panelElsewhere.Count -gt 0) { return 'OwnWindow' }
+    return 'Unknown'
+}
+
+function Get-GfxVisualizerPlacement {
+    <#
+    .SYNOPSIS
+        Where the visuals were drawn: which SCREEN (scored), and which window
+        hosted them (recorded, not scored).
+    .DESCRIPTION
+        NeurOptimal has TWO full-screen controls and they are different
+        actions. The first sizes NeurOptimal's own window and is used before a
+        recording starts. The second appears only once a session is running,
+        detaches the visualizer, and asks which display to put it on. A
+        recording made with the second one is measuring two screens at once.
+
+        WHICH WINDOW HOSTS THE VISUALIZER IS NOT A DETACHMENT SIGNAL, and this
+        function used to treat it as one. MEASURED ON NO 4.0.0.9, 2026-09-18,
+        nobody having touched the visualizer control:
+
+          before the session   butterchurn -> window 461894 (hidden)
+                               video.js    -> window 461894
+          during the session   butterchurn -> window 397666 (the main,
+                                              maximized NeurOptimal window)
+                               video.js    -> window 461894 (still hidden)
+                               ...and a new 'Matrix Mirror' window appeared
+
+        NO MOVES ITS PANES BETWEEN TOP-LEVEL LABVIEW WINDOWS AS A MATTER OF
+        COURSE. Comparing the visualizer's host window against video.js's
+        therefore read 'Separate' on 13 of 13 samples of a perfectly ordinary
+        session -- a detector that fires on every clean run is worse than no
+        detector, because it trains a reader to ignore it.
+
+        So attachment is 'Unverified' and the window handles are recorded as
+        OBSERVATIONS, the same treatment AppFullScreen gets and for the same
+        reason: nothing observed so far separates the detached state from a
+        normal one. Establishing it needs a capture taken WITH the separate
+        visualizer full-screen button pressed, which nobody has collected yet.
+        HostWindowsSeen is the set that capture will be compared against.
+
+        THE SCREEN IS STILL SCORED, and was never the doubtful part:
+
+          OnOtherDisplay  $true   the visualizer's window reported a different
+                                  display from NO's main window
+                          $false  both reported the same display
+                          $null   one of them did not report one; nothing is
+                                  claimed
+    .OUTPUTS
+        Hashtable: Attachment ('Unverified'), AttachmentReason,
+        HostWindowsSeen[], WindowHwnd, PeerWindowHwnd, MainWindowHwnd,
+        OnOtherDisplay, MonitorDevice, MainMonitorDevice, SamplesRead.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyCollection()][array]$Samples)
+
+    $r = @{ Attachment = 'Unknown'; HostWindowTitle = $null; HostWindowTitlesSeen = @()
+            AttachmentSamples = 0; DetachedSamples = 0
+            HostWindowsSeen = @(); WindowHwnd = $null; PeerWindowHwnd = $null; MainWindowHwnd = $null
+            OnOtherDisplay = $null; MonitorDevice = $null; MainMonitorDevice = $null; SamplesRead = 0 }
+    $diff = 0
+    $same = 0
+    $hosts = @()
+    $titles = @()
+    $stateCounts = @{}
+
+    foreach ($s in @($Samples)) {
+        $viz = @($s.Surfaces | Where-Object { [string]$_.Role -eq 'Butterchurn' }) | Select-Object -First 1
+        if (-not $viz) { continue }
+
+        # -------- WHICH WINDOW, and what kind of window it is ---------------
+        $state = Get-GfxVisualizerAttachmentState -HostTitle ([string]$viz.HostWindowTitle) `
+                    -HostVisible $viz.HostWindowVisible -VisibleTitles @($s.NoVisibleWindows)
+        if (-not $stateCounts.ContainsKey($state)) { $stateCounts[$state] = 0 }
+        $stateCounts[$state]++
+        if ($state -ne 'Unknown') { $r.AttachmentSamples++ }
+        if ($state -eq 'OwnWindow') { $r.DetachedSamples++ }
+        if ($viz.HostWindowTitle) {
+            $t = [string]$viz.HostWindowTitle
+            if ($titles -notcontains $t) { $titles += $t }
+            if (-not $r.HostWindowTitle -or $state -eq 'OwnWindow') { $r.HostWindowTitle = $t }
+        }
+        if ($null -ne $viz.WindowHwnd) {
+            $h = [long]$viz.WindowHwnd
+            if ($hosts -notcontains $h) { $hosts += $h }
+            if (-not $r.WindowHwnd) { $r.WindowHwnd = $h }
+        }
+        if (-not $r.PeerWindowHwnd) {
+            $peer = @($s.Surfaces | Where-Object { [string]$_.Role -eq 'VideoJs' -and $null -ne $_.WindowHwnd }) | Select-Object -First 1
+            if ($peer) { $r.PeerWindowHwnd = $peer.WindowHwnd }
+        }
+        if (-not $r.MainWindowHwnd -and $s.NoWindow -and $null -ne $s.NoWindow.Hwnd) { $r.MainWindowHwnd = $s.NoWindow.Hwnd }
+
+        # -------- SCORED: which screen -------------------------------------
+        $main = $null
+        if ($s.NoWindow) { $main = [string]$s.NoWindow.MonitorDevice }
+        if ([string]::IsNullOrWhiteSpace($main)) { continue }
+        $dev = [string]$viz.MonitorDevice
+        if ([string]::IsNullOrWhiteSpace($dev)) { continue }
+        $r.SamplesRead++
+        if (-not $r.MonitorDevice) { $r.MonitorDevice = $dev; $r.MainMonitorDevice = $main }
+        if ($dev -eq $main) { $same++ } else { $diff++; $r.MonitorDevice = $dev; $r.MainMonitorDevice = $main }
+    }
+
+    $r.HostWindowsSeen = @($hosts | Sort-Object)
+    $r.HostWindowTitlesSeen = @($titles | Sort-Object)
+    if ($r.SamplesRead -gt 0) { $r.OnOtherDisplay = ($diff -gt 0) }
+
+    # ANY sample in its own window makes the run a detached one: the operator
+    # either pressed the button or did not, and the pane cannot be half
+    # detached. 'NotShown' does not outvote a reading -- a pane that was off
+    # screen for the first few samples is the ordinary way a session starts.
+    if ($r.AttachmentSamples -gt 0) {
+        if ($r.DetachedSamples -gt 0) { $r.Attachment = 'OwnWindow' }
+        elseif ($stateCounts.ContainsKey('InMainWindow') -and $stateCounts['InMainWindow'] -gt 0) { $r.Attachment = 'InMainWindow' }
+        else { $r.Attachment = 'NotShown' }
+    }
+    return $r
+}
+
+
+
+
+function Get-GfxBaselineVisualizerState {
+    <#
+    .SYNOPSIS
+        Whether the visuals were already drawing during the idle baseline, or
+        only appeared when the session started.
+    .DESCRIPTION
+        THE DELTA'S SCOPE, MEASURED RATHER THAN ASSUMED. This report has said
+        since it shipped that "butterchurn draws even while NO is idle, so the
+        absolute percentage answers nothing and the delta does". That was read
+        off one box. On a machine where the visuals are not on screen until a
+        session starts, the same sentence is false, and it invites a reader to
+        take the delta as the session's own extra cost when it is the cost of
+        the visualization APPEARING plus the session.
+
+        Both are legitimate; they are different quantities, and the report has
+        to say which one it is printing. So the idle arm is asked directly.
+
+        WHAT IT IS ASKED IS GPU LOAD, AND THAT IS ALL THE TEXT CLAIMS. An
+        engine reading below the floor does not establish that the visuals were
+        invisible, or stopped, or not being composited -- it establishes that
+        the GPU work attributed to that surface was below the floor. A pane can
+        be on screen and cheap. So the states are named for the measurement and
+        the sentences say "GPU activity", never "was not drawing" or "was not
+        on screen":
+
+          AboveFloor   the visualizer's 3D load during the baseline was at or
+                       above the floor, so the delta is what the session cost
+                       ON TOP of whatever that was
+          BelowFloor   it was below the floor. The comparison MAY include the
+                       visualization starting; that is a statement about what
+                       the delta can contain, not about what was on screen
+          NoSurface    no visualizer surface existed during the baseline at all
+                       -- a presence reading, and a definite one
+          NotMeasured  no reading either way, and nothing is claimed
+    .OUTPUTS
+        Hashtable: State, IdleMean, SessionMean, Text.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Summary,
+        [double]$VisualizerFloorPercent = $script:GfxVisualizerFloorPercent
+    )
+
+    $idle = @($Summary.Arms.Idle | Where-Object { $_ -and $_.Role -eq 'Butterchurn' }) | Select-Object -First 1
+    $sess = @($Summary.Arms.Session | Where-Object { $_ -and $_.Role -eq 'Butterchurn' }) | Select-Object -First 1
+    $idleMean = $null
+    $sessMean = $null
+    if ($idle -and $idle.Engines -and $idle.Engines.ContainsKey('3D')) { $idleMean = $idle.Engines['3D'].Mean }
+    if ($sess -and $sess.Engines -and $sess.Engines.ContainsKey('3D')) { $sessMean = $sess.Engines['3D'].Mean }
+
+    $r = @{ State = 'NotMeasured'; IdleMean = $idleMean; SessionMean = $sessMean; Text = $null }
+    if (-not $idle) {
+        if (@($Summary.Arms.Idle).Count -eq 0) { return $r }
+        # PRESENCE is a different reading from load, and this one is definite:
+        # the surface did not exist, so there was nothing to measure.
+        $r.State = 'NoSurface'
+        $r.Text = 'No visualizer surface was present during the baseline. The session comparison may include visualization startup.'
+        return $r
+    }
+    if ($null -eq $idleMean) { return $r }
+    $pct = [math]::Round([double]$idleMean, 1)
+    if ([double]$idleMean -ge $VisualizerFloorPercent) {
+        $r.State = 'AboveFloor'
+        $r.Text = "Visualizer GPU activity during baseline: $pct%. The session comparison is the cost above that."
+        return $r
+    }
+    $r.State = 'BelowFloor'
+    $r.Text = "Visualizer GPU activity during baseline: $pct%. The session comparison may include visualization startup."
+    return $r
+}
+
+
 function Get-GraphicsBenchSessionSummary {
     <#
     .SYNOPSIS
@@ -2802,9 +5121,12 @@ function Get-GraphicsBenchSessionSummary {
         when either arm is missing rather than 0: an unmeasured control is not
         a zero-cost control.
 
-        The idle arm matters because butterchurn renders unconditionally. Its
-        absolute 3D percentage answers no question on its own; what the visuals
-        COST is the difference between the two arms on the same box.
+        The idle arm is the control: the same box, driver, NO launch, window
+        size and screen, minutes earlier. WHAT THE CONTROL CONTAINED IS
+        MEASURED, NOT ASSUMED -- see Get-GfxBaselineVisualizerState. Whether
+        the visuals were already drawing during it decides whether the delta is
+        the session's extra cost on top of them or includes them appearing, and
+        the two are different quantities.
     .PARAMETER Samples
         Every 'Sample' record drained from the sampler, in time order.
     .PARAMETER Markers
@@ -2828,7 +5150,14 @@ function Get-GraphicsBenchSessionSummary {
         $MonitorCount,
         # Every count seen during the run, so a display change mid-recording is
         # a finding rather than a silent difference from the cohort key.
-        [array]$MonitorCountsObserved = @()
+        [array]$MonitorCountsObserved = @(),
+        # THE DISPLAY ARRANGEMENT AT THE MOMENT RECORDING STARTED, from
+        # Get-GfxDisplayArrangement. This is what says WHICH screen the run was
+        # made on -- the question a display count cannot answer, and the one
+        # that decides whether two packages can be pooled.
+        $DisplayArrangement,
+        # Every distinct arrangement signature seen while recording, as a set.
+        [array]$DisplaySetupsObserved = @()
     )
 
     $summary = @{
@@ -2857,8 +5186,12 @@ function Get-GraphicsBenchSessionSummary {
         StartedMidSession  = $false
         NoUiBaselineTitles = @()
         NoUiChanges        = @()
-        Arms               = @{ Idle = @(); Session = @(); After = @() }
-        ArmDurationSec     = @{ Idle = $null; Session = $null; After = $null }
+        Arms               = @{ Idle = @(); Session = @(); After = @(); Transition = @() }
+        # The manual transition the operator bracketed with typed markers, when
+        # the test asked for one. Reported on its own; NEVER inside the session
+        # arm the deltas are taken from.
+        TransitionSpan     = $null
+        ArmDurationSec     = @{ Idle = $null; Session = $null; After = $null; Transition = $null }
         Deltas             = @()
         # How NO's window was placed (Windowed / Maximized / FullScreen), as
         # spans, because the cost of a pane plausibly follows its size and
@@ -2875,8 +5208,28 @@ function Get-GraphicsBenchSessionSummary {
         # written from the layout at the start, so a monitor plugged in halfway
         # through would otherwise leave no trace at all.
         MonitorCountsObserved = @($MonitorCountsObserved | Where-Object { $null -ne $_ } | Sort-Object -Unique)
+        # WHICH SCREEN THIS WAS MEASURED ON. Carried whole, so the package can
+        # be re-read later against a question nobody has asked yet -- the
+        # monitor's name, its refresh rate and its scale factor are all in it.
+        DisplayArrangement    = $DisplayArrangement
+        DisplaySetupsObserved = @($DisplaySetupsObserved | Where-Object { $_ } | Sort-Object -Unique)
+        # Where the visuals were drawn, and what the baseline contained.
+        Visualizer            = @{ OnOtherDisplay = $null; MonitorDevice = $null; MainMonitorDevice = $null; SamplesRead = 0 }
+        BaselineVisualizer    = @{ State = 'NotMeasured'; IdleMean = $null; SessionMean = $null; Text = $null }
     }
     if ($Samples.Count -eq 0) { return $summary }
+
+    # A SAMPLE THAT IS ITSELF AN ARRAY is the 'return ,$x' trap arriving from a
+    # caller: '@(fn)' over a function that returns ',$samples' yields ONE
+    # element holding the whole array, and concatenating two of those hands
+    # this function a list of lists. Every read below then coerces an array to
+    # a double and fails hundreds of lines from the cause -- which is what it
+    # did, in this module's own suite. Caught here, named here.
+    for ($i = 0; $i -lt $Samples.Count; $i++) {
+        if ($Samples[$i] -is [System.Collections.IEnumerable] -and $Samples[$i] -isnot [string] -and $Samples[$i] -isnot [System.Collections.IDictionary]) {
+            throw "Sample $i is a collection, not a sample. A caller has passed a list of lists -- assign the result of each sample-producing call to a variable before combining them, because '@(fn)' over a function returning ',`$samples' yields one element holding the whole array."
+        }
+    }
 
     $summary.StartUtc = $Samples[0].AtUtc
     $summary.EndUtc = $Samples[$Samples.Count - 1].AtUtc
@@ -2925,6 +5278,7 @@ function Get-GraphicsBenchSessionSummary {
     $idleSamples = @()
     $sessionSamples = @()
     $afterSamples = @()
+    $transitionSamples = @()
     if ($null -ne $splitIndex -and $splitIndex -gt 0) {
         $idleSamples = @($Samples[0..($splitIndex - 1)])
         $sessionLast = $Samples.Count - 1
@@ -2933,7 +5287,46 @@ function Get-GraphicsBenchSessionSummary {
             $afterSamples = @($Samples[$endIndex..($Samples.Count - 1)])
         }
         $sessionSamples = @($Samples[$splitIndex..$sessionLast])
+
+        # THE MANUAL TRANSITION COMES OUT OF THE SESSION ARM.
+        #
+        # When the operator bracketed a transition with the two typed markers,
+        # the stretch between them is someone dragging a window between screens.
+        # Averaging it into the session makes the session wrong and hides the
+        # transition; leaving it in and calling the whole thing 'session' is
+        # what the detached test used to do, and its instructions promised
+        # otherwise. So the session arm becomes the STEADY period after the
+        # second marker, the transition is its own arm, and every delta
+        # downstream is steady-minus-idle without a single line changing.
+        $summary.TransitionSpan = Get-GfxTransitionSpan -Markers $Markers -Samples $Samples
+        if ($summary.TransitionSpan) {
+            $tStart = [datetime]$summary.TransitionSpan.StartUtc
+            $tEnd = [datetime]$summary.TransitionSpan.EndUtc
+            $tFrom = $null
+            $tTo = $null
+            for ($i = $splitIndex; $i -le $sessionLast; $i++) {
+                $at = $null
+                try { $at = [datetime]$Samples[$i].AtUtc } catch { continue }
+                if ($at -ge $tStart -and $null -eq $tFrom) { $tFrom = $i }
+                if ($at -ge $tEnd -and $null -eq $tTo) { $tTo = $i; break }
+            }
+            # Both edges must land INSIDE the session arm. Markers pressed
+            # before the session started, or after it ended, describe something
+            # this run cannot cut on, and the span is kept as a record while the
+            # arms stay as they were.
+            if ($null -ne $tFrom -and $null -ne $tTo -and $tTo -gt $tFrom) {
+                $transitionSamples = @($Samples[$tFrom..($tTo - 1)])
+                $sessionSamples = @($Samples[$tTo..$sessionLast])
+                $summary.TransitionSpan.Applied = $true
+            } else {
+                $summary.TransitionSpan.Applied = $false
+            }
+        }
     }
+
+    $transitionSec = $null
+    if ($transitionSamples.Count -ge 2) { try { $transitionSec = [math]::Round(([datetime]$transitionSamples[$transitionSamples.Count - 1].AtUtc - [datetime]$transitionSamples[0].AtUtc).TotalSeconds, 1) } catch { } }
+    $summary.ArmDurationSec.Transition = $transitionSec
 
     $idleSec = $null
     if ($idleSamples.Count -ge 2) { try { $idleSec = [math]::Round(([datetime]$idleSamples[$idleSamples.Count - 1].AtUtc - [datetime]$idleSamples[0].AtUtc).TotalSeconds, 1) } catch { } }
@@ -2961,6 +5354,9 @@ function Get-GraphicsBenchSessionSummary {
     $summary.Arms.Idle = Get-GfxRoleAggregate -Samples $idleSamples -DurationSec $idleSecArg
     $summary.Arms.Session = Get-GfxRoleAggregate -Samples $sessionSamples -DurationSec $sessionSecArg
     $summary.Arms.After = Get-GfxRoleAggregate -Samples $afterSamples -DurationSec $afterSecArg
+    $transitionSecArg = 0.0
+    if ($null -ne $transitionSec) { $transitionSecArg = [double]$transitionSec }
+    $summary.Arms.Transition = Get-GfxRoleAggregate -Samples $transitionSamples -DurationSec $transitionSecArg
 
     foreach ($sessRole in @($summary.Arms.Session | Where-Object { $null -ne $_ })) {
         $idleRole = @($summary.Arms.Idle | Where-Object { $_.Role -eq $sessRole.Role }) | Select-Object -First 1
@@ -2985,6 +5381,12 @@ function Get-GraphicsBenchSessionSummary {
         }
         $surf.AdapterNames = @($names | Sort-Object -Unique)
     }
+
+    # Which screen the visuals were drawn on, and what the baseline actually
+    # contained. Both read from the arms above, so the report never has to
+    # assert either one from a box someone once looked at.
+    $summary.Visualizer = Get-GfxVisualizerPlacement -Samples $Samples
+    $summary.BaselineVisualizer = Get-GfxBaselineVisualizerState -Summary $summary -VisualizerFloorPercent $VisualizerFloorPercent
 
     # A host or GPU pid changing mid-run means the process was replaced --
     # the pane-goes-blank failure class. Report the identities, not a count.
@@ -3163,6 +5565,73 @@ function Get-GraphicsBenchFindings {
         }
     }
 
+    # THE VISUALS ON A SCREEN OF THEIR OWN. Ranked with the window-mode
+    # findings because it is the same defect class and worse: a second screen
+    # drawing the visuals is a second GPU load the delta silently contains, and
+    # nothing before this could see it. Raised for ANY run, not only one that
+    # declared a profile -- an exploratory recording made this way is just as
+    # unreadable, it simply is not a protocol departure.
+    # THE VISUALS IN A WINDOW OF THEIR OWN. Raised for ANY run: a recording
+    # made this way measures a different arrangement whether or not a profile
+    # asked about it.
+    if ($Summary.Visualizer -and [string]$Summary.Visualizer.Attachment -eq 'OwnWindow') {
+        $v = $Summary.Visualizer
+        $screenLine = switch ($v.OnOtherDisplay) {
+            $true   { "It was also on a different screen ($($v.MonitorDevice)) from the main window ($($v.MainMonitorDevice))." }
+            $false  { 'It was on the SAME screen as the main window, so a check that only compared screens would have passed this run.' }
+            default { 'Which screen it was on could not be read.' }
+        }
+        $candidates += @{
+            Rank       = 3
+            Id         = 'GFX-VISUALIZER-DETACHED'
+            Title      = 'The visuals were drawn in a window of their own, not inside NeurOptimal'
+            Result     = 'WARN'
+            AppliesTo  = 'Measurement'
+            Evidence   = @(
+                "The visualizer surface was hosted by a separate visible window titled '$($v.HostWindowTitle)' on $($v.DetachedSamples) of $($v.AttachmentSamples) readable sample(s), while NeurOptimal's own panel was visible elsewhere.",
+                $screenLine,
+                'This is what the separate visualizer full-screen button does, and it makes the numbers the cost of that arrangement rather than of the session alone.'
+            )
+            ActionHint = 'For a baseline recording, leave the visuals inside NeurOptimal and do not use the separate visualizer full-screen button. To measure this arrangement on purpose, use the Detached visualizer test.'
+        }
+    }
+
+    if ($Summary.Visualizer -and $Summary.Visualizer.OnOtherDisplay -eq $true -and [string]$Summary.Visualizer.Attachment -ne 'OwnWindow') {
+        $v = $Summary.Visualizer
+        $candidates += @{
+            Rank       = 3
+            Id         = 'GFX-VISUALIZER-OTHER-DISPLAY'
+            Title      = 'The visuals were drawn on a different screen from the NeurOptimal window'
+            Result     = 'WARN'
+            AppliesTo  = 'Measurement'
+            Evidence   = @(
+                "The window hosting the visualizer reported display $($v.MonitorDevice); NeurOptimal's main window reported $($v.MainMonitorDevice).",
+                'Two screens were drawing at once, so the numbers are the cost of that arrangement and not of the session alone.',
+                "Which control put it there is not established: $($v.AttachmentReason)."
+            )
+            ActionHint = 'Put NeurOptimal and its visuals on one screen for a baseline recording, or use the Detached visualizer test to measure this arrangement on purpose.'
+        }
+    }
+
+    # THE DISPLAY ARRANGEMENT CHANGED WHILE RECORDING. Same rank as the window
+    # change and for the same reason: half the run measured a different screen,
+    # so the deltas average two setups.
+    $seenSetups = @($Summary.DisplaySetupsObserved | Where-Object { $_ } | Sort-Object -Unique)
+    if ($seenSetups.Count -gt 1) {
+        $candidates += @{
+            Rank       = 4
+            Id         = 'GFX-DISPLAY-SETUP-CHANGED'
+            Title      = 'The screens changed while the recording was running'
+            Result     = 'WARN'
+            AppliesTo  = 'Measurement'
+            Evidence   = @(
+                "Setups seen during the run: $($seenSetups -join ' / ').",
+                'The visuals are drawn across the whole window, so their load follows the pixel area of the screen. A run spanning two setups has no single screen for its numbers to belong to.'
+            )
+            ActionHint = 'Set the screens up before pressing Start watching and leave them alone until the session ends, then re-run.'
+        }
+    }
+
     # Departures from the selected profile that no finding above already
     # names. The two window-mode keys are excluded on purpose: they each have
     # a dedicated finding with its own evidence, and the list is capped at
@@ -3173,7 +5642,8 @@ function Get-GraphicsBenchFindings {
     # absent value yields ONE element holding $null, and $null.Key passes any
     # -ne filter. Without it this finding fires on every legacy capture --
     # which is exactly what the suite caught.
-    $covered = @('WindowMode', 'BaselineMode', 'WindowChanged', 'BaselineLength')
+    $covered = @('WindowMode', 'BaselineMode', 'WindowChanged', 'BaselineLength',
+                 'VisualizerOtherDisplay', 'VisualizerDetached', 'DisplaySetupChanged')
     $deviations = @($Summary.ProfileDeviations | Where-Object { $null -ne $_ -and $covered -notcontains $_.Key })
     if ($deviations.Count -gt 0) {
         $profileLabel = $Summary.ProfileName
@@ -3236,7 +5706,7 @@ function Get-GraphicsBenchFindings {
                 AppliesTo  = 'Measurement'
                 Evidence   = @(
                     "NO's window set never changed for $(Get-GfxUiChangeDwellSamples) consecutive samples, so the run has one arm and no deltas.",
-                    'Butterchurn draws while NO is idle, so a whole-run percentage cannot be read as session cost.'
+                    'A whole-run percentage cannot be read as a session cost: it mixes whatever NO was doing before the session with the session itself, and nothing here separates them.'
                 )
                 ActionHint = 'Start watching FIRST, leave NeurOptimal alone until the line says Baseline collected, and only then start the session.'
             }
@@ -3450,6 +5920,12 @@ function Save-GraphicsBenchRun {
         # package without opening the session file.
         cohortKey     = $(if ($cohort) { $cohort.Key } else { $null })
         cohort        = $cohort
+        # WHICH KEY SHAPE. Version 2 keys on the display ARRANGEMENT; version 1
+        # keyed on resolutions and a count and pooled a built-in panel with an
+        # external monitor of the same size. The ingest side needs to know which
+        # it is holding, because the two do not pool with each other -- and
+        # should not.
+        cohortVersion = $(if ($cohort -and $cohort.Version) { $cohort.Version } else { 1 })
         # Window placement rides along for the same reason: a pool of runs
         # should be split by it without opening every session file. Additive;
         # schemaVersion stays 1.
@@ -3465,6 +5941,51 @@ function Save-GraphicsBenchRun {
         profileId             = $(try { $Session.summary.ProfileId } catch { $null })
         profileDeviationCount = $(try { @($Session.summary.ProfileDeviations).Count } catch { $null })
         monitorCount          = $(try { $Session.summary.MonitorCount } catch { $null })
+        # WHICH SCREEN, in the manifest, for the same reason the window mode is:
+        # a pool should be split by it without opening every session file, and
+        # a 49-inch external display and a 14-inch built-in panel are not the
+        # same measurement however alike their display COUNTS look. Additive;
+        # schemaVersion stays 1.
+        displaySetup          = $(try { $Session.summary.DisplayArrangement.Layout } catch { $null })
+        displaySignature      = $(try { $Session.summary.DisplayArrangement.Signature } catch { $null })
+        displaySetupChanged   = $(try { (@($Session.summary.DisplaySetupsObserved).Count -gt 1) } catch { $null })
+        builtInDisplayState   = $(try { $Session.summary.DisplayArrangement.BuiltIn.State } catch { $null })
+        # The SCREEN is scored; the WINDOW is recorded and not scored, because
+        # NO relocates its panes between windows on its own. visualizerHostWindows
+        # is the evidence the first capture taken with the separate visualizer
+        # control pressed will be compared against.
+        visualizerOnOtherDisplay = $(try { $Session.summary.Visualizer.OnOtherDisplay } catch { $null })
+        visualizerAttachment     = $(try { $Session.summary.Visualizer.Attachment } catch { $null })
+        visualizerHostWindowTitle = $(try { $Session.summary.Visualizer.HostWindowTitle } catch { $null })
+        # Every host-window title seen, so an unrecognised one can be read out
+        # of a package and taught to the classifier -- the same way the
+        # Bluetooth lexicon carries UnknownWindowTitles.
+        visualizerHostWindowTitles = $(try { @($Session.summary.Visualizer.HostWindowTitlesSeen) } catch { $null })
+        visualizerHostWindows    = $(try { @($Session.summary.Visualizer.HostWindowsSeen) } catch { $null })
+        baselineVisualizer    = $(try { $Session.summary.BaselineVisualizer.State } catch { $null })
+        # Whether the SESSION arm was cut at the operator's second mark, and how
+        # long the manual transition it excluded took. A pool that ignores this
+        # compares a steady period against a whole session.
+        transitionSec         = $(try { $Session.summary.TransitionSpan.DurationSec } catch { $null })
+        transitionApplied     = $(try { [bool]$Session.summary.TransitionSpan.Applied } catch { $null })
+        # 'Unverified' on every run so far, on purpose: a window's placement
+        # does not record which control set it. The field answers this, not the
+        # tool -- read it beside windowMode across packages.
+        appFullScreen         = 'Unverified'
+        # How much of the monitor the window actually covered, per arm. Two
+        # runs that both say 'maximized' can differ by a taskbar strip, and
+        # that difference is drawn area.
+        idleScreenFraction    = $(try { $Session.summary.WindowMode.IdleScreenFraction } catch { $null })
+        sessionScreenFraction = $(try { $Session.summary.WindowMode.SessionScreenFraction } catch { $null })
+        # The area the visuals were actually drawn into, in DESKTOP pixels --
+        # the quantity the numbers follow. Measured across two displays on one
+        # box: a physical-pixel model of the cost needs a negative fixed term
+        # and is refuted; this one does not.
+        idleWindowDesktopPixels    = $(try { $Session.summary.WindowMode.IdleWindowDesktopPixels } catch { $null })
+        sessionWindowDesktopPixels = $(try { $Session.summary.WindowMode.SessionWindowDesktopPixels } catch { $null })
+        # The raw style word, so the question of which control set the window
+        # can be re-asked of an old package without a new build.
+        windowStyleHex        = $(try { $Session.summary.WindowMode.StyleHex } catch { $null })
         schemaVersion = 1
     }
     $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Run.ManifestPath -Encoding UTF8
@@ -3563,9 +6084,15 @@ function Format-GraphicsInventoryReport {
 
         $driving = @($Inventory.DisplayDrivingAdapters)
         $drivingText = if ($driving.Count -gt 0) { $driving -join ', ' } else { [string][char]0x2014 }
-        $displayText = @(@($Inventory.Displays) | ForEach-Object { $_.Bounds }) -join ', '
-        if ([string]::IsNullOrWhiteSpace($displayText)) { $displayText = [string][char]0x2014 }
-        $r += @{ Level = 'INFO'; Text = ("  {0,-10}display driven by {1}  |  {2} on {3} monitor(s)  |  WebView2 {4}" -f 'GRAPHICS', $drivingText, $displayText, (Format-GraphicsValue $Inventory.MonitorCount), (Format-GraphicsValue $Inventory.WebView2.Version)); NoPrefix = $true }
+        $r += @{ Level = 'INFO'; Text = ("  {0,-10}display driven by {1}  |  WebView2 {2}" -f 'GRAPHICS', $drivingText, (Format-GraphicsValue $Inventory.WebView2.Version)); NoPrefix = $true }
+        # THE ARRANGEMENT, not the count. A resolution list beside "1
+        # monitor(s)" reads as a controlled setup on a laptop running one
+        # 5120x1440 external screen with the lid shut, which is the case this
+        # whole block exists to make visible.
+        foreach ($line in (Format-GfxDisplaySetupLines -Arrangement $Inventory.DisplayArrangement -NoDisplay $null -NoDisplayReason $null)) {
+            if ($line.Key -eq 'NoLocation') { continue }
+            $r += @{ Level = $(if ($line.Level -eq 'Unknown') { 'WARN' } else { 'DIM' }); Text = ("  {0,-10}{1}" -f '', $line.Text); NoPrefix = $true }
+        }
 
         if ($Inventory.HybridGpu) {
             # Which adapter each pane used is in the grid's own column, so the
@@ -3606,9 +6133,32 @@ function Format-GraphicsInventoryReport {
         $r += @{ Level = 'WARN'; Text = '  HYBRID GPU: two vendors present. Which adapter each pane chose is recorded'; NoPrefix = $true }
         $r += @{ Level = 'WARN'; Text = '  as the measured LUID per surface, not inferred from the adapter list.'; NoPrefix = $true }
     }
-    foreach ($d in @($Inventory.Displays)) {
-        $primary = if ($d.Primary) { '  (primary)' } else { '' }
-        $r += @{ Level = 'DIM'; Text = ("  {0,-14}{1}  {2}{3}" -f 'Display', (Format-GraphicsValue $d.DeviceName), (Format-GraphicsValue $d.Bounds), $primary); NoPrefix = $true }
+    # THE ARRANGEMENT, in full: identity, mode, refresh and scale per display,
+    # so two runs made on two different external monitors stay distinguishable
+    # in the package without anyone having to remember which room they were in.
+    $arr = $Inventory.DisplayArrangement
+    if ($arr) {
+        $r += @{ Level = 'INFO'; Text = ("  {0,-14}{1}" -f 'Display setup', $arr.LayoutText); NoPrefix = $true }
+        foreach ($d in @($arr.Displays)) {
+            $kind = if ($d.Internal -eq $true) { 'built-in' } elseif ($d.Internal -eq $false) { 'external' } else { 'kind unknown' }
+            $primary = if ($d.Primary) { ', primary' } else { '' }
+            $r += @{ Level = 'DIM'; Text = ("  {0,-14}{1}  ({2}{3})" -f 'Display', (Format-GfxDisplayLabel -Display $d), $kind, $primary); NoPrefix = $true }
+            $hz = if ($null -ne $d.RefreshExact) { "$($d.RefreshExact) Hz exact" } else { [string][char]0x2014 }
+            $r += @{ Level = 'DIM'; Text = ("  {0,-14}{1}  |  {2}  |  {3}" -f '', (Format-GraphicsValue $d.GdiName), (Format-GraphicsValue $d.Connection), $hz); NoPrefix = $true }
+            if ($d.DevicePath) { $r += @{ Level = 'DIM'; Text = ("  {0,-14}{1}" -f '', $d.DevicePath); NoPrefix = $true } }
+        }
+        $r += @{ Level = 'DIM'; Text = ("  {0,-14}{1}" -f 'Built-in', $arr.BuiltIn.StateText); NoPrefix = $true }
+        if ($arr.BuiltIn.Inferred) {
+            $r += @{ Level = 'DIM'; Text = ("  {0,-14}INFERRED from this machine having a battery -- Windows enumerated no built-in panel" -f ''); NoPrefix = $true }
+        }
+        foreach ($e in @($arr.Errors)) {
+            $r += @{ Level = 'WARN'; Text = ("  {0,-14}partly unread: {1}" -f '', $e); NoPrefix = $true }
+        }
+    } else {
+        foreach ($d in @($Inventory.Displays)) {
+            $primary = if ($d.Primary) { '  (primary)' } else { '' }
+            $r += @{ Level = 'DIM'; Text = ("  {0,-14}{1}  {2}{3}" -f 'Display', (Format-GraphicsValue $d.DeviceName), (Format-GraphicsValue $d.Bounds), $primary); NoPrefix = $true }
+        }
     }
     $r += @{ Level = 'INFO'; Text = ("  {0,-14}{1}  (NO fixed-version runtime)" -f 'WebView2', (Format-GraphicsValue $Inventory.WebView2.Version)); NoPrefix = $true }
 
@@ -3685,8 +6235,9 @@ function Format-GraphicsBenchReport {
     $r += @{ Level = 'STEP'; Text = 'WHAT THE SESSION COST'; NoPrefix = $true }
     if (-not $compact) {
         $r += @{ Level = 'DIM'; Text = '  Session mean minus this box own idle baseline, measured minutes earlier on the'; NoPrefix = $true }
-        $r += @{ Level = 'DIM'; Text = '  same hardware, driver and NO launch. Butterchurn draws even when NO is idle,'; NoPrefix = $true }
-        $r += @{ Level = 'DIM'; Text = '  so the absolute percentage answers nothing on its own -- the delta does.'; NoPrefix = $true }
+        $r += @{ Level = 'DIM'; Text = '  same hardware, driver, NO launch, window size and screen. The absolute'; NoPrefix = $true }
+        $r += @{ Level = 'DIM'; Text = '  percentage answers nothing on its own -- the delta does, and only against a'; NoPrefix = $true }
+        $r += @{ Level = 'DIM'; Text = '  baseline whose contents are stated. What this baseline contained is below.'; NoPrefix = $true }
     }
 
     if ($Summary.SessionStartSource -eq 'none-detected') {
@@ -3729,10 +6280,37 @@ function Format-GraphicsBenchReport {
             $endText = "ended at $endAt (Session Complete)"
         }
         $r += @{ Level = 'DIM'; Text = ("  idle arm {0}  |  session arm {1}, {2}  |  split at {3} ({4})" -f (Format-GraphicsDuration $Summary.ArmDurationSec.Idle), (Format-GraphicsDuration $Summary.ArmDurationSec.Session), $endText, $split, $Summary.SessionStartSource); NoPrefix = $true }
+        # THE MANUAL TRANSITION, ON ITS OWN LINE. It is deliberately not in the
+        # table above: it is someone dragging a window between screens, which
+        # is neither the baseline nor the steady period, and averaging it into
+        # either makes both wrong.
+        if ($Summary.TransitionSpan) {
+            $ts = $Summary.TransitionSpan
+            if ($ts.Applied) {
+                $r += @{ Level = 'DIM'; Text = ("  transition {0} (marked by the operator) is EXCLUDED from the session arm; the numbers above start when the visuals settled." -f (Format-GraphicsDuration $ts.DurationSec)); NoPrefix = $true }
+            } else {
+                $r += @{ Level = 'WARN'; Text = ("  transition {0} was marked but falls outside the recorded session, so the arms were not cut around it." -f (Format-GraphicsDuration $ts.DurationSec)); NoPrefix = $true }
+            }
+        } elseif ($BenchProfile -and $BenchProfile.Requires -and $BenchProfile.Requires.ContainsKey('TransitionMarkers')) {
+            $r += @{ Level = 'WARN'; Text = '  This test asks for the detach to be marked at both ends. It was not, so the numbers above span the manual transition.'; NoPrefix = $true }
+        }
         if ($Summary.WindowMode) {
             $wm = $Summary.WindowMode
             $wmText = "  NO window: {0}" -f (Format-GraphicsValue $wm.Dominant)
             if ($wm.Bounds) { $wmText += " $($wm.Bounds)" }
+            # HOW MUCH OF THE SCREEN, beside the label. 'Maximized' is not a
+            # quantity; the fraction is, and it is what the numbers follow.
+            # [math]::Round, written out: a bare [int] cast ROUNDS in
+            # PowerShell rather than truncating, so 0.979 renders 98 and not
+            # 97. Stating the intent stops the next reader assuming the other.
+            if ($null -ne $wm.SessionScreenFraction) { $wmText += (", covering {0}% of the screen" -f [math]::Round([double]$wm.SessionScreenFraction * 100)) }
+            # THE NUMBER TO COMPARE ACROSS BOXES. The visuals are drawn into a
+            # target sized in DESKTOP pixels, so this -- not the monitor's
+            # resolution and not the covered fraction -- is what the deltas
+            # follow. Two machines are comparable on the visualizer when this
+            # matches; a 150% display gives 2.25x fewer of them than the same
+            # panel at 100%.
+            if ($null -ne $wm.SessionWindowDesktopPixels) { $wmText += (" = {0:N0} desktop pixels drawn" -f $wm.SessionWindowDesktopPixels) }
             if ($wm.ChangedDuringSession) { $wmText += "  CHANGED during the session ($(@($wm.SessionModes) -join ' / '))" }
             $r += @{ Level = $(if ($wm.ChangedDuringSession) { 'WARN' } else { 'DIM' }); Text = $wmText; NoPrefix = $true }
             # Both arms' modes on one line, because the delta above is only a
@@ -3741,6 +6319,30 @@ function Format-GraphicsBenchReport {
             if ($wm.IdleMode -and $wm.IdleMode -ne 'Unknown' -and $wm.Dominant -ne 'Unknown' -and $wm.IdleMode -ne $wm.Dominant) {
                 $r += @{ Level = 'WARN'; Text = ("  Baseline was measured {0} and the session ran {1} {2} the deltas above include that size change." -f $wm.IdleMode, $wm.Dominant, $dash); NoPrefix = $true }
             }
+        }
+
+        # WHICH SCREEN, AND WHAT THE BASELINE CONTAINED. Both printed with the
+        # numbers rather than in a footnote, because both change what the
+        # numbers mean and a reader who does not scroll is the common case.
+        if ($Summary.DisplayArrangement) {
+            $arr = $Summary.DisplayArrangement
+            $screens = @(@($arr.Displays) | ForEach-Object { Format-GfxDisplayLabel -Display $_ })
+            $screenText = if ($screens.Count -gt 0) { $screens -join '; ' } else { $dash }
+            $r += @{ Level = 'DIM'; Text = ("  Measured on: {0} {1} {2}" -f $arr.LayoutText, $dash, $screenText); NoPrefix = $true }
+        }
+        if ($Summary.Visualizer -and $Summary.Visualizer.OnOtherDisplay -eq $true) {
+            $r += @{ Level = 'WARN'; Text = '  The visuals were drawn on a DIFFERENT SCREEN from the main NeurOptimal window,'; NoPrefix = $true }
+            $r += @{ Level = 'WARN'; Text = '  so the numbers above are the cost of two screens drawing at once.'; NoPrefix = $true }
+        }
+        # THE CORRECTION THIS BLOCK EXISTS FOR. It used to be asserted, from one
+        # box, that the visuals draw while NO is idle -- which makes the delta
+        # read as the session's own extra cost. On a machine where the visuals
+        # are not on screen until a session starts, the same delta is the cost
+        # of the visualization APPEARING plus the session, and nothing said so.
+        # It is now read off the idle arm and printed either way.
+        if ($Summary.BaselineVisualizer -and $Summary.BaselineVisualizer.Text) {
+            $lvl = if ($Summary.BaselineVisualizer.State -eq 'AboveFloor') { 'DIM' } else { 'WARN' }
+            $r += @{ Level = $lvl; Text = ("  {0}" -f $Summary.BaselineVisualizer.Text); NoPrefix = $true }
         }
 
         # AUDIO-ONLY IS NOT A FAULT. An audio session draws butterchurn and
@@ -4255,7 +6857,14 @@ function Get-GraphicsBenchVerdict {
         [string]$Phase = 'NotStarted'
     )
 
-    $footnote = "Butterchurn draws even while NO is idle. A percentage is a session cost only as a difference against this box's own idle stretch."
+    # THE FOOTNOTE STATES A LIMIT, IT DOES NOT ASSERT A READING. It used to say
+    # "butterchurn draws even while NO is idle", which was true of the box it
+    # was written on and false on a machine where the visuals only appear when
+    # a session starts -- and on that machine it told the reader the delta was
+    # the session's own extra cost when it was the visuals appearing as well.
+    # What the baseline actually contained is MEASURED per run and printed with
+    # the numbers; the permanent caveat is the one thing true of every run.
+    $footnote = "A percentage is a session cost only as a difference against this box's own baseline, and only when the baseline was measured at the same window size on the same screen."
 
     if ($Phase -eq 'NotStarted') {
         return @{ Text = 'No run yet.'; Context = 'Press Start watching before the session begins.'
@@ -4340,10 +6949,27 @@ Export-ModuleMember -Function @(
     'Get-GraphicsBenchFindings'
     'Get-GraphicsBenchProfiles'
     'Get-GraphicsBenchProfile'
+    'Get-GraphicsBenchProfileForArrangement'
+    'Get-GfxVisualizerPlacement'
+    'Get-GfxVisualizerAttachmentState'
+    'Get-GfxBaselineVisualizerState'
+    'Get-GfxTransitionMarkerKinds'
+    'Get-GfxTransitionSpan'
+    'Test-GfxExternalDisconnected'
     'Test-GraphicsBenchReadiness'
     'Get-GfxLiveNoWindow'
     'Get-GfxLiveDisplayCount'
     'Get-GfxNoRunning'
+    'Initialize-GfxDisplayScan'
+    'ConvertFrom-GfxDisplayScanRows'
+    'New-GfxDisplayArrangement'
+    'Get-GfxDisplayArrangement'
+    'Format-GfxDisplayLabel'
+    'Format-GfxDisplaySetupLines'
+    'ConvertTo-GfxMonitorKey'
+    'Get-GfxDisplayPhysicalSize'
+    'Resolve-GfxNoDisplay'
+    'Test-GfxDisplaySetupMatch'
     'Get-GraphicsBenchPhase'
     'Get-GraphicsBenchProfileOutcome'
     'Format-GraphicsClock'

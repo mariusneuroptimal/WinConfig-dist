@@ -4585,7 +4585,7 @@ $buttonHandlers = @{
 
             # GUARD: the measurement module itself
             $gfxMissing = @()
-            foreach ($gfxFn in @('Start-GraphicsSampler', 'Get-GraphicsInventory', 'Get-GraphicsBenchSessionSummary', 'Format-GraphicsBenchReport', 'New-GraphicsBenchRunFolder', 'Get-GraphicsBenchGridRows', 'Get-GfxUiChangeDwellSamples', 'Resolve-GfxLuidName', 'Get-GraphicsBenchProfiles', 'Get-GraphicsBenchProfile', 'Test-GraphicsBenchReadiness', 'Get-GfxLiveNoWindow', 'Get-GfxLiveDisplayCount', 'Get-GfxNoRunning', 'Get-GraphicsBenchPhase', 'Get-GraphicsBenchProfileOutcome')) {
+            foreach ($gfxFn in @('Start-GraphicsSampler', 'Get-GraphicsInventory', 'Get-GraphicsBenchSessionSummary', 'Format-GraphicsBenchReport', 'New-GraphicsBenchRunFolder', 'Get-GraphicsBenchGridRows', 'Get-GfxUiChangeDwellSamples', 'Resolve-GfxLuidName', 'Get-GraphicsBenchProfiles', 'Get-GraphicsBenchProfile', 'Test-GraphicsBenchReadiness', 'Get-GfxLiveNoWindow', 'Get-GfxLiveDisplayCount', 'Get-GfxNoRunning', 'Get-GraphicsBenchPhase', 'Get-GraphicsBenchProfileOutcome', 'Get-GfxDisplayArrangement', 'Format-GfxDisplaySetupLines', 'Resolve-GfxNoDisplay', 'Get-GraphicsBenchProfileForArrangement', 'Get-GfxCohortKey')) {
                 if (-not (Get-Command $gfxFn -ErrorAction SilentlyContinue)) { $gfxMissing += $gfxFn }
             }
             if ($gfxMissing.Count -gt 0) {
@@ -4638,14 +4638,22 @@ $buttonHandlers = @{
             $gfxS = $script:GfxViewScale
             $script:GfxViewM = @{
                 FormW     = [int](1180 * $gfxS)
-                FormH     = [int](820  * $gfxS)
+                # RAISED WITH THE GUIDE. The guide is now 245 px of fixed
+                # height above every data panel, and a window that did not
+                # grow with it would pay for the display block out of the
+                # log -- which the layout suite measures rather than trusts.
+                FormH     = [int](980  * $gfxS)
                 MinW      = [int](940  * $gfxS)
                 # RAISED with the guide panel, which is 154 px of new fixed
                 # height above every data panel in the window. At the old 620
                 # the log collapsed to a single pixel once the guide was
                 # populated -- caught by the min-size test, not by looking at
                 # a window opened at its preferred size.
-                MinH      = [int](720  * $gfxS)
+                # RAISED AGAIN with the display block, which is four more
+                # fixed rows inside the guide. Same reasoning as the 620 -> 720
+                # move: the guide sits above every data panel, so every row it
+                # gains comes out of the log unless the floor moves with it.
+                MinH      = [int](840  * $gfxS)
                 Pad       = [int](16   * $gfxS)
                 HeadPadX  = [int](18   * $gfxS)
                 HeadPadY  = [int](12   * $gfxS)
@@ -4669,10 +4677,28 @@ $buttonHandlers = @{
                 # fixed-height data panel in the window, so an AutoSize guide
                 # that grew with its text would push the grid, the timeline and
                 # the log down together -- and on a 768-line laptop it would
-                # push the Close button off the bottom. Three check rows:
-                # monitor count, NO running, window placement, which is every
-                # requirement the registry can check before a run.
-                CheckRows    = 3
+                # push the Close button off the bottom. FOUR check rows:
+                # display setup, no other display connected, NO running, window
+                # placement -- every requirement the registry can check before a
+                # run. A spare row is not free here, but a check that exists and
+                # is never painted is worse than one line of slack: the panel
+                # would silently drop whichever requirement sorted last.
+                CheckRows    = 4
+                # FOUR DISPLAY ROWS, built once and only ever re-texted like
+                # the checks. They answer "which screen is this being measured
+                # on", which the checklist's verdict alone cannot: 'Ready' on a
+                # one-display test is equally true of a laptop panel and of a
+                # 49-inch external monitor, and those two runs are not
+                # comparable. The block is DESCRIPTIVE, the checks are the
+                # verdict; keeping them apart is why the fourth row (where NO
+                # actually is) can be present without a pass/fail beside it.
+                #
+                # Four because Format-GfxDisplaySetupLines emits setup, one row
+                # per active display, built-in state and NO's location. Two
+                # active displays therefore need five, so the panel holds a
+                # spare and the renderer collapses the overflow rather than
+                # clipping it silently.
+                DisplayRows  = 5
                 GuideHeadH   = [int](26 * $gfxS)
                 GuidePhaseH  = [int](17 * $gfxS)
                 # The instruction is the longest string in the panel: two lines
@@ -4680,7 +4706,9 @@ $buttonHandlers = @{
                 GuideTextH   = [int](44 * $gfxS)
                 # Derived from its own rows, never asserted: a literal here is
                 # how EventsH came to clip the row a reader was looking for.
-                GuideH       = [int](((26 + 17 + 44 + (3 * 17)) + 16) * $gfxS)
+                # Derived from its own rows, never asserted: five display lines
+                # plus the operator confirmation row beneath them.
+                GuideH       = [int](((26 + 17 + 44 + (4 * 17) + (6 * 17) + 6) + 16) * $gfxS)
                 ColSurface = [int](104 * $gfxS)
                 # Wide enough for the longest state the module can emit,
                 # '[!] Drawing+decoding (unidentified)'. An ellipsised state is
@@ -4974,12 +5002,21 @@ $buttonHandlers = @{
             # AutoSize panel rebuilt once a second grows and shrinks the rows
             # beneath it on a small laptop screen, and disposes controls under
             # a timer that is about to touch them again.
-            $script:GfxProfile = Get-GraphicsBenchProfile
+            # THE TEST IS PRESELECTED FROM THE MACHINE'S ACTUAL SCREENS. The
+            # two baseline tests differ only in the screen the recording is
+            # made on, and opening on the wrong one puts a fixable-looking
+            # failure in front of a tester whose setup is already correct for
+            # the other test. It is a preselection, not a decision: the
+            # dropdown still offers every test.
+            $script:GfxArrangement = $null
+            try { $script:GfxArrangement = Get-GfxDisplayArrangement } catch { }
+            $script:GfxProfile = Get-GraphicsBenchProfileForArrangement -Arrangement $script:GfxArrangement
             $script:GfxReadiness = $null
+            $script:GfxDisplaySetups = @()
 
             $script:GfxStepsPanel = New-Object System.Windows.Forms.TableLayoutPanel
             $script:GfxStepsPanel.ColumnCount = 1
-            $script:GfxStepsPanel.RowCount = 4
+            $script:GfxStepsPanel.RowCount = 5
             $script:GfxStepsPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
             $script:GfxStepsPanel.AutoSize = $false
             $script:GfxStepsPanel.Height = $script:GfxViewM.GuideH
@@ -4987,6 +5024,7 @@ $buttonHandlers = @{
             [void]$script:GfxStepsPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $script:GfxViewM.GuideHeadH)))
             [void]$script:GfxStepsPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $script:GfxViewM.GuidePhaseH)))
             [void]$script:GfxStepsPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $script:GfxViewM.GuideTextH)))
+            [void]$script:GfxStepsPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, [int]($script:GfxViewM.CheckRows * $script:GfxViewM.LineH))))
             [void]$script:GfxStepsPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
             $script:GfxStepsPanel.BackColor = [System.Drawing.Color]::FromArgb(246, 249, 252)
             $script:GfxStepsPanel.Padding = New-Object System.Windows.Forms.Padding([int](10 * $gfxS), [int](4 * $gfxS), [int](10 * $gfxS), [int](4 * $gfxS))
@@ -5016,8 +5054,19 @@ $buttonHandlers = @{
             $script:GfxProfileBox.Font = New-Object System.Drawing.Font("Segoe UI", 9)
             $script:GfxProfileBox.Width = [int](300 * $gfxS)
             $script:GfxProfileBox.Margin = New-Object System.Windows.Forms.Padding(0, [int](2 * $gfxS), [int](10 * $gfxS), 0)
-            foreach ($gfxP in (Get-GraphicsBenchProfiles)) { [void]$script:GfxProfileBox.Items.Add($gfxP.Name) }
-            $script:GfxProfileBox.SelectedIndex = 0
+            # Assigned first, never '@(Get-...)': the registry returns
+            # ',$profiles' and wrapping that hands back one element.
+            $gfxAllProfiles = Get-GraphicsBenchProfiles
+            $gfxSelIndex = 0
+            for ($gfxPi = 0; $gfxPi -lt $gfxAllProfiles.Count; $gfxPi++) {
+                [void]$script:GfxProfileBox.Items.Add($gfxAllProfiles[$gfxPi].Name)
+                if ($gfxAllProfiles[$gfxPi].Id -eq $script:GfxProfile.Id) { $gfxSelIndex = $gfxPi }
+            }
+            # Opens on the test that matches the screens this machine is
+            # actually using, so a tester set up for the external-screen test
+            # is not shown a failure about a laptop panel they closed on
+            # purpose. Preselection only -- every test is still one click away.
+            $script:GfxProfileBox.SelectedIndex = $gfxSelIndex
             $script:GfxProfileBox.Add_SelectedIndexChanged({
                 # Assigned first, never '@(Get-...)': the registry returns
                 # ',$profiles' and wrapping that hands back one element.
@@ -5093,6 +5142,74 @@ $buttonHandlers = @{
                 $script:GfxCheckLabels += $lbl
             }
             $script:GfxStepsPanel.Controls.Add($gfxChecksPanel, 0, 3)
+
+            # ROW 4 -- WHICH SCREEN THIS IS BEING MEASURED ON.
+            #
+            # Separate from the checks above, and deliberately without a
+            # pass/fail marker of its own. The checklist says whether the setup
+            # matches the test; this says what the setup IS -- the monitor's
+            # name, its resolution and its scaling, whether the built-in panel
+            # is in use, and which of the screens NeurOptimal is on. A count
+            # cannot answer any of those, and 'One monitor: Ready' is equally
+            # true of a 14-inch laptop panel and a 49-inch external display
+            # with the lid shut, which are not the same measurement.
+            $gfxDisplayPanel = New-Object System.Windows.Forms.TableLayoutPanel
+            $gfxDisplayPanel.ColumnCount = 1
+            # One row per display line, PLUS one for the operator confirmation
+            # below them. The confirmation is not a display line and must not
+            # share a cell with one -- two controls in one TableLayoutPanel cell
+            # overlap rather than stack.
+            $gfxDisplayPanel.RowCount = $script:GfxViewM.DisplayRows + 1
+            $gfxDisplayPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+            [void]$gfxDisplayPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+            $gfxDisplayPanel.Margin = New-Object System.Windows.Forms.Padding(0, [int](6 * $gfxS), 0, 0)
+            $gfxDisplayPanel.BackColor = [System.Drawing.Color]::Transparent
+
+            $script:GfxDisplayLabels = @()
+            for ($gfxI = 0; $gfxI -lt ($script:GfxViewM.DisplayRows + 1); $gfxI++) {
+                [void]$gfxDisplayPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $script:GfxViewM.LineH)))
+                if ($gfxI -ge $script:GfxViewM.DisplayRows) { continue }
+                $lbl = New-Object System.Windows.Forms.Label
+                $lbl.Text = ""
+                $lbl.Font = New-Object System.Drawing.Font("Consolas", 8.5)
+                $lbl.ForeColor = [System.Drawing.Color]::FromArgb(90, 95, 110)
+                $lbl.Dock = [System.Windows.Forms.DockStyle]::Fill
+                $lbl.AutoSize = $false
+                $lbl.AutoEllipsis = $true
+                $lbl.Margin = New-Object System.Windows.Forms.Padding(0)
+                $gfxDisplayPanel.Controls.Add($lbl, 0, $gfxI)
+                $script:GfxDisplayLabels += $lbl
+            }
+            # THE ONE THING THE TESTER CAN ANSWER THAT WINDOWS CANNOT.
+            #
+            # 'Built-in screen only' is a statement about what is being drawn
+            # to. An external monitor plugged in and switched off satisfies it,
+            # and Windows does not reliably enumerate a display that is not in
+            # use -- measured here: a lid-closed laptop reports no internal
+            # target in either query. So the check is genuinely unreadable, and
+            # rather than pass it silently the window asks the person who can
+            # see the back of the machine.
+            #
+            # ATTESTED, NEVER MEASURED. Ticking this can only lift a reading
+            # that did not happen; it can never overrule a monitor the tool
+            # actually saw, and the package records which of the two it was.
+            $script:GfxNoOtherDisplaysConfirmed = $false
+            $script:GfxConfirmBox = New-Object System.Windows.Forms.CheckBox
+            $script:GfxConfirmBox.Text = "I have checked: no other display is plugged in"
+            $script:GfxConfirmBox.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+            $script:GfxConfirmBox.ForeColor = [System.Drawing.Color]::FromArgb(120, 80, 20)
+            $script:GfxConfirmBox.BackColor = [System.Drawing.Color]::Transparent
+            $script:GfxConfirmBox.AutoSize = $false
+            $script:GfxConfirmBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $script:GfxConfirmBox.Margin = New-Object System.Windows.Forms.Padding(0)
+            $script:GfxConfirmBox.Visible = $false
+            $script:GfxConfirmBox.Add_CheckedChanged({
+                $script:GfxNoOtherDisplaysConfirmed = [bool]$this.Checked
+                try { & $script:GfxPaintSteps } catch { }
+            })
+            $gfxDisplayPanel.Controls.Add($script:GfxConfirmBox, 0, $script:GfxViewM.DisplayRows)
+
+            $script:GfxStepsPanel.Controls.Add($gfxDisplayPanel, 0, 4)
 
             $gfxTable.Controls.Add($script:GfxStepsPanel, 0, 1)
 
@@ -5238,6 +5355,22 @@ $buttonHandlers = @{
             $gfxButtonRow.Margin = New-Object System.Windows.Forms.Padding(0)
 
             $script:GfxMarkerBtn = & $gfxMakeButton "Add marker" $false $false
+            # THE TRANSITION BUTTON. A test that brackets a manual step needs
+            # TYPED marks, not free text: the first version of the detached test
+            # told the tester to type "detaching" into the marker box, and the
+            # summariser had no way to find it again -- so the split its
+            # instructions promised was never implemented.
+            #
+            # ONE BUTTON THAT ADVANCES, rather than two that are wrong to press
+            # out of order. Its label and its kind both come from
+            # Get-GfxTransitionMarkerKinds, so the window cannot offer a mark
+            # the summariser does not look for.
+            $script:GfxTransitionKinds = Get-GfxTransitionMarkerKinds
+            $script:GfxTransitionStep = 0
+            $script:GfxTransitionBtn = & $gfxMakeButton ([string]$script:GfxTransitionKinds[0].Label) $true $false
+            $script:GfxTransitionBtn.Visible = $false
+            $script:GfxTransitionBtn.Enabled = $false
+            $gfxButtonRow.Controls.Add($script:GfxTransitionBtn)
             $script:GfxOpenBtn   = & $gfxMakeButton "Open run folder" $false $false
             $gfxCloseBtn         = & $gfxMakeButton "Close" $true $false
             $gfxButtonRow.Controls.Add($script:GfxMarkerBtn)
@@ -5344,6 +5477,14 @@ $buttonHandlers = @{
                     }
                 }
                 Write-WinConfigGuiDiagnostic -Level DIM -Message 'If you start anyway, what was wrong or unchecked is recorded in the package.' -Box $body -NoPrefix
+                # WHAT THIS CHECK DID NOT DO, stated in the dialog that reports
+                # the problem -- the same footer, for the same reason, as the
+                # Bluetooth serial-readiness dialog's "opened no serial port and
+                # changed no pairing or process state". A dialog that tells
+                # someone their screens are wrong invites the question of
+                # whether the tool changed them, and that has to be answered
+                # where the question is asked rather than in a comment.
+                Write-WinConfigGuiDiagnostic -Level DIM -Message 'This check only read the machine: no display was added, removed, moved, re-scaled or switched, and nothing in NeurOptimal was touched.' -Box $body -NoPrefix
                 # Both Enter and Escape return to setup.
                 $dlg.AcceptButton = $setupBtn
                 $dlg.CancelButton = $setupBtn
@@ -5417,10 +5558,29 @@ $buttonHandlers = @{
                 }
                 if (-not $noWin) { $noWin = Get-GfxLiveNoWindow }
 
-                # Both live reads, every repaint. The inventory is a snapshot
+                # Every live read, every repaint. The inventory is a snapshot
                 # from when the window opened and answers a different question.
                 $liveMonitors = Get-GfxLiveDisplayCount
-                $script:GfxReadiness = Test-GraphicsBenchReadiness -BenchProfile $prof -Inventory $script:GfxInventory -NoWindow $noWin -MonitorCount $liveMonitors -NoRunning (Get-GfxNoRunning)
+                $hasBattery = $null
+                if ($script:GfxInventory -and $script:GfxInventory.Power) { $hasBattery = $script:GfxInventory.Power.HasBattery }
+                $script:GfxArrangement = Get-GfxDisplayArrangement -HasBattery $hasBattery
+                $script:GfxReadiness = Test-GraphicsBenchReadiness -BenchProfile $prof -Inventory $script:GfxInventory `
+                                            -NoWindow $noWin -MonitorCount $liveMonitors -NoRunning (Get-GfxNoRunning) `
+                                            -Arrangement $script:GfxArrangement `
+                                            -NoOtherDisplaysConfirmed ([bool]$script:GfxNoOtherDisplaysConfirmed)
+
+                # THE ONE CHECK A PERSON CAN ANSWER AND WINDOWS CANNOT. An
+                # external monitor that is plugged in and switched off does not
+                # reliably appear in any query, so 'no external display
+                # connected' is usually unreadable -- and a tester can simply
+                # look at the back of the machine. The tick is shown only while
+                # the check is genuinely unreadable, and it is recorded in the
+                # package as ATTESTED rather than measured.
+                $gfxConfirmChk = @($script:GfxReadiness.Checks | Where-Object { $_.Key -eq 'ExternalDisconnected' }) | Select-Object -First 1
+                if ($script:GfxConfirmBox -and -not $script:GfxConfirmBox.IsDisposed) {
+                    $wantVisible = ($null -ne $gfxConfirmChk -and ($gfxConfirmChk.OperatorCanConfirm -or $gfxConfirmChk.OperatorConfirmed) -and -not $running)
+                    if ($script:GfxConfirmBox.Visible -ne $wantVisible) { $script:GfxConfirmBox.Visible = $wantVisible }
+                }
 
                 # While recording, every count seen goes into the package, so a
                 # monitor plugged in halfway through is a finding rather than a
@@ -5431,6 +5591,47 @@ $buttonHandlers = @{
                         Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'DisplayCountChanged' -Data @{ count = [int]$liveMonitors; seen = @($script:GfxMonitorCounts) }
                         & $script:GfxAddEvent ("Displays now {0}" -f $liveMonitors) 'WARN'
                     }
+                }
+                # ...and every ARRANGEMENT seen, which catches what a count
+                # cannot: swapping the built-in screen for an external one, or
+                # changing resolution or scaling, leaves the count at 1 and
+                # changes every number the run reports.
+                $liveSig = [string]$script:GfxArrangement.Signature
+                if ($running -and $liveSig -and $script:GfxDisplaySetups -notcontains $liveSig) {
+                    $script:GfxDisplaySetups += $liveSig
+                    if ($script:GfxRun) {
+                        Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'DisplaySetupChanged' -Data @{ signature = $liveSig; layout = [string]$script:GfxArrangement.Layout; seen = @($script:GfxDisplaySetups) }
+                        & $script:GfxAddEvent ("Screens changed: {0}" -f $script:GfxArrangement.LayoutText) 'WARN'
+                    }
+                }
+
+                # The display block. Descriptive rows, no pass/fail marker: the
+                # checks below carry the verdict, and putting one here as well
+                # would be a second opinion about the same desktop.
+                $noOn = Resolve-GfxNoDisplay -Arrangement $script:GfxArrangement -NoWindow $noWin
+                $noWhy = $null
+                if (-not $noOn) { $noWhy = if ($noWin) { 'its window did not report a display' } else { 'NeurOptimal is not running' } }
+                $dispRows = @(Format-GfxDisplaySetupLines -Arrangement $script:GfxArrangement -NoDisplay $noOn -NoDisplayReason $noWhy)
+                for ($i = 0; $i -lt @($script:GfxDisplayLabels).Count; $i++) {
+                    $lbl = $script:GfxDisplayLabels[$i]
+                    if ($lbl.IsDisposed) { continue }
+                    # The LAST slot absorbs the overflow rather than dropping
+                    # rows off the end: a desktop with more displays than the
+                    # panel has slots must still say how many there are.
+                    $text = ''
+                    $lvl = 'Info'
+                    if ($i -lt $dispRows.Count) {
+                        if ($i -eq @($script:GfxDisplayLabels).Count - 1 -and $dispRows.Count -gt @($script:GfxDisplayLabels).Count) {
+                            $text = "(+{0} more display line(s) -- they are all in the package)" -f ($dispRows.Count - $i)
+                            $lvl = 'Unknown'
+                        } else {
+                            $text = [string]$dispRows[$i].Text
+                            $lvl = [string]$dispRows[$i].Level
+                        }
+                    }
+                    if ($lbl.Text -ne $text) { $lbl.Text = $text }
+                    $col = if ($lvl -eq 'Unknown') { [System.Drawing.Color]::FromArgb(150, 110, 40) } else { [System.Drawing.Color]::FromArgb(90, 95, 110) }
+                    if ($lbl.ForeColor -ne $col) { $lbl.ForeColor = $col }
                 }
 
                 $checks = @($script:GfxReadiness.Checks)
@@ -5460,15 +5661,33 @@ $buttonHandlers = @{
                 # end told a tester the session was still running, and the
                 # progress line is the one thing they read to decide whether it
                 # has run long enough.
+                # THE CLOCK STARTS WHERE THE MEASUREMENT DOES. On a test that
+                # brackets a manual transition the summariser cuts the session
+                # arm at the second mark, so the progress line has to count from
+                # there too -- a guide counting from session start while the
+                # report counts from the mark is two answers to one question.
+                $gfxNeedsMarks = ($prof.Requires -and $prof.Requires.ContainsKey('TransitionMarkers') -and [bool]$prof.Requires.TransitionMarkers)
+                $gfxMarkStep = [int]$script:GfxTransitionStep
+                $gfxClockFrom = $script:GfxSessionSplitAt
+                if ($gfxNeedsMarks -and $script:GfxVisualsReadyAt) { $gfxClockFrom = $script:GfxVisualsReadyAt }
                 $sessionSec = $null
-                if ($script:GfxSessionSplitAt) {
+                if ($gfxClockFrom -and (-not $gfxNeedsMarks -or $script:GfxVisualsReadyAt)) {
                     $sessionEndsAt = $(if ($script:GfxSessionEndAt) { $script:GfxSessionEndAt } else { Get-Date })
-                    $sessionSec = ($sessionEndsAt - $script:GfxSessionSplitAt).TotalSeconds
+                    $sessionSec = ($sessionEndsAt - $gfxClockFrom).TotalSeconds
                 }
                 $phase = Get-GraphicsBenchPhase -BenchProfile $prof -RunPhase $runPhase -Readiness $script:GfxReadiness `
                             -IdleSec $idleSec -SessionSec $sessionSec -SessionDetected ([bool]$script:GfxSessionSplitAt) `
                             -SessionEnded ([bool]$script:GfxSessionEndAt) `
+                            -TransitionStarted ($gfxMarkStep -ge 1) -VisualsReady ($gfxMarkStep -ge 2) `
                             -StartedMidSession ($script:GfxPreRun -and $script:GfxPreRun.SessionLikely -eq 'Yes')
+
+                # The transition button belongs to the tests that ask for it,
+                # and only while there is a session to mark inside.
+                if ($script:GfxTransitionBtn -and -not $script:GfxTransitionBtn.IsDisposed) {
+                    if ($script:GfxTransitionBtn.Visible -ne $gfxNeedsMarks) { $script:GfxTransitionBtn.Visible = $gfxNeedsMarks }
+                    $wantEnabled = ($gfxNeedsMarks -and $running -and [bool]$script:GfxSessionSplitAt -and $gfxMarkStep -lt 2)
+                    if ($script:GfxTransitionBtn.Enabled -ne $wantEnabled) { $script:GfxTransitionBtn.Enabled = $wantEnabled }
+                }
 
                 if ($script:GfxPhaseTitle.Text -ne $phase.Title) { $script:GfxPhaseTitle.Text = [string]$phase.Title }
                 if ($script:GfxPhaseText.Text -ne $phase.Instruction) { $script:GfxPhaseText.Text = [string]$phase.Instruction }
@@ -5902,7 +6121,17 @@ $buttonHandlers = @{
                     # report have to agree, and they only can if the number
                     # they are both reading is the same one.
                     $script:GfxMonitorAtStart = Get-GfxLiveDisplayCount
-                    $rd = Test-GraphicsBenchReadiness -BenchProfile $script:GfxProfile -Inventory $script:GfxInventory -NoWindow (Get-GfxLiveNoWindow) -MonitorCount $script:GfxMonitorAtStart -NoRunning (Get-GfxNoRunning)
+                    # THE ARRANGEMENT THE REPORT WILL BE SCORED ON. Read once,
+                    # here, for the same reason the count is: the checklist and
+                    # the report have to agree, and they only can if the reading
+                    # they are both judging is the same one.
+                    $gfxBatteryAtStart = $null
+                    if ($script:GfxInventory -and $script:GfxInventory.Power) { $gfxBatteryAtStart = $script:GfxInventory.Power.HasBattery }
+                    $script:GfxArrangementAtStart = Get-GfxDisplayArrangement -HasBattery $gfxBatteryAtStart
+                    $rd = Test-GraphicsBenchReadiness -BenchProfile $script:GfxProfile -Inventory $script:GfxInventory `
+                            -NoWindow (Get-GfxLiveNoWindow) -MonitorCount $script:GfxMonitorAtStart -NoRunning (Get-GfxNoRunning) `
+                            -Arrangement $script:GfxArrangementAtStart `
+                            -NoOtherDisplaysConfirmed ([bool]$script:GfxNoOtherDisplaysConfirmed)
                     $script:GfxReadiness = $rd
                     & $script:GfxPaintSteps
                     # Asks for anything short of Ready -- a requirement that
@@ -5926,6 +6155,15 @@ $buttonHandlers = @{
                     $script:GfxSessionEndAt = $null
                     $script:GfxMonitorCounts = @()
                     if ($null -ne $script:GfxMonitorAtStart) { $script:GfxMonitorCounts = @([int]$script:GfxMonitorAtStart) }
+                    $script:GfxDisplaySetups = @()
+                    if ($script:GfxArrangementAtStart -and $script:GfxArrangementAtStart.Signature) { $script:GfxDisplaySetups = @([string]$script:GfxArrangementAtStart.Signature) }
+                    # The transition marks belong to the RUN, not the window: a
+                    # second recording must not inherit the first one's marks.
+                    $script:GfxTransitionStep = 0
+                    $script:GfxVisualsReadyAt = $null
+                    if ($script:GfxTransitionBtn -and -not $script:GfxTransitionBtn.IsDisposed) {
+                        $script:GfxTransitionBtn.Text = [string]@($script:GfxTransitionKinds)[0].Label
+                    }
                     $script:GfxIdleClockStart = $null
                     $script:GfxIdleFloorAnnounced = $false
                     $script:GfxWindowMode = $null
@@ -5950,6 +6188,16 @@ $buttonHandlers = @{
 
                     if (-not $script:GfxInventory) { $script:GfxInventory = Get-GraphicsInventory }
                     if (-not $script:GfxNomp) { $script:GfxNomp = Get-NompConfigSnapshot }
+                    # RE-KEY THE COHORT FROM THE ARRANGEMENT AT START. The
+                    # inventory's own copy was read when this window opened,
+                    # and the tester has been changing screens since -- which
+                    # is the whole point of the checklist. A cohort key written
+                    # from the older reading would pool this package against a
+                    # setup it was no longer using.
+                    if ($script:GfxArrangementAtStart) {
+                        $script:GfxInventory.DisplayArrangement = $script:GfxArrangementAtStart
+                        try { $script:GfxInventory.Cohort = Get-GfxCohortKey -Inventory $script:GfxInventory -Arrangement $script:GfxArrangementAtStart } catch { }
+                    }
 
                     # Media-file baseline BEFORE the run, so the file NO opens
                     # can be told apart from files this tool's own enumeration
@@ -6006,6 +6254,16 @@ $buttonHandlers = @{
                         # a run that departed and a run nobody scored.
                         testProfile = @{ id = $script:GfxProfile.Id; name = $script:GfxProfile.Name }
                         readinessAtStart = $script:GfxReadiness
+                        # The screens as they were when Start was pressed:
+                        # identity, mode, refresh and scale per display. This
+                        # is what makes two packages comparable or not, and it
+                        # is recorded whole so a question nobody has asked yet
+                        # can still be answered from the package.
+                        displayArrangementAtStart = $script:GfxArrangementAtStart
+                        # ATTESTED, not measured. Recorded next to the reading
+                        # it stood in for, so a reader can tell a check the tool
+                        # made from a check a person made.
+                        noOtherDisplaysConfirmedByOperator = [bool]$script:GfxNoOtherDisplaysConfirmed
                     }
 
                     # The run timer takes over the guide from here.
@@ -6081,7 +6339,7 @@ $buttonHandlers = @{
                     # "no media opened" without ever having scanned.
                     & $script:GfxMediaScan
 
-                    $summary = Get-GraphicsBenchSessionSummary -Samples $script:GfxSamples -Markers $script:GfxMarkers -AdapterLuidMap $script:GfxInventory.AdapterLuidMap -BenchProfile $script:GfxProfile -MonitorCount $script:GfxMonitorAtStart -MonitorCountsObserved $script:GfxMonitorCounts
+                    $summary = Get-GraphicsBenchSessionSummary -Samples $script:GfxSamples -Markers $script:GfxMarkers -AdapterLuidMap $script:GfxInventory.AdapterLuidMap -BenchProfile $script:GfxProfile -MonitorCount $script:GfxMonitorAtStart -MonitorCountsObserved $script:GfxMonitorCounts -DisplayArrangement $script:GfxArrangementAtStart -DisplaySetupsObserved $script:GfxDisplaySetups
                     $findings = Get-GraphicsBenchFindings -Summary $summary
                     $mediaRecord = @{
                         root        = $script:GfxWatchRoot
@@ -6285,6 +6543,33 @@ $buttonHandlers = @{
                 Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'Marker' -Data @{ text = $note }
                 & $script:GfxAddEvent "Marked: $note" 'ACTION'
                 Write-WinConfigGuiDiagnostic -Level ACTION -Message "Marker: $note" -Box $script:GfxLog
+            })
+
+            # The typed transition marks. No prompt and no free text: the whole
+            # point is that the summariser can find these again, and a sentence
+            # a tester typed is exactly what it could not.
+            $script:GfxTransitionBtn.Add_Click({
+                $kinds = @($script:GfxTransitionKinds)
+                $i = [int]$script:GfxTransitionStep
+                if ($i -ge $kinds.Count -or -not $script:GfxRun) { return }
+                $kind = [string]$kinds[$i].Kind
+                $label = [string]$kinds[$i].Label
+                $script:GfxMarkers += @{ AtUtc = [datetime]::UtcNow.ToString('o'); Kind = $kind; Text = $label }
+                if ($kind -eq 'VisualsReady') { $script:GfxVisualsReadyAt = Get-Date }
+                Write-GraphicsBenchEvent -EventsPath $script:GfxRun.EventsPath -Kind 'Marker' -Data @{ kind = $kind; text = $label }
+                & $script:GfxAddEvent $label 'ACTION'
+                Write-WinConfigGuiDiagnostic -Level ACTION -Message "Marker: $label" -Box $script:GfxLog
+                $script:GfxTransitionStep = $i + 1
+                if ($script:GfxTransitionStep -lt $kinds.Count) {
+                    $script:GfxTransitionBtn.Text = [string]$kinds[$script:GfxTransitionStep].Label
+                } else {
+                    # Both marks taken. The button stays visible and disabled
+                    # rather than vanishing: a control that disappears reads as
+                    # a control that failed.
+                    $script:GfxTransitionBtn.Text = 'Transition marked'
+                    $script:GfxTransitionBtn.Enabled = $false
+                }
+                try { & $script:GfxPaintSteps } catch { }
             })
 
             $script:GfxOpenBtn.Add_Click({
