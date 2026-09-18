@@ -58,8 +58,10 @@ $script:GfxAudioUiFloorPercent = 0.5
 # How long the idle arm should be before a session starts. Every number the
 # tool reports is a difference against this stretch, so a short one makes the
 # deltas noisy. Sixty seconds is sixty samples at the 1 s tick; the coverage
-# line counts up to it and turns green when it is reached, so the operator is
-# never left guessing when "about a minute" has passed.
+# line counts up to it and then SAYS 'Baseline collected', so the operator is
+# never left guessing when "about a minute" has passed -- and never has to
+# read a colour to know, which a screenshot, a monochrome remote session or a
+# colour vision deficiency each take away.
 $script:GfxIdleFloorSec = 60
 
 # ---------------------------------------------------------------------------
@@ -1037,13 +1039,692 @@ function Get-GfxUiChangeDwellSamples {
 function Get-GfxIdleFloorSec {
     <#
     .SYNOPSIS
-        Seconds of idle arm the coverage line asks for before it turns green.
+        Seconds of idle arm the coverage line asks for before it reports
+        Baseline collected.
         The single source for the live line, the Start instruction and the
         short-idle finding.
     #>
     [CmdletBinding()]
     param()
     return $script:GfxIdleFloorSec
+}
+
+# ---------------------------------------------------------------------------
+# TEST PROFILES -- the protocol a run was collected under
+# ---------------------------------------------------------------------------
+#
+# The 2026-09-18 Vivobook campaign produced five runs from three boxes and only
+# one of them was poolable, for reasons that had nothing to do with the tool:
+#
+#   * The instruction said "maximize" without saying WHEN. Every tester
+#     maximized NO a few seconds AFTER pressing Start watching, so the idle
+#     baseline was measured on a small pane and the session on a full-screen
+#     one. The headline delta (+21 to +28 points of 3D) was then mostly window
+#     AREA, not session cost: inside one session arm the same butterchurn read
+#     ~16% windowed and ~40% maximized, and the reference box -- held windowed
+#     throughout -- reported a session delta of exactly 0.
+#   * The instruction said "single monitor". One box ran both attempts with an
+#     external display attached, which changes the cohort key, so its numbers
+#     could not be pooled with the other two.
+#
+# Neither is a measurement bug. Both are the protocol travelling in prose that
+# the tool never saw. A PROFILE is that prose turned into data: the steps the
+# tester is shown, the requirements the tool checks BEFORE the run, and the
+# deviations it records in the package afterwards.
+#
+# ADDING THE NEXT TEST IS A DATA CHANGE. Append a hashtable here -- the window's
+# dropdown, the console's -ProfileId, the readiness checklist, the deviation
+# finding and the manifest field all read this registry and need no edit. The
+# two already named for later are a dual-monitor arm (Requires.MonitorCount = 2)
+# and a video arm (Requires.SessionKind = 'Video', which expects the decode
+# engines to be non-zero instead of structurally zero).
+
+function Get-GraphicsBenchProfiles {
+    <#
+    .SYNOPSIS
+        Every test profile this bench knows.
+    .DESCRIPTION
+        One row per test. Steps are what the tester is shown, verbatim, on
+        screen and in the console -- there is no second copy of them in prose.
+        Requires is what the tool can CHECK; a requirement it cannot observe is
+        left out rather than asserted.
+    .OUTPUTS
+        Array of hashtables: Id, Name, Summary, Steps[], Requires, IsDefault.
+
+        RETURNED ',$profiles', so a registry that ever holds one profile does
+        not unroll to a bare hashtable. ASSIGN IT FIRST -- '@(Get-...Profiles)'
+        yields ONE element holding the whole list, which is this repo's oldest
+        trap and was caught here by the suite.
+    #>
+    [CmdletBinding()]
+    param()
+
+    # A middle dot, built rather than typed. These files are BOM-less UTF-8 and
+    # Windows PowerShell 5.1 reads them as ANSI, so a literal non-ASCII glyph in
+    # a string would arrive on a field box as mojibake.
+    $dot = [string][char]0x00B7
+
+    $profiles = @(
+        @{
+            Id        = 'baseline-audio-15'
+            Name      = "Audio baseline $dot 15 minutes $dot 1 monitor"
+            Summary   = 'The first recording every machine makes, so results can be compared across machines.'
+            IsDefault = $true
+            Steps     = @(
+                'Disconnect any second monitor. This test uses one screen only; a recording made with two screens cannot be compared with the others.'
+                'Close everything else -- no browser, no screen recorder, no video call. Only NeurOptimal and this window.'
+                'Launch NeurOptimal and leave it on its home screen, with no session started.'
+                'Maximize the NeurOptimal window NOW, before the next step. The baseline and the session have to be the same size on screen, or the numbers measure the window instead of the session.'
+                'Start the recording -- press Start watching (the console script starts by itself) -- and leave NeurOptimal alone until it says Baseline collected.'
+                'Start an audio-only session (a music track, no video) and let it run for 15 minutes. Do not resize, move, minimize or full-screen the NeurOptimal window while it runs.'
+                'When the session ends, press Stop and show results, then send the package.'
+            )
+            # One short sentence per phase, in the tester's words. The phase
+            # line on screen is composed from these plus live progress, so the
+            # instruction a tester reads mid-run is never assembled in the
+            # window -- the same discipline the numbers follow.
+            Phrases   = @{
+                Prepare  = 'Maximize NeurOptimal before starting the recording.'
+                Baseline = 'Leave NeurOptimal on its home screen.'
+                Ready    = 'Baseline collected. Start your audio-only session in NeurOptimal.'
+                Session  = 'Keep the window unchanged.'
+            }
+            Requires  = @{
+                MonitorCount  = 1
+                WindowMode    = 'Maximized'
+                SessionKind   = 'Audio'
+                SessionMinSec = 900
+            }
+        }
+        @{
+            Id        = 'exploratory'
+            Name      = 'Exploratory recording'
+            Summary   = 'A free-form recording. Nothing is checked before it and nothing is scored after it -- use it to reproduce something, not to add this machine to the comparison.'
+            IsDefault = $false
+            Steps     = @(
+                'Press Start watching before whatever you want to observe begins.'
+                'Leave NeurOptimal alone until it says Baseline collected, so the recording still has something to measure against.'
+                'Press Stop and show results when you are done.'
+            )
+            Phrases   = @{
+                Prepare  = 'Press Start watching before whatever you want to observe begins.'
+                Baseline = 'Leave NeurOptimal alone while the baseline is measured.'
+                Ready    = 'Baseline collected. Go ahead with whatever you wanted to observe.'
+                Session  = 'Recording.'
+            }
+            Requires  = @{}
+        }
+    )
+    return ,$profiles
+}
+
+function Get-GraphicsBenchProfile {
+    <#
+    .SYNOPSIS
+        One profile by Id, or the default when Id is absent or unknown.
+    .DESCRIPTION
+        An unknown Id resolves to the default rather than throwing: a stale
+        shortcut or a mistyped -ProfileId must never be the reason a field run
+        does not happen. A caller that cares can compare the returned Id.
+    #>
+    [CmdletBinding()]
+    param([string]$Id)
+
+    $all = Get-GraphicsBenchProfiles
+    if ($Id) {
+        foreach ($p in $all) { if ($p.Id -eq $Id) { return $p } }
+    }
+    foreach ($p in $all) { if ($p.IsDefault) { return $p } }
+    return $all[0]
+}
+
+function Test-GraphicsBenchReadiness {
+    <#
+    .SYNOPSIS
+        Whether the machine is in the shape the selected test asks for, RIGHT
+        NOW -- before the recording starts, while it can still be fixed.
+    .DESCRIPTION
+        Checks only what is observable without touching anything: how many
+        displays are connected, whether NeurOptimal is running, and how its
+        window is placed. SessionKind cannot be known before the session
+        starts, so it is not checked here; it is judged after the run from the
+        decode engines.
+
+        EVERY INPUT IS PASSED IN AND NONE IS CACHED. The caller re-reads the
+        display count and the window placement each time it asks, because both
+        change while the tester is preparing: the whole value of this check is
+        that it is true at the moment Start is pressed, and a cached answer is
+        a check that congratulates someone for a monitor they just plugged
+        back in.
+
+        'Unknown' is a distinct state from 'NotYet'. A requirement the tool
+        could not read must not render as a failed one -- the same em-dash rule
+        every number in this module follows.
+    .PARAMETER MonitorCount
+        Displays connected right now. Prefer Get-GfxLiveDisplayCount over the
+        inventory's copy, which is a snapshot from when the window opened.
+    .PARAMETER NoWindow
+        NO's primary window as Select-GfxPrimaryNoWindow returns it, or $null
+        when NeurOptimal is not running yet.
+    .PARAMETER NoRunning
+        Whether NeurOptimal is running RIGHT NOW, from Get-GfxNoRunning. The
+        inventory's PID is a snapshot from when the window opened and stays
+        'running' after the tester closes NeurOptimal, which is how the guide
+        came to tell someone everything was set while the thing being measured
+        was gone.
+    .OUTPUTS
+        Hashtable: Status ('Ready' | 'NeedsAttention' | 'CouldNotVerify'), Ok
+        (Status -eq 'Ready'), Checks[] (@{ Key, Text, State, Label, Detail,
+        Fix }), Unmet[] (the Fix sentences), Unverified[] (what could not be
+        read).
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$BenchProfile,
+        $Inventory,
+        $NoWindow,
+        $MonitorCount,
+        $NoRunning
+    )
+
+    if (-not $BenchProfile) { $BenchProfile = Get-GraphicsBenchProfile }
+    $req = $BenchProfile.Requires
+    if (-not $req) { $req = @{} }
+
+    # 'Ready' / 'Needs attention' / 'Could not check'. Words, not brackets: an
+    # '[x]' beside an instruction reads as a ticked checkbox to half the people
+    # who see it, which is the opposite of what it means.
+    $labelOf = @{ Ok = 'Ready'; NotYet = 'Needs attention'; Unknown = 'Could not check' }
+
+    $checks = @()
+    $unmet = @()
+    $unverified = @()
+
+    if ($req.ContainsKey('MonitorCount')) {
+        $want = [int]$req.MonitorCount
+        $have = $null
+        # A caller that PASSED -MonitorCount has spoken, even when it passed
+        # $null: that means its live read failed, and the answer is 'could not
+        # check', not the count from when the window opened. Falling back there
+        # let a stale 1 report Ready while nothing current was known at all.
+        # The inventory is only for a caller with no live reader of its own.
+        if ($PSBoundParameters.ContainsKey('MonitorCount')) {
+            if ($null -ne $MonitorCount) { $have = [int]$MonitorCount }
+        } elseif ($Inventory -and $null -ne $Inventory.MonitorCount) {
+            $have = [int]$Inventory.MonitorCount
+        }
+        $state = 'Unknown'
+        $detail = 'display count not read'
+        $fix = $null
+        if ($null -ne $have) {
+            $detail = "$have connected"
+            $state = if ($have -eq $want) { 'Ok' } else { 'NotYet' }
+            if ($state -eq 'NotYet') {
+                $fix = if ($have -gt $want) {
+                    "Disconnect the extra monitor -- $have are connected and this test uses $want. A recording made with $have cannot be compared with the other baseline recordings."
+                } else {
+                    "Connect $want monitors -- $have is connected and this test uses $want."
+                }
+            }
+        }
+        $text = if ($want -eq 1) { 'One monitor only' } else { "$want monitors connected" }
+        $checks += @{ Key = 'MonitorCount'; Text = $text; State = $state; Label = $labelOf[$state]; Detail = $detail; Fix = $fix }
+        if ($fix) { $unmet += $fix }
+        if ($state -eq 'Unknown') { $unverified += 'the number of connected displays could not be read' }
+    }
+
+    # LIVE, when the caller can answer it. Falling back to the inventory's PID
+    # is only for a caller that has no live reader -- and that fallback is
+    # exactly what let the guide say 'Everything is set' after NeurOptimal had
+    # been closed, so it is recorded as unverified rather than as running.
+    $noState = 'Unknown'
+    $noDetail = 'could not tell whether NeurOptimal is running'
+    if ($null -ne $NoRunning) {
+        $noState = if ([bool]$NoRunning) { 'Ok' } else { 'NotYet' }
+        $noDetail = if ([bool]$NoRunning) { 'running' } else { 'not running' }
+    } elseif ($NoWindow) {
+        $noState = 'Ok'; $noDetail = 'running'
+    } elseif ($Inventory -and $Inventory.No -and $Inventory.No.Pid) {
+        $noState = 'Unknown'; $noDetail = 'last seen running when this window opened'
+    }
+    $noFix = if ($noState -eq 'NotYet') { 'Launch NeurOptimal and leave it on its home screen -- there is nothing to measure until it is running.' } else { $null }
+    $checks += @{ Key = 'NoRunning'; Text = 'NeurOptimal is running'; State = $noState; Label = $labelOf[$noState]
+                  Detail = $noDetail; Fix = $noFix }
+    if ($noFix) { $unmet += $noFix }
+    if ($noState -eq 'Unknown') { $unverified += 'whether NeurOptimal is running could not be confirmed' }
+
+    if ($req.ContainsKey('WindowMode')) {
+        $want = [string]$req.WindowMode
+        $have = $null
+        if ($NoWindow -and $NoWindow.Mode) { $have = [string]$NoWindow.Mode }
+        $state = 'Unknown'
+        $detail = 'window not found'
+        $fix = $null
+        if ($have) {
+            $detail = "currently $($have.ToLower())"
+            $state = if ($have -eq $want) { 'Ok' } else { 'NotYet' }
+            if ($state -eq 'NotYet') {
+                # The mode name is a past participle ('Maximized'); an
+                # instruction needs the verb, so the two are not the same
+                # string and must not be interpolated as if they were.
+                $verb = switch ($want) {
+                    'Maximized'  { 'Maximize' }
+                    'FullScreen' { 'Put into full screen' }
+                    'Windowed'   { 'Restore down' }
+                    'Minimized'  { 'Minimize' }
+                    default      { "Set to $want" }
+                }
+                $fix = "$verb the NeurOptimal window now. Doing it after the recording starts is too late: the baseline is measured at whatever size the window is when you press Start."
+            }
+        }
+        # The check NAMES the requirement; the timing lives in the Fix, which
+        # is what a tester is shown while they can still act on it. 'before you
+        # start' in the check itself reads as stale eight minutes into a
+        # recording, where the same line is still on screen.
+        $checks += @{ Key = 'WindowMode'; Text = "NeurOptimal $($want.ToLower())"; State = $state; Label = $labelOf[$state]; Detail = $detail; Fix = $fix }
+        if ($fix) { $unmet += $fix }
+        if ($state -eq 'Unknown') { $unverified += "the NeurOptimal window's placement could not be read" }
+    }
+
+    # THREE ANSWERS, not two. 'Ok' used to mean only 'nothing explicitly
+    # failed', so a check the tool could not read at all still let the guide
+    # say everything was set. An unreadable requirement is not a passing one.
+    $status = 'Ready'
+    if ($unmet.Count -gt 0) { $status = 'NeedsAttention' }
+    elseif ($unverified.Count -gt 0) { $status = 'CouldNotVerify' }
+
+    return @{ Status = $status; Ok = ($status -eq 'Ready'); Checks = $checks
+              Unmet = @($unmet); Unverified = @($unverified) }
+}
+
+function Get-GfxNoRunning {
+    <#
+    .SYNOPSIS
+        Whether NeurOptimal is running RIGHT NOW.
+    .DESCRIPTION
+        One process lookup. The inventory's PID answers 'was it running when
+        this window opened', which is a different question and the wrong one:
+        a tester who closes NeurOptimal after opening the bench went on being
+        told the setup was fine.
+
+        Returns $null when the lookup itself failed, which renders as 'Could
+        not check' rather than as 'not running'.
+    #>
+    [CmdletBinding()]
+    param()
+
+    try { return ([bool](@(Get-Process -Name 'NO' -ErrorAction SilentlyContinue).Count -gt 0)) }
+    catch { return $null }
+}
+
+function Get-GfxLiveDisplayCount {
+    <#
+    .SYNOPSIS
+        Displays connected RIGHT NOW.
+    .DESCRIPTION
+        SystemInformation.MonitorCount is GetSystemMetrics(SM_CMONITORS) and is
+        never cached, unlike Screen::AllScreens, which holds its array until a
+        display-change message is pumped. The readiness check is asked once a
+        second while a tester is unplugging a monitor, so a cached count would
+        keep telling them the thing they just fixed is still wrong.
+
+        Returns $null when it cannot be read, which renders as 'Could not
+        check' rather than as a failed requirement.
+    #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        return [int][System.Windows.Forms.SystemInformation]::MonitorCount
+    } catch { return $null }
+}
+
+function Get-GfxLiveNoWindow {
+    <#
+    .SYNOPSIS
+        NO's primary window placement RIGHT NOW, for the readiness checklist,
+        before any sampler exists.
+    .DESCRIPTION
+        The sampler learns NO's window mode once a second, but the check that
+        matters most -- "is NO maximized BEFORE you press Start watching" --
+        has to be answerable while nothing is running yet. This walks the same
+        scan and the same two pure classifiers the sampler does rather than
+        adding a second opinion about what 'Maximized' means.
+
+        Read-only and cheap: one window enumeration. Returns $null when NO is
+        not running or has no visible top-level window, which the readiness
+        check renders as 'not read yet', never as a failed requirement.
+    .OUTPUTS
+        The Get-GfxWindowMode record, or $null.
+    #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        if (-not (Initialize-GfxWindowScan)) { return $null }
+        $proc = @(Get-Process -Name 'NO' -ErrorAction SilentlyContinue | Sort-Object StartTime) | Select-Object -First 1
+        if (-not $proc) { return $null }
+        $rows = [WinConfigDiag.GfxWindowScan]::Scan($proc.Id)
+        if (-not $rows) { return $null }
+        $parsed = ConvertFrom-GfxWindowScanRows -Rows $rows
+        return (Select-GfxPrimaryNoWindow -Geometry @($parsed.Geometry))
+    } catch { return $null }
+}
+
+function Get-GraphicsBenchPhase {
+    <#
+    .SYNOPSIS
+        Where the tester is in the test, and the ONE thing to do next.
+    .DESCRIPTION
+        Seven numbered instructions on screen at once is a reference card, not
+        guidance: a tester four minutes into a baseline has to re-find their
+        place in it every time they look up. This collapses the test to the
+        single phase they are in and the single sentence that applies, with
+        live progress where there is any. The full list stays one click away.
+
+        THE WORDS COME FROM THE PROFILE, not from here and not from the window.
+        This composes them with measured progress; it never invents an
+        instruction, so a new test in the registry is guided without touching
+        a renderer.
+
+        Phases: Prepare -> Baseline -> ReadyForSession -> Recording -> Results.
+    .OUTPUTS
+        Hashtable: Key, Title, Instruction, Level.
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$BenchProfile,
+        [ValidateSet('NotStarted', 'Watching', 'Stopped')]
+        [string]$RunPhase = 'NotStarted',
+        $Readiness,
+        $IdleSec,
+        $SessionSec,
+        [bool]$SessionDetected = $false,
+        # NO announced the session over (its 'Session Complete' dialog). The
+        # clock stops here: a progress line that keeps counting past the end
+        # tells a tester the session is still running when it is not.
+        [bool]$SessionEnded = $false,
+        [bool]$StartedMidSession = $false,
+        [string]$OutcomeText,
+        [double]$IdleFloorSec = $script:GfxIdleFloorSec
+    )
+
+    if (-not $BenchProfile) { $BenchProfile = Get-GraphicsBenchProfile }
+    $phrases = $BenchProfile.Phrases
+    if (-not $phrases) { $phrases = @{} }
+    $dash = [string][char]0x2014
+
+    if ($RunPhase -eq 'Stopped') {
+        $text = 'Recording complete.'
+        if ($OutcomeText) { $text = "Recording complete. $OutcomeText" }
+        return @{ Key = 'Results'; Title = 'RESULTS'; Level = 'Healthy'
+                  Instruction = "$text Use Open run folder for the package to send." }
+    }
+
+    if ($RunPhase -eq 'NotStarted') {
+        # The first thing standing in the way, in the tester's words, straight
+        # from the check that failed. When nothing is in the way the phase says
+        # so rather than repeating a step they have already done.
+        $firstFix = $null
+        if ($Readiness) { $firstFix = @($Readiness.Unmet) | Select-Object -First 1 }
+        if ($firstFix) {
+            return @{ Key = 'Prepare'; Title = 'PREPARE'; Level = 'Degraded'; Instruction = [string]$firstFix }
+        }
+        # 'Everything is set' REQUIRES Status 'Ready', not merely the absence
+        # of a failure. A check the tool could not read is not a check that
+        # passed, and saying so was how the guide came to reassure a tester
+        # who had closed NeurOptimal.
+        if ($Readiness -and $Readiness.Status -eq 'CouldNotVerify') {
+            $why = @($Readiness.Unverified) | Select-Object -First 1
+            $text = "Setup could not be checked"
+            if ($why) { $text = "Setup could not be checked $dash $why." }
+            return @{ Key = 'Prepare'; Title = 'PREPARE'; Level = 'Unknown'
+                      Instruction = "$text You can still start, and what could not be checked is recorded in the package." }
+        }
+        $ready = [string]$phrases['Prepare']
+        if ($Readiness -and $Readiness.Status -eq 'Ready') { $ready = 'Everything is set. Press Start watching, then leave NeurOptimal alone.' }
+        return @{ Key = 'Prepare'; Title = 'PREPARE'; Level = 'Unknown'; Instruction = $ready }
+    }
+
+    # Watching.
+    if ($StartedMidSession) {
+        return @{ Key = 'Recording'; Title = 'RECORDING'; Level = 'Degraded'
+                  Instruction = "NeurOptimal was already busy when the recording started, so there is no baseline to measure against $dash this recording will report totals only." }
+    }
+
+    # NO said the session is over. One instruction left, and no clock.
+    if ($SessionEnded) {
+        return @{ Key = 'SessionEnded'; Title = 'SESSION COMPLETE'; Level = 'Healthy'
+                  Instruction = 'Session ended. Press Stop and show results.' }
+    }
+
+    if ($SessionDetected) {
+        $target = $null
+        if ($BenchProfile.Requires -and $BenchProfile.Requires.ContainsKey('SessionMinSec')) { $target = [double]$BenchProfile.Requires.SessionMinSec }
+        $done = 0.0
+        if ($null -ne $SessionSec) { $done = [double]$SessionSec }
+        $progress = if ($null -ne $target) {
+            "Session recorded: {0} of {1}." -f (Format-GraphicsClock $done), (Format-GraphicsClock $target)
+        } else {
+            "Session recorded: {0}." -f (Format-GraphicsClock $done)
+        }
+        return @{ Key = 'Recording'; Title = 'RECORD SESSION'; Level = 'Healthy'
+                  Instruction = ("{0} {1}" -f $progress, [string]$phrases['Session']).Trim() }
+    }
+
+    $idle = 0.0
+    if ($null -ne $IdleSec) { $idle = [double]$IdleSec }
+    if ($idle -ge $IdleFloorSec) {
+        return @{ Key = 'ReadyForSession'; Title = 'READY FOR SESSION'; Level = 'Healthy'
+                  Instruction = [string]$phrases['Ready'] }
+    }
+    return @{ Key = 'Baseline'; Title = 'MEASURE BASELINE'; Level = 'Unknown'
+              Instruction = ("{0} Baseline: {1} of {2} seconds." -f [string]$phrases['Baseline'], [int][math]::Floor($idle), [int]$IdleFloorSec).Trim() }
+}
+
+function Get-GraphicsBenchProfileOutcome {
+    <#
+    .SYNOPSIS
+        What this run is entitled to claim about the test it followed.
+    .DESCRIPTION
+        FOUR OUTCOMES, BECAUSE 'no deviations' IS NOT 'requirements met'. The
+        first version of this printed 'Protocol followed' whenever the
+        deviation list came back empty -- which it also does for an
+        exploratory run that was never scored, and for a run where the window
+        placement was never readable or no session ever started, so nothing
+        could be checked. Three different situations reading as a pass is how
+        an unusable recording gets pooled.
+
+          Met            every requirement was checked and held
+          NotMet         at least one was checked and did not hold
+          CouldNotVerify nothing departed, but something could not be read
+          Exploratory    the test declares no requirements
+          Unscored       the run predates test profiles
+
+        NotMet outranks CouldNotVerify: a known departure is a stronger fact
+        than an unreadable one.
+    .OUTPUTS
+        Hashtable: Key, Text, Level, Deviations[], Unverifiable[].
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Summary,
+        [hashtable]$BenchProfile
+    )
+
+    $dash = [string][char]0x2014
+    $devs = @($Summary.ProfileDeviations | Where-Object { $null -ne $_ })
+
+    if (-not $Summary.ProfileId) {
+        return @{ Key = 'Unscored'; Level = 'Unknown'; Deviations = @(); Unverifiable = @()
+                  Text = 'No test was recorded for this run, so it was not checked against one.' }
+    }
+
+    $req = $null
+    if ($BenchProfile) { $req = $BenchProfile.Requires }
+    if (-not $req -or $req.Count -eq 0) {
+        return @{ Key = 'Exploratory'; Level = 'Unknown'; Deviations = @(); Unverifiable = @()
+                  Text = "Exploratory $dash not assessed for comparison with other baseline recordings." }
+    }
+
+    # What could not be READ, as opposed to what was read and was wrong.
+    $unverifiable = @()
+    if ($req.ContainsKey('MonitorCount') -and $null -eq $Summary.MonitorCount) {
+        $unverifiable += 'the number of connected displays was not recorded'
+    }
+    if ($req.ContainsKey('WindowMode')) {
+        $dom = $null; $idle = $null
+        if ($Summary.WindowMode) { $dom = [string]$Summary.WindowMode.Dominant; $idle = [string]$Summary.WindowMode.IdleMode }
+        if (-not $dom -or $dom -eq 'Unknown') { $unverifiable += "the NeurOptimal window's placement could not be read during the session" }
+        elseif (-not $idle -or $idle -eq 'Unknown') { $unverifiable += "the NeurOptimal window's placement could not be read while the baseline was measured" }
+    }
+    if ($req.ContainsKey('SessionMinSec')) {
+        $sec = $null
+        if ($Summary.ArmDurationSec -and $null -ne $Summary.ArmDurationSec.Session) { $sec = [double]$Summary.ArmDurationSec.Session }
+        # A zero-length or absent session arm used to slip past the length
+        # check, which only fired for a session longer than nothing.
+        if ($null -eq $sec -or $sec -le 0) { $unverifiable += 'no session was detected, so its length could not be checked' }
+    }
+    if ($req.ContainsKey('SessionKind')) {
+        $measured = $false
+        foreach ($surf in @($Summary.Surfaces | Where-Object { $_.Role -eq 'VideoJs' })) {
+            if ($surf.Engines -and $surf.Engines.ContainsKey('VideoDecode') -and $null -ne $surf.Engines['VideoDecode'].Max) { $measured = $true }
+        }
+        if (-not $measured) { $unverifiable += 'video decode was not measured, so audio-only could not be confirmed' }
+    }
+
+    if ($devs.Count -gt 0) {
+        return @{ Key = 'NotMet'; Level = 'Degraded'; Deviations = $devs; Unverifiable = $unverifiable
+                  Text = "Requirements not met $dash this recording cannot be compared with other baseline recordings." }
+    }
+    if ($unverifiable.Count -gt 0) {
+        return @{ Key = 'CouldNotVerify'; Level = 'Degraded'; Deviations = @(); Unverifiable = $unverifiable
+                  Text = "Could not verify $dash $($unverifiable -join '; ')." }
+    }
+    return @{ Key = 'Met'; Level = 'Healthy'; Deviations = @(); Unverifiable = @()
+              Text = 'Requirements met. This recording can be compared with other baseline recordings.' }
+}
+
+function Get-GraphicsBenchProfileDeviations {
+    <#
+    .SYNOPSIS
+        Where a finished run departed from the profile it claimed to follow.
+    .DESCRIPTION
+        Judged from the summary alone, after the fact, so a run collected by
+        either surface is scored the same way. Each deviation carries what was
+        asked, what happened, and WHY it costs the run -- the reason is the part
+        a tester acts on, and leaving it out is what produced five runs in one
+        morning that could not be compared.
+
+        A profile with no Requires returns nothing: an exploratory run cannot
+        deviate from a protocol it never claimed.
+    .OUTPUTS
+        Array of hashtables: Key, Text.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Summary,
+        [hashtable]$BenchProfile
+    )
+
+    $out = @()
+    if (-not $BenchProfile) { return ,$out }
+    $req = $BenchProfile.Requires
+    if (-not $req -or $req.Count -eq 0) { return ,$out }
+
+    # The display layout CHANGED while recording. Raised before the count
+    # itself, because a run that was 1 monitor at the start and 2 at the end
+    # has no single layout to be compared against anything.
+    # The observed counts are a SET -- sorted and de-duplicated -- so they carry
+    # no order. Writing them as 'saw 1, then 2' invented a chronology the data
+    # does not have, and would have read backwards for the common case of
+    # unplugging a monitor mid-run.
+    $seen = @($Summary.MonitorCountsObserved | Where-Object { $null -ne $_ } | Sort-Object -Unique)
+    if ($seen.Count -gt 1) {
+        $seenText = if ($seen.Count -eq 2) { $seen -join ' and ' } else { (($seen[0..($seen.Count - 2)]) -join ', ') + ' and ' + $seen[-1] }
+        $out += @{ Key    = 'MonitorCountChanged'
+                   Text   = "A monitor was connected or disconnected while recording. Observed monitor counts: $seenText. This recording cannot be compared with the other baseline recordings."
+                   Detail = "Display count changed mid-run; the cohort key describes only the layout observed at the start." }
+    }
+
+    if ($req.ContainsKey('MonitorCount')) {
+        $have = $null
+        if ($null -ne $Summary.MonitorCount) { $have = [int]$Summary.MonitorCount }
+        if ($null -ne $have -and $have -ne [int]$req.MonitorCount) {
+            $out += @{ Key    = 'MonitorCount'
+                       Text   = "$have monitors were connected; this test uses $([int]$req.MonitorCount). This recording cannot be compared with the other baseline recordings."
+                       Detail = "The cohort key carries the display layout, so this package pools with other $have-monitor runs and not with the baseline corpus." }
+        }
+    }
+
+    if ($req.ContainsKey('WindowMode')) {
+        $want = [string]$req.WindowMode
+        $dominant = $null
+        $idleMode = $null
+        if ($Summary.WindowMode) {
+            $dominant = [string]$Summary.WindowMode.Dominant
+            $idleMode = [string]$Summary.WindowMode.IdleMode
+        }
+        if ($dominant -and $dominant -ne 'Unknown' -and $dominant -ne $want) {
+            $out += @{ Key    = 'WindowMode'
+                       Text   = "NeurOptimal was $($dominant.ToLower()) during the session; this test needs it $($want.ToLower())."
+                       Detail = "Session-arm dominant window mode was $dominant, not $want." }
+        }
+        if ($idleMode -and $dominant -and $idleMode -ne 'Unknown' -and $dominant -ne 'Unknown' -and $idleMode -ne $dominant) {
+            $out += @{ Key    = 'BaselineMode'
+                       Text   = "The NeurOptimal window was $($idleMode.ToLower()) while the baseline was measured and $($dominant.ToLower()) during the session, so the numbers below include that size change as well as the session."
+                       Detail = "Idle arm dominant mode $idleMode, session arm dominant mode $dominant; every delta is the sum of the size change and the session." }
+        }
+    }
+
+    # THE BASELINE'S OWN LENGTH. Every number in the package is a difference
+    # against it, so a short one makes every delta less certain -- and the
+    # outcome used to call that 'Requirements met' while the findings list
+    # carried GFX-IDLE-ARM-SHORT three lines further down.
+    $idleFloor = Get-GfxIdleFloorSec
+    $idleSec = $null
+    if ($Summary.ArmDurationSec -and $null -ne $Summary.ArmDurationSec.Idle) { $idleSec = [double]$Summary.ArmDurationSec.Idle }
+    if ($null -ne $idleSec -and $idleSec -lt [double]$idleFloor) {
+        $out += @{ Key    = 'BaselineLength'
+                   Text   = "The baseline was only $(Format-GraphicsClock $idleSec); this test needs $([int]$idleFloor) seconds of it before the session starts."
+                   Detail = "Idle arm $(Format-GraphicsDuration $idleSec) against a $([int]$idleFloor) s floor; every delta is session minus this mean." }
+    }
+
+    # The window was RESTORED AND RE-MAXIMIZED mid-session, or otherwise moved
+    # between shapes. Distinct from the session running in the wrong mode: the
+    # session arm here averages two shapes of pane, and the outcome used to
+    # pass it while GFX-WINDOW-MODE-CHANGED warned about it.
+    if ($Summary.WindowMode -and $Summary.WindowMode.ChangedDuringSession) {
+        $modes = @($Summary.WindowMode.SessionModes)
+        $out += @{ Key    = 'WindowChanged'
+                   Text   = "The NeurOptimal window changed size during the session ($($modes -join ' and ')), so the numbers below average two different shapes of window."
+                   Detail = "Session arm spans more than one placement mode: $($modes -join ', ')." }
+    }
+
+    if ($req.ContainsKey('SessionMinSec')) {
+        $sec = $null
+        if ($Summary.ArmDurationSec -and $null -ne $Summary.ArmDurationSec.Session) { $sec = [double]$Summary.ArmDurationSec.Session }
+        if ($null -ne $sec -and $sec -gt 0 -and $sec -lt [double]$req.SessionMinSec) {
+            $out += @{ Key    = 'SessionLength'
+                       Text   = "The session ran $(Format-GraphicsClock $sec); this test needs $(Format-GraphicsClock ([double]$req.SessionMinSec))."
+                       Detail = "Session arm $(Format-GraphicsDuration $sec) against a $(Format-GraphicsDuration ([double]$req.SessionMinSec)) floor; memory growth and the visualizer's plateau are only judgeable over a full-length session." }
+        }
+    }
+
+    if ($req.ContainsKey('SessionKind') -and [string]$req.SessionKind -eq 'Audio') {
+        $decodeMax = $null
+        foreach ($surf in @($Summary.Surfaces | Where-Object { $_.Role -eq 'VideoJs' })) {
+            if ($surf.Engines -and $surf.Engines.ContainsKey('VideoDecode')) { $decodeMax = $surf.Engines['VideoDecode'].Max }
+        }
+        if ($null -ne $decodeMax -and [double]$decodeMax -gt 0) {
+            $out += @{ Key    = 'SessionKind'
+                       Text   = "Video decode reached $decodeMax%, so this session played video; this test is audio-only."
+                       Detail = "The VideoDecode engine peaked at $decodeMax% on the video.js surface, which an audio-only session leaves at a structural 0." }
+        }
+    }
+
+    return ,$out
 }
 
 function ConvertTo-GfxLuidKey {
@@ -1734,11 +2415,11 @@ function Format-GraphicsPreRunReport {
         }
         'No' {
             $r += @{ Level = 'OK'; Text = "NO.exe is running (PID $pid_) and reads as idle -- $($Activity.Reason)."; NoPrefix = $false }
-            $r += @{ Level = 'ACTION'; Text = "Press Start watching, leave NO idle until the coverage line turns green (about $(Get-GfxIdleFloorSec) s), then start your session."; NoPrefix = $false }
+            $r += @{ Level = 'ACTION'; Text = "Press Start watching, leave NeurOptimal on its home screen until the line says Baseline collected (about $(Get-GfxIdleFloorSec) s), then start your session."; NoPrefix = $false }
         }
         default {
             $r += @{ Level = 'WARN'; Text = "NO.exe is running (PID $pid_), but whether a session is under way could not be determined -- $($Activity.Reason)."; NoPrefix = $false }
-            $r += @{ Level = 'ACTION'; Text = 'If NO is idle, press Start watching, leave it idle until the coverage line turns green, then start your session. If a session is already running, let it finish first.'; NoPrefix = $false }
+            $r += @{ Level = 'ACTION'; Text = 'If NeurOptimal is idle, press Start watching, leave it alone until the line says Baseline collected, then start your session. If a session is already running, let it finish first.'; NoPrefix = $false }
         }
     }
     return $r
@@ -1932,7 +2613,13 @@ function Get-NoWindowModeSummary {
         [int]$MinDwellSamples = $script:GfxUiChangeDwellSamples
     )
 
-    $r = @{ Dominant = 'Unknown'; Bounds = $null; Spans = @(); SessionModes = @(); ChangedDuringSession = $false }
+    # IdleMode is the mode the BASELINE arm was measured in. It is reported
+    # beside Dominant because the pair is what makes a delta readable: the
+    # 2026-09-18 campaign measured every idle arm windowed and ran every
+    # session maximized, and the resulting "+21 to +28 points" was mostly the
+    # pane growing. A delta across two window sizes is not a session cost, and
+    # nothing downstream could say so while only the session's mode was kept.
+    $r = @{ Dominant = 'Unknown'; IdleMode = 'Unknown'; Bounds = $null; Spans = @(); SessionModes = @(); ChangedDuringSession = $false }
     if ($Samples.Count -eq 0) { return $r }
 
     $states = @()
@@ -1994,6 +2681,22 @@ function Get-NoWindowModeSummary {
     }
     $r.SessionModes = @($modes | Where-Object { $_ -ne 'Unknown' } | Sort-Object -Unique)
     $r.ChangedDuringSession = ($r.SessionModes.Count -gt 1)
+
+    # The idle arm's own dominant mode, counted the same way over 0..split-1.
+    # With no split there is no idle arm, and it stays Unknown rather than
+    # borrowing the session's answer.
+    if ($null -ne $SplitIndex -and [int]$SplitIndex -gt 0) {
+        $idleCounts = @{}
+        for ($i = 0; $i -lt [int]$SplitIndex -and $i -lt $modeSamples.Count; $i++) {
+            $m = $modeSamples[$i].Mode
+            if (-not $idleCounts.ContainsKey($m)) { $idleCounts[$m] = 0 }
+            $idleCounts[$m]++
+        }
+        $idleBest = $null
+        foreach ($m in $idleCounts.Keys) { if ($null -eq $idleBest -or $idleCounts[$m] -gt $idleCounts[$idleBest]) { $idleBest = $m } }
+        if ($idleBest) { $r.IdleMode = $idleBest }
+    }
+
     return $r
 }
 
@@ -2113,7 +2816,19 @@ function Get-GraphicsBenchSessionSummary {
         [array]$Markers = @(),
         [double]$VisualizerFloorPercent = $script:GfxVisualizerFloorPercent,
         [double]$MediaFloorPercent = $script:GfxMediaFloorPercent,
-        [hashtable]$AdapterLuidMap = @{}
+        [hashtable]$AdapterLuidMap = @{},
+        # The test profile the operator selected, so the package records the
+        # protocol a run CLAIMED to follow next to what it actually did. Absent
+        # means the run predates profiles; it is not scored against one.
+        [hashtable]$BenchProfile,
+        # Displays connected, VERIFIED AT THE MOMENT RECORDING STARTED -- not
+        # the inventory's snapshot from when the window opened. The readiness
+        # check and the report have to agree, and they only can if they are
+        # reading the same number.
+        $MonitorCount,
+        # Every count seen during the run, so a display change mid-recording is
+        # a finding rather than a silent difference from the cohort key.
+        [array]$MonitorCountsObserved = @()
     )
 
     $summary = @{
@@ -2148,7 +2863,18 @@ function Get-GraphicsBenchSessionSummary {
         # How NO's window was placed (Windowed / Maximized / FullScreen), as
         # spans, because the cost of a pane plausibly follows its size and
         # an operator can toggle it mid-session.
-        WindowMode         = @{ Dominant = 'Unknown'; Bounds = $null; Spans = @(); SessionModes = @(); ChangedDuringSession = $false }
+        WindowMode         = @{ Dominant = 'Unknown'; IdleMode = 'Unknown'; Bounds = $null; Spans = @(); SessionModes = @(); ChangedDuringSession = $false }
+        # The protocol this run claimed, and where it departed from it. Both
+        # are recorded even when there are no deviations, so a reader can tell
+        # "followed the baseline" apart from "was never scored against one".
+        ProfileId          = $(if ($BenchProfile) { $BenchProfile.Id } else { $null })
+        ProfileName        = $(if ($BenchProfile) { $BenchProfile.Name } else { $null })
+        ProfileDeviations  = @()
+        MonitorCount       = $(if ($null -ne $MonitorCount) { [int]$MonitorCount } else { $null })
+        # Every distinct display count seen WHILE RECORDING. The cohort key is
+        # written from the layout at the start, so a monitor plugged in halfway
+        # through would otherwise leave no trace at all.
+        MonitorCountsObserved = @($MonitorCountsObserved | Where-Object { $null -ne $_ } | Sort-Object -Unique)
     }
     if ($Samples.Count -eq 0) { return $summary }
 
@@ -2268,6 +2994,20 @@ function Get-GraphicsBenchSessionSummary {
         }
     }
 
+    # Scored LAST: every deviation reads a field the walk above has already
+    # filled in, and scoring against the profile from the finished summary --
+    # rather than from live state -- is what keeps the app and the console
+    # harness from growing two answers to the same question.
+    #
+    # Assigned WITHOUT an @() wrapper. The function returns ',$out' so a
+    # single deviation cannot unroll, and wrapping that in @() produces one
+    # element holding the whole list -- the same 'return ,@()' trap that cost
+    # 86cfa77, caught here by replaying the 2026-09-18 captures, where a
+    # two-deviation run rendered as one row with both keys jammed together.
+    if ($BenchProfile) {
+        $summary.ProfileDeviations = Get-GraphicsBenchProfileDeviations -Summary $summary -BenchProfile $BenchProfile
+    }
+
     return $summary
 }
 
@@ -2373,6 +3113,31 @@ function Get-GraphicsBenchFindings {
         }
     }
 
+    # THE BASELINE WAS MEASURED AT A DIFFERENT WINDOW SIZE THAN THE SESSION.
+    # Ranked above the mid-session change because it is worse and quieter: the
+    # mode can be perfectly steady for the whole session arm and every delta
+    # still be meaningless, because the thing it is subtracted from was a
+    # smaller pane. Measured on 2026-09-18 across three boxes -- inside ONE
+    # session arm butterchurn read ~16% windowed and ~40% maximized, while the
+    # box that stayed windowed end to end reported a session delta of 0.
+    if ($Summary.WindowMode -and
+        $Summary.WindowMode.IdleMode -and $Summary.WindowMode.IdleMode -ne 'Unknown' -and
+        $Summary.WindowMode.Dominant -and $Summary.WindowMode.Dominant -ne 'Unknown' -and
+        $Summary.WindowMode.IdleMode -ne $Summary.WindowMode.Dominant) {
+        $candidates += @{
+            Rank       = 3
+            Id         = 'GFX-BASELINE-MODE-MISMATCH'
+            Title      = "Idle baseline was measured $($Summary.WindowMode.IdleMode) but the session ran $($Summary.WindowMode.Dominant)"
+            Result     = 'WARN'
+            AppliesTo  = 'Measurement'
+            Evidence   = @(
+                "The idle arm held $($Summary.WindowMode.IdleMode); the session arm was mostly $($Summary.WindowMode.Dominant).",
+                'Butterchurn renders the whole pane, so its load follows window AREA. A delta taken across two window sizes is that size change plus the session, and the size change is the larger half of it.'
+            )
+            ActionHint = "Re-run with NO already $($Summary.WindowMode.Dominant.ToLower()) BEFORE you press Start watching, so both arms are the same shape."
+        }
+    }
+
     # The window's placement changed while the session was running, so the
     # session arm averages two shapes of pane. Changes before the split are
     # the operator arranging the screen and are not raised.
@@ -2391,7 +3156,36 @@ function Get-GraphicsBenchFindings {
                 "Placement spans: $($spanLines -join '; ').",
                 'The session numbers above average across those shapes, so they are not comparable with a run held in one mode.'
             )
-            ActionHint = 'Re-run keeping NO in one window mode, or read the per-mode spans in the package.'
+            # The operator maximizes NO by hand; NO does not do it. So the fix
+            # is a step, not a re-run: do it before Start watching, while the
+            # baseline has not been measured yet.
+            ActionHint = 'Next run, set NO to its final window size BEFORE pressing Start watching, and leave it alone until the session ends.'
+        }
+    }
+
+    # Departures from the selected profile that no finding above already
+    # names. The two window-mode keys are excluded on purpose: they each have
+    # a dedicated finding with its own evidence, and the list is capped at
+    # three, so letting them in twice would push a real defect off the screen.
+    #
+    # The $null test is load-bearing, not defensive: a summary from before
+    # profiles existed has no ProfileDeviations key at all, @() over that
+    # absent value yields ONE element holding $null, and $null.Key passes any
+    # -ne filter. Without it this finding fires on every legacy capture --
+    # which is exactly what the suite caught.
+    $covered = @('WindowMode', 'BaselineMode', 'WindowChanged', 'BaselineLength')
+    $deviations = @($Summary.ProfileDeviations | Where-Object { $null -ne $_ -and $covered -notcontains $_.Key })
+    if ($deviations.Count -gt 0) {
+        $profileLabel = $Summary.ProfileName
+        if ([string]::IsNullOrWhiteSpace($profileLabel)) { $profileLabel = $Summary.ProfileId }
+        $candidates += @{
+            Rank       = 5
+            Id         = 'GFX-PROTOCOL-DEVIATION'
+            Title      = "Run departed from the '$profileLabel' protocol in $($deviations.Count) way(s)"
+            Result     = 'WARN'
+            AppliesTo  = 'Protocol'
+            Evidence   = @(@($deviations | ForEach-Object { [string]$_.Text }))
+            ActionHint = 'The numbers in this package are real; they just do not belong in the same pool as runs that followed the profile. Re-run following the steps on the bench window to add this box to the corpus.'
         }
     }
 
@@ -2444,7 +3238,7 @@ function Get-GraphicsBenchFindings {
                     "NO's window set never changed for $(Get-GfxUiChangeDwellSamples) consecutive samples, so the run has one arm and no deltas.",
                     'Butterchurn draws while NO is idle, so a whole-run percentage cannot be read as session cost.'
                 )
-                ActionHint = 'Start watching FIRST, leave NO idle until the coverage line turns green, and only then start the session.'
+                ActionHint = 'Start watching FIRST, leave NeurOptimal alone until the line says Baseline collected, and only then start the session.'
             }
         }
     } elseif ($null -ne $Summary.ArmDurationSec.Idle -and [double]$Summary.ArmDurationSec.Idle -lt $IdleFloorSec) {
@@ -2460,7 +3254,7 @@ function Get-GraphicsBenchFindings {
                 "The session started $(Format-GraphicsDuration $Summary.ArmDurationSec.Idle) after watching began; the floor is $([int]$IdleFloorSec) s.",
                 'Every delta is session minus this idle mean, so a short idle arm makes every delta less certain.'
             )
-            ActionHint = 'Next run, wait for the coverage line to turn green before starting the session.'
+            ActionHint = 'Next run, wait until the guide says Baseline collected before starting the session.'
         }
     }
 
@@ -2470,16 +3264,18 @@ function Get-GraphicsBenchFindings {
         } else {
             "Run shorter than $MemoryGrowthMinSeconds s, so memory growth was not judged either way."
         }
+        $evidence = @(
+            "$($Summary.SampleCount) samples over $($Summary.DurationSec) s.",
+            "No host restart, no counter loss. $memoryLine"
+        )
+        if ($Summary.ProfileId) { $evidence += "Followed the '$($Summary.ProfileName)' protocol with no deviations, so this run pools directly with the corpus." }
         $candidates += @{
             Rank       = 9
             Id         = 'GFX-RUN-CLEAN'
             Title      = 'Graphics run completed with no anomalies detected'
             Result     = 'PASS'
             AppliesTo  = 'Graphics'
-            Evidence   = @(
-                "$($Summary.SampleCount) samples over $($Summary.DurationSec) s.",
-                "No host restart, no counter loss. $memoryLine"
-            )
+            Evidence   = $evidence
             ActionHint = 'Upload the package so this box joins the comparison corpus.'
         }
     }
@@ -2659,6 +3455,16 @@ function Save-GraphicsBenchRun {
         # schemaVersion stays 1.
         windowMode        = $(try { $Session.summary.WindowMode.Dominant } catch { $null })
         windowModeChanged = $(try { [bool]$Session.summary.WindowMode.ChangedDuringSession } catch { $null })
+        # Which arm the baseline was measured in. A pool that ignores this
+        # compares deltas taken across different window sizes.
+        idleWindowMode    = $(try { $Session.summary.WindowMode.IdleMode } catch { $null })
+        # The protocol the run claimed and whether it held to it, so the ingest
+        # side can pool by test without opening the session file. Additive;
+        # schemaVersion stays 1. A run with no profileId predates profiles and
+        # is unscored, which is not the same as having deviated.
+        profileId             = $(try { $Session.summary.ProfileId } catch { $null })
+        profileDeviationCount = $(try { @($Session.summary.ProfileDeviations).Count } catch { $null })
+        monitorCount          = $(try { $Session.summary.MonitorCount } catch { $null })
         schemaVersion = 1
     }
     $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Run.ManifestPath -Encoding UTF8
@@ -2706,6 +3512,26 @@ function Format-GraphicsDuration {
     if ($ts.TotalHours -ge 1) { return ('{0}h{1:00}m{2:00}s' -f [int]$ts.TotalHours, $ts.Minutes, $ts.Seconds) }
     if ($ts.TotalMinutes -ge 1) { return ('{0}m{1:00}s' -f [int]$ts.TotalMinutes, $ts.Seconds) }
     return ('{0}s' -f [int]$ts.TotalSeconds)
+}
+
+function Format-GraphicsClock {
+    <#
+    .SYNOPSIS
+        Elapsed time as mm:ss, for progress a tester reads against a target.
+    .DESCRIPTION
+        Distinct from Format-GraphicsDuration, which writes '8m32s' and is what
+        a report says. '08:32 of 15:00' is what a clock says, and a phase line
+        counting toward a target reads as a clock.
+    #>
+    [CmdletBinding()]
+    param($Seconds)
+    if ($null -eq $Seconds) { return [string][char]0x2014 }
+    $ts = [TimeSpan]::FromSeconds([math]::Max(0, [double]$Seconds))
+    # FLOOR, not [int]. A PowerShell cast rounds, so 512 s rendered as '09:32'
+    # -- a clock a full minute ahead of itself for most of every minute, and
+    # the number a tester reads to decide the session has run long enough.
+    if ($ts.TotalHours -ge 1) { return ('{0}:{1:00}:{2:00}' -f [int][math]::Floor($ts.TotalHours), $ts.Minutes, $ts.Seconds) }
+    return ('{0:00}:{1:00}' -f [int][math]::Floor($ts.TotalMinutes), $ts.Seconds)
 }
 
 function Format-GraphicsInventoryReport {
@@ -2820,7 +3646,12 @@ function Format-GraphicsBenchReport {
         [array]$Findings = @(),
         [hashtable]$MediaFile,
         [ValidateSet('Full', 'Compact')]
-        [string]$Detail = 'Full'
+        [string]$Detail = 'Full',
+        # The test the run claimed, so the status line can tell 'nothing
+        # departed' apart from 'nothing could be checked'. Absent falls back
+        # to the profile's own id, which still yields a correct outcome for
+        # every registry-known test.
+        [hashtable]$BenchProfile
     )
 
     $dash = [string][char]0x2014
@@ -2828,6 +3659,26 @@ function Format-GraphicsBenchReport {
     $r = @()
 
     $r += @{ Level = 'STEP'; Text = ("RESULTS   {0}   {1} samples" -f (Format-GraphicsDuration $Summary.DurationSec), $Summary.SampleCount); NoPrefix = $true }
+
+    # WHICH TEST THIS WAS, immediately under the duration. A package that does
+    # not say which protocol it followed cannot be pooled by anything except a
+    # human remembering what they told the tester, which is the failure the
+    # 2026-09-18 campaign ran into five times in one morning.
+    if ($Summary.ProfileId) {
+        $prof = $BenchProfile
+        if (-not $prof) { $prof = Get-GraphicsBenchProfile -Id $Summary.ProfileId }
+        $outcome = Get-GraphicsBenchProfileOutcome -Summary $Summary -BenchProfile $prof
+        $r += @{ Level = 'DIM'; Text = ("  Test          {0}" -f $Summary.ProfileName); NoPrefix = $true }
+        $level = if ($outcome.Level -eq 'Healthy') { 'DIM' } else { 'WARN' }
+        $r += @{ Level = $level; Text = ("  Status        {0}" -f $outcome.Text); NoPrefix = $true }
+        foreach ($d in @($outcome.Deviations)) {
+            $r += @{ Level = 'WARN'; Text = ("                  - {0}" -f $d.Text); NoPrefix = $true }
+            # The technical phrasing rides UNDER the tester's, never instead
+            # of it: 'cohort key' and 'session arm' are what an engineer needs
+            # to act on the package and what a tester has no use for.
+            if ($d.Detail) { $r += @{ Level = 'DIM'; Text = ("                    {0}" -f $d.Detail); NoPrefix = $true } }
+        }
+    }
     $r += @{ Level = 'INFO'; Text = ''; NoPrefix = $true }
 
     # --- the headline: session minus this box's own idle arm ---
@@ -2847,7 +3698,7 @@ function Format-GraphicsBenchReport {
             $r += @{ Level = 'WARN'; Text = '  No session start was seen, so this run has no idle/session split and no deltas.'; NoPrefix = $true }
             $r += @{ Level = 'WARN'; Text = '  The table above is the whole run and is still valid, but none of it is'; NoPrefix = $true }
             $r += @{ Level = 'WARN'; Text = '  attributable to the session. Re-run: Start watching, leave NO idle until the'; NoPrefix = $true }
-            $r += @{ Level = 'WARN'; Text = '  coverage line turns green, then start the session.'; NoPrefix = $true }
+            $r += @{ Level = 'WARN'; Text = '  line says Baseline collected, then start the session.'; NoPrefix = $true }
         }
     } else {
         $r += @{ Level = 'DIM'; Text = ("  {0,-13}{1,-17}{2,10}{3,12}{4,12}" -f 'surface', 'engine', 'idle', 'session', 'delta'); NoPrefix = $true }
@@ -2884,6 +3735,22 @@ function Format-GraphicsBenchReport {
             if ($wm.Bounds) { $wmText += " $($wm.Bounds)" }
             if ($wm.ChangedDuringSession) { $wmText += "  CHANGED during the session ($(@($wm.SessionModes) -join ' / '))" }
             $r += @{ Level = $(if ($wm.ChangedDuringSession) { 'WARN' } else { 'DIM' }); Text = $wmText; NoPrefix = $true }
+            # Both arms' modes on one line, because the delta above is only a
+            # session cost when they match. Printed whenever they differ, even
+            # if the session itself never changed shape.
+            if ($wm.IdleMode -and $wm.IdleMode -ne 'Unknown' -and $wm.Dominant -ne 'Unknown' -and $wm.IdleMode -ne $wm.Dominant) {
+                $r += @{ Level = 'WARN'; Text = ("  Baseline was measured {0} and the session ran {1} {2} the deltas above include that size change." -f $wm.IdleMode, $wm.Dominant, $dash); NoPrefix = $true }
+            }
+        }
+
+        # AUDIO-ONLY IS NOT A FAULT. An audio session draws butterchurn and
+        # nothing else, so the decode engines read a structural zero. Saying so
+        # here stops a reader treating the run's largest block of zeroes as a
+        # missing hardware decode path.
+        $audioSpans = @($Summary.Spans | Where-Object { $_.State -eq 'AudioLikely' })
+        $decodeSpans = @($Summary.Spans | Where-Object { $_.State -eq 'MediaOnly' -or $_.State -eq 'Both' })
+        if ($audioSpans.Count -gt 0 -and $decodeSpans.Count -eq 0) {
+            $r += @{ Level = 'DIM'; Text = '  Zero video decode activity is expected for this audio-only test.'; NoPrefix = $true }
         }
         $addedTitles = @()
         foreach ($c in @($Summary.NoUiChanges)) { $addedTitles += @($c.Added) }
@@ -3319,14 +4186,17 @@ function Get-GraphicsBenchCoverage {
                 @{ State = 'WaitingForNo'; Marker = '[~]'; Level = 'Unknown'
                    Text = "NO.exe is not running yet $dash the idle clock starts when it appears." }
             } elseif ($null -ne $IdleSec -and [double]$IdleSec -ge $IdleFloorSec) {
-                # The green line. This is the cue "about a minute" never gave.
+                # The cue "about a minute" never gave. Named, not coloured:
+                # "when the line turns green" is unusable to a tester reading a
+                # screenshot, a monochrome remote session, or with a colour
+                # vision deficiency.
                 @{ State = 'BaselineReady'; Marker = '[ok]'; Level = 'Healthy'
-                   Text = "Idle baseline solid ($(Format-GraphicsDuration $IdleSec)) $dash start your session now, then press Stop when it ends." }
+                   Text = "Baseline collected ($(Format-GraphicsDuration $IdleSec)) $dash start your session now, then press Stop when it ends." }
             } else {
                 $so = 0
                 if ($null -ne $IdleSec) { $so = [int][math]::Floor([double]$IdleSec) }
                 @{ State = 'BaselineBuilding'; Marker = '[~]'; Level = 'Unknown'
-                   Text = "Idle baseline $so s of $floorText $dash keep NO idle. Start your session when this line turns green." }
+                   Text = "Baseline: $so s of $floorText. Leave NeurOptimal on its home screen $dash this line says Baseline collected when it is done." }
             }
         }
         'Stopped' {
@@ -3468,6 +4338,16 @@ Export-ModuleMember -Function @(
     'Get-GfxRoleAggregate'
     'Get-GraphicsBenchSessionSummary'
     'Get-GraphicsBenchFindings'
+    'Get-GraphicsBenchProfiles'
+    'Get-GraphicsBenchProfile'
+    'Test-GraphicsBenchReadiness'
+    'Get-GfxLiveNoWindow'
+    'Get-GfxLiveDisplayCount'
+    'Get-GfxNoRunning'
+    'Get-GraphicsBenchPhase'
+    'Get-GraphicsBenchProfileOutcome'
+    'Format-GraphicsClock'
+    'Get-GraphicsBenchProfileDeviations'
     'Test-GraphicsBenchPreconditions'
     'New-GraphicsBenchRunFolder'
     'Write-GraphicsBenchEvent'
