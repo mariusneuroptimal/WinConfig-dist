@@ -1310,6 +1310,10 @@ function Stop-GraphicsSampler {
 # the channel-mismatch class this repo has hit repeatedly. Both read this.
 $script:GfxUiChangeDwellSamples = 3
 
+# How far short of the test's length a session that ENDED AT SESSION COMPLETE
+# may read before it is called short. See the SessionLength deviation.
+$script:GfxSessionLengthToleranceSec = 15
+
 function Get-GfxUiChangeDwellSamples {
     <#
     .SYNOPSIS
@@ -2401,12 +2405,29 @@ function Get-GraphicsBenchProfiles {
     .SYNOPSIS
         Every test profile this bench knows.
     .DESCRIPTION
-        One row per test. Steps are what the tester is shown, verbatim, on
-        screen and in the console -- there is no second copy of them in prose.
-        Requires is what the tool can CHECK; a requirement it cannot observe is
-        left out rather than asserted.
+        One row per test. The PROCEDURE is the test: an ordered list of steps,
+        each with the words the tester reads and the GATE that must hold before
+        the window lets them past it. Steps[] is derived from it, verbatim, for
+        the console and the "View all steps" list -- there is no second copy of
+        the protocol in prose.
+
+        Requires is what the tool can CHECK after the run; a requirement it
+        cannot observe is left out rather than asserted.
+
+        GATE KINDS (read by Get-GraphicsBenchStepView):
+          Checks        readiness checks, by Key, that must read Ready
+          Confirm       an attestation the tester ticks -- ATTESTED, never
+                        measured, and recorded as such with its timestamp
+          Info          nothing to verify; Next moves on
+          Start         Next is Start watching; passes once the baseline is in
+          SessionStart  passes when the session is detected
+          Mark          Next is the typed transition mark MarkIndex
+          SessionRun    the measured stretch; stops by itself at Session Complete
+          FreeRun       an exploratory stretch; Stop whenever
+        A step may carry Checks AND Confirm; both must hold.
     .OUTPUTS
-        Array of hashtables: Id, Name, Summary, Steps[], Requires, IsDefault.
+        Array of hashtables: Id, Name, Summary, Procedure[], Steps[], Phrases,
+        Requires, IsDefault.
 
         RETURNED ',$profiles', so a registry that ever holds one profile does
         not unroll to a bare hashtable. ASSIGN IT FIRST -- '@(Get-...Profiles)'
@@ -2435,8 +2456,30 @@ function Get-GraphicsBenchProfiles {
     $quietStep = 'Close everything else -- no browser, no screen recorder, no video call. Only NeurOptimal and this window.'
     $launchStep = 'Launch NeurOptimal and leave it on its home screen, with no session started.'
     $watchStep = 'Press Start watching, then leave NeurOptimal alone until it says Baseline collected.'
-    $sessionStep = 'Start an audio-only session (a music track, no video) and let it run for 15 minutes. Do not resize, move or minimize the NeurOptimal window, and do not connect or disconnect a screen, while it runs.'
-    $stopStep = 'When the session ends, press Stop and show results, then send the package.'
+    $sessionStartStep = 'Open Configure Session in NeurOptimal, set the session type to "Quick Session", and start the session with audio only (a music track, no video).'
+    $sessionRunStep = 'Let the session run for 15 minutes. Do not resize, move or minimize the NeurOptimal window, and do not connect or disconnect a screen, while it runs. When NeurOptimal shows Session Complete the recording stops by itself and the package is sent.'
+
+    # THE STEPS SHARED BY EVERY SCORED TEST, as records. One definition each:
+    # a gate typed twice is a gate that drifts between the two tests that are
+    # supposed to be comparable.
+    $stepQuiet = @{ Id = 'close-others'; Title = 'Close other programs'; Text = $quietStep
+                    Gate = @{ Kind = 'Confirm'; Confirm = 'Only NeurOptimal and this window are open' } }
+    $stepLaunch = @{ Id = 'launch'; Title = 'Open NeurOptimal'; Text = $launchStep
+                     Gate = @{ Kind = 'Checks'; Checks = @('NoRunning'); Confirm = 'NeurOptimal is on its home screen, with no session started' } }
+    # THE SESSION TYPE IS PART OF THE TEST, and it is chosen in NeurOptimal's
+    # Configure Session dialog -- the dialog that starts the session. So it is
+    # part of the session-start step, AFTER the baseline, not a step of its
+    # own before it: opening Configure Session early is clicking through
+    # NeurOptimal during the stretch the session is measured against, and
+    # on SP9 (run 1A7A0385, 2026-09-23) opening it 8 s into the baseline ended
+    # the baseline at 8 s. It is not ticked: the bench is behind a full-screen
+    # NeurOptimal by then. It is VERIFIED instead -- only a Quick Session ends
+    # with Session Complete at the test's length, and EndsAtSessionComplete
+    # scores a run that did not as a departure.
+    $stepWatch = @{ Id = 'baseline'; Title = 'Measure the baseline'; Text = $watchStep; Gate = @{ Kind = 'Start' } }
+    $stepSessionStart = @{ Id = 'session-start'; Title = 'Start a Quick Session'; Text = $sessionStartStep; Gate = @{ Kind = 'SessionStart' } }
+    $stepSessionRun = @{ Id = 'session-run'; Title = 'Let the session run'; Text = $sessionRunStep; Gate = @{ Kind = 'SessionRun' } }
+    $stepVisualizer = @{ Id = 'visualizer-inside'; Title = 'Leave the visualizer inside NeurOptimal'; Text = $leaveVisualizerStep; Gate = @{ Kind = 'Info' } }
 
     $audioPhrases = @{
         Baseline = 'Leave NeurOptimal on its home screen.'
@@ -2450,15 +2493,19 @@ function Get-GraphicsBenchProfiles {
             Name      = "Audio baseline $dot 15 minutes $dot Built-in screen"
             Summary   = "The first recording a laptop makes on its own screen, so results can be compared across machines."
             IsDefault = $true
-            Steps     = @(
-                "Disconnect every external monitor -- unplug it, do not just switch it off -- and open the lid, so the laptop's built-in screen is the only display in use."
-                $quietStep
-                $launchStep
-                "$noFullScreenStep It must be full screen on the built-in screen."
-                $leaveVisualizerStep
-                $watchStep
-                $sessionStep
-                $stopStep
+            Procedure = @(
+                @{ Id = 'screens'; Title = 'Use the built-in screen only'
+                   Text = "Disconnect every external monitor -- unplug it, do not just switch it off -- and open the lid, so the laptop's built-in screen is the only display in use."
+                   Gate = @{ Kind = 'Checks'; Checks = @('DisplaySetup', 'ExternalDisconnected'); ShowDisplays = $true } }
+                $stepQuiet
+                $stepLaunch
+                @{ Id = 'full-screen'; Title = 'Put NeurOptimal full screen'
+                   Text = "$noFullScreenStep It must be full screen on the built-in screen."
+                   Gate = @{ Kind = 'Checks'; Checks = @('ScreenCoverage') } }
+                $stepVisualizer
+                $stepWatch
+                $stepSessionStart
+                $stepSessionRun
             )
             # One short sentence per phase, in the tester's words. The phase
             # line on screen is composed from these plus live progress, so the
@@ -2475,6 +2522,10 @@ function Get-GraphicsBenchProfiles {
                 ScreenCoverage     = 'Full'
                 SessionKind        = 'Audio'
                 SessionMinSec      = 900
+                # THE SESSION ENDS WHERE NEUROPTIMAL ENDS IT. A recording
+                # stopped by hand ends wherever the tester happened to press,
+                # and two runs of one test then end by different rules.
+                EndsAtSessionComplete = $true
                 VisualizerAttached    = $true
                 VisualizerSameDisplay = $true
             }
@@ -2484,15 +2535,19 @@ function Get-GraphicsBenchProfiles {
             Name      = "Audio baseline $dot 15 minutes $dot External screen"
             Summary   = 'The same recording made on one external display with the built-in screen off. A separate test, because the screen it is made on changes the numbers.'
             IsDefault = $false
-            Steps     = @(
-                'Use ONE external display, with the built-in screen off -- close the lid, or press Windows+P and choose Second screen only. Unplug any other monitor rather than leaving it connected and dark.'
-                $quietStep
-                $launchStep
-                "$noFullScreenStep It must be full screen on the external display."
-                $leaveVisualizerStep
-                $watchStep
-                $sessionStep
-                $stopStep
+            Procedure = @(
+                @{ Id = 'screens'; Title = 'Use one external display only'
+                   Text = 'Use ONE external display, with the built-in screen off -- close the lid, or press Windows+P and choose Second screen only. Unplug any other monitor rather than leaving it connected and dark.'
+                   Gate = @{ Kind = 'Checks'; Checks = @('DisplaySetup', 'ExternalDisconnected'); ShowDisplays = $true } }
+                $stepQuiet
+                $stepLaunch
+                @{ Id = 'full-screen'; Title = 'Put NeurOptimal full screen'
+                   Text = "$noFullScreenStep It must be full screen on the external display."
+                   Gate = @{ Kind = 'Checks'; Checks = @('ScreenCoverage') } }
+                $stepVisualizer
+                $stepWatch
+                $stepSessionStart
+                $stepSessionRun
             )
             Phrases   = @{
                 Prepare  = 'Put NeurOptimal full screen on the external display before starting the recording.'
@@ -2505,6 +2560,10 @@ function Get-GraphicsBenchProfiles {
                 ScreenCoverage     = 'Full'
                 SessionKind        = 'Audio'
                 SessionMinSec      = 900
+                # THE SESSION ENDS WHERE NEUROPTIMAL ENDS IT. A recording
+                # stopped by hand ends wherever the tester happened to press,
+                # and two runs of one test then end by different rules.
+                EndsAtSessionComplete = $true
                 VisualizerAttached    = $true
                 VisualizerSameDisplay = $true
             }
@@ -2514,16 +2573,27 @@ function Get-GraphicsBenchProfiles {
             Name      = "Detached visualizer $dot 15 minutes"
             Summary   = 'What the separate visualizer full-screen button costs. Its own test, because detaching the visuals is a manual step in the middle of the measurement -- so the recording is cut around it and the 15 minutes are counted from the moment the visuals settle.'
             IsDefault = $false
-            Steps     = @(
-                'Set up the screens you want to test, and leave them alone for the whole recording.'
-                $quietStep
-                $launchStep
-                "$noFullScreenStep"
-                $watchStep
-                'Start an audio-only session (a music track, no video) and let it settle for a minute.'
-                'Press Mark transition start, then use the separate visualizer full-screen button. NeurOptimal asks which monitor to use -- pick it by the Display number this window shows beside each screen, then press OK. The recording waits for you; take as long as you need.'
-                'Press Mark visuals ready as soon as the visuals are settled on their display. The stretch between the two is reported on its own and is kept out of the comparison.'
-                'Let the session run for 15 minutes FROM the second mark, then press Stop and show results.'
+            Procedure = @(
+                @{ Id = 'screens'; Title = 'Set up the screens'
+                   Text = 'Set up the screens you want to test, and leave them alone for the whole recording.'
+                   Gate = @{ Kind = 'Confirm'; Confirm = 'The screens are set up and will not be changed during the recording'; ShowDisplays = $true } }
+                $stepQuiet
+                $stepLaunch
+                @{ Id = 'full-screen'; Title = 'Put NeurOptimal full screen'; Text = "$noFullScreenStep"
+                   Gate = @{ Kind = 'Checks'; Checks = @('ScreenCoverage') } }
+                $stepWatch
+                @{ Id = 'session-start'; Title = 'Start a Quick Session'
+                   Text = 'Open Configure Session in NeurOptimal, set the session type to "Quick Session", and start the session with audio only (a music track, no video). Let it settle for a minute.'
+                   Gate = @{ Kind = 'SessionStart' } }
+                @{ Id = 'mark-start'; Title = 'Detach the visualizer'
+                   Text = 'Press Mark transition start, then use the separate visualizer full-screen button. NeurOptimal asks which monitor to use -- pick it by the Display number this window shows beside each screen, then press OK. The recording waits for you; take as long as you need.'
+                   Gate = @{ Kind = 'Mark'; MarkIndex = 0 } }
+                @{ Id = 'mark-ready'; Title = 'Mark the visuals ready'
+                   Text = 'Press Mark visuals ready as soon as the visuals are settled on their display. The stretch between the two is reported on its own and is kept out of the comparison.'
+                   Gate = @{ Kind = 'Mark'; MarkIndex = 1 } }
+                @{ Id = 'session-run'; Title = 'Let the session run'
+                   Text = 'Let the session run for 15 minutes FROM the second mark. When NeurOptimal shows Session Complete the recording stops by itself and the package is sent.'
+                   Gate = @{ Kind = 'SessionRun' } }
             )
             Phrases   = @{
                 Prepare  = 'Put NeurOptimal full screen before starting the recording.'
@@ -2538,14 +2608,15 @@ function Get-GraphicsBenchProfiles {
             # shipped: instructions that promised a split nothing implemented.
             #
             # SessionMinSec is checked against the STEADY arm, which the
-            # summariser cuts at the second marker. No DisplaySetup and no
-            # No VisualizerAttached and no VisualizerSameDisplay: the detached,
+            # summariser cuts at the second marker. No DisplaySetup, no
+            # VisualizerAttached and no VisualizerSameDisplay: the detached,
             # possibly two-screen arrangement is the POINT of this test, so it
             # is recorded rather than demanded.
             Requires  = @{
                 ScreenCoverage     = 'Full'
                 SessionKind        = 'Audio'
                 SessionMinSec      = 900
+                EndsAtSessionComplete = $true
                 TransitionMarkers  = $true
             }
         }
@@ -2555,10 +2626,13 @@ function Get-GraphicsBenchProfiles {
             Name      = 'Exploratory recording'
             Summary   = 'A free-form recording. Nothing is checked before it and nothing is scored after it -- use it to reproduce something, not to add this machine to the comparison.'
             IsDefault = $false
-            Steps     = @(
-                'Press Start watching before whatever you want to observe begins.'
-                'Leave NeurOptimal alone until it says Baseline collected, so the recording still has something to measure against.'
-                'Press Stop and show results when you are done.'
+            Procedure = @(
+                @{ Id = 'baseline'; Title = 'Start watching'
+                   Text = 'Press Start watching before whatever you want to observe begins, and leave NeurOptimal alone until it says Baseline collected, so the recording still has something to measure against.'
+                   Gate = @{ Kind = 'Start' } }
+                @{ Id = 'free-run'; Title = 'Record'
+                   Text = 'Do whatever you want to observe, then press Stop and show results when you are done.'
+                   Gate = @{ Kind = 'FreeRun' } }
             )
             Phrases   = @{
                 Prepare  = 'Press Start watching before whatever you want to observe begins.'
@@ -2569,6 +2643,13 @@ function Get-GraphicsBenchProfiles {
             Requires  = @{}
         }
     )
+
+    # Steps[] is the procedure's words, in order. Derived, never typed: the
+    # list a tester reads in "View all steps" and the console is the same text
+    # the step-by-step window walks them through.
+    foreach ($p in $profiles) {
+        $p.Steps = @(@($p.Procedure) | ForEach-Object { [string]$_.Text })
+    }
     return ,$profiles
 }
 
@@ -3086,6 +3167,371 @@ function Get-GraphicsBenchPhase {
               Instruction = ("{0} Baseline: {1} of {2} seconds." -f [string]$phrases['Baseline'], [int][math]::Floor($idle), [int]$IdleFloorSec).Trim() }
 }
 
+function Get-GraphicsBenchProtocolVersion {
+    <#
+    .SYNOPSIS
+        A short fingerprint of the procedure a run followed.
+    .DESCRIPTION
+        TWO RUNS ARE COMPARABLE ONLY IF THEY FOLLOWED THE SAME STEPS. The test
+        Id says which test was selected; it does not change when a step's
+        wording or gate does, and a reworded step is a different instruction to
+        the tester. The fingerprint covers the Id, every step's words and gate,
+        and the requirements, so any change to what a tester was told or
+        checked on produces a new version -- and runs are pooled by it.
+
+        Hashed from a canonical string (keys sorted), never from a serialiser
+        whose field order is not promised.
+    .OUTPUTS
+        Twelve lowercase hex characters.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$BenchProfile)
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    $parts.Add("id=$($BenchProfile.Id)")
+    foreach ($s in @($BenchProfile.Procedure)) {
+        if (-not $s) { continue }
+        $g = $s.Gate
+        if (-not $g) { $g = @{} }
+        $gateText = (@($g.Keys | Sort-Object) | ForEach-Object { "$_=$(@($g[$_]) -join ',')" }) -join ';'
+        $parts.Add("step=$($s.Id)|$($s.Text)|$gateText")
+    }
+    $req = $BenchProfile.Requires
+    if ($req) {
+        foreach ($k in @($req.Keys | Sort-Object)) { $parts.Add("req=$k=$($req[$k])") }
+    }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes(($parts -join "`n"))
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
+    return (-join ($hash[0..5] | ForEach-Object { $_.ToString('x2') }))
+}
+
+function Get-GraphicsBenchStepView {
+    <#
+    .SYNOPSIS
+        What the step-by-step window shows for ONE step, and whether the tester
+        may move past it.
+    .DESCRIPTION
+        THE SAME STEPS, IN THE SAME ORDER, ON EVERY BOX. Datasets from different
+        testers are only comparable if the procedure was the same, and a list of
+        instructions on screen does not make it the same -- people skim, reorder
+        and skip. So the window shows one step at a time, and Next stays
+        disabled until that step's GATE holds:
+
+          * what the tool can MEASURE (the display setup, NeurOptimal running,
+            its window filling the screen) is checked live, and
+          * what it cannot (other programs closed, the home screen) is a tick
+            the tester gives -- ATTESTED, never measured, and logged with its
+            time so a reader can tell the two apart.
+
+        A gate that does not hold can still be passed with "Continue anyway",
+        which the window records as an override. It asks, it does not block:
+        the operator is the testing team, and the package says what departed.
+
+        Once recording starts the gates are the run's own milestones -- the
+        baseline collected, the session detected, the marks pressed -- and the
+        window moves on BY ITSELF, so nobody's timing decides when a stretch
+        begins. AdvanceTo says where to; it skips a milestone that has already
+        happened (a session started before the baseline was in, or a recording
+        started mid-session) rather than stranding the tester on it.
+
+        PURE. Every input is passed in; the window owns no wording and no rule.
+    .OUTPUTS
+        Hashtable: Id, Number, Total, Stage ('Prepare'|'Recording'|'Results'),
+        StepLabel, Title, Instruction, Level, Items[] (@{ Text; State }),
+        ShowDisplays, Passed, ConfirmKey, ConfirmText, Confirmed, NextText,
+        NextAction ('Advance'|'Start'|'Mark'|'Stop'|'Restart'), NextEnabled,
+        BackEnabled, OverrideOffered, StopEarlyOffered, AdvanceTo (index or
+        $null), AutoStop, Regressions[].
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$BenchProfile,
+        [int]$Index = 0,
+        $Readiness,
+        # Ticks the tester has given, by ConfirmKey.
+        [hashtable]$Confirmed = @{},
+        # Steps the tester chose to pass with "Continue anyway", by step Id.
+        [hashtable]$Overridden = @{},
+        [ValidateSet('NotStarted', 'Watching', 'Stopped')]
+        [string]$RunPhase = 'NotStarted',
+        $IdleSec,
+        $SessionSec,
+        [bool]$SessionDetected = $false,
+        [bool]$SessionEnded = $false,
+        [bool]$StartedMidSession = $false,
+        [int]$TransitionStep = 0,
+        [string]$OutcomeText,
+        [string]$OutcomeLevel,
+        # What happened to the package: sent, kept on this PC, or not sent
+        # and why. Said on the Results step because the tester's next move
+        # depends on it, and a log line nobody opens is not telling them.
+        [string]$SendText,
+        [string]$SendLevel,
+        [double]$IdleFloorSec = $script:GfxIdleFloorSec,
+        # How long past the session length to wait for Session Complete before
+        # telling the tester the session type was probably not Quick Session.
+        [double]$SessionCompleteGraceSec = 120,
+        # How much baseline was measured before the session started, once it
+        # has. Below the floor the card says so while the run can still be
+        # abandoned and redone, not only in the report fifteen minutes later.
+        $BaselineSec
+    )
+
+    $steps = @($BenchProfile.Procedure | Where-Object { $null -ne $_ })
+    $results = @{ Id = 'results'; Title = 'Results'; Text = ''; Gate = @{ Kind = 'Results' } }
+    $all = @($steps) + @($results)
+    $total = $all.Count
+    if ($RunPhase -eq 'Stopped') { $Index = $total - 1 }
+    if ($Index -lt 0) { $Index = 0 }
+    if ($Index -ge $total) { $Index = $total - 1 }
+    $step = $all[$Index]
+    $gate = $step.Gate
+    if (-not $gate) { $gate = @{ Kind = 'Info' } }
+    $kind = [string]$gate.Kind
+
+    $checksByKey = @{}
+    if ($Readiness) { foreach ($c in @($Readiness.Checks)) { if ($c -and $c.Key) { $checksByKey[[string]$c.Key] = $c } } }
+    $target = $null
+    if ($BenchProfile.Requires -and $BenchProfile.Requires.ContainsKey('SessionMinSec')) { $target = [double]$BenchProfile.Requires.SessionMinSec }
+    $markKinds = Get-GfxTransitionMarkerKinds
+
+    # A step's gate, judged against the readiness checks and the ticks. Used
+    # for the current step AND for the earlier ones, so a setup undone after
+    # its step was passed is reported rather than silently carried into the
+    # recording.
+    $judgePrepare = {
+        param($S)
+        $g = $S.Gate
+        if (-not $g) { $g = @{} }
+        $items = @()
+        $ok = $true
+        $unreadable = $false
+        $fix = $null
+        $firstBad = $null
+        foreach ($key in @($g.Checks)) {
+            if (-not $key) { continue }
+            $c = $checksByKey[[string]$key]
+            # A check the selected test does not declare is not this step's
+            # business: the registry's Requires decides what is checked.
+            if (-not $c) { continue }
+            $items += @{ Text = ("{0,-16}{1}  ({2})" -f $c.Label, $c.Text, $c.Detail); State = [string]$c.State }
+            if ($c.State -ne 'Ok') {
+                $ok = $false
+                if ($c.State -eq 'Unknown') { $unreadable = $true }
+                if (-not $fix -and $c.Fix) { $fix = [string]$c.Fix }
+                if (-not $firstBad) { $firstBad = "$($c.Text) -- $($c.Label.ToLower())" }
+            }
+        }
+        $confirmKey = $null
+        $confirmText = $null
+        # THE ONE CHECK A PERSON CAN ANSWER AND WINDOWS CANNOT, carried by the
+        # check itself: 'no external display connected' is usually unreadable,
+        # and the tester can look at the back of the machine.
+        $ext = $null
+        if (@($g.Checks) -contains 'ExternalDisconnected') { $ext = $checksByKey['ExternalDisconnected'] }
+        if ($ext -and ($ext.OperatorCanConfirm -or $ext.OperatorConfirmed)) {
+            $confirmKey = 'no-other-displays'
+            $confirmText = 'I have checked: no other display is plugged in'
+        } elseif ($g.Confirm) {
+            $confirmKey = "confirm:$($S.Id)"
+            $confirmText = "I confirm: $([string]$g.Confirm)"
+            if (-not [bool]$Confirmed[$confirmKey]) { $ok = $false }
+        }
+        return @{ Items = $items; Ok = $ok; Unreadable = $unreadable; Fix = $fix; FirstBad = $firstBad; ConfirmKey = $confirmKey; ConfirmText = $confirmText }
+    }
+
+    # Recording milestones. A step already satisfied is skipped over, so a
+    # session that started while the baseline was still being measured does
+    # not leave the tester staring at "Start the session".
+    $satisfied = {
+        param($S)
+        $k = [string]$S.Gate.Kind
+        switch ($k) {
+            'Start'        { return ($RunPhase -eq 'Watching' -and ($StartedMidSession -or $SessionDetected -or ($null -ne $IdleSec -and [double]$IdleSec -ge $IdleFloorSec))) }
+            'SessionStart' { return ($StartedMidSession -or $SessionDetected) }
+            'Mark'         { return ($TransitionStep -gt [int]$S.Gate.MarkIndex) }
+            default        { return $false }
+        }
+    }
+
+    $view = @{
+        Id = [string]$step.Id; Number = $Index + 1; Total = $total
+        Title = [string]$step.Title; Instruction = [string]$step.Text; Level = 'Unknown'
+        Items = @(); ShowDisplays = [bool]$gate.ShowDisplays; Passed = $false
+        ConfirmKey = $null; ConfirmText = $null; Confirmed = $false
+        NextText = 'Next'; NextAction = 'Advance'; NextEnabled = $false
+        BackEnabled = $false; OverrideOffered = $false; StopEarlyOffered = $false
+        StopEarlyKind = $null; StopEarlyText = $null
+        AdvanceTo = $null; AutoStop = $false; Regressions = @()
+    }
+    $prepKinds = @('Checks', 'Confirm', 'Info')
+    $stage = if ($kind -eq 'Results') { 'Results' } elseif ($RunPhase -eq 'Watching') { 'Recording' } else { 'Prepare' }
+    $view.Stage = $stage
+    $view.StepLabel = "STEP $($Index + 1) OF $total"
+
+    if ($prepKinds -contains $kind) {
+        $j = & $judgePrepare $step
+        $view.Items = @($j.Items)
+        $view.ConfirmKey = $j.ConfirmKey
+        $view.ConfirmText = $j.ConfirmText
+        if ($j.ConfirmKey) { $view.Confirmed = [bool]$Confirmed[$j.ConfirmKey] }
+        $view.Passed = [bool]$j.Ok
+        $view.NextEnabled = [bool]$j.Ok
+        $view.BackEnabled = ($Index -gt 0)
+        # Offered only when there is something to override. A tick the tester
+        # has not given is not a check that failed -- it is theirs to give.
+        $view.OverrideOffered = (-not $j.Ok -and @($j.Items | Where-Object { $_.State -ne 'Ok' }).Count -gt 0)
+        $view.Level = if ($j.Ok) { 'Healthy' } else { 'Unknown' }
+        if ($j.Fix) { $view.Items = @(@{ Text = $j.Fix; State = 'Hint' }) + @($view.Items) }
+
+        # EARLIER STEPS THAT NO LONGER HOLD. Passing a step does not freeze the
+        # machine: a tester who closes NeurOptimal on step 4 has undone step 3,
+        # and the recording is about to be measured on the undone setup.
+        for ($k = 0; $k -lt $Index; $k++) {
+            $prev = $all[$k]
+            if ($prepKinds -notcontains [string]$prev.Gate.Kind) { continue }
+            if ([bool]$Overridden[[string]$prev.Id]) { continue }
+            $pj = & $judgePrepare $prev
+            if (-not $pj.Ok -and @($pj.Items | Where-Object { $_.State -ne 'Ok' }).Count -gt 0) {
+                $what = if ($pj.Fix) { $pj.Fix } elseif ($pj.FirstBad) { $pj.FirstBad } else { 'it no longer checks out' }
+                $view.Regressions += "Step $($k + 1) ($($prev.Title)) no longer holds -- $what"
+            }
+        }
+        return $view
+    }
+
+    switch ($kind) {
+        'Start' {
+            if ($RunPhase -ne 'Watching') {
+                # The last step before the measurement. Next IS Start watching,
+                # and the window re-checks the whole setup at that press.
+                $view.NextText = 'Start watching'
+                $view.NextAction = 'Start'
+                $view.NextEnabled = $true
+                $view.BackEnabled = ($Index -gt 0)
+                $unmet = @()
+                if ($Readiness) { $unmet = @($Readiness.Unmet) }
+                if ($unmet.Count -gt 0) {
+                    $view.Items = @(@{ Text = "Not ready: $($unmet[0])"; State = 'NotYet' })
+                    $view.Level = 'Degraded'
+                } elseif ($Readiness -and $Readiness.Status -eq 'Ready') {
+                    $view.Items = @(@{ Text = 'Every setup check is ready.'; State = 'Ok' })
+                    $view.Level = 'Healthy'
+                }
+                $view.Instruction = [string]$step.Text
+            } else {
+                $view.NextEnabled = $false
+                if ($null -eq $IdleSec) {
+                    $view.Items = @(@{ Text = 'Waiting for NeurOptimal to appear...'; State = 'Unknown' })
+                } else {
+                    $view.Items = @(@{ Text = ("Baseline: {0} of {1} seconds. Do not touch anything." -f [int][math]::Floor([double]$IdleSec), [int]$IdleFloorSec); State = 'Unknown' })
+                }
+                $view.Instruction = 'Recording. Leave NeurOptimal on its home screen and do not touch anything while the baseline is measured.'
+            }
+        }
+        'SessionStart' {
+            $view.Items = @(@{ Text = 'Baseline collected. Waiting for the session to start...'; State = 'Ok' })
+            $view.Level = 'Healthy'
+        }
+        'Mark' {
+            $mi = [int]$gate.MarkIndex
+            $view.NextText = [string]$markKinds[$mi].Label
+            $view.NextAction = 'Mark'
+            $view.NextEnabled = ($RunPhase -eq 'Watching')
+            $view.Items = @(@{ Text = [string]$markKinds[$mi].Instruction; State = 'Unknown' })
+        }
+        'SessionRun' {
+            $done = 0.0
+            if ($null -ne $SessionSec) { $done = [double]$SessionSec }
+            $reached = ($null -eq $target -or $done -ge $target)
+            $progress = if ($null -ne $target) { "Session recorded: {0} of {1}." -f (Format-GraphicsClock $done), (Format-GraphicsClock $target) } else { "Session recorded: {0}." -f (Format-GraphicsClock $done) }
+            $view.Items = @(@{ Text = $progress; State = $(if ($reached) { 'Ok' } else { 'Unknown' }) })
+            $view.NextText = 'Stop and show results'
+            $view.NextAction = 'Stop'
+            $view.Level = 'Healthy'
+            $waitForComplete = ($BenchProfile.Requires -and $BenchProfile.Requires.ContainsKey('EndsAtSessionComplete') -and [bool]$BenchProfile.Requires.EndsAtSessionComplete)
+            if (-not $waitForComplete) {
+                $view.NextEnabled = ($reached -or $SessionEnded)
+                $view.StopEarlyOffered = -not $view.NextEnabled
+                $view.StopEarlyKind = 'Early'
+                $view.StopEarlyText = 'Stop early...'
+            } elseif (-not $reached) {
+                # Short of the length: stopping is possible, on the record.
+                $view.StopEarlyOffered = $true
+                $view.StopEarlyKind = 'Early'
+                $view.StopEarlyText = 'Stop early...'
+            } elseif (-not $SessionEnded) {
+                # LONG ENOUGH, AND STILL NOT OVER. The end belongs to
+                # NeurOptimal: a Quick Session shows Session Complete shortly
+                # after this (24 s on SP9, 2026-09-23), and a hand-pressed Stop
+                # would cut every run at a different moment. The one reason
+                # Session Complete never comes is a session type that is not
+                # Quick Session -- so that is what the way out is named for,
+                # and after a grace period the card says to take it.
+                $view.NextText = 'Waiting for Session Complete'
+                $view.StopEarlyOffered = $true
+                $view.StopEarlyKind = 'NoSessionComplete'
+                $view.StopEarlyText = 'Session Complete did not appear - stop now...'
+                $over = $done - [double]$target
+                if ($over -ge $SessionCompleteGraceSec) {
+                    $view.Instruction = ("Session Complete has not appeared {0} after the 15 minutes. The session type was probably not Quick Session: press 'Session Complete did not appear - stop now'. The recording will be kept and marked as not following the test." -f (Format-GraphicsClock $over))
+                    $view.Level = 'Degraded'
+                } else {
+                    $view.Instruction = 'The 15 minutes are recorded. Leave everything alone and wait for NeurOptimal to show Session Complete -- the recording then stops by itself and the package is sent.'
+                }
+            }
+            if ($SessionEnded) {
+                # NO said the session is over. The recording stops itself, so
+                # the end of the measured stretch is NeurOptimal's, not the
+                # moment somebody noticed.
+                $view.Instruction = 'NeurOptimal says the session is complete. Stopping the recording and sending the package...'
+                $view.AutoStop = $true
+            }
+        }
+        'FreeRun' {
+            $done = 0.0
+            if ($null -ne $SessionSec) { $done = [double]$SessionSec }
+            $view.Items = @(@{ Text = ("Recording. Session recorded: {0}." -f (Format-GraphicsClock $done)); State = 'Unknown' })
+            $view.NextText = 'Stop and show results'
+            $view.NextAction = 'Stop'
+            $view.NextEnabled = $true
+        }
+        'Results' {
+            $view.Title = 'Results'
+            # The way back to step 1 for the next recording, on the same
+            # button every other step uses to move on.
+            $view.NextText = 'Start a new recording'
+            $view.NextAction = 'Restart'
+            $view.NextEnabled = $true
+            $sendLine = if ($SendText) { $SendText } else { 'Sending the package...' }
+            $view.Instruction = if ($OutcomeText) { "Recording complete. $OutcomeText $sendLine" } else { "Recording complete. $sendLine" }
+            $view.Level = if ($OutcomeLevel) { $OutcomeLevel } else { 'Healthy' }
+            # A package that did not arrive outranks a clean result: the
+            # recording is only useful once it has been sent.
+            if ($SendLevel -and $SendLevel -ne 'Healthy') { $view.Level = 'Degraded' }
+        }
+    }
+
+    # THE BASELINE WAS CUT SHORT. NeurOptimal left its home screen before the
+    # floor -- a session started early, or Configure Session opened during the
+    # baseline -- and the recording has too little to measure against. Said on
+    # every recording step after it, because the tester can still stop and
+    # start again; the report would only say it once the session was over.
+    if ($RunPhase -eq 'Watching' -and $null -ne $BaselineSec -and @('SessionStart', 'Mark', 'SessionRun') -contains $kind -and [double]$BaselineSec -lt $IdleFloorSec) {
+        $view.Regressions += ("The baseline was cut short: NeurOptimal left its home screen after {0} s, and the baseline needs {1} s. This recording will be marked as not comparable -- stop it and start a new recording, and leave NeurOptimal alone until the baseline is collected." -f [int][math]::Floor([double]$BaselineSec), [int]$IdleFloorSec)
+        $view.Level = 'Degraded'
+    }
+
+    # Already past this milestone? Move to the first step that is not.
+    if ($RunPhase -eq 'Watching' -and (& $satisfied $step)) {
+        $to = $Index + 1
+        while ($to -lt ($total - 1) -and (& $satisfied $all[$to])) { $to++ }
+        $view.AdvanceTo = $to
+    }
+    return $view
+}
+
 function Get-GraphicsBenchProfileOutcome {
     <#
     .SYNOPSIS
@@ -3457,7 +3903,15 @@ function Get-GraphicsBenchProfileDeviations {
     if ($req.ContainsKey('SessionMinSec')) {
         $sec = $null
         if ($Summary.ArmDurationSec -and $null -ne $Summary.ArmDurationSec.Session) { $sec = [double]$Summary.ArmDurationSec.Session }
-        if ($null -ne $sec -and $sec -gt 0 -and $sec -lt [double]$req.SessionMinSec) {
+        # A TOLERANCE, for a test that ends at Session Complete. The length is
+        # then NeurOptimal's -- a Quick Session is 15:00 of audio (SP9, run
+        # 062F7649: 20:04:47 -> 20:19:45) -- and the arm is bounded by two
+        # detections at one-second sampling, so a full session reads a few
+        # seconds either side of 15:00. Without it, every compliant run would
+        # be failed for the sampling, not for the session.
+        $lengthFloor = [double]$req.SessionMinSec
+        if ($req.ContainsKey('EndsAtSessionComplete') -and [bool]$req.EndsAtSessionComplete -and $Summary.SessionEndSource -and [string]$Summary.SessionEndSource -ne 'none-detected') { $lengthFloor -= $script:GfxSessionLengthToleranceSec }
+        if ($null -ne $sec -and $sec -gt 0 -and $sec -lt $lengthFloor) {
             # NAMES WHERE THE CLOCK STARTED. On a test with a bracketed
             # transition this is the steady period after the second mark, not
             # the whole session, and a tester who ran 15 minutes end to end
@@ -3466,6 +3920,19 @@ function Get-GraphicsBenchProfileDeviations {
             $out += @{ Key    = 'SessionLength'
                        Text   = "The session ran $(Format-GraphicsClock $sec)$fromText; this test needs $(Format-GraphicsClock ([double]$req.SessionMinSec))."
                        Detail = "Session arm $(Format-GraphicsDuration $sec) against a $(Format-GraphicsDuration ([double]$req.SessionMinSec)) floor$(if ($fromText) { ', measured from the VisualsReady marker' }); memory growth and the visualizer's plateau are only judgeable over a full-length session." }
+        }
+    }
+
+    # ENDED BY HAND, NOT BY NEUROPTIMAL. Only judged when a session was seen:
+    # a run with no session is already reported as such, and a second line
+    # about how it ended would be a deviation about nothing.
+    if ($req.ContainsKey('EndsAtSessionComplete') -and [bool]$req.EndsAtSessionComplete) {
+        $started = ($Summary.SessionStartSource -and [string]$Summary.SessionStartSource -ne 'none-detected')
+        $ended = ($Summary.SessionEndSource -and [string]$Summary.SessionEndSource -ne 'none-detected')
+        if ($started -and -not $ended) {
+            $out += @{ Key    = 'SessionEnd'
+                       Text   = 'The recording was stopped by hand before NeurOptimal showed Session Complete. The session type may not have been Quick Session, so this recording may not be comparable with the other baseline recordings.'
+                       Detail = "No Session Complete dialog was seen in NO's window set; the session arm ends where the operator stopped, not where NeurOptimal ended the session." }
         }
     }
 
@@ -4411,6 +4878,71 @@ function Get-NoSessionEndIndex {
     return $null
 }
 
+function Get-GfxPlaybackStartIndex {
+    <#
+    .SYNOPSIS
+        The sample at which NeurOptimal's player started playing, after the
+        session's first window change.
+    .DESCRIPTION
+        THE SESSION STARTS AT THE AUDIO, NOT AT CONFIGURE SESSION. NO's window
+        set changes the moment the tester opens Configure Session -- the dialog
+        where the session type is chosen -- and that used to open the session
+        arm. The stretch from there to the audio is a person choosing Quick
+        Session and NO loading: 14 s on SP9 (run 062F7649, 2026-09-23), and a
+        different number for every tester. It is neither baseline nor session.
+
+        Playback is read from the player surface's own engines, through
+        Get-GraphicsActivityState: AudioLikely (video.js redrawing its controls
+        with nothing decoding -- which is what audio playback looks like),
+        MediaOnly or Both. It must HOLD for the dwell the window-set detector
+        uses, so a one-sample blip cannot open the session.
+
+        Bounded: only within -MaxWaitSec of the window change. Past that, the
+        player's reading is not trusted to be this session's start, and the
+        caller falls back to the window change and says so.
+    .OUTPUTS
+        [int] sample index, or $null.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()]$Samples,
+        $FromIndex,
+        $ToIndex,
+        [int]$DwellSamples = $script:GfxUiChangeDwellSamples,
+        [double]$MaxWaitSec = 180,
+        [double]$MediaFloorPercent = $script:GfxMediaFloorPercent,
+        [double]$AudioUiFloorPercent = $script:GfxAudioUiFloorPercent
+    )
+    if ($null -eq $FromIndex) { return $null }
+    $all = @($Samples)
+    $last = $all.Count - 1
+    if ($null -ne $ToIndex -and [int]$ToIndex -lt $last) { $last = [int]$ToIndex }
+    $from = [int]$FromIndex
+    if ($from -lt 0 -or $from -gt $last) { return $null }
+    $t0 = $null
+    try { $t0 = [datetime]$all[$from].AtUtc } catch { }
+    $playing = @('AudioLikely', 'MediaOnly', 'Both')
+    $run = 0
+    $runStart = $null
+    for ($i = $from; $i -le $last; $i++) {
+        if ($null -ne $t0 -and $null -eq $runStart) {
+            $at = $null
+            try { $at = [datetime]$all[$i].AtUtc } catch { }
+            if ($null -ne $at -and ($at - $t0).TotalSeconds -gt $MaxWaitSec) { return $null }
+        }
+        $state = Get-GraphicsActivityState -Sample $all[$i] -MediaFloorPercent $MediaFloorPercent -AudioUiFloorPercent $AudioUiFloorPercent
+        if ($playing -contains $state) {
+            if ($run -eq 0) { $runStart = $i }
+            $run++
+            if ($run -ge $DwellSamples) { return [int]$runStart }
+        } else {
+            $run = 0
+            $runStart = $null
+        }
+    }
+    return $null
+}
+
 function Get-NoWindowModeSummary {
     <#
     .SYNOPSIS
@@ -5279,6 +5811,8 @@ function Get-GraphicsBenchSessionSummary {
     $sessionSamples = @()
     $afterSamples = @()
     $transitionSamples = @()
+    $setupSamples = @()
+    $summary.SetupSpan = $null
     if ($null -ne $splitIndex -and $splitIndex -gt 0) {
         $idleSamples = @($Samples[0..($splitIndex - 1)])
         $sessionLast = $Samples.Count - 1
@@ -5286,7 +5820,27 @@ function Get-GraphicsBenchSessionSummary {
             $sessionLast = $endIndex - 1
             $afterSamples = @($Samples[$endIndex..($Samples.Count - 1)])
         }
-        $sessionSamples = @($Samples[$splitIndex..$sessionLast])
+        # THE SESSION STARTS AT THE AUDIO. The window change that ended the
+        # baseline is the tester opening Configure Session; the session arm
+        # opens where the player starts playing, and the stretch between is
+        # SETUP -- in neither arm. When no playback is seen, the window change
+        # stays the start and SessionStartSource says so.
+        $sessionFirst = $splitIndex
+        $playIndex = Get-GfxPlaybackStartIndex -Samples $Samples -FromIndex $splitIndex -ToIndex $sessionLast -MediaFloorPercent $MediaFloorPercent
+        if ($null -ne $playIndex) {
+            # Named only when it MOVED the start: playback on the very sample
+            # the window changed is the old split, and says so.
+            if ($playIndex -gt $splitIndex) {
+                $summary.SessionStartSource = 'playback-start'
+                $sessionFirst = $playIndex
+                $setupSamples = @($Samples[$splitIndex..($playIndex - 1)])
+                $summary.SessionStartUtc = $Samples[$playIndex].AtUtc
+                $setupSec = $null
+                try { $setupSec = [math]::Round(([datetime]$Samples[$playIndex].AtUtc - [datetime]$Samples[$splitIndex].AtUtc).TotalSeconds, 1) } catch { }
+                $summary.SetupSpan = @{ StartUtc = $Samples[$splitIndex].AtUtc; EndUtc = $Samples[$playIndex].AtUtc; DurationSec = $setupSec; Samples = $setupSamples.Count }
+            }
+        }
+        $sessionSamples = @($Samples[$sessionFirst..$sessionLast])
 
         # THE MANUAL TRANSITION COMES OUT OF THE SESSION ARM.
         #
@@ -5304,7 +5858,7 @@ function Get-GraphicsBenchSessionSummary {
             $tEnd = [datetime]$summary.TransitionSpan.EndUtc
             $tFrom = $null
             $tTo = $null
-            for ($i = $splitIndex; $i -le $sessionLast; $i++) {
+            for ($i = $sessionFirst; $i -le $sessionLast; $i++) {
                 $at = $null
                 try { $at = [datetime]$Samples[$i].AtUtc } catch { continue }
                 if ($at -ge $tStart -and $null -eq $tFrom) { $tFrom = $i }
@@ -5327,6 +5881,7 @@ function Get-GraphicsBenchSessionSummary {
     $transitionSec = $null
     if ($transitionSamples.Count -ge 2) { try { $transitionSec = [math]::Round(([datetime]$transitionSamples[$transitionSamples.Count - 1].AtUtc - [datetime]$transitionSamples[0].AtUtc).TotalSeconds, 1) } catch { } }
     $summary.ArmDurationSec.Transition = $transitionSec
+    $summary.ArmDurationSec.Setup = $(if ($summary.SetupSpan) { $summary.SetupSpan.DurationSec } else { $null })
 
     $idleSec = $null
     if ($idleSamples.Count -ge 2) { try { $idleSec = [math]::Round(([datetime]$idleSamples[$idleSamples.Count - 1].AtUtc - [datetime]$idleSamples[0].AtUtc).TotalSeconds, 1) } catch { } }
@@ -5746,7 +6301,10 @@ function Get-GraphicsBenchFindings {
             Result     = 'PASS'
             AppliesTo  = 'Graphics'
             Evidence   = $evidence
-            ActionHint = 'Upload the package so this box joins the comparison corpus.'
+            # The package is sent by the run itself when it stops; whether it
+            # arrived is on the Results step. An instruction to upload it by
+            # hand was left over from when sending was manual.
+            ActionHint = 'Nothing to fix. This recording can be compared with the other baseline recordings.'
         }
     }
 
@@ -6971,6 +7529,9 @@ Export-ModuleMember -Function @(
     'Resolve-GfxNoDisplay'
     'Test-GfxDisplaySetupMatch'
     'Get-GraphicsBenchPhase'
+    'Get-GraphicsBenchStepView'
+    'Get-GfxPlaybackStartIndex'
+    'Get-GraphicsBenchProtocolVersion'
     'Get-GraphicsBenchProfileOutcome'
     'Format-GraphicsClock'
     'Get-GraphicsBenchProfileDeviations'
