@@ -8145,6 +8145,13 @@ namespace WinConfigDiag {
         // An NO error dialog can sit on any monitor, so the whole virtual
         // desktop is taken rather than a guessed crop.
         public static void CaptureVirtualScreenJpeg(string path, long quality) {
+            System.IO.File.WriteAllBytes(path, CaptureVirtualScreenJpegBytes(quality));
+        }
+
+        // The same capture into memory. The NO-window sampler thread grabs
+        // the pixels the instant a dialog appears and hands the bytes to the
+        // drain, which alone decides whether they are ever written to disk.
+        public static byte[] CaptureVirtualScreenJpegBytes(long quality) {
             Rectangle area = SystemInformation.VirtualScreen;
             using (Bitmap bmp = new Bitmap(area.Width, area.Height)) {
                 using (Graphics g = Graphics.FromImage(bmp)) {
@@ -8156,7 +8163,10 @@ namespace WinConfigDiag {
                 }
                 using (EncoderParameters ep = new EncoderParameters(1)) {
                     ep.Param[0] = new EncoderParameter(Encoder.Quality, quality);
-                    bmp.Save(path, enc, ep);
+                    using (System.IO.MemoryStream ms = new System.IO.MemoryStream()) {
+                        bmp.Save(ms, enc, ep);
+                        return ms.ToArray();
+                    }
                 }
             }
         }
@@ -8291,11 +8301,23 @@ namespace WinConfigDiag {
                     # in data. Optional -- an older call site simply omits both
                     # fields from the record.
                     $AppearedWindows,
-                    $NoModalState
+                    $NoModalState,
+                    # Pixels already grabbed by the NO-window sampler thread at
+                    # the appearance instant, and when. A dialog can close before
+                    # the drain runs (capture 2E25CD93449C: a 2.2 s 'Cannot
+                    # connect the Arc' was gone when the loop-side grab fired,
+                    # ~4 s after it appeared), so the drain passes these instead
+                    # of grabbing the screen again.
+                    [byte[]]$PreCapturedJpeg,
+                    $CapturedAtUtc
                 )
                 if (-not $script:BtRec_ScreenshotEnabled) { return $false }
                 if (-not $RunFolder) { return $false }
                 $when = $(if ($At) { [datetime]$At } else { Get-Date })
+                # The sampler's timestamps are UTC; the tick events and the
+                # cooldown bookkeeping are local. One kind here, or a UTC trigger
+                # would skew the cooldown by the zone offset.
+                if ($when.Kind -eq [System.DateTimeKind]::Utc) { $when = $when.ToLocalTime() }
                 # Runaway backstop -- applies to EVERYTHING, high-value included.
                 # Not the tuning cap; a safety net so no fault storm can fill the
                 # disk. Well above any real run's shot count.
@@ -8331,20 +8353,35 @@ namespace WinConfigDiag {
                         [void](New-Item -ItemType Directory -Path $shotDir -Force)
                     }
                     $safeTrigger = if ($Trigger) { ($Trigger -replace '[^A-Za-z0-9_-]', '_') } else { 'event' }
-                    $shotName = "shot_{0}_{1}.jpg" -f $when.ToUniversalTime().ToString('yyyyMMdd_HHmmss_fff'), $safeTrigger
+                    # $when is the TRIGGER's time. The tick call sites pass the
+                    # event timestamp, and the grab can run seconds after it --
+                    # capture 2E25CD93449C stamped a shot 13:17:45 whose pixels
+                    # post-date a dialog that was on screen at 13:17:43. The file
+                    # name and AtUtc are the instant the PIXELS were taken; the
+                    # trigger time rides along as TriggerAtUtc.
+                    $preCaptured = ($null -ne $PreCapturedJpeg -and $PreCapturedJpeg.Length -gt 0 -and $null -ne $CapturedAtUtc)
+                    $capturedUtc = if ($preCaptured) { ([datetime]$CapturedAtUtc).ToUniversalTime() } else { [datetime]::UtcNow }
+                    $shotName = "shot_{0}_{1}.jpg" -f $capturedUtc.ToString('yyyyMMdd_HHmmss_fff'), $safeTrigger
                     $shotPath = Join-Path $shotDir $shotName
                     # Whole virtual screen, JPEG q85 (a full desktop PNG measured
                     # 6.4 MB on the dev box -- ~78 MB at the 12-shot cap -- against
                     # a dialog fully legible at ~1/10th of that). The capture
                     # itself is done in the compiled method to keep the Empire
                     # token pattern out of the PowerShell layer AMSI scans.
-                    [WinConfigDiag.ScreenGrab]::CaptureVirtualScreenJpeg($shotPath, [long]85)
+                    if ($preCaptured) { [System.IO.File]::WriteAllBytes($shotPath, $PreCapturedJpeg) }
+                    else { [WinConfigDiag.ScreenGrab]::CaptureVirtualScreenJpeg($shotPath, [long]85) }
                     $script:BtRec_ScreenshotsTaken  = [int]$script:BtRec_ScreenshotsTaken + 1
                     if ($HighValue) { $script:BtRec_ScreenshotsHighValue = [int]$script:BtRec_ScreenshotsHighValue + 1 }
                     $script:BtRec_LastScreenshotAt  = $when
                     if (Get-Command Add-WinConfigDiagnosticJsonLine -ErrorAction SilentlyContinue) {
                         $shotWrote = Add-WinConfigDiagnosticJsonLine -RunFolder $RunFolder -Name 'events.jsonl' -Data ([ordered]@{
-                            AtUtc             = $when.ToUniversalTime().ToString('o')
+                            AtUtc             = $capturedUtc.ToString('o')
+                            # When the triggering event happened, and how far
+                            # behind it the pixels are. A lag longer than the
+                            # dialog's LifetimeMs means the shot cannot show it.
+                            TriggerAtUtc      = $when.ToUniversalTime().ToString('o')
+                            CaptureLagMs      = [int]($capturedUtc - $when.ToUniversalTime()).TotalMilliseconds
+                            CaptureSource     = $(if ($preCaptured) { 'NoWindowSamplerThread' } else { 'RecordingLoop' })
                             Kind              = 'SCREENSHOT'
                             State             = 'Captured'
                             Level             = 'INFO'
@@ -8370,7 +8407,7 @@ namespace WinConfigDiag {
                         else { $script:BtRec_EventLinesWritten = [int]$script:BtRec_EventLinesWritten + 1 }
                     }
                     if (Get-Command Write-BtLog -ErrorAction SilentlyContinue) {
-                        Write-BtLog "  $($when.ToString('HH:mm:ss'))  [SHOT    ]  Screen captured ($Trigger) -> screenshots\$shotName" -Level 'DIM'
+                        Write-BtLog "  $($capturedUtc.ToLocalTime().ToString('HH:mm:ss'))  [SHOT    ]  Screen captured ($Trigger) -> screenshots\$shotName" -Level 'DIM'
                     }
                     return $true
                 } catch {
@@ -8618,6 +8655,14 @@ namespace WinConfigDiag {
                 @{ Pattern = '^Arc Not Detected';                                    Class = 'ErrorDialog';     Code = 12005 }
                 @{ Pattern = '^Arc Connection Lost';                                 Class = 'ErrorDialog';     Code = 12006 }
                 @{ Pattern = '^Bluetooth Error';                                     Class = 'ErrorDialog';     Code = 12012 }
+                # NO 4.0.0.10 retitled the connect failure 'Cannot connect the
+                # Arc' and moved the diagnosis into the body (namespace fault /
+                # port busy / timeout / auth failure / ... guidance). Capture
+                # 2E25CD93449C (MM06, 2026-09-24) fell to 'Other' on it. Its one
+                # observed instance showed NO Code 12005, but one title now
+                # fronts several remediation branches, so it implies no code --
+                # the code and the branch are body-only, i.e. screenshot-only.
+                @{ Pattern = '^Cannot connect the Arc';                              Class = 'ErrorDialog';     Code = $null }
                 @{ Pattern = 'New Headset Discovered Notification';                  Class = 'DiscoveryPrompt'; Code = $null }
                 @{ Pattern = '^Wake Up Arc';                                         Class = 'WakeStep';        Code = $null }
                 @{ Pattern = '^Device Details';                                      Class = 'Result';          Code = $null }
@@ -8668,7 +8713,23 @@ namespace WinConfigDiag {
                 # runspace can call it without loading anything itself.
                 if (-not (script:Initialize-BtWindowScan)) { return $false }
                 try {
-                    $control = [hashtable]::Synchronized(@{ Stop = $false; Error = $null; SampleCount = 0 })
+                    $control = [hashtable]::Synchronized(@{ Stop = $false; Error = $null; SampleCount = 0; PreShot = $false; NoShotPattern = $null; PreShotsTaken = 0; PreShotFailures = 0; PreShotCap = 40 })
+                    # Appearance-instant grab (capture 2E25CD93449C). The drain
+                    # runs on the tick-bound loop, so a dialog shot taken there
+                    # can land after the dialog closed. The thread grabs the
+                    # screen in the same pass that SEES the window and queues the
+                    # bytes with the row; the drain alone decides whether they
+                    # are written. Consent-gated on the LOCKED opt-in (locked
+                    # before observation starts, so it is settled here), and the
+                    # grab is the compiled ScreenGrab type -- compiled on this
+                    # thread first, like WindowScan. Titles the drain would never
+                    # photograph (NO's launch parade, the routine lexicon
+                    # classes) are skipped so the thread does not grab for them.
+                    if ($script:BtRec_ScreenshotEnabled -and (script:Initialize-BtScreenCapture)) {
+                        $noShot = @('^(NeurOptimal|Splashscreen|Refreshing Licensing)') + @($script:BtNoWindowLexicon | Where-Object { $_.Class -notin @('ErrorDialog', 'DiscoveryPrompt') } | ForEach-Object { [string]$_.Pattern })
+                        $control.NoShotPattern = (@($noShot | ForEach-Object { "(?:$_)" }) -join '|')
+                        $control.PreShot = $true
+                    }
                     $queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
                     # The runspace script is self-contained on purpose: script:
                     # functions and $script: state belong to the UI thread's
@@ -8714,16 +8775,49 @@ namespace WinConfigDiag {
                                     }
                                 }
                                 $Control.SampleCount = [int]$Control.SampleCount + 1
+                                # Windows new in THIS pass (every window on the
+                                # first pass), and whether any is one the drain
+                                # might photograph. One grab serves the whole
+                                # pass: a LabVIEW dialog and its Backdrop clone
+                                # appear together.
+                                $fresh = @(foreach ($k in $cur.Keys) { if ($baselineDone -and $prev.ContainsKey($k)) { continue }; $k })
+                                $shotJpeg = $null
+                                $shotAtUtc = $null
+                                if ($Control.PreShot -and [int]$Control.PreShotsTaken -lt [int]$Control.PreShotCap -and
+                                    @($fresh | Where-Object { [string]$cur[$_].Title -notmatch [string]$Control.NoShotPattern }).Count -gt 0) {
+                                    try {
+                                        $shotAtUtc = [datetime]::UtcNow
+                                        $shotJpeg = [WinConfigDiag.ScreenGrab]::CaptureVirtualScreenJpegBytes([long]85)
+                                        $Control.PreShotsTaken = [int]$Control.PreShotsTaken + 1
+                                    } catch {
+                                        # The drain falls back to its own grab.
+                                        $shotJpeg = $null
+                                        $shotAtUtc = $null
+                                        $Control.PreShotFailures = [int]$Control.PreShotFailures + 1
+                                    }
+                                }
                                 if (-not $baselineDone) {
                                     foreach ($k in $cur.Keys) { $firstSeen[$k] = $null }
+                                    # A dialog already open at the first sample
+                                    # has no Appeared row and so was never shot
+                                    # (capture 2E25CD93449C: the operator's own
+                                    # screenshot is the only record of the first
+                                    # 12005). 'Present' items carry the grab to
+                                    # the drain; they write no timeline row.
+                                    if ($shotJpeg) {
+                                        foreach ($k in $fresh) {
+                                            $w = $cur[$k]
+                                            if ([string]$w.Title -match [string]$Control.NoShotPattern) { continue }
+                                            $Queue.Enqueue(@{ AtUtc = $nowUtc; State = 'Present'; Hwnd = $w.Hwnd; Title = $w.Title; Enabled = $w.Enabled; Baseline = $true; LifetimeMs = $null; ShotJpeg = $shotJpeg; ShotAtUtc = $shotAtUtc })
+                                        }
+                                    }
                                     $prev = $cur
                                     $baselineDone = $true
                                 } else {
-                                    foreach ($k in $cur.Keys) {
-                                        if ($prev.ContainsKey($k)) { continue }
+                                    foreach ($k in $fresh) {
                                         $firstSeen[$k] = $nowUtc
                                         $w = $cur[$k]
-                                        $Queue.Enqueue(@{ AtUtc = $nowUtc; State = 'Appeared'; Hwnd = $w.Hwnd; Title = $w.Title; Enabled = $w.Enabled; Baseline = $false; LifetimeMs = $null })
+                                        $Queue.Enqueue(@{ AtUtc = $nowUtc; State = 'Appeared'; Hwnd = $w.Hwnd; Title = $w.Title; Enabled = $w.Enabled; Baseline = $false; LifetimeMs = $null; ShotJpeg = $shotJpeg; ShotAtUtc = $shotAtUtc })
                                     }
                                     foreach ($k in $prev.Keys) {
                                         if ($cur.ContainsKey($k)) { continue }
@@ -8810,6 +8904,19 @@ namespace WinConfigDiag {
                     while ($st.Queue.TryDequeue([ref]$item)) {
                         $w = $item
                         $cls = script:Get-BtNoWindowClass -Title $w.Title
+                        if ($w.State -eq 'Present') {
+                            # A dialog already open at the first sample: no
+                            # timeline row (baseline windows only ever get a
+                            # Gone row), but the same consent-gated, deduped
+                            # immediate shot an appearance would have fired.
+                            if ($cls -in @('ErrorDialog', 'DiscoveryPrompt') -and $script:BtRec_ScreenshotEnabled -and $RunFolder -and
+                                -not $script:BtRec_SeenNoWindows.Contains([long]$w.Hwnd)) {
+                                [void]$script:BtRec_SeenNoWindows.Add([long]$w.Hwnd)
+                                $shot = script:Invoke-BtEventScreenshot -RunFolder $RunFolder -Trigger 'NoDialogOpenAtStart' -HighValue -At $w.AtUtc -PreCapturedJpeg $w.ShotJpeg -CapturedAtUtc $w.ShotAtUtc -AppearedWindows @([pscustomobject]@{ Hwnd = [long]$w.Hwnd; Enabled = [bool]$w.Enabled; Title = [string]$w.Title })
+                                if ($shot) { $st.ShotsFired = [int]$st.ShotsFired + 1 }
+                            }
+                            continue
+                        }
                         $utc = ([datetime]$w.AtUtc).ToString('o')
                         # The two automations that retire the routine operator
                         # Mark (operator-requested 2026-08-26): the NO code,
@@ -8941,7 +9048,7 @@ namespace WinConfigDiag {
                             # reason errors do: the payload (device name + MAC)
                             # is in the BODY, which only a screenshot records.
                             [void]$script:BtRec_SeenNoWindows.Add([long]$w.Hwnd)
-                            $shot = script:Invoke-BtEventScreenshot -RunFolder $RunFolder -Trigger 'NoDialogAppeared' -HighValue -AppearedWindows @([pscustomobject]@{ Hwnd = [long]$w.Hwnd; Enabled = [bool]$w.Enabled; Title = [string]$w.Title })
+                            $shot = script:Invoke-BtEventScreenshot -RunFolder $RunFolder -Trigger 'NoDialogAppeared' -HighValue -At $w.AtUtc -PreCapturedJpeg $w.ShotJpeg -CapturedAtUtc $w.ShotAtUtc -AppearedWindows @([pscustomobject]@{ Hwnd = [long]$w.Hwnd; Enabled = [bool]$w.Enabled; Title = [string]$w.Title })
                             if ($shot) { $st.ShotsFired = [int]$st.ShotsFired + 1 }
                         }
                         # Safety net for windows the lexicon cannot key: the
@@ -8965,7 +9072,7 @@ namespace WinConfigDiag {
                             $st.UnknownShotTitles[[string]$w.Title] = $true
                             $st.UnknownShotCount = [int]$st.UnknownShotCount + 1
                             [void]$script:BtRec_SeenNoWindows.Add([long]$w.Hwnd)
-                            $shot = script:Invoke-BtEventScreenshot -RunFolder $RunFolder -Trigger 'NoUnknownWindowAppeared' -HighValue -AppearedWindows @([pscustomobject]@{ Hwnd = [long]$w.Hwnd; Enabled = [bool]$w.Enabled; Title = [string]$w.Title })
+                            $shot = script:Invoke-BtEventScreenshot -RunFolder $RunFolder -Trigger 'NoUnknownWindowAppeared' -HighValue -At $w.AtUtc -PreCapturedJpeg $w.ShotJpeg -CapturedAtUtc $w.ShotAtUtc -AppearedWindows @([pscustomobject]@{ Hwnd = [long]$w.Hwnd; Enabled = [bool]$w.Enabled; Title = [string]$w.Title })
                             if ($shot) { $st.ShotsFired = [int]$st.ShotsFired + 1 }
                         }
                     }
@@ -12847,6 +12954,14 @@ namespace WinConfigDiag {
                         ErrorDialogTitles     = $btNwst.ErrorTitles
                         ShortestErrorDialogMs = $btNwst.ShortestErrorDialogMs
                         ShotsFired            = [int]$btNwst.ShotsFired
+                        # Appearance-instant grabs by the sampler thread (the
+                        # drain keeps only those it would have shot anyway).
+                        # PreShotArmed false = screenshots declined or the
+                        # capture backend unavailable; every dialog shot then
+                        # came from the loop and may trail the dialog.
+                        PreShotArmed          = [bool]$btNwst.Control.PreShot
+                        PreShotsTaken         = [int]$btNwst.Control.PreShotsTaken
+                        PreShotFailures       = [int]$btNwst.Control.PreShotFailures
                         EventLinesWritten     = [int]$btNwst.EventLinesWritten
                         EventLinesSuppressed  = [int]$btNwst.EventLinesSuppressed
                         # Build provenance (audit 2026-09-14). The lexicon
