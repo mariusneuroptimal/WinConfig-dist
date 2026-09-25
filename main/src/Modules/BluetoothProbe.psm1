@@ -6164,7 +6164,10 @@ function Initialize-SerialOpenApi {
         if (-not ([System.Management.Automation.PSTypeName]'WinConfigSerialOpen').Type) {
             Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 public static class WinConfigSerialOpen {
     const uint GENERIC_READ  = 0x80000000;
     const uint GENERIC_WRITE = 0x40000000;
@@ -6190,6 +6193,93 @@ public static class WinConfigSerialOpen {
         CloseHandle(h);
         return 0;
     }
+
+    // Deadline-bounded variant (2026-09-24). See Initialize-SerialOpenDeadlineApi.
+    // Runs TryOpen -- the SAME single CreateFile above, never a second copy --
+    // on its own thread and waits at most deadlineMs. A port whose previous
+    // open is still running is never opened again (AlreadyInFlight). An
+    // abandoned open still finishes and closes its handle; its real code and
+    // duration are queued for DrainLate.
+    public const int DeadlineElapsed = -1;
+    public const int AlreadyInFlight = -2;
+
+    public sealed class LateResult {
+        public string PortName;
+        public string Phase;
+        public DateTime StartedUtc;
+        public double ElapsedMs;
+        public int Win32Error;
+    }
+
+    // Test seam: a test installs a deliberately slow opener to exercise the
+    // real threading. Production never assigns it.
+    public static Func<string, int> Opener = TryOpen;
+
+    static readonly object Gate = new object();
+    static readonly Dictionary<string, bool> InFlight = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+    static readonly Queue<LateResult> Late = new Queue<LateResult>();
+    const int MaxLate = 256;
+    static int droppedLate = 0;
+
+    public static int OpenWithDeadline(string portName, int deadlineMs, string phase, out double elapsedMs) {
+        DateTime started = DateTime.UtcNow;
+        Stopwatch sw = Stopwatch.StartNew();
+        int[] result = new int[] { int.MinValue };
+        double[] resultMs = new double[] { 0 };
+        bool[] abandoned = new bool[] { false };
+        Func<string, int> opener = Opener ?? TryOpen;
+
+        lock (Gate) {
+            bool busy;
+            if (InFlight.TryGetValue(portName, out busy) && busy) { elapsedMs = 0; return AlreadyInFlight; }
+            InFlight[portName] = true;
+        }
+
+        Task t = new Task(delegate {
+            int code;
+            try { code = opener(portName); } catch { code = 31; }
+            double ms = sw.Elapsed.TotalMilliseconds;
+            lock (Gate) {
+                result[0] = code;
+                resultMs[0] = ms;
+                InFlight[portName] = false;
+                if (abandoned[0]) {
+                    if (Late.Count >= MaxLate) { Late.Dequeue(); droppedLate++; }
+                    LateResult lr = new LateResult();
+                    lr.PortName = portName; lr.Phase = phase; lr.StartedUtc = started;
+                    lr.ElapsedMs = ms; lr.Win32Error = code;
+                    Late.Enqueue(lr);
+                }
+            }
+        }, TaskCreationOptions.LongRunning);
+        t.Start();
+        t.Wait(deadlineMs < 0 ? 0 : deadlineMs);
+
+        lock (Gate) {
+            if (result[0] != int.MinValue) { elapsedMs = resultMs[0]; return result[0]; }
+            abandoned[0] = true;
+            elapsedMs = sw.Elapsed.TotalMilliseconds;
+            return DeadlineElapsed;
+        }
+    }
+
+    public static LateResult[] DrainLate() {
+        lock (Gate) {
+            LateResult[] all = Late.ToArray();
+            Late.Clear();
+            return all;
+        }
+    }
+
+    public static int InFlightCount() {
+        lock (Gate) {
+            int n = 0;
+            foreach (bool b in InFlight.Values) { if (b) { n++; } }
+            return n;
+        }
+    }
+
+    public static int DroppedLateCount() { lock (Gate) { return droppedLate; } }
 }
 '@ -ErrorAction Stop
         }
@@ -6198,6 +6288,92 @@ public static class WinConfigSerialOpen {
     } catch {
         return $false
     }
+}
+
+function Initialize-SerialOpenDeadlineApi {
+    <#
+    .SYNOPSIS
+        Makes the deadline-bounded open available. Idempotent.
+    .DESCRIPTION
+        WHY THIS EXISTS (2026-09-24, TDUNN_03 capture 451347689098). A single
+        recorder tick took 98.4 s, 97.5 s of it inside the port opens: both of
+        the Arc's channels answered win32 87, the ~33 s blocking class, and the
+        tick opened them one after the other on the UI thread. For that minute
+        and a half the recorder window froze, two screenshots came out
+        byte-identical, every timestamp in the stretch was late -- and the
+        probe's own RFCOMM connect was in flight while NO.exe's Get Details
+        failed 12005 "Connect Known Ports timed out". A synchronous CreateFile
+        cannot be interrupted from here, so the wait is bounded instead:
+
+          * The open runs on its own thread; the caller waits at most DeadlineMs.
+          * A port whose previous open is STILL IN FLIGHT is never opened again
+            -- the call returns AlreadyInFlight without touching the port. This
+            is what stops a slow port piling up connects tick after tick.
+          * An abandoned open still finishes (and still closes its handle
+            immediately, exactly like TryOpen). Its real code and real duration
+            are queued and handed back by DrainLate, so the evidence arrives a
+            tick late rather than being lost.
+
+        The deadline members live on WinConfigSerialOpen and call its TryOpen,
+        so there is still exactly ONE CreateFile declaration and one call to it
+        (SerialRawOpenAttempt.Tests.ps1 pins both). A process that loaded an
+        OLDER WinConfigSerialOpen (a long-lived dev shell) lacks the members;
+        this returns $false there and every caller falls back to the blocking
+        open, which is the pre-existing behaviour.
+    .OUTPUTS
+        [bool]
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    if ($script:SerialOpenDeadlineApiAvailable) { return $true }
+    if (-not (Initialize-SerialOpenApi)) { return $false }
+    if (-not [WinConfigSerialOpen].GetMethod('OpenWithDeadline')) { return $false }
+    $script:SerialOpenDeadlineApiAvailable = $true
+    return $true
+}
+
+function Get-SerialOpenLateResults {
+    <#
+    .SYNOPSIS
+        Drains the opens that outlived their deadline and returns them as
+        ordinary WinConfig.Serial.OpenAttempt observations, stamped Late.
+    .DESCRIPTION
+        An abandoned open is not a lost measurement -- it finishes on its own
+        thread with a real win32 code and a real duration (a 121 at ~5 s, an 87
+        at ~33 s). Those are exactly the codes the PORTWHY classifier exists
+        for, so they are handed back rather than dropped. TimestampIso is when
+        the open STARTED and ElapsedMs is how long it really took, so the
+        observation describes the attempt, not the moment it was collected.
+        Late = $true tells every consumer this is a previous tick's attempt and
+        must not be read as the port's state NOW.
+    .OUTPUTS
+        [pscustomobject[]] WinConfig.Serial.OpenAttempt, possibly empty.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:SerialOpenDeadlineApiAvailable) { return @() }
+    $out = @()
+    foreach ($r in @([WinConfigSerialOpen]::DrainLate())) {
+        $out += [pscustomobject]@{
+            PSTypeName     = 'WinConfig.Serial.OpenAttempt'
+            PortName       = $r.PortName
+            Role           = $null
+            Phase          = $r.Phase
+            TimestampIso   = $r.StartedUtc.ToString('o')
+            Attempted      = $true
+            Win32Error     = [int]$r.Win32Error
+            ElapsedMs      = [math]::Round($r.ElapsedMs, 1)
+            HandleAcquired = ($r.Win32Error -eq 0)
+            CoarseState    = (Get-SerialOpenCoarseState -Win32Error $r.Win32Error)
+            Contract       = 'CreateFileRawWin32/v1'
+            Unavailable    = $null
+            Late           = $true
+        }
+    }
+    return $out
 }
 
 function Invoke-SerialRawOpenAttempt {
@@ -6234,6 +6410,18 @@ function Invoke-SerialRawOpenAttempt {
         Which part of the recording this attempt came from: Selection, Startup,
         Tick or Anomaly. Recorded because a report built from ticks alone drops
         the COLD opens, which are the slowest on a Bluetooth SPP port.
+    .PARAMETER DeadlineMs
+        0 (the default) blocks until the open returns, which is what the
+        operator-driven probe wants. A positive value bounds the wait: see
+        Initialize-SerialOpenDeadlineApi. Two extra outcomes then exist, both
+        with CoarseState 'Pending' and Win32Error $null -- the code is not known
+        yet, and must never read as 0 ("opened"):
+          DeadlineExceeded  the open is still running on its own thread; its
+                            real code arrives later via Get-SerialOpenLateResults.
+          InFlightSkipped   the previous open of this port had not finished, so
+                            NOTHING was opened (Attempted = $false).
+        A Pending port was NOT held by another process at the attempt: a held
+        port refuses at the sharing check in ~0 ms and returns 5.
     .OUTPUTS
         [pscustomobject] WinConfig.Serial.OpenAttempt
     #>
@@ -6241,10 +6429,55 @@ function Invoke-SerialRawOpenAttempt {
     param(
         [Parameter(Mandatory)][string]$PortName,
         [string]$Role,
-        [string]$Phase = 'Tick'
+        [string]$Phase = 'Tick',
+        [int]$DeadlineMs = 0
     )
 
     $attemptedAt = (Get-Date).ToUniversalTime()
+
+    if ($DeadlineMs -gt 0 -and (Initialize-SerialOpenDeadlineApi)) {
+        $elapsed = [double]0
+        $code = [WinConfigSerialOpen]::OpenWithDeadline($PortName, $DeadlineMs, [string]$Phase, [ref]$elapsed)
+        $pendingKind = switch ($code) {
+            ([WinConfigSerialOpen]::DeadlineElapsed) { 'DeadlineExceeded' }
+            ([WinConfigSerialOpen]::AlreadyInFlight) { 'InFlightSkipped' }
+            default { $null }
+        }
+        if ($pendingKind) {
+            return [pscustomobject]@{
+                PSTypeName       = 'WinConfig.Serial.OpenAttempt'
+                PortName         = $PortName
+                Role             = $Role
+                Phase            = $Phase
+                TimestampIso     = $attemptedAt.ToString('o')
+                Attempted        = ($pendingKind -eq 'DeadlineExceeded')
+                Win32Error       = $null
+                ElapsedMs        = [math]::Round($elapsed, 1)
+                HandleAcquired   = $false
+                CoarseState      = 'Pending'
+                Contract         = 'CreateFileRawWin32/v1'
+                Unavailable      = $null
+                DeadlineMs       = $DeadlineMs
+                DeadlineExceeded = ($pendingKind -eq 'DeadlineExceeded')
+                InFlightSkipped  = ($pendingKind -eq 'InFlightSkipped')
+            }
+        }
+        return [pscustomobject]@{
+            PSTypeName     = 'WinConfig.Serial.OpenAttempt'
+            PortName       = $PortName
+            Role           = $Role
+            Phase          = $Phase
+            TimestampIso   = $attemptedAt.ToString('o')
+            Attempted      = $true
+            Win32Error     = [int]$code
+            ElapsedMs      = [math]::Round($elapsed, 1)
+            HandleAcquired = ($code -eq 0)
+            CoarseState    = (Get-SerialOpenCoarseState -Win32Error $code)
+            Contract       = 'CreateFileRawWin32/v1'
+            Unavailable    = $null
+            DeadlineMs     = $DeadlineMs
+        }
+    }
 
     if (-not (Initialize-SerialOpenApi)) {
         # ABSENT, not healthy. There is no win32 code because no attempt was
@@ -9138,6 +9371,8 @@ Export-ModuleMember -Function @(
     # P/Invoke -- two implementations of "what does opening this port do" would
     # be two answers to one question.
     'Invoke-SerialRawOpenAttempt',
+    'Initialize-SerialOpenDeadlineApi',
+    'Get-SerialOpenLateResults',
     'Get-SerialOpenCoarseState',
     'Invoke-RevealHiddenBluetoothDevices',
     'Invoke-BluetoothGhostCOMCleanup',

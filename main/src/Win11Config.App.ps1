@@ -11116,9 +11116,21 @@ namespace WinConfigDiag {
                         # ACCEPTED events only -- the batch dedup has already
                         # run, so a re-queried overlap row cannot double-count.
                         if ($btProbeSession -and $btProbeTargetMac -and (Get-Command Add-BtAuthFailureObservation -ErrorAction SilentlyContinue)) {
+                            $overlapBefore = if ($btProbeSession.ContainsKey('BtAuthFailureOverlapCount') -and $null -ne $btProbeSession.BtAuthFailureOverlapCount) { [int]$btProbeSession.BtAuthFailureOverlapCount } else { 0 }
                             $newAuthFails = Add-BtAuthFailureObservation -Session $btProbeSession -Events @($mergeResult.AcceptedEvents) -TargetMac $btProbeTargetMac
                             if ($newAuthFails -gt 0 -and $renderLive) {
-                                Write-BtLog "  [!] $newAuthFails mutual-authentication failure(s) against the target headset (BTHUSB Event 16) -- bond suspect" -Level FAIL
+                                # Split by attribution (2026-09-24): a row logged
+                                # while the recorder's own open was in flight may
+                                # be the recorder's connect, not NO.exe's.
+                                $overlapAfter = if ($btProbeSession.ContainsKey('BtAuthFailureOverlapCount') -and $null -ne $btProbeSession.BtAuthFailureOverlapCount) { [int]$btProbeSession.BtAuthFailureOverlapCount } else { 0 }
+                                $overlapNew = $overlapAfter - $overlapBefore
+                                $independentNew = $newAuthFails - $overlapNew
+                                if ($independentNew -gt 0) {
+                                    $ovTail = if ($overlapNew -gt 0) { "; $overlapNew more during the recorder's own port opens, not counted" } else { '' }
+                                    Write-BtLog "  [!] $independentNew mutual-authentication failure(s) against the target headset (BTHUSB Event 16) outside the recorder's own port opens -- bond suspect$ovTail" -Level FAIL
+                                } else {
+                                    Write-BtLog "  [~] $newAuthFails mutual-authentication failure(s) against the target headset (BTHUSB Event 16), all during the recorder's own port opens -- not attributable, no bond reading" -Level WARN
+                                }
                             }
                         }
                     }

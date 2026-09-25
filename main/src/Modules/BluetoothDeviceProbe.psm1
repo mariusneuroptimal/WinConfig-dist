@@ -1031,18 +1031,37 @@ function Get-ComPortOpenObservation {
     param(
         [Parameter(Mandatory)][string]$PortName,
         [string]$Role,
-        [string]$Phase = 'Tick'
+        [string]$Phase = 'Tick',
+        # 0 = block until the open returns (every pre-existing caller). The
+        # recorder's tick passes a bound; see Initialize-SerialOpenDeadlineApi.
+        # The legacy SerialPort fallback below cannot honour it and stays
+        # blocking -- stated, not hidden.
+        [int]$DeadlineMs = 0
     )
 
-    if (Get-Command Invoke-SerialRawOpenAttempt -ErrorAction SilentlyContinue) {
-        $raw = Invoke-SerialRawOpenAttempt -PortName $PortName -Role $Role -Phase $Phase
+    $rawCmd = Get-Command Invoke-SerialRawOpenAttempt -ErrorAction SilentlyContinue
+    if ($rawCmd) {
+        $raw = if ($DeadlineMs -gt 0 -and $rawCmd.Parameters.ContainsKey('DeadlineMs')) {
+            Invoke-SerialRawOpenAttempt -PortName $PortName -Role $Role -Phase $Phase -DeadlineMs $DeadlineMs
+        } else {
+            Invoke-SerialRawOpenAttempt -PortName $PortName -Role $Role -Phase $Phase
+        }
         # PRESENCE OF THE FUNCTION IS NOT SUCCESS OF THE API. When
         # Initialize-SerialOpenApi cannot Add-Type, the primitive still returns
         # -- with Attempted = $false and no code. Returning that here would have
         # meant NO open was made at all and the coarse state read 'Unknown',
         # which is a silently degraded capture: exactly what the fallback exists
         # to prevent, and what this branch previously did.
-        if ($raw -and $raw.Attempted) { return $raw }
+        #
+        # An in-flight skip is ALSO Attempted = $false, but for the opposite
+        # reason: the API is fine and the port is still busy with our previous
+        # open. Falling through to the blocking legacy open there would be the
+        # exact pile-up the in-flight guard exists to prevent.
+        $inFlight = $raw -and $raw.PSObject.Properties['InFlightSkipped'] -and $raw.InFlightSkipped
+        if ($raw -and ($raw.Attempted -or $inFlight)) {
+            if ($raw.Attempted) { Add-OwnOpenWindow -Observation $raw }
+            return $raw
+        }
     }
 
     # --- Legacy path: coarse state only, and it says so. ---
@@ -1066,7 +1085,7 @@ function Get-ComPortOpenObservation {
     }
     $sw.Stop()
 
-    return [pscustomobject]@{
+    $legacy = [pscustomobject]@{
         PSTypeName     = 'WinConfig.Serial.OpenAttempt'
         PortName       = $PortName
         Role           = $Role
@@ -1080,6 +1099,208 @@ function Get-ComPortOpenObservation {
         Contract       = 'SerialPortLegacy/v1'
         Unavailable    = 'Raw win32 code not observable through System.IO.Ports'
     }
+    Add-OwnOpenWindow -Observation $legacy
+    return $legacy
+}
+
+# ── Own-open window log ──────────────────────────────────────────────────────
+# WHY (2026-09-24, TDUNN_03 capture 451347689098). The recorder annotated a 1231
+# with "3 target-matched mutual-authentication failure(s) -- displaced-bond
+# signature ... Re-pairing here will break that other system". Every one of
+# those Event 16 rows -- and the two after them -- fell inside one of the
+# recorder's OWN in-flight opens of the Arc's ports, while NO.exe was also
+# connecting. An open is an RFCOMM connect over the air; a rejected key on OUR
+# connect writes the same Event 16 as a rejected key on NO's. So the count the
+# annotation stood on could not be attributed, and the advice it gave (do not
+# re-pair) was a verdict built on evidence the probe may have written itself.
+#
+# This is the record that makes the attribution checkable: when each of our
+# opens started and when it ended. Module-scoped rather than on the session
+# because the opens happen in four places (selection, startup, tick, anomaly)
+# and only two of them carry a session. Reset by New-DeviceProbeSession, so a
+# recording only ever judges its own opens.
+#
+# An open still running (deadline exceeded, result not back) has EndUtc $null and
+# is treated as open until it is closed -- the conservative reading.
+$script:OwnOpenWindows        = New-Object System.Collections.Generic.List[object]
+$script:OwnOpenWindowsMax     = 4000
+$script:OwnOpenWindowsDropped = 0
+
+function Add-OwnOpenWindow {
+    <#
+    .SYNOPSIS
+        Records the wall-clock window of one of the recorder's own port opens.
+        Tolerant: a malformed observation is ignored, never thrown on.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()]$Observation)
+
+    if ($null -eq $Observation) { return }
+    $names = @($Observation.PSObject.Properties.Name)
+    if (-not ($names -contains 'PortName')) { return }
+    if (-not ($names -contains 'TimestampIso') -or -not $Observation.TimestampIso) { return }
+    $start = $null
+    try { $start = ([datetime]::Parse([string]$Observation.TimestampIso, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime() } catch { return }
+    $pending = ($names -contains 'CoarseState') -and ([string]$Observation.CoarseState -eq 'Pending')
+    $ms = if ($names -contains 'ElapsedMs' -and $null -ne $Observation.ElapsedMs) { [double]$Observation.ElapsedMs } else { [double]0 }
+    $end = if ($pending) { $null } else { $start.AddMilliseconds($ms) }
+
+    if ($script:OwnOpenWindows.Count -ge $script:OwnOpenWindowsMax) {
+        # Bounded, and the drop is COUNTED -- same rule as every other bounded
+        # list in this module. Oldest first: the overlap test only ever asks
+        # about recent events.
+        $script:OwnOpenWindows.RemoveAt(0)
+        $script:OwnOpenWindowsDropped++
+    }
+    $script:OwnOpenWindows.Add([pscustomobject]@{
+        Port     = [string]$Observation.PortName
+        Phase    = $(if ($names -contains 'Phase') { [string]$Observation.Phase } else { '' })
+        StartUtc = $start
+        EndUtc   = $end
+    })
+}
+
+function Close-OwnOpenWindow {
+    <#
+    .SYNOPSIS
+        Closes the still-open window of an abandoned open when its late result
+        arrives, using the late result's real duration.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()]$LateObservation)
+
+    if ($null -eq $LateObservation -or -not $LateObservation.PSObject.Properties['TimestampIso'] -or -not $LateObservation.TimestampIso) { return }
+    $start = $null
+    try { $start = ([datetime]::Parse([string]$LateObservation.TimestampIso, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime() } catch { return }
+    $ms = if ($LateObservation.PSObject.Properties['ElapsedMs'] -and $null -ne $LateObservation.ElapsedMs) { [double]$LateObservation.ElapsedMs } else { [double]0 }
+    # Match on port + start within a second: the native side stamps its own
+    # start a few ms after the PowerShell side does.
+    foreach ($w in $script:OwnOpenWindows) {
+        if ($null -eq $w.EndUtc -and $w.Port -eq [string]$LateObservation.PortName -and
+            [math]::Abs(($w.StartUtc - $start).TotalMilliseconds) -le 1000) {
+            $w.EndUtc = $w.StartUtc.AddMilliseconds($ms)
+            return
+        }
+    }
+    # No pending window found (log reset, or dropped by the bound): record the
+    # finished attempt so the overlap test still sees it.
+    $script:OwnOpenWindows.Add([pscustomobject]@{ Port = [string]$LateObservation.PortName; Phase = $(if ($LateObservation.PSObject.Properties['Phase']) { [string]$LateObservation.Phase } else { '' }); StartUtc = $start; EndUtc = $start.AddMilliseconds($ms) })
+}
+
+function Get-OwnOpenWindows {
+    <#
+    .SYNOPSIS
+        Returns a snapshot of the recorder's own open windows (oldest first).
+    #>
+    [CmdletBinding()]
+    param()
+    return @($script:OwnOpenWindows.ToArray())
+}
+
+function Reset-OwnOpenWindows {
+    <#
+    .SYNOPSIS
+        Clears the own-open log, keeping any open that started within the last
+        KeepRecentSeconds or is still running. Called by New-DeviceProbeSession.
+    .DESCRIPTION
+        Not a plain Clear(): the App's candidate-selection opens run moments
+        BEFORE the session is constructed, and the event log commits late, so an
+        Event 16 written by one of those opens can arrive inside the recording.
+        Forgetting that open would count its row as independent evidence -- the
+        exact error this log exists to prevent. Anything older than the window
+        belongs to an earlier recording and is dropped.
+    #>
+    [CmdletBinding()]
+    param(
+        [double]$KeepRecentSeconds = 120,
+        [datetime]$Now = ((Get-Date).ToUniversalTime())
+    )
+    $cutoff = $Now.ToUniversalTime().AddSeconds(-$KeepRecentSeconds)
+    $keep = @($script:OwnOpenWindows | Where-Object { $null -eq $_.EndUtc -or $_.StartUtc -ge $cutoff })
+    $script:OwnOpenWindows.Clear()
+    foreach ($w in $keep) { $script:OwnOpenWindows.Add($w) }
+    $script:OwnOpenWindowsDropped = 0
+}
+
+function Test-EventOverlapsOwnOpen {
+    <#
+    .SYNOPSIS
+        Pure. $true when an event instant falls inside (or just after) one of
+        the recorder's own open windows.
+    .DESCRIPTION
+        The window is widened asymmetrically. 0.5 s BEFORE the open started
+        covers clock skew between our Get-Date and the kernel's event stamp; an
+        event earlier than that cannot have been caused by an open that had not
+        begun. 3 s AFTER it ended covers the stack logging the rejection after
+        CreateFile has already returned. An open with no end yet is open until
+        -Now.
+
+        Overlap does NOT mean the recorder caused the event -- NO.exe may have
+        been connecting at the same moment, and in the TDUNN capture it was. It
+        means the event cannot be ATTRIBUTED, which is the only claim the
+        displaced-bond reading needs to stop making.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)][datetime]$EventUtc,
+        [AllowEmptyCollection()][array]$Windows = @(),
+        [datetime]$Now = ((Get-Date).ToUniversalTime()),
+        [double]$LeadSeconds = 0.5,
+        [double]$TrailSeconds = 3.0
+    )
+
+    $t = $EventUtc.ToUniversalTime()
+    foreach ($w in @($Windows)) {
+        if ($null -eq $w -or $null -eq $w.StartUtc) { continue }
+        $s = ([datetime]$w.StartUtc).ToUniversalTime().AddSeconds(-$LeadSeconds)
+        $e = if ($null -ne $w.EndUtc) { ([datetime]$w.EndUtc).ToUniversalTime() } else { $Now.ToUniversalTime() }
+        $e = $e.AddSeconds($TrailSeconds)
+        if ($t -ge $s -and $t -le $e) { return $true }
+    }
+    return $false
+}
+
+function Test-ExpensiveOpenFailure {
+    <#
+    .SYNOPSIS
+        Pure. $true for an open outcome that cost an over-the-air connect
+        attempt and told us nothing new -- the shape the failure backoff exists
+        to stop repeating.
+    .DESCRIPTION
+        The throttle's original premise was "a DENIED open is free (~0 ms, no
+        handle)". That holds for a sharing violation (5: someone holds the
+        port) and for the fast local refusals (2, 433: the symlink or the
+        target is gone, answered in 0-2 ms). It is FALSE for the codes the
+        TDUNN_03 capture spent its time in:
+          121   no answer in ~5 s   -- a connect attempt that timed out
+          87    ~33 s blocking      -- the recorder's worst case
+          1231  RFCOMM refused      -- the connect reached the Arc and was
+                                       rejected; on a key mismatch each one is
+                                       an authentication attempt (Event 16)
+        Any Unavailable answer that took >= 1 s is counted too, so a code this
+        list does not name still backs off if it was slow. A Pending result
+        (deadline exceeded, or our previous open still in flight) is the most
+        expensive shape of all and always counts.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]$Observation,
+        [double]$SlowMs = 1000
+    )
+
+    if ($null -eq $Observation) { return $false }
+    # Property reads through PSObject: StrictMode is on for this module and a
+    # test mock or an older observation may lack any of these.
+    $p = $Observation.PSObject.Properties
+    $state = if ($p['CoarseState']) { [string]$p['CoarseState'].Value } else { '' }
+    if ($state -eq 'Pending') { return $true }
+    if ($state -ne 'Unavailable') { return $false }
+    $code = if ($p['Win32Error']) { $p['Win32Error'].Value } else { $null }
+    if ($null -ne $code -and [int]$code -in @(121, 87, 1231)) { return $true }
+    $ms = if ($p['ElapsedMs']) { $p['ElapsedMs'].Value } else { $null }
+    return ($null -ne $ms -and [double]$ms -ge $SlowMs)
 }
 
 function Test-ComPortInUse {
@@ -1138,7 +1359,16 @@ function Get-ActiveOpenDecision {
           3. ANY CHANGE RESETS THE STREAK. A different port set, a change in
              whether the application is running, or a change in radio link state
              all mean the world moved and the next observation is worth its cost.
-          4. Otherwise back off once the answer has been the same for
+          4. FAILURE BACKOFF (2026-09-24). If the last probed tick produced an
+             EXPENSIVE failure (Test-ExpensiveOpenFailure: 121, 87, 1231, any
+             refusal that took >= 1 s, or an open still in flight) and nothing
+             changed, probe only one tick in FailureBackoffCadence. The original
+             design treated every refusal as free and reset the streak on it,
+             so a port answering 87 (~33 s) or 1231 (an RFCOMM connect the Arc
+             rejects) was re-attempted on EVERY tick. In TDUNN_03 capture
+             451347689098 that put a recorder connect in flight across both of
+             NO.exe's 12005s and every target-matched Event 16 in the run.
+          5. Otherwise back off once the answer has been the same for
              StreakBeforeBackoff ticks: probe one tick in BackoffCadence.
 
         WHAT THE BACKOFF COSTS, stated rather than hidden: a transition from free
@@ -1175,7 +1405,9 @@ function Get-ActiveOpenDecision {
         [bool]$WorldChanged = $false,
         [bool]$TargetResolvable = $true,
         [int]$StreakBeforeBackoff = 3,
-        [int]$BackoffCadence = 5
+        [int]$BackoffCadence = 5,
+        [int]$FailureStreak = 0,
+        [int]$FailureBackoffCadence = 10
     )
 
     if ($Phase -ne 'Tick') {
@@ -1186,6 +1418,12 @@ function Get-ActiveOpenDecision {
     }
     if ($WorldChanged) {
         return [pscustomobject]@{ Probe = $true; Rule = 'WorldChanged'; Reason = 'The port set, the application process state, or the radio link state changed since the last tick; the next observation is worth taking.' }
+    }
+    if ($FailureStreak -gt 0) {
+        if ($FailureBackoffCadence -le 1 -or ($TickCount % $FailureBackoffCadence) -eq 0) {
+            return [pscustomobject]@{ Probe = $true; Rule = 'FailureBackoffCadence'; Reason = "The last probed tick failed expensively ($FailureStreak in a row); this is the 1-in-$FailureBackoffCadence tick that still probes." }
+        }
+        return [pscustomobject]@{ Probe = $false; Rule = 'FailureBackoff'; Reason = "The last probed tick failed expensively (a slow refusal, an RFCOMM connect the device rejected, or an open that outlived its deadline) and nothing changed since. Repeating it would put another over-the-air connect in NO.exe's way and tell us nothing new." }
     }
     if ($AcquiredStreak -lt $StreakBeforeBackoff) {
         return [pscustomobject]@{ Probe = $true; Rule = 'WarmUp'; Reason = "Only $AcquiredStreak consecutive ticks have acquired the handle (backoff begins at $StreakBeforeBackoff)." }
@@ -1259,8 +1497,20 @@ function Get-StreamingState {
         }
     }
 
+    # ── Late results of earlier opens (2026-09-24) ───────────────────────
+    # An open that outlived its deadline finished on its own thread; its real
+    # code and duration are collected here, EVERY call, before any early return
+    # -- a device that went Missing in the meantime still has evidence owed.
+    # Carried out as LateOpenObservations, never folded into this tick's hold
+    # state: they describe a previous tick's attempt, not the port now.
+    $late = @()
+    if (Get-Command Get-SerialOpenLateResults -ErrorAction SilentlyContinue) {
+        $late = @(Get-SerialOpenLateResults | Where-Object { $_ })
+        foreach ($lo in $late) { Close-OwnOpenWindow -LateObservation $lo }
+    }
+
     if ($WatchState.ComPortState -notin @('ComPortFound', 'ComPortAmbiguous')) {
-        return @{ State = 'Stopped'; ActivePort = $null; HeldPorts = @(); UnavailablePorts = @() }
+        return @{ State = 'Stopped'; ActivePort = $null; HeldPorts = @(); UnavailablePorts = @(); LateOpenObservations = @($late) }
     }
 
     $ports = @()
@@ -1271,7 +1521,7 @@ function Get-StreamingState {
         $ports += $WatchState.AmbiguousComPortMatches | ForEach-Object { $_.PortName }
     }
     $ports = @($ports | Where-Object { $_ } | Select-Object -Unique)
-    if ($ports.Count -eq 0) { return @{ State = 'Unknown'; ActivePort = $null; HeldPorts = @(); UnavailablePorts = @() } }
+    if ($ports.Count -eq 0) { return @{ State = 'Unknown'; ActivePort = $null; HeldPorts = @(); UnavailablePorts = @(); LateOpenObservations = @($late) } }
 
     # ── The throttle ─────────────────────────────────────────────────────
     # Placed AFTER port resolution (which opens nothing) and BEFORE the first
@@ -1319,12 +1569,17 @@ function Get-StreamingState {
             -WorldChanged $worldChanged `
             -TargetResolvable ($wsDeviceState -ne 'Missing') `
             -StreakBeforeBackoff ([int]$Session.ActiveOpenStreakBeforeBackoff) `
-            -BackoffCadence ([int]$Session.ActiveOpenBackoffCadence)
+            -BackoffCadence ([int]$Session.ActiveOpenBackoffCadence) `
+            -FailureStreak $(if ($Session.ContainsKey('ActiveOpenFailureStreak')) { [int]$Session.ActiveOpenFailureStreak } else { 0 }) `
+            -FailureBackoffCadence $(if ($Session.ContainsKey('ActiveOpenFailureBackoffCadence')) { [int]$Session.ActiveOpenFailureBackoffCadence } else { 10 })
 
         $Session.ActiveOpenLastWorld = $worldNow
 
         if (-not $decision.Probe) {
             $Session.ActiveOpenSkippedTicks++
+            if ($decision.Rule -eq 'FailureBackoff' -and $Session.ContainsKey('ActiveOpenFailureBackoffSkips')) {
+                $Session.ActiveOpenFailureBackoffSkips++
+            }
             # CARRY FORWARD, do not invent. Returning 'Stopped' would manufacture
             # the measurement "the probe opened every port and found none held"
             # out of a decision not to look -- the same error the
@@ -1347,6 +1602,7 @@ function Get-StreamingState {
                 ProbedPorts          = @()
                 PortOpenDurations    = @()
                 PortOpenObservations = @()
+                LateOpenObservations = @($late)
                 ActiveOpenCarried    = $true
                 ActiveOpenSkipRule   = $decision.Rule
                 ActiveOpenSkipReason = $decision.Reason
@@ -1354,6 +1610,11 @@ function Get-StreamingState {
         }
         $Session.ActiveOpenProbedTicks++
     }
+
+    # Deadline for each open (2026-09-24). Opt-in by the session field, like the
+    # throttle: an older caller or a mock without it blocks exactly as before.
+    $deadlineMs = if (($Session -is [hashtable]) -and $Session.ContainsKey('ActiveOpenDeadlineMs')) { [int]$Session.ActiveOpenDeadlineMs } else { 0 }
+    $pendingPorts = @()
 
     $activePorts = @()
     $deadPorts   = @()
@@ -1382,9 +1643,28 @@ function Get-StreamingState {
     # call that already measured itself.
     $durations    = @()
     $observations = @()
+    $prevDead = @()
+    if (($Session -is [hashtable]) -and $Session.ContainsKey('UnavailablePortsCurrent')) {
+        $prevDead = @($Session.UnavailablePortsCurrent | Where-Object { $_ })
+    }
+    # Splatted, and -DeadlineMs only when set, so a pre-existing mock of
+    # Get-ComPortOpenObservation sees exactly the call it always did.
+    $openArgs = @{ Phase = $Phase }
+    if ($deadlineMs -gt 0) { $openArgs['DeadlineMs'] = $deadlineMs }
     foreach ($p in $ports) {
-        $obs = Get-ComPortOpenObservation -PortName $p -Phase $Phase
+        $obs = Get-ComPortOpenObservation -PortName $p @openArgs
         $holdState = $obs.CoarseState
+        # PENDING (2026-09-24): the open outlived its deadline, or our previous
+        # open of this port is still running. Either way the port was NOT held by
+        # another process -- a held port refuses at the sharing check in ~0 ms --
+        # so it is never added to the held set. Its code is not known yet, so it
+        # is not newly unavailable either; a port that was already unavailable
+        # last tick keeps that reading (carried, and named in PendingPorts) rather
+        # than flickering out of the set for a tick.
+        if ($holdState -eq 'Pending') {
+            $pendingPorts += $p
+            if ($p -in $prevDead) { $deadPorts += $p }
+        }
         $observations += $obs
         $durations += @{
             Port       = $p
@@ -1424,6 +1704,17 @@ function Get-StreamingState {
             $Session.ActiveOpenAcquiredStreak = 0
         }
         $Session.ActiveOpenLastHoldMap = $holdMapNow
+
+        # The failure streak (rule 4 of Get-ActiveOpenDecision). Only a PHASE
+        # 'Tick' outcome feeds it: the one-shot phases always probe and must not
+        # arm a backoff for the loop that follows.
+        if ($Session.ContainsKey('ActiveOpenFailureStreak') -and $Phase -eq 'Tick') {
+            $expensive = @($observations | Where-Object { Test-ExpensiveOpenFailure -Observation $_ }).Count -gt 0
+            if ($expensive) { $Session.ActiveOpenFailureStreak++ } else { $Session.ActiveOpenFailureStreak = 0 }
+        }
+        if ($pendingPorts.Count -gt 0 -and $Session.ContainsKey('ActiveOpenPendingCount')) {
+            $Session.ActiveOpenPendingCount += $pendingPorts.Count
+        }
     }
 
     if ($activePorts.Count -gt 0) {
@@ -1434,15 +1725,19 @@ function Get-StreamingState {
             UnavailablePorts     = @($deadPorts)
             OpenedPorts          = @($openedPorts)
             ProbedPorts          = @($ports)
+            PendingPorts         = @($pendingPorts)
             PortOpenDurations    = @($durations)
             PortOpenObservations = @($observations)
+            LateOpenObservations = @($late)
         }
     }
     return @{
         State = 'Stopped'; ActivePort = $null; HeldPorts = @()
         UnavailablePorts = @($deadPorts); OpenedPorts = @($openedPorts); ProbedPorts = @($ports)
+        PendingPorts = @($pendingPorts)
         PortOpenDurations = @($durations)
         PortOpenObservations = @($observations)
+        LateOpenObservations = @($late)
     }
 }
 
@@ -2088,16 +2383,27 @@ function Measure-BluetoothAuthFailures {
         story. Providers are restricted to the BTHUSB family because that is
         where Windows logs the mutual-authentication failure; BTHPORT and the
         audio providers never carry it.
+        OWN-OPEN OVERLAP (2026-09-24). The recorder's own port opens are RFCOMM
+        connects too, and a rejected key on OUR connect logs the same Event 16
+        as a rejected key on NO.exe's. Each matched row is therefore split by
+        Test-EventOverlapsOwnOpen against -OwnOpenWindows: OverlapCount rows
+        fell inside (or just after) one of our opens and cannot be attributed;
+        IndependentCount rows did not. Count stays the total, so every existing
+        reader keeps its meaning. With no windows supplied every row is
+        independent -- the pre-existing behaviour.
     .OUTPUTS
-        [pscustomobject] Count / LastAtUtc / MessageOnlyCount, or $null when no
-        target MAC is available -- absent stays absent: without an identity to
-        match, "0" would be the claim "no auth failures against the target",
-        which nothing measured.
+        [pscustomobject] Count / LastAtUtc / MessageOnlyCount / OverlapCount /
+        IndependentCount / IndependentLastAtUtc, or $null when no target MAC is
+        available -- absent stays absent: without an identity to match, "0"
+        would be the claim "no auth failures against the target", which nothing
+        measured.
     #>
     [CmdletBinding()]
     param(
         [AllowEmptyCollection()][array]$Events = @(),
-        [AllowNull()][string]$TargetMac
+        [AllowNull()][string]$TargetMac,
+        [AllowEmptyCollection()][array]$OwnOpenWindows = @(),
+        [datetime]$Now = ((Get-Date).ToUniversalTime())
     )
 
     $normalizedTarget = if ($TargetMac) { ($TargetMac -replace '[^0-9A-Fa-f]', '').ToUpperInvariant() } else { '' }
@@ -2106,6 +2412,8 @@ function Measure-BluetoothAuthFailures {
     $count = 0
     $messageOnly = 0
     $lastAt = $null
+    $overlap = 0
+    $independentLastAt = $null
     foreach ($eventRow in @($Events)) {
         if ($null -eq $eventRow) { continue }
         $names = if ($eventRow -is [System.Collections.IDictionary]) { @($eventRow.Keys) } else { @($eventRow.PSObject.Properties.Name) }
@@ -2127,17 +2435,33 @@ function Measure-BluetoothAuthFailures {
         if (-not $matched) { continue }
 
         $count++
+        $t = $null
         if ($names -contains 'TimeCreated' -and $eventRow.TimeCreated) {
             $t = ([datetime]$eventRow.TimeCreated).ToUniversalTime()
             if ($null -eq $lastAt -or $t -gt $lastAt) { $lastAt = $t }
         }
+        # A row with no timestamp cannot be placed against our opens, so it can
+        # never be CLEARED of them: with any windows on record it counts as
+        # overlapping. Unattributable is the honest reading of "unknown when".
+        $ownWindows = @($OwnOpenWindows)
+        $isOverlap = if ($ownWindows.Count -eq 0) { $false }
+                     elseif ($null -eq $t) { $true }
+                     else { Test-EventOverlapsOwnOpen -EventUtc $t -Windows $ownWindows -Now $Now }
+        if ($isOverlap) {
+            $overlap++
+        } elseif ($null -ne $t -and ($null -eq $independentLastAt -or $t -gt $independentLastAt)) {
+            $independentLastAt = $t
+        }
     }
 
     return [pscustomobject]@{
-        PSTypeName       = 'WinConfig.BluetoothAuthFailure.Measurement'
-        Count            = $count
-        LastAtUtc        = $lastAt
-        MessageOnlyCount = $messageOnly
+        PSTypeName           = 'WinConfig.BluetoothAuthFailure.Measurement'
+        Count                = $count
+        LastAtUtc            = $lastAt
+        MessageOnlyCount     = $messageOnly
+        OverlapCount         = $overlap
+        IndependentCount     = ($count - $overlap)
+        IndependentLastAtUtc = $independentLastAt
     }
 }
 
@@ -2157,10 +2481,15 @@ function Add-BtAuthFailureObservation {
     param(
         [Parameter(Mandatory)][hashtable]$Session,
         [AllowEmptyCollection()][array]$Events = @(),
-        [AllowNull()][string]$TargetMac
+        [AllowNull()][string]$TargetMac,
+        # Defaults to the module's own-open log, so the App's existing call
+        # gains the split without changing. A test passes its own.
+        [AllowNull()][array]$OwnOpenWindows = $null,
+        [datetime]$Now = ((Get-Date).ToUniversalTime())
     )
 
-    $m = Measure-BluetoothAuthFailures -Events $Events -TargetMac $TargetMac
+    $windows = if ($null -ne $OwnOpenWindows) { @($OwnOpenWindows) } else { @(Get-OwnOpenWindows) }
+    $m = Measure-BluetoothAuthFailures -Events $Events -TargetMac $TargetMac -OwnOpenWindows $windows -Now $Now
     if ($null -eq $m) { return 0 }
     if ($null -eq $Session.BtAuthFailureCount) { $Session.BtAuthFailureCount = 0 }
     $Session.BtAuthFailureCount += [int]$m.Count
@@ -2169,7 +2498,65 @@ function Add-BtAuthFailureObservation {
             $Session.BtAuthFailureLastAt = $m.LastAtUtc
         }
     }
+    # The attributable split. ContainsKey-guarded: a session built by an older
+    # caller keeps only the totals above, and its readers fall back to them.
+    if ($Session.ContainsKey('BtAuthFailureIndependentCount')) {
+        if ($null -eq $Session.BtAuthFailureIndependentCount) { $Session.BtAuthFailureIndependentCount = 0 }
+        if ($null -eq $Session.BtAuthFailureOverlapCount)     { $Session.BtAuthFailureOverlapCount = 0 }
+        $Session.BtAuthFailureIndependentCount += [int]$m.IndependentCount
+        $Session.BtAuthFailureOverlapCount     += [int]$m.OverlapCount
+        if ($m.IndependentLastAtUtc) {
+            if ($null -eq $Session.BtAuthFailureIndependentLastAt -or $m.IndependentLastAtUtc -gt $Session.BtAuthFailureIndependentLastAt) {
+                $Session.BtAuthFailureIndependentLastAt = $m.IndependentLastAtUtc
+            }
+        }
+    }
     return [int]$m.Count
+}
+
+function Get-BtAuthFailureAttribution {
+    <#
+    .SYNOPSIS
+        Pure. Reads a session's auth-failure counters and says what they may be
+        used to claim.
+    .DESCRIPTION
+        One answerer for the three places that word a bond verdict (the live
+        1231 PORTWHY annotation, the link-flap annotation, and the closing
+        summary), so they cannot drift apart.
+
+          Attributable  at least one target-matched Event 16 fell OUTSIDE every
+                        one of the recorder's own opens. The bond reading may be
+                        stated -- still as a signature, never as a verdict.
+          Confounded    every matched row overlapped one of our opens. The rows
+                        are real; who caused them is not known. No bond claim
+                        and no re-pair advice.
+          None          nothing matched (or nothing was watched).
+
+        A session without the split fields (older caller) is read as
+        Attributable on its total -- exactly its pre-existing behaviour.
+    .OUTPUTS
+        [pscustomobject] Status / Total / Independent / Overlap / LastIndependentAt
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Session)
+
+    $total = if ($Session.ContainsKey('BtAuthFailureCount') -and $null -ne $Session.BtAuthFailureCount) { [int]$Session.BtAuthFailureCount } else { 0 }
+    $hasSplit = $Session.ContainsKey('BtAuthFailureIndependentCount') -and $null -ne $Session.BtAuthFailureIndependentCount
+    $independent = if ($hasSplit) { [int]$Session.BtAuthFailureIndependentCount } else { $total }
+    $overlap     = if ($hasSplit -and $null -ne $Session.BtAuthFailureOverlapCount) { [int]$Session.BtAuthFailureOverlapCount } else { 0 }
+    $lastInd = if ($hasSplit) {
+        if ($Session.ContainsKey('BtAuthFailureIndependentLastAt')) { $Session.BtAuthFailureIndependentLastAt } else { $null }
+    } else {
+        if ($Session.ContainsKey('BtAuthFailureLastAt')) { $Session.BtAuthFailureLastAt } else { $null }
+    }
+    $status = if ($total -le 0) { 'None' } elseif ($independent -gt 0) { 'Attributable' } else { 'Confounded' }
+    return [pscustomobject]@{
+        Status            = $status
+        Total             = $total
+        Independent       = $independent
+        Overlap           = $overlap
+        LastIndependentAt = $lastInd
+    }
 }
 
 function Complete-SerialOpenTopologyRequest {
@@ -2221,6 +2608,13 @@ function New-SerialOpenAttemptRecord {
         AttemptCount           = 0
         NotAttemptedCount      = 0
         LegacyContractCount    = 0
+        # Opens with no code YET (2026-09-24): abandoned at the deadline (their
+        # code arrives later as a separate, Late observation and is counted
+        # then), or skipped because our previous open was still running.
+        # Counted apart from NotAttempted so neither reads as "the API failed".
+        DeadlineExceededCount  = 0
+        InFlightSkippedCount   = 0
+        LateResultCount        = 0
         Transitions            = @()
         MaxTransitions         = $MaxTransitions
         DroppedTransitionCount = 0
@@ -2269,6 +2663,20 @@ function Add-SerialOpenAttempt {
         # letting a reader infer from an empty code table that nothing failed.
         $Record.LegacyContractCount++
         return $false
+    }
+
+    # Pending outcomes, counted by kind. ContainsKey-guarded: a record built by
+    # an older copy of New-SerialOpenAttemptRecord lacks the counters.
+    if ($names -contains 'InFlightSkipped' -and $Observation.InFlightSkipped) {
+        if ($Record.ContainsKey('InFlightSkippedCount')) { $Record.InFlightSkippedCount++ } else { $Record.NotAttemptedCount++ }
+        return $false
+    }
+    if ($names -contains 'DeadlineExceeded' -and $Observation.DeadlineExceeded) {
+        if ($Record.ContainsKey('DeadlineExceededCount')) { $Record.DeadlineExceededCount++ } else { $Record.NotAttemptedCount++ }
+        return $false
+    }
+    if ($names -contains 'Late' -and $Observation.Late -and $Record.ContainsKey('LateResultCount')) {
+        $Record.LateResultCount++
     }
 
     $attempted = if ($names -contains 'Attempted') { [bool]$Observation.Attempted } else { $false }
@@ -4822,6 +5230,10 @@ function New-DeviceProbeSession {
     # read ActivePortOpenProbeEnabled, so one computed value here is the lock.
     $apopEffective = [bool]$apop.Enabled -and -not $ForcePassiveOnly
 
+    # A new recording judges its own opens -- and the selection opens made just
+    # before it (see Reset-OwnOpenWindows) -- but not an earlier recording's.
+    Reset-OwnOpenWindows
+
     return @{
         # ── The active port-open probe treatment, LOCKED at construction ────
         # Pre-registration section 5.3. Absent or unreadable => ENABLED, so a
@@ -4921,6 +5333,12 @@ function New-DeviceProbeSession {
         # (the displaced-bond shape the idle-sawtooth model mislabels).
         BtAuthFailureCount       = $null
         BtAuthFailureLastAt      = $null
+        # The attributable split (2026-09-24, Get-BtAuthFailureAttribution):
+        # rows OUTSIDE every one of the recorder's own opens vs rows inside one.
+        # Same $null-until-watched rule as the total.
+        BtAuthFailureIndependentCount  = $null
+        BtAuthFailureOverlapCount      = $null
+        BtAuthFailureIndependentLastAt = $null
         BtLinkEverConnected      = $false
         # Cross-evidence context findings are latched for the run. A scope
         # mismatch can disappear from the live inputs when NeurOptimal exits;
@@ -5082,6 +5500,28 @@ function New-DeviceProbeSession {
         # returning immediately to every tick.
         ActiveOpenStreakBeforeBackoff = 3
         ActiveOpenBackoffCadence      = 5
+        # ── Failure backoff + open deadline (2026-09-24, TDUNN_03) ───────
+        # See Get-ActiveOpenDecision rule 4 and Initialize-SerialOpenDeadlineApi.
+        # A tick whose open failed expensively (121 / 87 / 1231 / slow / still
+        # in flight) arms a backoff of one probe in 10 ticks (~30 s) until the
+        # world changes; each open waits at most 2.5 s -- above a normal cold
+        # open (~0.4 s), below the 121 class (~5 s) -- and a port whose previous
+        # open is still running is never opened again.
+        ActiveOpenFailureStreak         = 0
+        ActiveOpenFailureBackoffCadence = 10
+        ActiveOpenFailureBackoffSkips   = 0
+        ActiveOpenDeadlineMs            = 2500
+        ActiveOpenPendingCount          = 0
+        # ── Recorder stall (2026-09-24) ──────────────────────────────────
+        # Largest gap between two ticks, and how many gaps exceeded the
+        # threshold. The TDUNN capture's loop stopped for ~98 s inside its own
+        # opens and nothing in the findings said so -- a stretch whose every
+        # timestamp and screenshot is late must be named as such.
+        TickGapMaxSeconds         = 0.0
+        TickStallCount            = 0
+        TickStallSeconds          = 0.0
+        TickStallThresholdSeconds = 15
+        TickStalls                = @()
         StreamPeakCpuS           = 0.0
         StreamPeakWorkingSetMB   = 0
         # Was the monitored application EVER observed running during this
@@ -5452,6 +5892,26 @@ function Invoke-DeviceProbeTick {
     $events = @()
     $now = $Now
 
+    # ── Recorder stall (2026-09-24) ──────────────────────────────────────────
+    # Measured BEFORE LastTickAt moves: the gap is the time since the previous
+    # tick began, which is what a reader of this tick's timestamps needs to know.
+    # COUNTED, not emitted as a live event: the App already warns live when the
+    # cadence slips, and this tick's events are read positionally by callers. What
+    # was missing was the capture saying so -- the closing summary and the
+    # manifest carry it, with the end time of each stall so a reader can find the
+    # late stretch. ContainsKey-guarded for sessions built by older callers.
+    if ($Session.ContainsKey('TickStallCount') -and $Session.LastTickAt) {
+        $gap = ($now - [datetime]$Session.LastTickAt).TotalSeconds
+        if ($gap -gt [double]$Session.TickGapMaxSeconds) { $Session.TickGapMaxSeconds = [math]::Round($gap, 1) }
+        if ($gap -gt [double]$Session.TickStallThresholdSeconds) {
+            $Session.TickStallCount++
+            $Session.TickStallSeconds = [math]::Round([double]$Session.TickStallSeconds + $gap, 1)
+            if ($Session.ContainsKey('TickStalls') -and @($Session.TickStalls).Count -lt 50) {
+                $Session.TickStalls = @(@($Session.TickStalls) + @(@{ EndedAtUtc = $now.ToUniversalTime().ToString('o'); GapSeconds = [math]::Round($gap, 1) }))
+            }
+        }
+    }
+
     $Session.TickCount++
     if (-not $Session.FirstTickAt) { $Session.FirstTickAt = $now }
     $Session.LastTickAt = $now
@@ -5472,6 +5932,18 @@ function Invoke-DeviceProbeTick {
     $activeProbe  = Test-ActivePortOpenProbeEnabled -Session $Session
     $streamResult = Get-StreamingState -WatchState $WatchState -Session $Session
     $newStreamState = $streamResult.State
+    # This tick's opens PLUS the late results of earlier abandoned ones
+    # (2026-09-24). Both are real attempts with real codes, so both feed the WHY
+    # map, the live PORTWHY classifier and the attempt record. Only this tick's
+    # own opens decide the hold state -- that happened inside Get-StreamingState.
+    # Late FIRST: they are older, so where a port has both, this tick's fresh
+    # code is the one left standing in the WHY map.
+    $tickOpenObs = @()
+    if ($streamResult -is [hashtable]) {
+        if ($streamResult.ContainsKey('LateOpenObservations')) { $tickOpenObs += @($streamResult.LateOpenObservations) }
+        if ($streamResult.ContainsKey('PortOpenObservations')) { $tickOpenObs += @($streamResult.PortOpenObservations) }
+    }
+    $tickOpenObs = @($tickOpenObs | Where-Object { $null -ne $_ })
     # Snapshot BEFORE this tick's observations are folded into the ever-union.
     # Ordering is the evidence: unavailable on this tick counts as "after held"
     # only if the SAME port was held on an earlier tick (or at arrival).
@@ -5524,8 +5996,8 @@ function Invoke-DeviceProbeTick {
         # map keeps the LAST code per port. Legacy-fallback observations carry
         # Win32Error=$null -- recorded as absent, never as 0.
         $reasonsNow = @{}
-        if ($streamResult -is [hashtable] -and $streamResult.ContainsKey('PortOpenObservations')) {
-            foreach ($obs in @($streamResult.PortOpenObservations)) {
+        if ($tickOpenObs.Count -gt 0) {
+            foreach ($obs in $tickOpenObs) {
                 if ($null -eq $obs) { continue }
                 if ($obs.CoarseState -eq 'Unavailable' -and $obs.PortName) {
                     $reasonsNow[[string]$obs.PortName] = $obs.Win32Error
@@ -5577,8 +6049,8 @@ function Invoke-DeviceProbeTick {
         if (-not $Session.ContainsKey('PortReasonAnnounced') -or $null -eq $Session.PortReasonAnnounced) {
             $Session.PortReasonAnnounced = @{}
         }
-        if ($streamResult -is [hashtable] -and $streamResult.ContainsKey('PortOpenObservations')) {
-            foreach ($obs in @($streamResult.PortOpenObservations)) {
+        if ($tickOpenObs.Count -gt 0) {
+            foreach ($obs in $tickOpenObs) {
                 if ($null -eq $obs -or [string]::IsNullOrWhiteSpace([string]$obs.PortName)) { continue }
                 $pk = [string]$obs.PortName
                 $lastCode = if ($Session.PortReasonAnnounced.ContainsKey($pk)) { $Session.PortReasonAnnounced[$pk] } else { $null }
@@ -5606,9 +6078,21 @@ function Invoke-DeviceProbeTick {
                         # in THIS session - 1231 alone must never be reported
                         # as a bond verdict (measured: it is also a cold radio
                         # or an out-of-range device).
+                        #
+                        # ATTRIBUTION (2026-09-24): only Event 16 rows that fell
+                        # OUTSIDE every one of the recorder's own opens may carry
+                        # the bond reading. In TDUNN_03 capture 451347689098 all
+                        # of them fell inside one, and this line still told the
+                        # tester re-pairing would break another system.
                         $anno = $null
-                        if ($code -eq 1231 -and $Session.ContainsKey('BtAuthFailureCount') -and [int]$Session.BtAuthFailureCount -gt 0) {
-                            $anno = "[!] 1231 with $([int]$Session.BtAuthFailureCount) target-matched mutual-authentication failure(s) (BTHUSB Event 16) this session -- displaced-bond signature: this machine's pairing has been superseded by a more recent pairing on another system. Re-pairing here will break that other system and permanently consume COM numbers."
+                        if ($code -eq 1231 -and $Session.ContainsKey('BtAuthFailureCount') -and $null -ne $Session.BtAuthFailureCount -and [int]$Session.BtAuthFailureCount -gt 0) {
+                            $attr = Get-BtAuthFailureAttribution -Session $Session
+                            if ($attr.Status -eq 'Attributable') {
+                                $ovNote = if ($attr.Overlap -gt 0) { " ($($attr.Overlap) more fell during the recorder's own port opens and are not counted)" } else { '' }
+                                $anno = "[!] 1231 with $($attr.Independent) target-matched mutual-authentication failure(s) (BTHUSB Event 16) this session outside the recorder's own port opens$ovNote -- displaced-bond signature: this machine's pairing may have been superseded by a more recent pairing on another system. Confirm which system paired this headset last before re-pairing: if another one did, re-pairing here will break it and permanently consume COM numbers."
+                            } elseif ($attr.Status -eq 'Confounded') {
+                                $anno = "[~] 1231 with $($attr.Total) target-matched mutual-authentication failure(s) (BTHUSB Event 16) this session, but EVERY one fell during one of this recorder's own port opens. The recorder's opens are connection attempts too, so these cannot be attributed to NeurOptimal or to the pairing -- no bond reading is made from them. To test the bond, record again with the active port-open probe OFF."
+                            }
                         }
                         $events += @{ Kind = 'PORTWHY'; State = $label; Reason = "$pk refused to open: win32 $code$gloss"; Annotation = $anno; Level = $level; Timestamp = $now }
                     }
@@ -5754,8 +6238,8 @@ function Invoke-DeviceProbeTick {
         # caller or a test mock of Get-StreamingState, in which case the record
         # stays empty and the archive reports no raw evidence rather than
         # implying every attempt succeeded.
-        if ($streamResult.ContainsKey('PortOpenObservations') -and $Session.SerialOpenAttempts) {
-            foreach ($obs in @($streamResult.PortOpenObservations)) {
+        if ($Session.SerialOpenAttempts) {
+            foreach ($obs in $tickOpenObs) {
                 $null = Add-SerialOpenAttempt -Record $Session.SerialOpenAttempts -Observation $obs
             }
         }
@@ -5963,9 +6447,17 @@ function Invoke-DeviceProbeTick {
                 # 30-90s.
                 $authAnno = "[~] Device paired but radio link down"
                 $authLevel = 'WARN'
-                if ($Session.BtAuthFailureLastAt -and ($now.ToUniversalTime() - $Session.BtAuthFailureLastAt).TotalSeconds -le 120) {
-                    $authAnno = "[!] Link flapping WITH mutual-authentication failures against this headset (BTHUSB Event 16, $($Session.BtAuthFailureCount) so far) -- bond suspect, not idle. Measured remedy: re-pair through the NO Device Panel; the first session attempt after the re-pair may still fail 12005 while the link is flapping -- one Try Again cleared it (2026-08-23 SP6 rep #4)."
+                # Keyed to the last ATTRIBUTABLE failure (2026-09-24): a row
+                # written during the recorder's own open cannot mark this drop
+                # as a bond fault. A recent confounded row is still said, as a
+                # caveat rather than a remedy.
+                $attr = Get-BtAuthFailureAttribution -Session $Session
+                $lastAll = if ($Session.ContainsKey('BtAuthFailureLastAt')) { $Session.BtAuthFailureLastAt } else { $null }
+                if ($attr.LastIndependentAt -and ($now.ToUniversalTime() - ([datetime]$attr.LastIndependentAt)).TotalSeconds -le 120) {
+                    $authAnno = "[!] Link flapping WITH mutual-authentication failures against this headset (BTHUSB Event 16, $($attr.Independent) outside the recorder's own port opens so far) -- bond suspect, not idle. Measured remedy: re-pair through the NO Device Panel; the first session attempt after the re-pair may still fail 12005 while the link is flapping -- one Try Again cleared it (2026-08-23 SP6 rep #4)."
                     $authLevel = 'FAIL'
+                } elseif ($lastAll -and ($now.ToUniversalTime() - ([datetime]$lastAll)).TotalSeconds -le 120) {
+                    $authAnno = "[~] Device paired but radio link down. Mutual-authentication failures against this headset were logged recently (BTHUSB Event 16), but only during the recorder's own port opens -- not attributable, so no bond reading is made."
                 }
                 $events += @{ Kind = 'BTLINK'; State = 'NotConnected'; Reason = "Radio link dropped, device still paired$fromStr"; Annotation = $authAnno; Level = $authLevel; Timestamp = $now }
                 $Session.BtLinkFlapCount++
@@ -6968,6 +7460,31 @@ function Get-DeviceProbeSessionSummary {
         [void]$findings.Add("[info] BT link monitoring unavailable (Bthprops.cpl not loaded)")
     }
 
+    # ── Recorder self-interference (2026-09-24, TDUNN_03 451347689098) ───────
+    # Three things that capture needed said and did not: the loop had stalled
+    # for ~98 s inside its own opens; every target-matched Event 16 fell inside
+    # one of those opens; and the opens kept repeating on a failing port. Each is
+    # ContainsKey-guarded so a session built by an older caller adds nothing.
+    if ($Session.ContainsKey('TickStallCount') -and [int]$Session.TickStallCount -gt 0) {
+        [void]$findings.Add("[~] The recorder's check loop stalled $([int]$Session.TickStallCount) time(s) (longest gap $([int]$Session.TickGapMaxSeconds) s, $([int]$Session.TickStallSeconds) s in total). Events, timestamps and screenshots from those stretches were recorded late, not live -- do not read their timing as the moment something happened.")
+    }
+    if ($Session.ContainsKey('BtAuthFailureIndependentCount') -and $null -ne $Session.BtAuthFailureIndependentCount) {
+        $attrS = Get-BtAuthFailureAttribution -Session $Session
+        if ($attrS.Status -eq 'Confounded') {
+            [void]$findings.Add("[~] $($attrS.Total) target-matched mutual-authentication failure(s) (BTHUSB Event 16) were logged, but EVERY one fell during one of this recorder's own port opens. The recorder's opens are connection attempts too, so these rows cannot be attributed to NeurOptimal or to the pairing, and no bond reading is made from them. To test the bond, record again with the active port-open probe OFF.")
+        } elseif ($attrS.Status -eq 'Attributable' -and $attrS.Overlap -gt 0) {
+            [void]$findings.Add("[i] Of $($attrS.Total) target-matched mutual-authentication failure(s) (BTHUSB Event 16), $($attrS.Independent) fell outside the recorder's own port opens and $($attrS.Overlap) during them. Only the first number is evidence about the pairing.")
+        }
+    }
+    if ($Session.ContainsKey('ActiveOpenFailureBackoffSkips')) {
+        $fbSkips = [int]$Session.ActiveOpenFailureBackoffSkips
+        $pend    = if ($Session.ContainsKey('ActiveOpenPendingCount')) { [int]$Session.ActiveOpenPendingCount } else { 0 }
+        if ($fbSkips -gt 0 -or $pend -gt 0) {
+            $dl = if ($Session.ContainsKey('ActiveOpenDeadlineMs')) { [int]$Session.ActiveOpenDeadlineMs } else { 0 }
+            [void]$findings.Add("[info] Recorder port opens held back to stay out of the headset's way: $fbSkips tick(s) skipped after an expensive failed open (121 / 87 / 1231 / slow), and $pend open(s) that did not answer within $dl ms were left to finish in the background rather than block the recording. A port's recovery can therefore be seen up to ~30 s late.")
+        }
+    }
+
     # SPP server channel accumulation
     if ($Session.StartupSppChannelCount -ge 4) {
         # A raw LOCALMFG count is not itself corruption.  CDE30CD6BF8C had four
@@ -7046,6 +7563,23 @@ function Get-DeviceProbeSessionSummary {
         # (2026-08-23 displaced-bond counter).
         BtAuthFailureCount = $Session.BtAuthFailureCount
         BtAuthFailureLastAtUtc = if ($Session.BtAuthFailureLastAt) { $Session.BtAuthFailureLastAt.ToString('o') } else { $null }
+        # The attributable split (2026-09-24): rows outside vs inside the
+        # recorder's own opens. $null = never watched, same rule as the total.
+        BtAuthFailureIndependentCount = if ($Session.ContainsKey('BtAuthFailureIndependentCount')) { $Session.BtAuthFailureIndependentCount } else { $null }
+        BtAuthFailureOverlapCount     = if ($Session.ContainsKey('BtAuthFailureOverlapCount')) { $Session.BtAuthFailureOverlapCount } else { $null }
+        BtAuthFailureAttribution      = (Get-BtAuthFailureAttribution -Session $Session).Status
+        # Recorder self-interference accounting (2026-09-24).
+        RecorderSelfInterference = @{
+            TickStallCount                = $(if ($Session.ContainsKey('TickStallCount')) { [int]$Session.TickStallCount } else { $null })
+            TickGapMaxSeconds             = $(if ($Session.ContainsKey('TickGapMaxSeconds')) { [double]$Session.TickGapMaxSeconds } else { $null })
+            TickStallSeconds              = $(if ($Session.ContainsKey('TickStallSeconds')) { [double]$Session.TickStallSeconds } else { $null })
+            TickStalls                    = $(if ($Session.ContainsKey('TickStalls')) { @($Session.TickStalls) } else { $null })
+            ActiveOpenDeadlineMs          = $(if ($Session.ContainsKey('ActiveOpenDeadlineMs')) { [int]$Session.ActiveOpenDeadlineMs } else { $null })
+            ActiveOpenPendingCount        = $(if ($Session.ContainsKey('ActiveOpenPendingCount')) { [int]$Session.ActiveOpenPendingCount } else { $null })
+            ActiveOpenFailureBackoffSkips = $(if ($Session.ContainsKey('ActiveOpenFailureBackoffSkips')) { [int]$Session.ActiveOpenFailureBackoffSkips } else { $null })
+            ActiveOpenFailureBackoffCadence = $(if ($Session.ContainsKey('ActiveOpenFailureBackoffCadence')) { [int]$Session.ActiveOpenFailureBackoffCadence } else { $null })
+            OwnOpenWindowsDropped         = [int]$script:OwnOpenWindowsDropped
+        }
         UnavailableAfterHeldPorts = @($Session.UnavailableAfterHeldPorts | Where-Object { $_ })
         # The WHY behind each after-held port (win32 + link state at the failed
         # open) and the subset the link-park guard explains. Without these the
@@ -7136,7 +7670,14 @@ function Invoke-AnomalyDiagnosticSnapshot {
         # and it previously kept only InUse, throwing the win32 code away. The
         # same observation feeds the snapshot AND the session accumulator, so
         # nothing here opens the port twice.
-        $anomalyObs = @($ports | ForEach-Object { Get-ComPortOpenObservation -PortName $_ -Phase 'Anomaly' })
+        # Same deadline as the tick (2026-09-24): an anomaly fires exactly when
+        # the headset is misbehaving, which is when an open is most likely to
+        # block for 5-33 s on the UI thread.
+        $anomalyArgs = @{ Phase = 'Anomaly' }
+        if (($Session -is [hashtable]) -and $Session.ContainsKey('ActiveOpenDeadlineMs') -and [int]$Session.ActiveOpenDeadlineMs -gt 0) {
+            $anomalyArgs['DeadlineMs'] = [int]$Session.ActiveOpenDeadlineMs
+        }
+        $anomalyObs = @($ports | ForEach-Object { Get-ComPortOpenObservation -PortName $_ @anomalyArgs })
         $snapshot.ComPortStatus = @($anomalyObs | ForEach-Object {
             @{
                 PortName   = $_.PortName
@@ -8835,6 +9376,13 @@ Export-ModuleMember -Function @(
     # Pure decision function for the active-open throttle. Exported so the
     # rule table can be tested directly rather than inferred from tick behaviour.
     'Get-ActiveOpenDecision',
+    'Test-ExpensiveOpenFailure',
+    'Test-EventOverlapsOwnOpen',
+    'Add-OwnOpenWindow',
+    'Close-OwnOpenWindow',
+    'Get-OwnOpenWindows',
+    'Reset-OwnOpenWindows',
+    'Get-BtAuthFailureAttribution',
     'Test-ActivePortOpenProbeEnabled',
     'Get-ProbeStateConsistency',
     'Get-LinkParkedAfterHeldPorts',
