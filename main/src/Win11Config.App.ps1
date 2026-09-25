@@ -6929,14 +6929,15 @@ $buttonHandlers = @{
 
             # Stopping by hand, in the two cases the step allows it: short of
             # the length, or long enough but with no Session Complete coming --
-            # which is what a session type other than Quick Session looks like.
+            # which is what a session type other than the test's looks like.
             # Either way it asks first and goes in the log by name.
             $script:GfxStopEarlyBtn.Add_Click({
                 $v = $script:GfxWizView
                 if ($v -and [string]$v.StopEarlyKind -eq 'NoSessionComplete') {
-                    $lines = @('NeurOptimal has not shown Session Complete. That usually means the session type was not set to Quick Session.',
+                    $gfxType = $(if ($script:GfxProfile -and $script:GfxProfile.SessionType) { [string]$script:GfxProfile.SessionType } else { 'the one this test asks for' })
+                    $lines = @("NeurOptimal has not shown Session Complete. That usually means the session type was not set to $gfxType.",
                         'If you stop now, the recording is kept and sent, but it is marked as not ending at Session Complete, so it may not be comparable with the other recordings.',
-                        'If the session type WAS Quick Session, keep recording and wait a little longer.')
+                        "If the session type WAS $gfxType, keep recording and wait a little longer.")
                     if (-not (& $script:GfxAsk $this.FindForm() 'Stop without Session Complete?' $lines 'Stop now' 'Keep waiting')) { return }
                     & $script:GfxWizNote 'stopped-no-session-complete' ''
                 } else {

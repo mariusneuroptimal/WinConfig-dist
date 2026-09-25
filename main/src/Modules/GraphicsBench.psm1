@@ -2456,8 +2456,36 @@ function Get-GraphicsBenchProfiles {
     $quietStep = 'Close everything else -- no browser, no screen recorder, no video call. Only NeurOptimal and this window.'
     $launchStep = 'Launch NeurOptimal and leave it on its home screen, with no session started.'
     $watchStep = 'Press Start watching, then leave NeurOptimal alone until it says Baseline collected.'
-    $sessionStartStep = 'Open Configure Session in NeurOptimal, set the session type to "Quick Session", and start the session with audio only (a music track, no video).'
-    $sessionRunStep = 'Let the session run for 15 minutes. Do not resize, move or minimize the NeurOptimal window, and do not connect or disconnect a screen, while it runs. When NeurOptimal shows Session Complete the recording stops by itself and the package is sent.'
+    # THE SESSION LENGTHS. NeurOptimal's Quick Session is 15:00 of audio; the
+    # regular session -- the one Configure Session offers by default -- is
+    # 33:00. Every scored test exists at both lengths with the same steps and
+    # gates: only the session type chosen and the length it is judged against
+    # differ. Each length is its own profile, and so its own protocol version,
+    # because a 15-minute run and a 33-minute run do not pool.
+    #
+    # THE 15-MINUTE WORDS ARE THE ONES ea2cad2 SHIPPED, character for
+    # character. The protocol version is a hash of them; rewording them would
+    # split the baseline runs already collected from the ones still to come.
+    # Type is how the session type reads inside a sentence ("the session type
+    # was probably not ..."); Choose is the instruction for Configure Session.
+    $lengths = @(
+        @{ Minutes = 15; Sec = 900; Type = 'Quick Session'; Title = 'Start a Quick Session'
+           Choose = 'set the session type to "Quick Session"' }
+        @{ Minutes = 33; Sec = 1980; Type = 'the regular 33-minute session'; Title = 'Start a 33-minute session'
+           Choose = 'leave the session type on the regular 33-minute session (the default)' }
+    )
+
+    # THE DETACHED TEST'S STEADY STRETCH IS SHORTER THAN THE SESSION. The
+    # recording ends where NeurOptimal ends the session -- at the session's
+    # length, counted from the music -- and the steady stretch only starts at
+    # the second mark. So every second spent before that mark comes out of it,
+    # and a floor equal to the session length can never be met: the first
+    # field run of this test (2026-09-24, run 3C7ACD84) did everything asked
+    # and would still have been failed for it. The test therefore gives the
+    # tester this long after the music starts to detach the visuals, and
+    # judges the steady stretch against the session length MINUS it.
+    $detachWindowSec = 180
+    $detachMinutes = [int]($detachWindowSec / 60)
 
     # THE STEPS SHARED BY EVERY SCORED TEST, as records. One definition each:
     # a gate typed twice is a gate that drifts between the two tests that are
@@ -2473,12 +2501,10 @@ function Get-GraphicsBenchProfiles {
     # NeurOptimal during the stretch the session is measured against, and
     # on SP9 (run 1A7A0385, 2026-09-23) opening it 8 s into the baseline ended
     # the baseline at 8 s. It is not ticked: the bench is behind a full-screen
-    # NeurOptimal by then. It is VERIFIED instead -- only a Quick Session ends
-    # with Session Complete at the test's length, and EndsAtSessionComplete
-    # scores a run that did not as a departure.
+    # NeurOptimal by then. It is VERIFIED instead -- only the chosen session
+    # type ends with Session Complete at the test's length, and
+    # EndsAtSessionComplete scores a run that did not as a departure.
     $stepWatch = @{ Id = 'baseline'; Title = 'Measure the baseline'; Text = $watchStep; Gate = @{ Kind = 'Start' } }
-    $stepSessionStart = @{ Id = 'session-start'; Title = 'Start a Quick Session'; Text = $sessionStartStep; Gate = @{ Kind = 'SessionStart' } }
-    $stepSessionRun = @{ Id = 'session-run'; Title = 'Let the session run'; Text = $sessionRunStep; Gate = @{ Kind = 'SessionRun' } }
     $stepVisualizer = @{ Id = 'visualizer-inside'; Title = 'Leave the visualizer inside NeurOptimal'; Text = $leaveVisualizerStep; Gate = @{ Kind = 'Info' } }
 
     $audioPhrases = @{
@@ -2487,12 +2513,26 @@ function Get-GraphicsBenchProfiles {
         Session  = 'Keep the window and the screens unchanged.'
     }
 
-    $profiles = @(
-        @{
-            Id        = 'baseline-audio-15-builtin'
-            Name      = "Audio baseline $dot 15 minutes $dot Built-in screen"
-            Summary   = "The first recording a laptop makes on its own screen, so results can be compared across machines."
-            IsDefault = $true
+    # SessionLengthSec and SessionType sit OUTSIDE Requires on purpose: they
+    # are what the window and the reports say, not what is scored, and
+    # Requires is hashed into the protocol version.
+    $baselines = @()
+    $detached = @()
+    foreach ($len in $lengths) {
+        $m = [int]$len.Minutes
+        $sessionStartStep = "Open Configure Session in NeurOptimal, $($len.Choose), and start the session with audio only (a music track, no video)."
+        $sessionRunStep = "Let the session run for $m minutes. Do not resize, move or minimize the NeurOptimal window, and do not connect or disconnect a screen, while it runs. When NeurOptimal shows Session Complete the recording stops by itself and the package is sent."
+        $stepSessionStart = @{ Id = 'session-start'; Title = [string]$len.Title; Text = $sessionStartStep; Gate = @{ Kind = 'SessionStart' } }
+        $stepSessionRun = @{ Id = 'session-run'; Title = 'Let the session run'; Text = $sessionRunStep; Gate = @{ Kind = 'SessionRun' } }
+        $longer = $(if ($m -eq 15) { '' } else { " Run over NeurOptimal's regular $m-minute session." })
+
+        $baselines += @{
+            Id        = "baseline-audio-$m-builtin"
+            Name      = "Audio baseline $dot $m minutes $dot Built-in screen"
+            Summary   = "The first recording a laptop makes on its own screen, so results can be compared across machines.$longer"
+            IsDefault = ($m -eq 15)
+            SessionLengthSec = [double]$len.Sec
+            SessionType      = [string]$len.Type
             Procedure = @(
                 @{ Id = 'screens'; Title = 'Use the built-in screen only'
                    Text = "Disconnect every external monitor -- unplug it, do not just switch it off -- and open the lid, so the laptop's built-in screen is the only display in use."
@@ -2521,7 +2561,7 @@ function Get-GraphicsBenchProfiles {
                 DisplaySetup       = 'BuiltInOnly'
                 ScreenCoverage     = 'Full'
                 SessionKind        = 'Audio'
-                SessionMinSec      = 900
+                SessionMinSec      = [int]$len.Sec
                 # THE SESSION ENDS WHERE NEUROPTIMAL ENDS IT. A recording
                 # stopped by hand ends wherever the tester happened to press,
                 # and two runs of one test then end by different rules.
@@ -2530,11 +2570,13 @@ function Get-GraphicsBenchProfiles {
                 VisualizerSameDisplay = $true
             }
         }
-        @{
-            Id        = 'baseline-audio-15-external'
-            Name      = "Audio baseline $dot 15 minutes $dot External screen"
-            Summary   = 'The same recording made on one external display with the built-in screen off. A separate test, because the screen it is made on changes the numbers.'
+        $baselines += @{
+            Id        = "baseline-audio-$m-external"
+            Name      = "Audio baseline $dot $m minutes $dot External screen"
+            Summary   = "The same recording made on one external display with the built-in screen off. A separate test, because the screen it is made on changes the numbers.$longer"
             IsDefault = $false
+            SessionLengthSec = [double]$len.Sec
+            SessionType      = [string]$len.Type
             Procedure = @(
                 @{ Id = 'screens'; Title = 'Use one external display only'
                    Text = 'Use ONE external display, with the built-in screen off -- close the lid, or press Windows+P and choose Second screen only. Unplug any other monitor rather than leaving it connected and dark.'
@@ -2559,7 +2601,7 @@ function Get-GraphicsBenchProfiles {
                 DisplaySetup       = 'ExternalOnly'
                 ScreenCoverage     = 'Full'
                 SessionKind        = 'Audio'
-                SessionMinSec      = 900
+                SessionMinSec      = [int]$len.Sec
                 # THE SESSION ENDS WHERE NEUROPTIMAL ENDS IT. A recording
                 # stopped by hand ends wherever the tester happened to press,
                 # and two runs of one test then end by different rules.
@@ -2568,11 +2610,15 @@ function Get-GraphicsBenchProfiles {
                 VisualizerSameDisplay = $true
             }
         }
-        @{
-            Id        = 'visualizer-detached-15'
-            Name      = "Detached visualizer $dot 15 minutes"
-            Summary   = 'What the separate visualizer full-screen button costs. Its own test, because detaching the visuals is a manual step in the middle of the measurement -- so the recording is cut around it and the 15 minutes are counted from the moment the visuals settle.'
+
+        $steadyMinutes = $m - $detachMinutes
+        $detached += @{
+            Id        = "visualizer-detached-$m"
+            Name      = "Detached visualizer $dot $m minutes"
+            Summary   = "What the separate visualizer full-screen button costs. Its own test, because detaching the visuals is a manual step in the middle of the measurement -- so the recording is cut around it and only the steady stretch after the visuals settle is compared.$longer"
             IsDefault = $false
+            SessionLengthSec = [double]$len.Sec
+            SessionType      = [string]$len.Type
             Procedure = @(
                 @{ Id = 'screens'; Title = 'Set up the screens'
                    Text = 'Set up the screens you want to test, and leave them alone for the whole recording.'
@@ -2582,45 +2628,48 @@ function Get-GraphicsBenchProfiles {
                 @{ Id = 'full-screen'; Title = 'Put NeurOptimal full screen'; Text = "$noFullScreenStep"
                    Gate = @{ Kind = 'Checks'; Checks = @('ScreenCoverage') } }
                 $stepWatch
-                @{ Id = 'session-start'; Title = 'Start a Quick Session'
-                   Text = 'Open Configure Session in NeurOptimal, set the session type to "Quick Session", and start the session with audio only (a music track, no video). Let it settle for a minute.'
-                   Gate = @{ Kind = 'SessionStart' } }
+                $stepSessionStart
                 @{ Id = 'mark-start'; Title = 'Detach the visualizer'
-                   Text = 'Press Mark transition start, then use the separate visualizer full-screen button. NeurOptimal asks which monitor to use -- pick it by the Display number this window shows beside each screen, then press OK. The recording waits for you; take as long as you need.'
+                   Text = "As soon as the music is playing, press Mark transition start, then use the separate visualizer full-screen button. NeurOptimal asks which monitor to use -- pick it by the Display number this window shows beside each screen, then press OK. Be done within $detachMinutes minutes of the music starting: the session still ends at $m minutes, and at least $steadyMinutes of them have to come after the visuals settle."
                    Gate = @{ Kind = 'Mark'; MarkIndex = 0 } }
                 @{ Id = 'mark-ready'; Title = 'Mark the visuals ready'
                    Text = 'Press Mark visuals ready as soon as the visuals are settled on their display. The stretch between the two is reported on its own and is kept out of the comparison.'
                    Gate = @{ Kind = 'Mark'; MarkIndex = 1 } }
                 @{ Id = 'session-run'; Title = 'Let the session run'
-                   Text = 'Let the session run for 15 minutes FROM the second mark. When NeurOptimal shows Session Complete the recording stops by itself and the package is sent.'
+                   Text = "Let the session run until NeurOptimal shows Session Complete -- at least $steadyMinutes minutes after the second mark. The recording then stops by itself and the package is sent."
                    Gate = @{ Kind = 'SessionRun' } }
             )
             Phrases   = @{
                 Prepare  = 'Put NeurOptimal full screen before starting the recording.'
                 Baseline = $audioPhrases.Baseline
-                Ready    = 'Baseline collected. Start your audio-only session, let it settle, then mark and detach the visualizer.'
+                Ready    = 'Baseline collected. Start your audio-only session, then mark and detach the visualizer as soon as the music plays.'
                 Session  = 'Press Mark transition start, then detach the visualizer.'
             }
             # THE MARKERS ARE A REQUIREMENT, not a suggestion. Without them the
             # recording has no boundary between the manual transition and the
-            # steady period, so the 15 minutes it claims to measure cannot be
+            # steady period, so the stretch it claims to measure cannot be
             # located -- which is exactly what the first version of this test
             # shipped: instructions that promised a split nothing implemented.
             #
             # SessionMinSec is checked against the STEADY arm, which the
-            # summariser cuts at the second marker. No DisplaySetup, no
-            # VisualizerAttached and no VisualizerSameDisplay: the detached,
-            # possibly two-screen arrangement is the POINT of this test, so it
-            # is recorded rather than demanded.
+            # summariser cuts at the second marker -- hence the session length
+            # minus the detach window. No DisplaySetup and no
+            # VisualizerSameDisplay: the arrangement is the POINT of this test,
+            # so it is recorded rather than demanded. VisualizerDetached is the
+            # one thing it does demand: a run whose visuals never left
+            # NeurOptimal measured the baseline, not this.
             Requires  = @{
                 ScreenCoverage     = 'Full'
                 SessionKind        = 'Audio'
-                SessionMinSec      = 900
+                SessionMinSec      = [int]$len.Sec - $detachWindowSec
                 EndsAtSessionComplete = $true
                 TransitionMarkers  = $true
+                VisualizerDetached = $true
             }
         }
+    }
 
+    $profiles = @($baselines) + @($detached) + @(
         @{
             Id        = 'exploratory'
             Name      = 'Exploratory recording'
@@ -3270,7 +3319,7 @@ function Get-GraphicsBenchStepView {
         [string]$SendLevel,
         [double]$IdleFloorSec = $script:GfxIdleFloorSec,
         # How long past the session length to wait for Session Complete before
-        # telling the tester the session type was probably not Quick Session.
+        # telling the tester the session type was probably not the one asked for.
         [double]$SessionCompleteGraceSec = 120,
         # How much baseline was measured before the session started, once it
         # has. Below the floor the card says so while the run can still be
@@ -3474,11 +3523,21 @@ function Get-GraphicsBenchStepView {
                 $view.StopEarlyKind = 'NoSessionComplete'
                 $view.StopEarlyText = 'Session Complete did not appear - stop now...'
                 $over = $done - [double]$target
-                if ($over -ge $SessionCompleteGraceSec) {
-                    $view.Instruction = ("Session Complete has not appeared {0} after the 15 minutes. The session type was probably not Quick Session: press 'Session Complete did not appear - stop now'. The recording will be kept and marked as not following the test." -f (Format-GraphicsClock $over))
+                # A TEST WHOSE CLOCK STARTS AFTER THE MUSIC reaches its target
+                # before the session is over: the detached test clocks from
+                # the second mark, up to the detach window into the session.
+                # That slack is added to the grace, or a tester who detached
+                # promptly would be told the session type was wrong while
+                # NeurOptimal was still, correctly, playing.
+                $grace = $SessionCompleteGraceSec
+                if ($BenchProfile.SessionLengthSec -and [double]$BenchProfile.SessionLengthSec -gt [double]$target) { $grace += [double]$BenchProfile.SessionLengthSec - [double]$target }
+                $sessionType = $(if ($BenchProfile.SessionType) { [string]$BenchProfile.SessionType } else { 'the session type this test asks for' })
+                $targetMinutes = [int][math]::Round([double]$target / 60)
+                if ($over -ge $grace) {
+                    $view.Instruction = ("Session Complete has not appeared {0} after the {1} minutes. The session type was probably not {2}: press 'Session Complete did not appear - stop now'. The recording will be kept and marked as not following the test." -f (Format-GraphicsClock $over), $targetMinutes, $sessionType)
                     $view.Level = 'Degraded'
                 } else {
-                    $view.Instruction = 'The 15 minutes are recorded. Leave everything alone and wait for NeurOptimal to show Session Complete -- the recording then stops by itself and the package is sent.'
+                    $view.Instruction = ('The {0} minutes are recorded. Leave everything alone and wait for NeurOptimal to show Session Complete -- the recording then stops by itself and the package is sent.' -f $targetMinutes)
                 }
             }
             if ($SessionEnded) {
@@ -3802,6 +3861,19 @@ function Get-GraphicsBenchProfileDeviations {
         }
     }
 
+    # THE MIRROR, for the detached test: visuals that never left NeurOptimal's
+    # window measured the baseline arrangement, not the one this test is for.
+    # Only a READ attachment is scored -- NotShown and Unknown are the sampler
+    # not seeing the visuals, not the tester skipping the step.
+    if ($req.ContainsKey('VisualizerDetached') -and [bool]$req.VisualizerDetached) {
+        $v = $Summary.Visualizer
+        if ($v -and [string]$v.Attachment -eq 'InMainWindow') {
+            $out += @{ Key    = 'VisualizerNotDetached'
+                       Text   = 'The visuals stayed inside NeurOptimal for the whole recording. This test measures them detached with the separate visualizer full-screen button -- use an Audio baseline test for this arrangement.'
+                       Detail = 'No sample showed the visualizer surface hosted by a window of its own; the recording measured the attached arrangement.' }
+        }
+    }
+
     if ($req.ContainsKey('VisualizerSameDisplay') -and [bool]$req.VisualizerSameDisplay) {
         $v = $Summary.Visualizer
         if ($v -and $v.OnOtherDisplay -eq $true) {
@@ -3931,7 +4003,7 @@ function Get-GraphicsBenchProfileDeviations {
         $ended = ($Summary.SessionEndSource -and [string]$Summary.SessionEndSource -ne 'none-detected')
         if ($started -and -not $ended) {
             $out += @{ Key    = 'SessionEnd'
-                       Text   = 'The recording was stopped by hand before NeurOptimal showed Session Complete. The session type may not have been Quick Session, so this recording may not be comparable with the other baseline recordings.'
+                       Text   = "The recording was stopped by hand before NeurOptimal showed Session Complete. The session type may not have been $(if ($BenchProfile.SessionType) { [string]$BenchProfile.SessionType } else { 'the one this test asks for' }), so this recording may not be comparable with the other recordings of this test."
                        Detail = "No Session Complete dialog was seen in NO's window set; the session arm ends where the operator stopped, not where NeurOptimal ended the session." }
         }
     }
@@ -5267,9 +5339,43 @@ function Get-GfxTransitionMarkerKinds {
            Instruction = 'Press Mark transition start, then use the separate visualizer full-screen button and choose the display for it.' }
         @{ Kind = 'VisualsReady'
            Label = 'Mark visuals ready'
-           Instruction = 'Press Mark visuals ready as soon as the visuals are settled on their display. The 15 minutes are measured from here.' }
+           Instruction = 'Press Mark visuals ready as soon as the visuals are settled on their display. The steady recording is measured from here.' }
     )
     return ,$kinds
+}
+
+function ConvertTo-GfxUtcInstant {
+    <#
+    .SYNOPSIS
+        A timestamp as a UTC DateTime, whether it arrived as a DateTime or as
+        a round-trip string. PURE.
+    .DESCRIPTION
+        [datetime]'2026-09-24T20:27:00Z' IS LOCAL TIME in Windows PowerShell:
+        the cast converts to the machine's zone and drops the Z. A live sample
+        carries [datetime]::UtcNow (Kind Utc) while a marker carries the same
+        instant as a string, and DateTime comparison ignores Kind -- so in New
+        York every marker read four hours BEFORE every sample. That put both
+        marks of every detached-visualizer run before the session and the test
+        could not be passed anywhere west of Greenwich (run 3C7ACD84,
+        2026-09-24). Every comparison between a marker and a sample goes
+        through here, so both sides are the same kind of number.
+    .OUTPUTS
+        [datetime] with Kind Utc, or $null when the value cannot be read.
+    #>
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Local) { return $Value.ToUniversalTime() }
+        # Unspecified is treated as UTC: every timestamp this module writes is
+        # named *Utc and written as UTC.
+        return [datetime]::SpecifyKind($Value, [DateTimeKind]::Utc)
+    }
+    $parsed = [datetime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    if ([datetime]::TryParse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+        return [datetime]::SpecifyKind($parsed, [DateTimeKind]::Utc)
+    }
+    return $null
 }
 
 function Get-GfxTransitionSpan {
@@ -5318,7 +5424,8 @@ function Get-GfxTransitionSpan {
     foreach ($m in @($Markers | Where-Object { $_ })) {
         $kind = [string]$m.Kind
         $at = $null
-        try { $at = [datetime]$m.AtUtc } catch { continue }
+        $at = ConvertTo-GfxUtcInstant $m.AtUtc
+        if ($null -eq $at) { continue }
         if ($kind -eq 'TransitionStart') {
             if ($null -eq $start -or $at -lt $start) { $start = $at }
         } elseif ($kind -eq 'VisualsReady') {
@@ -5344,8 +5451,8 @@ function Get-GfxTransitionSpan {
             if ($t -and $t -match $script:GfxMonitorPickerPattern) { $open = $true; break }
         }
         if (-not $open) { continue }
-        $at = $null
-        try { $at = [datetime]$s.AtUtc } catch { continue }
+        $at = ConvertTo-GfxUtcInstant $s.AtUtc
+        if ($null -eq $at) { continue }
         if ($null -eq $first) { $first = $at }
         $last = $at
     }
@@ -5356,8 +5463,8 @@ function Get-GfxTransitionSpan {
     # 52.0 down to 51.978. One sample is not much and it is still wrong.
     $after = $null
     foreach ($s in @($Samples)) {
-        $at = $null
-        try { $at = [datetime]$s.AtUtc } catch { continue }
+        $at = ConvertTo-GfxUtcInstant $s.AtUtc
+        if ($null -eq $at) { continue }
         if ($at -le $last) { continue }
         $after = $at
         break
@@ -5735,6 +5842,11 @@ function Get-GraphicsBenchSessionSummary {
         ProfileId          = $(if ($BenchProfile) { $BenchProfile.Id } else { $null })
         ProfileName        = $(if ($BenchProfile) { $BenchProfile.Name } else { $null })
         ProfileDeviations  = @()
+        # Whether the test ASKED for the visuals in a window of their own. The
+        # findings read it so the detached test is not warned for doing what
+        # it asked (run 3C7ACD84, 2026-09-24: the tester was told to "use the
+        # Detached visualizer test" while running it).
+        VisualizerDetachExpected = [bool]($BenchProfile -and $BenchProfile.Requires -and $BenchProfile.Requires.ContainsKey('VisualizerDetached') -and [bool]$BenchProfile.Requires.VisualizerDetached)
         MonitorCount       = $(if ($null -ne $MonitorCount) { [int]$MonitorCount } else { $null })
         # Every distinct display count seen WHILE RECORDING. The cohort key is
         # written from the layout at the start, so a monitor plugged in halfway
@@ -5854,13 +5966,13 @@ function Get-GraphicsBenchSessionSummary {
         # downstream is steady-minus-idle without a single line changing.
         $summary.TransitionSpan = Get-GfxTransitionSpan -Markers $Markers -Samples $Samples
         if ($summary.TransitionSpan) {
-            $tStart = [datetime]$summary.TransitionSpan.StartUtc
-            $tEnd = [datetime]$summary.TransitionSpan.EndUtc
+            $tStart = ConvertTo-GfxUtcInstant $summary.TransitionSpan.StartUtc
+            $tEnd = ConvertTo-GfxUtcInstant $summary.TransitionSpan.EndUtc
             $tFrom = $null
             $tTo = $null
             for ($i = $sessionFirst; $i -le $sessionLast; $i++) {
-                $at = $null
-                try { $at = [datetime]$Samples[$i].AtUtc } catch { continue }
+                $at = ConvertTo-GfxUtcInstant $Samples[$i].AtUtc
+                if ($null -eq $at) { continue }
                 if ($at -ge $tStart -and $null -eq $tFrom) { $tFrom = $i }
                 if ($at -ge $tEnd -and $null -eq $tTo) { $tTo = $i; break }
             }
@@ -6129,7 +6241,10 @@ function Get-GraphicsBenchFindings {
     # THE VISUALS IN A WINDOW OF THEIR OWN. Raised for ANY run: a recording
     # made this way measures a different arrangement whether or not a profile
     # asked about it.
-    if ($Summary.Visualizer -and [string]$Summary.Visualizer.Attachment -eq 'OwnWindow') {
+    # NOT RAISED WHEN THE TEST ASKED FOR IT: on the detached test this
+    # arrangement is the measurement, and a WARN telling the tester to go and
+    # run the test they are running reads as a failure they did not commit.
+    if ($Summary.Visualizer -and [string]$Summary.Visualizer.Attachment -eq 'OwnWindow' -and -not $Summary.VisualizerDetachExpected) {
         $v = $Summary.Visualizer
         $screenLine = switch ($v.OnOtherDisplay) {
             $true   { "It was also on a different screen ($($v.MonitorDevice)) from the main window ($($v.MainMonitorDevice))." }
@@ -7531,6 +7646,7 @@ Export-ModuleMember -Function @(
     'Get-GraphicsBenchPhase'
     'Get-GraphicsBenchStepView'
     'Get-GfxPlaybackStartIndex'
+    'ConvertTo-GfxUtcInstant'
     'Get-GraphicsBenchProtocolVersion'
     'Get-GraphicsBenchProfileOutcome'
     'Format-GraphicsClock'
