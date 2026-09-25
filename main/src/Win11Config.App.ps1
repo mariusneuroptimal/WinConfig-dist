@@ -5202,6 +5202,36 @@ $buttonHandlers = @{
             $script:GfxResendBtn.Visible = $false
             $gfxNavLeft.Controls.Add($script:GfxStopEarlyBtn)
             $gfxNavLeft.Controls.Add($script:GfxResendBtn)
+            # THE PACKAGE'S NAME, one click from the clipboard. A tester who
+            # asks about a run has to say WHICH run, and the only other place
+            # the name appears is the details window's log -- run 3C7ACD84
+            # (2026-09-24) reached us as a blurry screenshot and was first
+            # read as 3C7AC004. Shown on the Results step whenever a package
+            # was made, sent or not: the name is how it is found either way.
+            $script:GfxCopyNameLink = New-Object System.Windows.Forms.LinkLabel
+            $script:GfxCopyNameLink.Text = ""
+            $script:GfxCopyNameLink.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+            $script:GfxCopyNameLink.AutoSize = $true
+            $script:GfxCopyNameLink.BackColor = [System.Drawing.Color]::Transparent
+            $script:GfxCopyNameLink.Margin = New-Object System.Windows.Forms.Padding(4, [int](7 * $gfxS), 0, 0)
+            $script:GfxCopyNameLink.Visible = $false
+            $script:GfxCopyNameLink.Add_LinkClicked({
+                if (-not $script:GfxLastZip) { return }
+                $name = Split-Path -Path $script:GfxLastZip -Leaf
+                try {
+                    [System.Windows.Forms.Clipboard]::SetText($name)
+                    $this.Text = "Copied: $name"
+                    Write-WinConfigGuiDiagnostic -Level ACTION -Message "Package name copied: $name" -Box $script:GfxLog
+                } catch {
+                    # The clipboard can be held by another program for a
+                    # moment. Say so, and leave the name on screen to read.
+                    # No longer than the link's own text: at the window's
+                    # minimum width, beside Back and Send again, that is all
+                    # the room the row has (measured: 391 of 597 px).
+                    $this.Text = "Copy failed, try again: $name"
+                }
+            })
+            $gfxNavLeft.Controls.Add($script:GfxCopyNameLink)
             $gfxNav.Controls.Add($gfxNavLeft, 0, 0)
             $script:GfxNextBtn = & $gfxMakeButton "Next >" $false $true
             $script:GfxNextBtn.Margin = New-Object System.Windows.Forms.Padding(0, [int](6 * $gfxS), 0, 0)
@@ -5863,6 +5893,17 @@ $buttonHandlers = @{
                 if ($script:GfxBackBtn.Enabled -ne [bool]$view.BackEnabled) { $script:GfxBackBtn.Enabled = [bool]$view.BackEnabled }
                 $script:GfxOverrideBtn.Visible = [bool]$view.OverrideOffered
                 $script:GfxResendBtn.Visible = ($view.Stage -eq 'Results' -and $script:GfxSendResult -and [bool]$script:GfxSendResult.CanRetry)
+                # Re-texted only when the package changes, so a repaint does
+                # not wipe the 'Copied' the tester just saw.
+                $wantCopy = [bool]($view.Stage -eq 'Results' -and $script:GfxLastZip)
+                if ($wantCopy) {
+                    $zipName = Split-Path -Path $script:GfxLastZip -Leaf
+                    if ([string]$script:GfxCopyNameLink.Tag -ne $zipName) {
+                        $script:GfxCopyNameLink.Tag = $zipName
+                        $script:GfxCopyNameLink.Text = "Copy package name: $zipName"
+                    }
+                }
+                $script:GfxCopyNameLink.Visible = $wantCopy
                 $wantEarly = ([bool]$view.StopEarlyOffered -and $running)
                 $script:GfxStopEarlyBtn.Visible = $wantEarly
                 if ($wantEarly -and $view.StopEarlyText -and $script:GfxStopEarlyBtn.Text -ne [string]$view.StopEarlyText) { $script:GfxStopEarlyBtn.Text = [string]$view.StopEarlyText }

@@ -62,7 +62,17 @@ Set-StrictMode -Off
 #   stale ASRL resources while the box had ZERO COM ports, with ASRL11::INSTR
 #   and ASRL3::INSTR both mapped to COM3. Nothing collected that layer, and the
 #   existing COM-arbiter/BTHENUM remedies do not clean it).
-$script:SupportBundleProbeVersion = '1.6.0'
+# 1.7.0 (2026-09-25): ZEN-NOLIVE-001 collector (FI-022 — NO.exe sat on
+#   "Refreshing Licensing Information" through three force-closes and two
+#   reboots on SP7P_I5_8GB_TES; the bundle proved the network healthy but could
+#   not say whether NO was busy, idle, or talking to anything, nor whether
+#   MySQL was up — it took three hand-run rounds and two memory dumps).
+#   WIN-WER-001 now actually emits the Sig values: its '-like "Sig[0].Value=*"'
+#   match treated [0] as a wildcard class and never matched a real line, so no
+#   bundle ever carried a hang/crash signature. ZEN-INI-001 withholds binary
+#   content (splashscreen.ini was an 800 KB non-text blob on that box) and
+#   ships size/mtime/sha256 in its place.
+$script:SupportBundleProbeVersion = '1.7.0'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -131,6 +141,14 @@ $script:SupportDomains    = @('zengar.com', 'neuroptimal.com', 'noreleases.neuro
 $script:BltLicensingHost  = 'blt-server.neuroptimal.com'
 $script:BltLicensingPorts = @(7000, 7001, 7002)   # CRITICAL for licensing
 $script:TrustFetchHosts   = @('ctldl.windowsupdate.com', 'crt.sectigo.com')  # KI-001
+
+# FI-022: live state of the running app and its local database. NO.exe keeps a
+# connection to the bundled MySQL server on loopback; the service installs as
+# 'MySQL56' (5.6.19) OUTSIDE C:\zengar, so ZEN-PROCESS-001 never sees it.
+$script:NoProcessName      = 'NO'
+$script:DbServiceNameLike  = 'MySQL%'   # WQL LIKE pattern
+$script:DbPort             = 3306
+$script:LiveSampleSeconds  = 5          # two samples this far apart give a CPU delta
 
 # FI-004 (2026-07-22): NO 4.x drives the zAmp through WinUSB + NI-VISA, and
 # ZEN-ZAMP-001 inspects zAmpLoader\driver — a directory that does not exist on
@@ -1166,13 +1184,36 @@ function Get-WinConfigSupportCollectors {
                 # NO.ini + splashscreen.ini ship verbatim (LabVIEW config corruption is a
                 # live failure class). maintenancetool.ini is NEVER copied — its whitelisted
                 # fields ship via ZEN-REPO-001 / ZEN-VERSION-001 (§6).
-                $files = @()
+                # FI-022: on SP7P_I5_8GB_TES splashscreen.ini was an 800 KB NON-TEXT
+                # blob — most of the bundle, none of it readable. Binary content is
+                # withheld and described instead; a UTF-16 BOM still counts as text.
+                $files    = @()
+                $withheld = @()
                 foreach ($name in @('NO.ini', 'splashscreen.ini')) {
                     $p = Join-Path $Context.ZengarRoot $name
-                    if (Test-Path $p) { $files += @{ SourcePath = $p; TargetName = $name } }
+                    if (-not (Test-Path -LiteralPath $p)) { continue }
+                    $head = New-Object byte[] 8192
+                    $read = 0
+                    $fs = [System.IO.File]::OpenRead($p)
+                    try { $read = $fs.Read($head, 0, $head.Length) } finally { $fs.Dispose() }
+                    $utf16Bom = ($read -ge 2) -and (($head[0] -eq 0xFF -and $head[1] -eq 0xFE) -or ($head[0] -eq 0xFE -and $head[1] -eq 0xFF))
+                    $hasNul   = ($read -gt 0) -and ([Array]::IndexOf($head, [byte]0, 0, $read) -ge 0)
+                    if ($hasNul -and -not $utf16Bom) {
+                        $item = Get-Item -LiteralPath $p
+                        $withheld += @{
+                            name      = $name
+                            reason    = 'binary content'
+                            sizeBytes = $item.Length
+                            mtime     = $item.LastWriteTime.ToString('o')
+                            sha256    = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash
+                        }
+                    } else {
+                        $files += @{ SourcePath = $p; TargetName = $name }
+                    }
                 }
                 $facts = @{
                     collected                 = @($files | ForEach-Object { $_.TargetName })
+                    withheld                  = @($withheld)
                     maintenancetoolIniPolicy  = 'never-copied-verbatim; whitelisted fields in ZEN-REPO-001'
                 }
                 @{ Facts = $facts; Files = $files }
@@ -1281,6 +1322,170 @@ function Get-WinConfigSupportCollectors {
                     processPathUnresolved = $unresolved
                     enumerationLimited    = (-not $Context.Elevated)
                 } }
+            }
+        }
+        @{
+            # RequiresZengar = $false: the database service lives outside the install
+            # root and its state is a fact even when the root is damaged or gone.
+            Id = 'ZEN-NOLIVE-001'; Ring = 1; RequiresAdmin = $false; RequiresZengar = $false; TimeoutSeconds = 45
+            Script = {
+                param($Context)
+                # FI-022 (SP7P_I5_8GB_TES, 2026-09-25): NO.exe sat on "Refreshing
+                # Licensing Information" through three force-closes and two reboots.
+                # The bundle proved DNS/TLS/proxy/licensing ports healthy but could not
+                # answer the three questions that mattered: is NO busy or idle, is it
+                # talking to any remote host, and is its database up? Answering them
+                # took three hand-run rounds and two memory dumps. Two samples a few
+                # seconds apart turn "CPU seconds" into "is it doing anything".
+                #
+                # Facts only. No window titles (a title can carry a client name), no
+                # command lines, no process memory. Remote endpoints are server
+                # addresses, not client data.
+                $sampleSec = [int]$Context.Caps.LiveSampleSeconds
+                $licPorts  = @($Context.BltLicensingPorts | ForEach-Object { [int]$_ })
+                $dbPort    = [int]$Context.DbPort
+
+                $readProc = {
+                    param([int]$ProcId)
+                    $p = $null
+                    try { $p = Get-Process -Id $ProcId -ErrorAction Stop } catch { return $null }
+                    $s = @{ at = (Get-Date).ToString('o') }
+                    # Each property can be access-denied on another user's process (MySQL
+                    # runs as a service account) — a null is "unreadable", never zero.
+                    try { $s.cpuSeconds = [math]::Round($p.TotalProcessorTime.TotalSeconds, 3) } catch { $s.cpuSeconds = $null }
+                    try { $s.responding = [bool]$p.Responding } catch { $s.responding = $null }
+                    try { $s.threadCount = $p.Threads.Count } catch { $s.threadCount = $null }
+                    try { $s.handleCount = $p.HandleCount } catch { $s.handleCount = $null }
+                    try { $s.workingSetBytes = $p.WorkingSet64 } catch { $s.workingSetBytes = $null }
+                    return $s
+                }
+
+                # Get-NetTCPConnection THROWS when a process owns no sockets; that is
+                # an empty answer, not an error. Keyed on the category, not the
+                # message text, which is localized on non-English boxes.
+                $readConns = {
+                    param([int]$ProcId, [string]$State)
+                    try {
+                        if ($State) { return @(Get-NetTCPConnection -OwningProcess $ProcId -State $State -ErrorAction Stop) }
+                        return @(Get-NetTCPConnection -OwningProcess $ProcId -ErrorAction Stop)
+                    } catch {
+                        if ("$($_.CategoryInfo.Category)" -eq 'ObjectNotFound') { return @() }
+                        throw
+                    }
+                }
+
+                $classify = {
+                    param($Rows)
+                    $ownPorts = @{}
+                    foreach ($r in $Rows) { $ownPorts[[int]$r.LocalPort] = $true }
+                    $out = @()
+                    foreach ($r in $Rows) {
+                        $state = "$($r.State)"
+                        if ($state -eq 'Bound' -or $state -eq 'Listen') { continue }
+                        $remote = "$($r.RemoteAddress)"
+                        $rport  = [int]$r.RemotePort
+                        $loop   = ($remote -like '127.*') -or ($remote -eq '::1')
+                        $peer = if ($loop) {
+                            if ($rport -eq $dbPort) { 'database' }
+                            elseif ($ownPorts.ContainsKey($rport)) { 'self' }
+                            else { 'local-other' }
+                        } elseif ($licPorts -contains $rport) { 'licensing-port' } else { 'remote' }
+                        $out += @{
+                            localPort     = [int]$r.LocalPort
+                            remoteAddress = $remote
+                            remotePort    = $rport
+                            state         = $state
+                            kind          = $(if ($loop) { 'loopback' } else { 'remote' })
+                            peer          = $peer
+                        }
+                    }
+                    return ,$out
+                }
+
+                $facts = @{
+                    sampleIntervalSeconds = $sampleSec
+                    elevated              = [bool]$Context.Elevated
+                    processName           = "$($Context.NoProcessName)"
+                    connectionsError      = $null
+                }
+
+                # --- sample 1 ---
+                $noIds = @(Get-Process -Name $Context.NoProcessName -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+                $dbSvcs = @(Get-CimInstance -ClassName Win32_Service -Filter "Name LIKE '$($Context.DbServiceNameLike)'" -ErrorAction SilentlyContinue)
+
+                $noState = @{}
+                foreach ($id in $noIds) {
+                    $e = @{ id = $id; samples = @(); connectionSamples = @() }
+                    try {
+                        $p = Get-Process -Id $id -ErrorAction Stop
+                        try { $e.path = "$($p.Path)" } catch { $e.path = $null }
+                        try { $e.startTime = $p.StartTime.ToString('o'); $e.uptimeSeconds = [int]((Get-Date) - $p.StartTime).TotalSeconds } catch { $e.startTime = $null }
+                    } catch { }
+                    $noState[$id] = $e
+                }
+                $dbState = @()
+                foreach ($s in $dbSvcs) {
+                    $d = @{
+                        name      = "$($s.Name)"
+                        state     = "$($s.State)"
+                        startMode = "$($s.StartMode)"
+                        processId = [int]$s.ProcessId
+                        pathName  = "$($s.PathName)"
+                        samples   = @()
+                    }
+                    if ($d.processId -gt 0) {
+                        try { $d.startTime = (Get-Process -Id $d.processId -ErrorAction Stop).StartTime.ToString('o') } catch { $d.startTime = $null }
+                        try {
+                            $d.listenPorts = @(& $readConns $d.processId 'Listen' | ForEach-Object { [int]$_.LocalPort } | Sort-Object -Unique)
+                        } catch { $facts.connectionsError = "$($_.Exception.Message)" }
+                    }
+                    $dbState += $d
+                }
+
+                $takeSample = {
+                    foreach ($e in $noState.Values) {
+                        $s = & $readProc $e.id
+                        if ($s) { $e.samples += $s }
+                        try {
+                            $rows = & $readConns $e.id ''
+                            $e.connectionSamples += @{ at = (Get-Date).ToString('o'); connections = (& $classify $rows) }
+                        } catch { $facts.connectionsError = "$($_.Exception.Message)" }
+                    }
+                    foreach ($d in $dbState) {
+                        if ($d.processId -gt 0) { $s = & $readProc $d.processId; if ($s) { $d.samples += $s } }
+                    }
+                }
+
+                . $takeSample
+                if ($sampleSec -gt 0 -and ($noState.Count -gt 0 -or $dbState.Count -gt 0)) {
+                    Start-Sleep -Seconds $sampleSec
+                    . $takeSample
+                }
+
+                # Deltas and summaries: the analyzer should not have to re-derive them
+                $delta = {
+                    param($Samples)
+                    $sm = @($Samples)
+                    if ($sm.Count -lt 2) { return $null }
+                    $a = $sm[0].cpuSeconds; $b = $sm[$sm.Count - 1].cpuSeconds
+                    if ($null -eq $a -or $null -eq $b) { return $null }
+                    return [math]::Round($b - $a, 3)
+                }
+                $noOut = @()
+                foreach ($e in $noState.Values) {
+                    $e.cpuDeltaSeconds = & $delta $e.samples
+                    $all = @($e.connectionSamples | ForEach-Object { $_.connections } | ForEach-Object { $_ })
+                    $e.remoteEndpoints   = @($all | Where-Object { $_.kind -eq 'remote' } | ForEach-Object { "$($_.remoteAddress):$($_.remotePort)" } | Sort-Object -Unique)
+                    $e.databaseConnected = [bool](@($all | Where-Object { $_.peer -eq 'database' }).Count -gt 0)
+                    $noOut += $e
+                }
+                foreach ($d in $dbState) { $d.cpuDeltaSeconds = & $delta $d.samples }
+
+                $facts.noProcesses       = @($noOut)
+                $facts.noProcessCount    = @($noOut).Count
+                $facts.databaseServices  = @($dbState)
+                $facts.databaseServiceCount = @($dbState).Count
+                @{ Facts = $facts }
             }
         }
 
@@ -1443,8 +1648,11 @@ function Get-WinConfigSupportCollectors {
                     "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportArchive",
                     "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportQueue"
                 )
+                # AppCrash: Sig[3] fault module, Sig[6] exception code, Sig[7] offset.
+                # AppHang:  Sig[3] hang signature, Sig[4] hang type.
                 $metaKeys = @('AppName', 'AppPath', 'EventType', 'EventTime', 'ReportStatus',
-                              'Sig[0].Value', 'Sig[1].Value', 'Sig[2].Value', 'Sig[3].Value', 'Sig[6].Value', 'Sig[7].Value')
+                              'Sig[0].Value', 'Sig[1].Value', 'Sig[2].Value', 'Sig[3].Value', 'Sig[4].Value',
+                              'Sig[5].Value', 'Sig[6].Value', 'Sig[7].Value')
                 foreach ($root in $roots) {
                     if (-not (Test-Path $root)) { continue }
                     $dirs = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
@@ -1453,11 +1661,18 @@ function Get-WinConfigSupportCollectors {
                         $wer = Join-Path $dir.FullName 'Report.wer'
                         $meta = @{ reportDir = $dir.Name; mtime = $dir.LastWriteTime.ToString('o') }
                         if (Test-Path $wer) {
+                            # Ordinal prefix match, NOT -like: '[0]' in a -like pattern is a
+                            # character class, so 'Sig[0].Value=*' never matched a real line
+                            # and every bundle before probe 1.7.0 shipped without Sig values.
+                            $sigNames = @{}
                             foreach ($line in (Get-Content -LiteralPath $wer -ErrorAction SilentlyContinue)) {
                                 foreach ($k in $metaKeys) {
-                                    if ($line -like "$k=*") { $meta[$k] = $line.Substring($k.Length + 1) }
+                                    if ($line.StartsWith("$k=", [System.StringComparison]::Ordinal)) { $meta[$k] = $line.Substring($k.Length + 1) }
                                 }
+                                if ($line -match '^(Sig\[\d+\])\.Name=(.*)$') { $sigNames[$Matches[1]] = $Matches[2] }
                             }
+                            # The Sig slots mean different things per EventType — ship their labels
+                            if ($sigNames.Count -gt 0) { $meta.sigNames = $sigNames }
                         }
                         $reports += $meta
                     }
@@ -2099,7 +2314,11 @@ function Invoke-WinConfigSupportCollection {
         ExternalComponents = $script:ExternalComponentTargets
         UninstallRegPaths  = $script:UninstallRegPaths
         NipkgPath          = $script:NipkgPath
+        NoProcessName      = $script:NoProcessName
+        DbServiceNameLike  = $script:DbServiceNameLike
+        DbPort             = $script:DbPort
         Caps             = @{
+            LiveSampleSeconds   = $script:LiveSampleSeconds
             InstallLogTailLines = $script:InstallLogTailLines
             SetupApiTailLines   = $script:SetupApiTailLines
             EventSliceMax       = $script:EventSliceMax

@@ -2468,11 +2468,16 @@ function Get-GraphicsBenchProfiles {
     # split the baseline runs already collected from the ones still to come.
     # Type is how the session type reads inside a sentence ("the session type
     # was probably not ..."); Choose is the instruction for Configure Session.
+    #
+    # LISTED 33 FIRST, and the 33-minute built-in test is the default: the
+    # regular session is the one NeurOptimal is normally run with, so it is
+    # what the dropdown opens on (user decision, 2026-09-25). The order of
+    # this list is the order of the dropdown.
     $lengths = @(
-        @{ Minutes = 15; Sec = 900; Type = 'Quick Session'; Title = 'Start a Quick Session'
-           Choose = 'set the session type to "Quick Session"' }
         @{ Minutes = 33; Sec = 1980; Type = 'the regular 33-minute session'; Title = 'Start a 33-minute session'
            Choose = 'leave the session type on the regular 33-minute session (the default)' }
+        @{ Minutes = 15; Sec = 900; Type = 'Quick Session'; Title = 'Start a Quick Session'
+           Choose = 'set the session type to "Quick Session"' }
     )
 
     # THE DETACHED TEST'S STEADY STRETCH IS SHORTER THAN THE SESSION. The
@@ -2530,7 +2535,7 @@ function Get-GraphicsBenchProfiles {
             Id        = "baseline-audio-$m-builtin"
             Name      = "Audio baseline $dot $m minutes $dot Built-in screen"
             Summary   = "The first recording a laptop makes on its own screen, so results can be compared across machines.$longer"
-            IsDefault = ($m -eq 15)
+            IsDefault = ($m -eq 33)
             SessionLengthSec = [double]$len.Sec
             SessionType      = [string]$len.Type
             Procedure = @(
@@ -2669,7 +2674,12 @@ function Get-GraphicsBenchProfiles {
         }
     }
 
-    $profiles = @($baselines) + @($detached) + @(
+    # Grouped BY LENGTH -- built-in, external, detached -- so each length's
+    # tests sit together in the dropdown, in the order of $lengths.
+    $scored = @($baselines) + @($detached)
+    $grouped = @()
+    foreach ($len in $lengths) { $grouped += @($scored | Where-Object { [double]$_.SessionLengthSec -eq [double]$len.Sec }) }
+    $profiles = @($grouped) + @(
         @{
             Id        = 'exploratory'
             Name      = 'Exploratory recording'
