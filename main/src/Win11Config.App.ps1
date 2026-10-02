@@ -14829,7 +14829,7 @@ namespace WinConfigDiag {
         return
     }
     $nlMissing = @()
-    foreach ($nlFn in @('Start-NoLaunchEtwSession', 'Stop-NoLaunchEtwSession', 'Stop-NoLaunchStaleEtwSessions', 'Get-NoLaunchWindows', 'Test-NoLaunchReady', 'Get-NoLaunchProcessSample', 'Get-NoLaunchContext', 'Get-NoLaunchSystemInfo', 'Invoke-NoLaunchFinalize', 'Send-NoLaunchPackage', 'Write-NoLaunchUploadMarker', 'Remove-NoLaunchSentFolders', 'Send-WinConfigLargeFile')) {
+    foreach ($nlFn in @('Start-NoLaunchEtwSession', 'Stop-NoLaunchEtwSession', 'Stop-NoLaunchStaleEtwSessions', 'Get-NoLaunchWindows', 'Test-NoLaunchReady', 'New-NoLaunchReadyState', 'Update-NoLaunchReadyState', 'Get-NoLaunchProcessSample', 'Get-NoLaunchContext', 'Get-NoLaunchSystemInfo', 'Invoke-NoLaunchFinalize', 'Send-NoLaunchPackage', 'Write-NoLaunchUploadMarker', 'Remove-NoLaunchSentFolders', 'Send-WinConfigLargeFile')) {
         if (-not (Get-Command $nlFn -ErrorAction SilentlyContinue)) { $nlMissing += $nlFn }
     }
     if ($nlMissing.Count -gt 0) {
@@ -14996,7 +14996,7 @@ namespace WinConfigDiag {
         $l.Row.SubItems[4].Text = 'Working -- please wait: packaging'
         $l.Row.ForeColor = [System.Drawing.Color]::FromArgb(200, 110, 0)
         $data = @{}
-        foreach ($k in @('LaunchId', 'Computer', 'ProcessId', 'LaunchStart', 'TraceLevel', 'Outcome', 'ReadyT', 'ReadyTitle', 'Context', 'Folder', 'SessionName', 'EtlPath', 'FileSessionName', 'FileEtlPath', 'TraceError', 'MarkedStuckByOperator')) { $data[$k] = $l[$k] }
+        foreach ($k in @('LaunchId', 'Computer', 'ProcessId', 'LaunchStart', 'TraceLevel', 'Outcome', 'ReadyT', 'ReadyTitle', 'ReadyBasis', 'ReadyRevocations', 'LicensingDialogSeen', 'Context', 'Folder', 'SessionName', 'EtlPath', 'FileSessionName', 'FileEtlPath', 'TraceError', 'MarkedStuckByOperator')) { $data[$k] = $l[$k] }
         $data.Samples = $l.Samples.ToArray()
         $data.WindowTimeline = $l.WindowTimeline.ToArray()
         & $script:NlStartJob 'Finalize' {
@@ -15084,7 +15084,8 @@ namespace WinConfigDiag {
                         FileEtlPath = $(if ($fr) { $fr.EtlPath } else { $null })
                         # Read once, at launch: MySQL's state and the uptime matter at the start, and the exe path is unreadable after NO exits.
                         Context = (Get-NoLaunchContext -Process $p -PriorLaunchesThisWatch ($st.LaunchesThisWatch - 1) -System $script:NlSystem)
-                        TraceError = $st.TraceError; ReadyT = $null; ReadyTitle = $null; PostReadyTicks = 0
+                        TraceError = $st.TraceError; ReadyT = $null; ReadyTitle = $null; PostReadyTicks = 0; ReadyState = (New-NoLaunchReadyState)
+                        ReadyBasis = $null; ReadyRevocations = 0; LicensingDialogSeen = $false
                         Samples = (New-Object System.Collections.ArrayList); WindowTimeline = (New-Object System.Collections.ArrayList); LastWindows = $null
                     }
                     $st.Session = $null
@@ -15106,20 +15107,25 @@ namespace WinConfigDiag {
                     foreach ($w in $wins) { [void]$l.WindowTimeline.Add([pscustomobject]@{ T = $smp.T; Hwnd = $w.Hwnd; Visible = $w.Visible; Class = $w.Class; Title = $w.Title }) }
                     $l.LastWindows = $sig
                 }
-                $ready = $null
-                if ($null -eq $l.ReadyT) {
-                    $ready = Test-NoLaunchReady -Windows $wins
-                    if ($ready.Ready) { $l.ReadyT = $smp.T; $l.ReadyTitle = $ready.Title }
-                }
-                if ($null -ne $l.ReadyT) {
+                # Ready is a SEQUENCE (provisional-3): one clear sample between the progress bar and
+                # "Refreshing Licensing Information" is not ready, and a dialog that comes back
+                # during the post-ready window revokes it (SP6_PERSONAL_I5 2026-10-02 15:42:16).
+                $rs = $l.ReadyState
+                $ready = Update-NoLaunchReadyState -State $rs -Windows $wins -T $smp.T -HoldSeconds $script:NlRules.ReadyHoldSeconds
+                $l.ReadyT = $rs.ReadyT; $l.ReadyTitle = $rs.ReadyTitle; $l.ReadyBasis = $rs.ReadyBasis
+                $l.ReadyRevocations = $rs.Revocations; $l.LicensingDialogSeen = $rs.LicensingSeen
+                if ($ready.Revoked) { $l.PostReadyTicks = 0 }
+                if ($ready.Ready) {
                     $l.PostReadyTicks++
                     $script:NlStatus.Text = "NeurOptimal was ready after {0:N1} s. Finishing the record..." -f $l.ReadyT
                     if ($l.PostReadyTicks -ge $script:NlRules.PostReadySeconds) { & $script:NlDecide 'Ready' $false }
-                } elseif ($smp.T -ge $script:NlRules.StuckAfterSeconds) {
+                } elseif ($smp.T -ge $script:NlRules.StuckAfterSeconds -and -not $ready.Pending) {
                     & $script:NlDecide 'Stuck' $false
                 } else {
                     $script:NlStatus.Text = "NeurOptimal is starting ({3}): {0:N0} s (counts as stuck at {2} s). CPU {1:N1} s." -f $smp.T, $smp.CpuSec, $script:NlRules.StuckAfterSeconds, $(if ($l.TraceLevel -ne 'None') { "$($l.TraceLevel) trace" } else { 'no trace' })
-                    if ($ready -and $ready.BlockedBy) { $script:NlStatus.Text += " Main window is up; waiting for '$($ready.BlockedBy)' to close." }
+                    if ($rs.Revocations -gt 0 -and $ready.Sample.Blocker) { $script:NlStatus.Text += " '$($ready.Sample.Blocker)' came back after the main window showed; still timing." }
+                    elseif ($ready.Sample.BlockedBy) { $script:NlStatus.Text += " Main window is up; waiting for '$($ready.Sample.BlockedBy)' to close." }
+                    elseif ($ready.Pending) { $script:NlStatus.Text += " Main window is up; checking that no startup dialog follows." }
                 }
             }
         } catch {

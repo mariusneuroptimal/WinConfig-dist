@@ -35,7 +35,7 @@
 # every package, so launches can be re-scored when the rule is confirmed.
 
 $script:NoLaunchSchema          = 'no-launch/1'
-$script:NoLaunchReadyRuleVersion = 'provisional-2'
+$script:NoLaunchReadyRuleVersion = 'provisional-3'
 $script:NoLaunchStuckAfterSec   = 90
 $script:NoLaunchSessionPrefix   = 'WinConfigNoLaunch'
 $script:NoLaunchTraceSetup      = 'light-at-watch+file-registry-at-launch/2'
@@ -508,7 +508,7 @@ function Stop-NoLaunchStaleEtwSessions {
 
 function Get-NoLaunchRules {
     <# The thresholds the window and the summaries share. #>
-    return [pscustomobject]@{ ReadyRuleVersion = $script:NoLaunchReadyRuleVersion; StuckAfterSeconds = $script:NoLaunchStuckAfterSec; PostReadySeconds = 5; TraceSetup = $script:NoLaunchTraceSetup; FileTraceMaxMB = 2048 }
+    return [pscustomobject]@{ ReadyRuleVersion = $script:NoLaunchReadyRuleVersion; StuckAfterSeconds = $script:NoLaunchStuckAfterSec; PostReadySeconds = 5; ReadyHoldSeconds = 10; TraceSetup = $script:NoLaunchTraceSetup; FileTraceMaxMB = 2048 }
 }
 
 function Get-NoLaunchSessionName {
@@ -553,26 +553,78 @@ function Get-NoLaunchWindowSignature {
 function Test-NoLaunchReady {
     <#
     .SYNOPSIS
-        Scores one window set against the ready rule. Pure.
+        Scores ONE window set: is the main panel up with no startup dialog over it? Pure.
     .DESCRIPTION
-        provisional-2: ready = a VISIBLE top-level window whose title contains
-        "NeurOptimal" (the main panel: "NeurOptimal® ... - <name>") AND no visible
-        startup dialog ("Refreshing Licensing Information", NO's progress bar).
-        Why the second half: the first healthy launch on record (MMEVOLD_06,
-        4.0.0.10, 2026-10-02) showed the main panel at 25 s with "Refreshing
-        Licensing Information" still up on top of it until ~27 s. provisional-1
-        (main panel alone) scored that as ready -- and would score a launch stuck
-        on that dialog the same way. Still provisional until a stuck launch is seen.
+        Clear = a VISIBLE top-level window whose title contains "NeurOptimal" (the main
+        panel: "NeurOptimal® ... - <name>") AND no visible startup dialog
+        ("Refreshing Licensing Information", NO's progress bar). One clear sample is
+        NOT ready: NO closes the progress bar, shows the main panel, and only then
+        opens the licensing dialog. Update-NoLaunchReadyState applies the sequence.
     #>
     param([object[]]$Windows)
     $visible = @(@($Windows) | Where-Object { $_.Visible })
     $hit = $visible | Where-Object { $_.Title -match 'NeurOptimal' } | Select-Object -First 1
     $blocker = $visible | Where-Object { $_.Title -match 'Refreshing Licensing|Progress Bar' } | Select-Object -First 1
+    $licensing = $visible | Where-Object { $_.Title -match 'Refreshing Licensing' } | Select-Object -First 1
     return [pscustomobject]@{
-        Ready       = [bool]($hit -and -not $blocker)
-        Title       = $(if ($hit) { $hit.Title } else { $null })
-        BlockedBy   = $(if ($hit -and $blocker) { $blocker.Title } else { $null })
-        RuleVersion = $script:NoLaunchReadyRuleVersion
+        Ready            = [bool]($hit -and -not $blocker)
+        Title            = $(if ($hit) { $hit.Title } else { $null })
+        BlockedBy        = $(if ($hit -and $blocker) { $blocker.Title } else { $null })
+        Blocker          = $(if ($blocker) { $blocker.Title } else { $null })
+        LicensingVisible = [bool]$licensing
+        RuleVersion      = $script:NoLaunchReadyRuleVersion
+    }
+}
+
+function New-NoLaunchReadyState {
+    return @{ LicensingSeen = $false; ClearSince = $null; ClearTitle = $null; ReadyT = $null; ReadyTitle = $null; ReadyBasis = $null; Revocations = 0; LastRevokedBy = $null }
+}
+
+function Update-NoLaunchReadyState {
+    <#
+    .SYNOPSIS
+        Feeds one window sample into the ready rule. Pure apart from -State.
+    .DESCRIPTION
+        provisional-3. Ready = the main panel is clear of startup dialogs AND either
+          (a) "Refreshing Licensing Information" has been seen and is now closed
+              (basis 'licensing-closed'), or
+          (b) the clear state has held for ReadyHoldSeconds without that dialog ever
+              showing (basis 'held' -- covers a launch where the 1 s sampler missed it).
+        The launch time is the moment the clear state BEGAN, not when it was confirmed.
+        Once ready, a startup dialog that reappears REVOKES ready (Revoked = $true) and
+        the launch is timed again -- the stuck clock keeps running from launch start.
+        Why: SP6_PERSONAL_I5 2026-10-02 15:42:16 (NO 4.0.0.10) showed the main panel
+        alone for one sample at 34.4 s between the progress bar (to 32.4 s) and
+        "Refreshing Licensing Information" (from 35.4 s, then hung). provisional-2 called
+        that ready and closed the record; the hang was never captured.
+        Returns: Ready (confirmed), Revoked, Pending (clear but unconfirmed), Sample.
+    #>
+    param([Parameter(Mandatory)] [hashtable]$State, [object[]]$Windows, [Parameter(Mandatory)] [double]$T, [double]$HoldSeconds = 10)
+    $r = Test-NoLaunchReady -Windows $Windows
+    if ($r.LicensingVisible) { $State.LicensingSeen = $true }
+    $revoked = $false
+    if ($null -ne $State.ReadyT) {
+        if ($r.Blocker) {
+            $State.Revocations++
+            $State.LastRevokedBy = $r.Blocker
+            $State.ReadyT = $null; $State.ReadyTitle = $null; $State.ReadyBasis = $null
+            $State.ClearSince = $null; $State.ClearTitle = $null
+            $revoked = $true
+        }
+    } elseif ($r.Ready) {
+        if ($null -eq $State.ClearSince) { $State.ClearSince = $T; $State.ClearTitle = $r.Title }
+        $basis = $null
+        if ($State.LicensingSeen) { $basis = 'licensing-closed' }
+        elseif (($T - [double]$State.ClearSince) -ge $HoldSeconds) { $basis = 'held' }
+        if ($basis) { $State.ReadyT = $State.ClearSince; $State.ReadyTitle = $State.ClearTitle; $State.ReadyBasis = $basis }
+    } else {
+        $State.ClearSince = $null; $State.ClearTitle = $null
+    }
+    return [pscustomobject]@{
+        Ready   = ($null -ne $State.ReadyT)
+        Revoked = $revoked
+        Pending = (($null -eq $State.ReadyT) -and ($null -ne $State.ClearSince))
+        Sample  = $r
     }
 }
 
@@ -1011,6 +1063,9 @@ function Get-NoLaunchSummary {
         ReadyRuleVersion        = $script:NoLaunchReadyRuleVersion
         LaunchSeconds           = $(if ($null -ne $Launch.ReadyT) { [math]::Round([double]$Launch.ReadyT, 1) } else { $null })
         ReadyWindowTitle        = $Launch.ReadyTitle
+        ReadyBasis              = $Launch.ReadyBasis
+        ReadyRevocations        = $(if ($null -ne $Launch.ReadyRevocations) { [int]$Launch.ReadyRevocations } else { 0 })
+        LicensingDialogSeen     = [bool]$Launch.LicensingDialogSeen
         StuckAfterSeconds       = $script:NoLaunchStuckAfterSec
         MarkedStuckByOperator   = [bool]$Launch.MarkedStuckByOperator
         FirstWindowSeconds      = $(if ($firstWin) { $firstWin[0].T } else { $null })
@@ -1273,6 +1328,8 @@ Export-ModuleMember -Function @(
     'Get-NoLaunchWindows'
     'Get-NoLaunchWindowSignature'
     'Test-NoLaunchReady'
+    'New-NoLaunchReadyState'
+    'Update-NoLaunchReadyState'
     'Get-NoLaunchProcessSample'
     'Get-NoLaunchThreadSnapshot'
     'Get-NoLaunchBusyThreads'
