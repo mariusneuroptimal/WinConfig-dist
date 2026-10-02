@@ -14829,7 +14829,7 @@ namespace WinConfigDiag {
         return
     }
     $nlMissing = @()
-    foreach ($nlFn in @('Start-NoLaunchEtwSession', 'Stop-NoLaunchEtwSession', 'Stop-NoLaunchStaleEtwSessions', 'Get-NoLaunchWindows', 'Test-NoLaunchReady', 'Get-NoLaunchProcessSample', 'Get-NoLaunchContext', 'Invoke-NoLaunchFinalize', 'Send-NoLaunchPackage', 'Write-NoLaunchUploadMarker', 'Remove-NoLaunchSentFolders', 'Send-WinConfigLargeFile')) {
+    foreach ($nlFn in @('Start-NoLaunchEtwSession', 'Stop-NoLaunchEtwSession', 'Stop-NoLaunchStaleEtwSessions', 'Get-NoLaunchWindows', 'Test-NoLaunchReady', 'Get-NoLaunchProcessSample', 'Get-NoLaunchContext', 'Get-NoLaunchSystemInfo', 'Invoke-NoLaunchFinalize', 'Send-NoLaunchPackage', 'Write-NoLaunchUploadMarker', 'Remove-NoLaunchSentFolders', 'Send-WinConfigLargeFile')) {
         if (-not (Get-Command $nlFn -ErrorAction SilentlyContinue)) { $nlMissing += $nlFn }
     }
     if ($nlMissing.Count -gt 0) {
@@ -15083,7 +15083,7 @@ namespace WinConfigDiag {
                         FileSessionName = $(if ($fr) { $fr.SessionName } else { $null })
                         FileEtlPath = $(if ($fr) { $fr.EtlPath } else { $null })
                         # Read once, at launch: MySQL's state and the uptime matter at the start, and the exe path is unreadable after NO exits.
-                        Context = (Get-NoLaunchContext -Process $p -PriorLaunchesThisWatch ($st.LaunchesThisWatch - 1))
+                        Context = (Get-NoLaunchContext -Process $p -PriorLaunchesThisWatch ($st.LaunchesThisWatch - 1) -System $script:NlSystem)
                         TraceError = $st.TraceError; ReadyT = $null; ReadyTitle = $null; PostReadyTicks = 0
                         Samples = (New-Object System.Collections.ArrayList); WindowTimeline = (New-Object System.Collections.ArrayList); LastWindows = $null
                     }
@@ -15130,6 +15130,8 @@ namespace WinConfigDiag {
     $script:NlStartBtn.Add_Click({
         if ($script:NlState.Mode -eq 'Idle') {
             [void](Stop-NoLaunchStaleEtwSessions)
+            # The machine (model, CPU, RAM, disk types): read now, never during a launch.
+            if (-not $script:NlSystem) { try { $script:NlSystem = Get-NoLaunchSystemInfo } catch { $script:NlSystem = $null } }
             $script:NlState.LaunchesThisWatch = 0
             $script:NlState.Recorded = @{}
             & $script:NlArm

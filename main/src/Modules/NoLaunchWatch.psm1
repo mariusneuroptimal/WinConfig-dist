@@ -650,13 +650,66 @@ function Save-NoLaunchDump {
     return @{ Ok = $false; Path = $Path; Bytes = $size; Error = ('MiniDumpWriteDump failed, error 0x{0:X8} (antivirus may block dumping)' -f $err) }
 }
 
+function Get-NoLaunchSystemInfo {
+    <#
+    .SYNOPSIS
+        The machine, for comparing launch times across models: maker/model, CPU, RAM,
+        Windows version, and each drive letter's disk type. Read once at Start watching,
+        never during a launch (CIM queries would load the launch being timed).
+    #>
+    [CmdletBinding()]
+    param()
+    $info = [ordered]@{}
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $info.Manufacturer = "$($cs.Manufacturer)".Trim()
+        $info.Model = "$($cs.Model)".Trim()
+        $info.SystemFamily = "$($cs.SystemFamily)".Trim()
+        $info.RamGB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+    } catch { }
+    try {
+        $cpu = @(Get-CimInstance Win32_Processor -ErrorAction Stop)
+        $info.Cpu = "$($cpu[0].Name)".Trim() -replace '\s+', ' '
+        $info.CpuCores = [int](($cpu | Measure-Object NumberOfCores -Sum).Sum)
+        $info.CpuThreads = [int](($cpu | Measure-Object NumberOfLogicalProcessors -Sum).Sum)
+    } catch { }
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        $info.Os = "$($os.Caption)".Trim()
+        $info.OsBuild = "$($os.BuildNumber)"
+        $info.OsDisplayVersion = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).DisplayVersion
+    } catch { }
+    # Drive letter -> physical disk (SSD/HDD, bus). NO's own drive is picked at launch from NO.exe's path.
+    $drives = @{}
+    try {
+        $ns = 'root/Microsoft/Windows/Storage'
+        $phys = @{}
+        foreach ($d in @(Get-CimInstance -Namespace $ns -ClassName MSFT_PhysicalDisk -ErrorAction Stop)) { $phys["$($d.DeviceId)"] = $d }
+        $media = @{ 0 = 'Unspecified'; 3 = 'HDD'; 4 = 'SSD'; 5 = 'SCM' }
+        $bus = @{ 7 = 'USB'; 8 = 'RAID'; 11 = 'SATA'; 17 = 'NVMe'; 10 = 'SAS'; 3 = 'ATA'; 12 = 'SD'; 13 = 'MMC'; 15 = 'FileBackedVirtual'; 16 = 'StorageSpaces' }
+        foreach ($p in @(Get-CimInstance -Namespace $ns -ClassName MSFT_Partition -ErrorAction Stop | Where-Object { $_.DriveLetter -and [int]$_.DriveLetter -ne 0 })) {
+            $letter = "$([char]$p.DriveLetter)".ToUpperInvariant()
+            $pd = $phys["$($p.DiskNumber)"]
+            if ($pd) {
+                $drives[$letter] = [ordered]@{
+                    MediaType = $(if ($media.ContainsKey([int]$pd.MediaType)) { $media[[int]$pd.MediaType] } else { "$($pd.MediaType)" })
+                    BusType   = $(if ($bus.ContainsKey([int]$pd.BusType)) { $bus[[int]$pd.BusType] } else { "$($pd.BusType)" })
+                    DiskModel = "$($pd.FriendlyName)".Trim()
+                }
+            }
+        }
+    } catch { }
+    $info.Drives = $drives
+    return $info
+}
+
 function Get-NoLaunchContext {
     <#
     .SYNOPSIS
         What else was true at launch -- the confounders of a launch time.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)] [System.Diagnostics.Process]$Process, [int]$PriorLaunchesThisWatch = -1)
+    param([Parameter(Mandatory)] [System.Diagnostics.Process]$Process, [int]$PriorLaunchesThisWatch = -1, $System = $null)
     $ctx = [ordered]@{}
     try {
         $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
@@ -680,7 +733,22 @@ function Get-NoLaunchContext {
         }
     } catch { }
     try { $ctx.AntivirusProducts = @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop | ForEach-Object { $_.displayName }) } catch { $ctx.AntivirusProducts = @() }
+    $ctx.System = ConvertTo-NoLaunchSystemContext -System $System -NoExePath $ctx.NoExePath
     return $ctx
+}
+
+function ConvertTo-NoLaunchSystemContext {
+    <# The machine as recorded with a launch: Get-NoLaunchSystemInfo minus the drive table, plus NO's drive. Pure. #>
+    param($System, [string]$NoExePath)
+    if (-not $System) { return $null }
+    $out = [ordered]@{}
+    foreach ($k in $System.Keys) { if ($k -ne 'Drives') { $out[$k] = $System[$k] } }
+    $out.NoDrive = $null
+    if ($NoExePath -match '^([A-Za-z]):') {
+        $letter = $Matches[1].ToUpperInvariant()
+        if ($System.Drives -and $System.Drives.ContainsKey($letter)) { $out.NoDrive = $System.Drives[$letter] }
+    }
+    return $out
 }
 
 #endregion
@@ -1210,6 +1278,8 @@ Export-ModuleMember -Function @(
     'Get-NoLaunchBusyThreads'
     'Save-NoLaunchDump'
     'Get-NoLaunchContext'
+    'Get-NoLaunchSystemInfo'
+    'ConvertTo-NoLaunchSystemContext'
     'ConvertFrom-NoLaunchNetAddress'
     'ConvertFrom-NoLaunchNetPort'
     'Get-NoLaunchEtwRows'
