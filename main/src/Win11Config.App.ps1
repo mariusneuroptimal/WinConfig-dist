@@ -14880,7 +14880,8 @@ namespace WinConfigDiag {
     $script:NlStartBtn.Text = "Start watching"
     $script:NlStartBtn.Size = New-Object System.Drawing.Size((& $nlPx 150), (& $nlPx 32))
     $script:NlStuckBtn = New-Object System.Windows.Forms.Button
-    $script:NlStuckBtn.Text = "NO is stuck now"
+    # Operator override, only live while a launch is being timed.
+    $script:NlStuckBtn.Text = "Mark as stuck"
     $script:NlStuckBtn.Size = New-Object System.Drawing.Size((& $nlPx 150), (& $nlPx 32))
     $script:NlStuckBtn.Enabled = $false
     $script:NlFullChk = New-Object System.Windows.Forms.CheckBox
@@ -14891,6 +14892,9 @@ namespace WinConfigDiag {
     $nlOpenBtn.Text = "Open folder"
     $nlOpenBtn.Size = New-Object System.Drawing.Size((& $nlPx 110), (& $nlPx 32))
     $nlBar.Controls.AddRange(@($script:NlStartBtn, $script:NlStuckBtn, $script:NlFullChk, $nlOpenBtn))
+    $nlTips = New-Object System.Windows.Forms.ToolTip
+    $nlTips.SetToolTip($script:NlStuckBtn, "While a launch is being timed: count it as stuck now instead of waiting $([int]$script:NlRules.StuckAfterSeconds) s.")
+    $nlTips.SetToolTip($script:NlFullChk, "Applies to the next launch. Can be changed while watching.")
     $nlRoot.Controls.Add($nlBar, 0, 1)
 
     $script:NlStatus = New-Object System.Windows.Forms.Label
@@ -14912,7 +14916,7 @@ namespace WinConfigDiag {
     $nlFoot.AutoSize = $true
     $nlFoot.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
     $nlFoot.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 110)
-    $nlFoot.Text = "Ready = NO's main window is showing (rule $($script:NlRules.ReadyRuleVersion)). Stuck launches send memory dumps of NO, which can contain client data. Files: $script:NlRoot -- a launch's files are deleted from this PC when WinConfig closes, once everything has been sent."
+    $nlFoot.Text = "Ready = NO's main window is showing and Refreshing Licensing Information has closed (rule $($script:NlRules.ReadyRuleVersion)). Stuck launches send memory dumps of NO, which can contain client data. Files: $script:NlRoot -- a launch's files are deleted from this PC when WinConfig closes, once everything has been sent."
     $nlRoot.Controls.Add($nlFoot, 0, 4)
 
     # ── state helpers ────────────────────────────────────────────────
@@ -14932,8 +14936,9 @@ namespace WinConfigDiag {
             if ($r.Ok) { $st.Session = $r } else { $st.TraceError = "trace did not start: $($r.Error)" }
         } else { $st.TraceError = 'WinConfig is not elevated' }
         $st.Mode = 'Armed'
-        $waitText = "Watching. Launch NeurOptimal now (desktop shortcut, not as administrator)."
-        if ($st.Known.Count -gt 0) { $waitText = "Watching. NeurOptimal is already running -- that launch is not recorded. Close it and launch it again." }
+        $lvl = $(if ($st.Session) { "$($st.Level) trace" } else { 'no trace' })
+        $waitText = "Watching ($lvl). Launch NeurOptimal now (desktop shortcut, not as administrator)."
+        if ($st.Known.Count -gt 0) { $waitText = "Watching ($lvl). NeurOptimal is already running -- that launch is not recorded. Close it and launch it again." }
         if ($st.TraceError) { $waitText += " (No trace: $($st.TraceError).)" }
         $script:NlStatus.Text = $waitText
     }
@@ -15006,8 +15011,7 @@ namespace WinConfigDiag {
         if ($st.Session) { [void](Stop-NoLaunchEtwSession -SessionName $st.Session.SessionName); $st.Session = $null }
         $st.Mode = 'Idle'
         $script:NlStartBtn.Text = "Start watching"
-        $script:NlFullChk.Enabled = $true
-        $script:NlStatus.Text = "Not watching."
+        $script:NlStatus.Text = "Not watching. Click Start watching before launching NeurOptimal."
     }
 
     # ── the watch: 500 ms tick, NO sampled every second ──────────────
@@ -15072,6 +15076,7 @@ namespace WinConfigDiag {
                     foreach ($w in $wins) { [void]$l.WindowTimeline.Add([pscustomobject]@{ T = $smp.T; Hwnd = $w.Hwnd; Visible = $w.Visible; Class = $w.Class; Title = $w.Title }) }
                     $l.LastWindows = $sig
                 }
+                $ready = $null
                 if ($null -eq $l.ReadyT) {
                     $ready = Test-NoLaunchReady -Windows $wins
                     if ($ready.Ready) { $l.ReadyT = $smp.T; $l.ReadyTitle = $ready.Title }
@@ -15083,7 +15088,10 @@ namespace WinConfigDiag {
                 } elseif ($smp.T -ge $script:NlRules.StuckAfterSeconds) {
                     & $script:NlDecide 'Stuck' $false
                 } else {
-                    $script:NlStatus.Text = "NeurOptimal is starting: {0:N0} s (counts as stuck at {3} s). CPU {1:N1} s, {2} window(s)." -f $smp.T, $smp.CpuSec, $wins.Count, $script:NlRules.StuckAfterSeconds
+                    $script:NlStatus.Text = "NeurOptimal is starting ({4}): {0:N0} s (counts as stuck at {3} s). CPU {1:N1} s, {2} window(s)." -f $smp.T, $smp.CpuSec, $wins.Count, $script:NlRules.StuckAfterSeconds, $(if ($l.EtlPath) { "$($l.TraceLevel) trace" } else { 'no trace' })
+                    if ($ready -and $ready.BlockedBy) { $script:NlStatus.Text += " Main window is up; waiting for '$($ready.BlockedBy)' to close." }
+                    $nextLvl = $(if ($script:NlFullChk.Checked) { 'Full' } else { 'Light' })
+                    if ($l.EtlPath -and $nextLvl -ne $l.TraceLevel) { $script:NlStatus.Text += " Next launch: $nextLvl trace." }
                 }
             }
         } catch {
@@ -15097,10 +15105,24 @@ namespace WinConfigDiag {
             $script:NlState.LaunchesThisWatch = 0
             & $script:NlArm
             $script:NlStartBtn.Text = "Stop watching"
-            $script:NlFullChk.Enabled = $false
             $script:NlTimer.Start()
         } else {
             & $script:NlStop
+        }
+    })
+    $script:NlFullChk.Add_CheckedChanged({
+        $st = $script:NlState
+        $lvl = $(if ($script:NlFullChk.Checked) { 'Full' } else { 'Light' })
+        if ($st.Mode -eq 'Armed') {
+            # Nothing recorded yet: restart the waiting trace at the new level.
+            $old = $st.PendingFolder
+            if ($st.Session) { [void](Stop-NoLaunchEtwSession -SessionName $st.Session.SessionName); $st.Session = $null }
+            try { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction Stop } catch { }
+            & $script:NlArm
+        } elseif ($st.Mode -eq 'Launch') {
+            $script:NlStatus.Text = "$lvl trace will apply to the next launch; this one keeps $($st.Launch.TraceLevel)."
+        } else {
+            $script:NlStatus.Text = "Not watching. $lvl trace selected -- click Start watching, then launch NeurOptimal."
         }
     })
     $script:NlStuckBtn.Add_Click({ if ($script:NlState.Mode -eq 'Launch') { & $script:NlDecide 'Stuck' $true } })

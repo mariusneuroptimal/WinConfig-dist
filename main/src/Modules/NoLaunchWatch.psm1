@@ -26,7 +26,7 @@
 # every package, so launches can be re-scored when the rule is confirmed.
 
 $script:NoLaunchSchema          = 'no-launch/1'
-$script:NoLaunchReadyRuleVersion = 'provisional-1'
+$script:NoLaunchReadyRuleVersion = 'provisional-2'
 $script:NoLaunchStuckAfterSec   = 180
 $script:NoLaunchSessionPrefix   = 'WinConfigNoLaunch'
 
@@ -186,17 +186,23 @@ function Test-NoLaunchReady {
     .SYNOPSIS
         Scores one window set against the ready rule. Pure.
     .DESCRIPTION
-        provisional-1: ready = a VISIBLE top-level window whose title contains
-        "NeurOptimal" (the main panel's title on 4.0.0.9: "NeurOptimal® ... - <name>").
-        NOT YET CONFIRMED against a labelled launch: if the licensing dialog is
-        itself a window titled NeurOptimal, this rule reads a stuck launch as
-        ready -- which is why the window timeline ships with every package.
+        provisional-2: ready = a VISIBLE top-level window whose title contains
+        "NeurOptimal" (the main panel: "NeurOptimal® ... - <name>") AND no visible
+        startup dialog ("Refreshing Licensing Information", NO's progress bar).
+        Why the second half: the first healthy launch on record (MMEVOLD_06,
+        4.0.0.10, 2026-10-02) showed the main panel at 25 s with "Refreshing
+        Licensing Information" still up on top of it until ~27 s. provisional-1
+        (main panel alone) scored that as ready -- and would score a launch stuck
+        on that dialog the same way. Still provisional until a stuck launch is seen.
     #>
     param([object[]]$Windows)
-    $hit = @($Windows) | Where-Object { $_.Visible -and $_.Title -match 'NeurOptimal' } | Select-Object -First 1
+    $visible = @(@($Windows) | Where-Object { $_.Visible })
+    $hit = $visible | Where-Object { $_.Title -match 'NeurOptimal' } | Select-Object -First 1
+    $blocker = $visible | Where-Object { $_.Title -match 'Refreshing Licensing|Progress Bar' } | Select-Object -First 1
     return [pscustomobject]@{
-        Ready       = [bool]$hit
+        Ready       = [bool]($hit -and -not $blocker)
         Title       = $(if ($hit) { $hit.Title } else { $null })
+        BlockedBy   = $(if ($hit -and $blocker) { $blocker.Title } else { $null })
         RuleVersion = $script:NoLaunchReadyRuleVersion
     }
 }
@@ -518,13 +524,13 @@ function Invoke-NoLaunchFinalize {
         $cap = [ordered]@{}
         & $stage 'Stuck: recording thread states and a memory dump'
         $before = Get-NoLaunchThreadSnapshot -ProcessId $Launch.ProcessId
-        $before | Export-Csv -NoTypeInformation -LiteralPath (Join-Path $folder 'threads-start.csv')
+        $before | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath (Join-Path $folder 'threads-start.csv')
         $d1 = Save-NoLaunchDump -ProcessId $Launch.ProcessId -Path (Join-Path $folder 'NO-stuck-1.dmp')
         $cap.Dump1 = @{ Ok = $d1.Ok; Bytes = $d1.Bytes; Error = $d1.Error }
         & $stage "Stuck: watching $StuckWatchSeconds s more"
         Start-Sleep -Seconds $StuckWatchSeconds
         $after = Get-NoLaunchThreadSnapshot -ProcessId $Launch.ProcessId
-        $after | Export-Csv -NoTypeInformation -LiteralPath (Join-Path $folder 'threads-end.csv')
+        $after | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath (Join-Path $folder 'threads-end.csv')
         $cap.BusiestThreads = Get-NoLaunchBusyThreads -Before $before -After $after
         $cap.ThreadStates = @($after | Group-Object ThreadState, WaitReason | ForEach-Object { "$($_.Name)=$($_.Count)" })
         & $stage 'Stuck: second memory dump'
@@ -535,14 +541,14 @@ function Invoke-NoLaunchFinalize {
     $endT = [math]::Round(((Get-Date) - $Launch.LaunchStart).TotalSeconds, 1)
     if ($Launch.SessionName) { [void](Stop-NoLaunchEtwSession -SessionName $Launch.SessionName) }
 
-    @($Launch.Samples) | Select-Object T, CpuSec, WorkingSetMB, Threads, Handles | Export-Csv -NoTypeInformation -LiteralPath (Join-Path $folder 'samples.csv')
-    @($Launch.WindowTimeline) | Export-Csv -NoTypeInformation -LiteralPath (Join-Path $folder 'windows.csv')
+    @($Launch.Samples) | Select-Object T, CpuSec, WorkingSetMB, Threads, Handles | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath (Join-Path $folder 'samples.csv')
+    @($Launch.WindowTimeline) | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath (Join-Path $folder 'windows.csv')
 
     if ($Launch.EtlPath -and (Test-Path -LiteralPath $Launch.EtlPath)) {
         & $stage 'Reading the trace'
         try {
             $rows = @(Get-NoLaunchEtwRows -EtlPath $Launch.EtlPath -ProcessId $Launch.ProcessId -LaunchStart $Launch.LaunchStart)
-            $rows | ForEach-Object { [pscustomobject]@{ T = $_.T; Provider = $_.Provider; Id = $_.Id; Op = $_.Op; Name = (Get-NoLaunchEtwRowName $_); Detail = (($_.Fields.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' | ') } } | Export-Csv -NoTypeInformation -LiteralPath (Join-Path $folder 'trace-NO.csv')
+            $rows | ForEach-Object { [pscustomobject]@{ T = $_.T; Provider = $_.Provider; Id = $_.Id; Op = $_.Op; Name = (Get-NoLaunchEtwRowName $_); Detail = (($_.Fields.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' | ') } } | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath (Join-Path $folder 'trace-NO.csv')
             $Launch.EtwDigest = Get-NoLaunchEtwDigest -Rows $rows -EndT $endT
         } catch {
             $Launch.EtwDigest = [ordered]@{ Error = $_.Exception.Message }
