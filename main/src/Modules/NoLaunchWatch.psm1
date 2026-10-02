@@ -318,6 +318,93 @@ function Get-NoLaunchContext {
 
 #region Decoding the trace
 
+function Get-NoLaunchEtwRows {
+    <#
+    .SYNOPSIS
+        Events from the trace that belong to one process, with T = seconds since launch.
+    .DESCRIPTION
+        Header PID for in-process events; payload PID/ProcessID for kernel network and
+        image events logged from System.
+
+        SPEED. Rendering every matched event to XML and parsing it back cost ~3 ms an
+        event -- minutes for a Full trace (~41k NO events). Field NAMES and how the XML
+        renders each value depend only on the event's provider/id/version/opcode, so they
+        are learned from the first event of each kind (one ToXml) and reused (~0.6 ms an
+        event). A field whose rendering cannot be reproduced from the raw value makes that
+        kind fall back to ToXml, so rows are identical to the XML reader's (checked on 22k
+        events of a real Full trace, 2026-10-02: 0 differences).
+        Unchanged: the filter visits every event in the file, ~150 s per GB of Full trace
+        whatever the XPath -- read time follows trace SIZE.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$EtlPath, [Parameter(Mandatory)] [int]$ProcessId, [Parameter(Mandatory)] [datetime]$LaunchStart, [int]$MaxEvents = 0)
+    $xp = "*[System/Execution[@ProcessID='{0}'] or EventData/Data[@Name='PID']='{0}' or EventData/Data[@Name='ProcessID']='{0}']" -f $ProcessId
+    $query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery($EtlPath, [System.Diagnostics.Eventing.Reader.PathType]::FilePath, $xp)
+    $reader = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($query)
+    $kinds = @{}
+    $rows = New-Object System.Collections.ArrayList
+    # Candidate renderings of a raw value, in the order XML tends to use them.
+    $render = @(
+        { param($v) [string]$v }
+        { param($v) ('0x{0:X}' -f $v) }
+        { param($v) ('0x{0:x}' -f $v) }
+        { param($v) ([string]$v).ToLowerInvariant() }
+        { param($v) ('{' + ([string]$v).ToUpperInvariant() + '}') }
+        { param($v) ('{' + [string]$v + '}') }
+    )
+    try {
+        while ($true) {
+            if ($MaxEvents -gt 0 -and $rows.Count -ge $MaxEvents) { break }
+            $e = $reader.ReadEvent()
+            if (-not $e) { break }
+            try {
+                $key = '{0}|{1}|{2}|{3}' -f $e.ProviderName, $e.Id, $e.Version, $e.Opcode
+                $kind = $kinds[$key]
+                $props = $e.Properties
+                if (-not $kind) {
+                    $x = [xml]$e.ToXml()
+                    $data = @($x.Event.EventData.Data | Where-Object { $_ })
+                    $fmt = New-Object 'int[]' $data.Count
+                    $usable = ($data.Count -eq $props.Count)
+                    for ($i = 0; $usable -and $i -lt $data.Count; $i++) {
+                        $text = [string]$data[$i].'#text'
+                        $v = $props[$i].Value
+                        $fmt[$i] = -1
+                        if (-not $text) { $fmt[$i] = 0; continue }
+                        for ($k = 0; $k -lt $render.Count; $k++) {
+                            $r = $null; try { $r = & $render[$k] $v } catch { }
+                            if ($r -ceq $text) { $fmt[$i] = $k; break }
+                        }
+                        if ($fmt[$i] -lt 0) { $usable = $false }
+                    }
+                    $kind = @{ Names = @($data | ForEach-Object { $_.Name }); Fmt = $fmt; Usable = $usable; Op = $e.OpcodeDisplayName; Provider = ($e.ProviderName -replace '^Microsoft-Windows-', '') }
+                    $kinds[$key] = $kind
+                }
+                $fields = [ordered]@{}
+                if ($kind.Usable) {
+                    for ($i = 0; $i -lt $kind.Names.Count; $i++) {
+                        $v = $props[$i].Value
+                        if ($null -eq $v) { continue }
+                        $t = & $render[$kind.Fmt[$i]] $v
+                        if ($t) { $fields[$kind.Names[$i]] = $t }
+                    }
+                } else {
+                    $x = [xml]$e.ToXml()
+                    foreach ($d in @($x.Event.EventData.Data)) { if ($d -and $d.'#text') { $fields[$d.Name] = $d.'#text' } }
+                }
+                [void]$rows.Add([pscustomobject]@{
+                    T        = [math]::Round(($e.TimeCreated - $LaunchStart).TotalSeconds, 3)
+                    Provider = $kind.Provider
+                    Id       = $e.Id
+                    Op       = $kind.Op
+                    Fields   = $fields
+                })
+            } finally { $e.Dispose() }
+        }
+    } finally { $reader.Dispose() }
+    return $rows.ToArray()
+}
+
 function ConvertFrom-NoLaunchNetAddress {
     <# Kernel-Network IPv4 daddr is a network-order uint32; IPv6 arrives as text. Pure. #>
     param([string]$Value)
@@ -330,35 +417,6 @@ function ConvertFrom-NoLaunchNetPort {
     param([string]$Value)
     if ($Value -match '^\d+$') { $p = [int]$Value; return (($p -band 0xFF) -shl 8) -bor ($p -shr 8) }
     return $Value
-}
-
-function Get-NoLaunchEtwRows {
-    <#
-    .SYNOPSIS
-        Events from the trace that belong to one process, with T = seconds since launch.
-    #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [string]$EtlPath, [Parameter(Mandatory)] [int]$ProcessId, [Parameter(Mandatory)] [datetime]$LaunchStart)
-    # Header PID for in-process events; payload PID/ProcessID for kernel network and image events logged from System.
-    $xp = "*[System/Execution[@ProcessID='{0}'] or EventData/Data[@Name='PID']='{0}' or EventData/Data[@Name='ProcessID']='{0}']" -f $ProcessId
-    $rows = New-Object System.Collections.ArrayList
-    try {
-        Get-WinEvent -Path $EtlPath -Oldest -FilterXPath $xp -ErrorAction Stop | ForEach-Object {
-            $x = [xml]$_.ToXml()
-            $fields = [ordered]@{}
-            foreach ($d in @($x.Event.EventData.Data)) { if ($d -and $d.'#text') { $fields[$d.Name] = $d.'#text' } }
-            [void]$rows.Add([pscustomobject]@{
-                T        = [math]::Round(($_.TimeCreated - $LaunchStart).TotalSeconds, 3)
-                Provider = ($_.ProviderName -replace '^Microsoft-Windows-', '')
-                Id       = $_.Id
-                Op       = $_.OpcodeDisplayName
-                Fields   = $fields
-            })
-        }
-    } catch {
-        if ($_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound') { throw }
-    }
-    return $rows.ToArray()
 }
 
 function Get-NoLaunchEtwRowName {
@@ -660,8 +718,8 @@ function Remove-NoLaunchSentFolders {
                 # Another WinConfig still running may need its files; a dead owner (crash) does not.
                 $remove = ($owner -eq $CurrentPid -or -not (Get-Process -Id $owner -ErrorAction SilentlyContinue))
             }
-        } elseif (@($files | Where-Object { $_.Extension -ne '.etl' }).Count -eq 0) {
-            # Only a raw trace, no launch record: armed and never launched, or a launch WinConfig closed on
+        } elseif (@($files | Where-Object { $_.Name -notmatch '\.etl(\.providers\.txt)?$' }).Count -eq 0) {
+            # Only a raw trace (and its providers list), no launch record: armed and never launched, or a launch WinConfig closed on
             # before it was packaged (its record lived in memory). Finalize always writes windows.csv.
             $remove = $true
         }
