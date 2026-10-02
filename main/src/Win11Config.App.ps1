@@ -14923,7 +14923,7 @@ namespace WinConfigDiag {
     $nlFoot.AutoSize = $true
     $nlFoot.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
     $nlFoot.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 110)
-    $nlFoot.Text = "Ready = NO's main window is showing and Refreshing Licensing Information has closed (rule $($script:NlRules.ReadyRuleVersion)). Stuck launches send memory dumps of NO, which can contain client data. Files: $script:NlRoot -- a launch's files are deleted from this PC when NO Support Tool is closed, once everything has been sent."
+    $nlFoot.Text = "Ready = NO's main window is showing and Refreshing Licensing Information has closed"
     $nlRoot.Controls.Add($nlFoot, 0, 5)
 
     # ── state helpers ────────────────────────────────────────────────
