@@ -195,11 +195,20 @@
         @{
             Id             = "graphics-session-bench"
             Name           = "Run Graphics Session Bench"
-            Category       = "Graphics"
+            Category       = "Testing"
             ToolCategory   = "Other"   # the sealed ToolCategory set has no Graphics member
             MutatesSystem  = $false
             SupportsDryRun = $false  # Read-only observation; there is nothing to plan
             Description    = "Watches one NeurOptimal session and reports what the butterchurn visualizer and video.js player cost, split by GPU engine"
+        }
+        @{
+            Id             = "no-launch-watch"
+            Name           = "Watch NO Launches"
+            Category       = "Testing"
+            ToolCategory   = "Other"
+            MutatesSystem  = $false
+            SupportsDryRun = $false  # Read-only observation: never launches, kills or writes to NO
+            Description    = "Times every NO launch until ready; a launch not ready within 3 minutes gets a stuck capture (threads, dumps, ETW trace) that is sent in full"
         }
         @{
             Id             = "bt-reset-com-ports"

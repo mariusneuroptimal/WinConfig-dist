@@ -287,7 +287,179 @@ function Send-WinConfigDiagnosticPackage {
 
 #endregion
 
+#region Large files: S3 multipart upload (NO-LAUNCH-001)
+# Invoke-R2Put reads the whole file into memory and sends one request -- fine
+# for a 60 KB bundle, not for a 1 GB memory dump on a client's connection. A
+# multipart upload sends fixed-size parts, retries a failed part on its own,
+# and aborts cleanly so R2 does not keep orphaned parts.
+
+# Seam for tests: replaced with a recorder so the request sequence and the
+# signing can be checked without a network. Signature of the real one:
+# param($Method, $Uri, $Headers, [byte[]]$Body) -> @{ StatusCode; Content; Headers }
+$script:R2Transport = {
+    param([string]$Method, [string]$Uri, [hashtable]$Headers, [byte[]]$Body)
+    $oldPref = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'   # PS 5.1 progress rendering slows large bodies badly
+    try {
+        $params = @{ Uri = $Uri; Method = $Method; Headers = $Headers; UseBasicParsing = $true; ErrorAction = 'Stop' }
+        if ($Body -and $Body.Length -gt 0) { $params.Body = $Body }
+        $resp = Invoke-WebRequest @params
+        return @{ StatusCode = [int]$resp.StatusCode; Content = [string]$resp.Content; Headers = $resp.Headers }
+    } finally {
+        $ProgressPreference = $oldPref
+    }
+}
+
+function ConvertTo-R2CanonicalQuery {
+    <# RFC 3986-encoded, key-sorted query string as SigV4 requires. #>
+    param([hashtable]$Query)
+    if (-not $Query -or $Query.Count -eq 0) { return '' }
+    $pairs = foreach ($k in ($Query.Keys | Sort-Object { [string]$_ } -CaseSensitive)) {
+        '{0}={1}' -f [Uri]::EscapeDataString([string]$k), [Uri]::EscapeDataString([string]$Query[$k])
+    }
+    return ($pairs -join '&')
+}
+
+function Get-R2SignedRequest {
+    <#
+    .SYNOPSIS
+        Builds the URI and SigV4 headers for one R2 request. Pure: the clock is a parameter.
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$Method,
+        [Parameter(Mandatory)] [hashtable]$R2,
+        [Parameter(Mandatory)] [string]$ObjectKey,
+        [hashtable]$Query = @{},
+        [byte[]]$Body = [byte[]]@(),
+        [string]$ContentType = 'application/octet-stream',
+        [datetime]$UtcNow = [datetime]::UtcNow
+    )
+    $r2Host       = "$($R2.AccountId).r2.cloudflarestorage.com"
+    $canonicalUri = "/$($R2.BucketName)/$ObjectKey"
+    $queryString  = ConvertTo-R2CanonicalQuery $Query
+    $amzDate      = $UtcNow.ToString('yyyyMMddTHHmmssZ')
+    $dateStamp    = $UtcNow.ToString('yyyyMMdd')
+    $payloadHash  = Get-Sha256HexBytes $Body
+
+    $canonicalHeaders = "content-type:$ContentType`nhost:$r2Host`nx-amz-content-sha256:$payloadHash`nx-amz-date:$amzDate`n"
+    $signedHeaders    = 'content-type;host;x-amz-content-sha256;x-amz-date'
+    $canonicalRequest = "$Method`n$canonicalUri`n$queryString`n$canonicalHeaders`n$signedHeaders`n$payloadHash"
+    $credentialScope  = "$dateStamp/auto/s3/aws4_request"
+    $stringToSign     = "AWS4-HMAC-SHA256`n$amzDate`n$credentialScope`n$(Get-Sha256HexString $canonicalRequest)"
+
+    $kDate    = Get-HmacSha256Bytes ([System.Text.Encoding]::UTF8.GetBytes("AWS4$($R2.SecretKey)")) $dateStamp
+    $kRegion  = Get-HmacSha256Bytes $kDate 'auto'
+    $kService = Get-HmacSha256Bytes $kRegion 's3'
+    $kSign    = Get-HmacSha256Bytes $kService 'aws4_request'
+    $sig      = ConvertTo-HexString (Get-HmacSha256Bytes $kSign $stringToSign)
+
+    return @{
+        Uri              = "https://$r2Host$canonicalUri$(if ($queryString) { "?$queryString" })"
+        CanonicalRequest = $canonicalRequest
+        Headers          = @{
+            'Authorization'        = "AWS4-HMAC-SHA256 Credential=$($R2.AccessKeyId)/$credentialScope, SignedHeaders=$signedHeaders, Signature=$sig"
+            'x-amz-date'           = $amzDate
+            'x-amz-content-sha256' = $payloadHash
+            'Content-Type'         = $ContentType
+        }
+    }
+}
+
+function Invoke-R2Request {
+    param([string]$Method, [hashtable]$R2, [string]$ObjectKey, [hashtable]$Query = @{}, [byte[]]$Body = [byte[]]@(), [string]$ContentType = 'application/octet-stream')
+    $req = Get-R2SignedRequest -Method $Method -R2 $R2 -ObjectKey $ObjectKey -Query $Query -Body $Body -ContentType $ContentType
+    return (& $script:R2Transport $Method $req.Uri $req.Headers $Body)
+}
+
+function Send-WinConfigLargeFile {
+    <#
+    .SYNOPSIS
+        Uploads one large file to R2 as an S3 multipart upload. Never copies it anywhere else.
+    .DESCRIPTION
+        The file stays where it is; on failure the caller still has it. Each part is
+        retried on its own; a failed upload is aborted so R2 keeps no orphaned parts.
+    .OUTPUTS
+        PSCustomObject: Status (Uploaded | Skipped | Failed), RemotePath, Bytes, Parts, Error
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$FilePath,
+        [Parameter(Mandatory)] [hashtable]$Config,
+        [Parameter(Mandatory)] [string]$ObjectKey,
+        [ValidateRange(5MB, 512MB)] [int]$PartSize = 32MB,
+        [int]$MaxAttemptsPerPart = 4,
+        [scriptblock]$OnProgress = $null
+    )
+    $result = [ordered]@{ Status = 'Failed'; RemotePath = $null; Bytes = 0; Parts = 0; Error = $null }
+    if (-not $Config.Enabled -or $Config.Provider -ne 'R2' -or -not $Config.R2) {
+        $result.Status = 'Skipped'; $result.Error = 'Cloud upload is not configured in this build'
+        return [pscustomobject]$result
+    }
+    if (-not (Test-Path -LiteralPath $FilePath)) { $result.Error = "File not found: $FilePath"; return [pscustomobject]$result }
+    if ($ObjectKey -notmatch '^[A-Za-z0-9_\-\./]+$') { $result.Error = "Object key has characters outside [A-Za-z0-9_-./]: $ObjectKey"; return [pscustomobject]$result }
+
+    $r2 = $Config.R2
+    $total = (Get-Item -LiteralPath $FilePath).Length
+    $result.Bytes = $total
+    $uploadId = $null
+    $stream = $null
+    try {
+        $init = Invoke-R2Request -Method 'POST' -R2 $r2 -ObjectKey $ObjectKey -Query @{ uploads = '' }
+        $uploadId = ([xml]$init.Content).InitiateMultipartUploadResult.UploadId
+        if (-not $uploadId) { throw 'R2 did not return an UploadId' }
+
+        $etags = New-Object System.Collections.ArrayList
+        $stream = [System.IO.File]::OpenRead($FilePath)
+        $buffer = New-Object byte[] $PartSize
+        $partNumber = 0
+        $sent = [int64]0
+        while ($true) {
+            $read = 0
+            while ($read -lt $PartSize) {
+                $n = $stream.Read($buffer, $read, $PartSize - $read)
+                if ($n -le 0) { break }
+                $read += $n
+            }
+            if ($read -le 0 -and $partNumber -gt 0) { break }
+            $partNumber++
+            # Assigned inside the branches, never as an if-expression: that would
+            # unroll the byte[] through the pipeline into one object per byte.
+            if ($read -eq $PartSize) { $body = $buffer } else { $body = New-Object byte[] $read; [Array]::Copy($buffer, $body, $read) }
+            $etag = $null
+            $lastErr = $null
+            for ($attempt = 1; $attempt -le $MaxAttemptsPerPart -and -not $etag; $attempt++) {
+                try {
+                    $resp = Invoke-R2Request -Method 'PUT' -R2 $r2 -ObjectKey $ObjectKey -Query @{ partNumber = "$partNumber"; uploadId = $uploadId } -Body $body
+                    $etag = [string]($resp.Headers['ETag'])
+                    if (-not $etag) { $lastErr = "part $partNumber returned no ETag" }
+                } catch { $lastErr = $_.Exception.Message }
+                if (-not $etag -and $attempt -lt $MaxAttemptsPerPart) { Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempt * $attempt)) }
+            }
+            if (-not $etag) { throw "Part $partNumber failed after $MaxAttemptsPerPart attempts: $lastErr" }
+            [void]$etags.Add(@{ PartNumber = $partNumber; ETag = $etag })
+            $sent += $read
+            if ($OnProgress) { try { & $OnProgress $sent $total } catch { } }
+            if ($read -lt $PartSize) { break }
+        }
+
+        $xml = '<CompleteMultipartUpload>' + (($etags | ForEach-Object { '<Part><PartNumber>{0}</PartNumber><ETag>{1}</ETag></Part>' -f $_.PartNumber, [System.Security.SecurityElement]::Escape($_.ETag) }) -join '') + '</CompleteMultipartUpload>'
+        $null = Invoke-R2Request -Method 'POST' -R2 $r2 -ObjectKey $ObjectKey -Query @{ uploadId = $uploadId } -Body ([System.Text.Encoding]::UTF8.GetBytes($xml)) -ContentType 'application/xml'
+        $result.Status = 'Uploaded'
+        $result.RemotePath = "$($r2.BucketName)/$ObjectKey"
+        $result.Parts = $etags.Count
+    } catch {
+        $result.Error = $_.Exception.Message
+        if ($uploadId) { try { $null = Invoke-R2Request -Method 'DELETE' -R2 $r2 -ObjectKey $ObjectKey -Query @{ uploadId = $uploadId } } catch { } }
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+    return [pscustomobject]$result
+}
+
+#endregion
+
 Export-ModuleMember -Function @(
     'Get-WinConfigDiagnosticsUploadConfig'
     'Send-WinConfigDiagnosticPackage'
+    'Send-WinConfigLargeFile'
 )

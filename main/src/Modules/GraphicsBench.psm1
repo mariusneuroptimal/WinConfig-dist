@@ -6497,7 +6497,7 @@ function Test-GraphicsBenchPreconditions {
 # Run folder, events, package, and the ONE report renderer
 # ---------------------------------------------------------------------------
 #
-# The console harness and the app's Graphics tab are two live views of one run.
+# The console harness and the app's Testing tab are two live views of one run.
 # That is exactly the shape this repo's channel-mismatch bug class takes, so the
 # run folder, the event writer, the package writer and the REPORT TEXT all live
 # here and both surfaces call them. Each surface owns only how it paints a line,
@@ -6870,7 +6870,7 @@ function Format-GraphicsBenchReport {
         The whole end-of-run report as renderable records. THE one renderer.
     .DESCRIPTION
         Returns @{ Level; Text; NoPrefix } rows. The console harness maps Level
-        to a console colour and the app's Graphics tab maps it to
+        to a console colour and the app's Testing tab maps it to
         Write-WinConfigGuiDiagnostic; neither decides what a row SAYS.
     #>
     [CmdletBinding()]

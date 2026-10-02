@@ -14806,6 +14806,319 @@ namespace WinConfigDiag {
 
     [System.Windows.Forms.MessageBox]::Show($resultMessage, "Backup Cleanup Complete", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
 }
+# ===== NO LAUNCH TESTING (NO-LAUNCH-001) =====
+#
+# A WATCH, NOT A ONE-SHOT. "Stuck on Refreshing Licensing Information"
+# (FI-022) is intermittent, so a tool the tester has to remember to arm
+# before the bad launch mostly records good ones -- or nothing. The tester
+# starts watching once and leaves WinConfig open; every NO launch from then
+# on is recorded. A healthy launch is a launch time AND the same-box control
+# the licensing hunt was missing; a launch that never becomes ready within
+# the stuck threshold gets the stuck capture (threads, two dumps) and is
+# sent in full.
+#
+# WinConfig NEVER launches or kills NO: it runs elevated and NO must not.
+# The trace is started before NO exists (Light by default so launch times
+# stay comparable; Full adds file + registry). Everything after an outcome
+# (dumps, decoding, packaging, sending) runs in background runspaces so the
+# window keeps watching for the next launch -- usually the tester's kill
+# and relaunch of a stuck NO, which is itself the next data point.
+"Watch NO Launches" = {
+    if (-not (Get-Command Initialize-WinConfigGuiDiagnosticBox -ErrorAction SilentlyContinue)) {
+        [System.Windows.Forms.MessageBox]::Show("NO Launch Testing cannot start: Console module failed to load.", "Module Load Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        return
+    }
+    $nlMissing = @()
+    foreach ($nlFn in @('Start-NoLaunchEtwSession', 'Stop-NoLaunchEtwSession', 'Stop-NoLaunchStaleEtwSessions', 'Get-NoLaunchWindows', 'Test-NoLaunchReady', 'Get-NoLaunchProcessSample', 'Get-NoLaunchContext', 'Invoke-NoLaunchFinalize', 'Send-NoLaunchPackage', 'Send-WinConfigLargeFile')) {
+        if (-not (Get-Command $nlFn -ErrorAction SilentlyContinue)) { $nlMissing += $nlFn }
+    }
+    if ($nlMissing.Count -gt 0) {
+        [System.Windows.Forms.MessageBox]::Show("NO Launch Testing cannot start: a module is not loaded.`r`n`r`nMissing: $($nlMissing -join ', ')", "Module Load Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        return
+    }
+    if ($script:NlForm -and -not $script:NlForm.IsDisposed) { $script:NlForm.Activate(); return }
+
+    # Module paths for the background runspaces (a loaded module does not cross a runspace).
+    $script:NlModulePaths = @((Get-Command Invoke-NoLaunchFinalize).Module.Path, (Get-Command Send-WinConfigLargeFile).Module.Path)
+    $script:NlIsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $script:NlRoot = Join-Path $env:LOCALAPPDATA 'Temp\WinConfig-NoLaunch'
+    $script:NlState = @{ Mode = 'Idle'; Seq = 0; Session = $null; Launch = $null; Known = @{}; LaunchesThisWatch = 0; Tick = 0 }
+    $script:NlRules = Get-NoLaunchRules
+    $script:NlJobs = New-Object System.Collections.ArrayList
+
+    $nlScale = 1.0
+    if ($script:DpiScale) { $nlScale = [Math]::Max(1.0, [double]$script:DpiScale) }
+    $nlPx = { param($v) [int][Math]::Round($v * $nlScale) }
+
+    $script:NlForm = New-Object System.Windows.Forms.Form
+    $script:NlForm.Text = "NO Launch Testing"
+    $script:NlForm.Size = New-Object System.Drawing.Size((& $nlPx 860), (& $nlPx 560))
+    $script:NlForm.MinimumSize = $script:NlForm.Size
+    $script:NlForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $script:NlForm.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
+
+    $nlRoot = New-Object System.Windows.Forms.TableLayoutPanel
+    $nlRoot.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $nlRoot.ColumnCount = 1
+    $nlRoot.RowCount = 5
+    $nlRoot.Padding = New-Object System.Windows.Forms.Padding((& $nlPx 12))
+    foreach ($i in 0..4) { [void]$nlRoot.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) }
+    $nlRoot.RowStyles[3] = New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)
+    $script:NlForm.Controls.Add($nlRoot)
+
+    $nlIntro = New-Object System.Windows.Forms.Label
+    $nlIntro.AutoSize = $true
+    $nlIntro.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
+    $nlIntro.Text = "Click Start watching, then launch NeurOptimal the normal way (desktop shortcut, not as administrator). Every launch is timed until NO is ready. If NO is not ready after $([int]($script:NlRules.StuckAfterSeconds / 60)) minutes, the launch counts as stuck: WinConfig records what NO is doing and sends it in full. Keep this window open; kill and relaunch NO as usual -- the next launch is recorded too."
+    $nlRoot.Controls.Add($nlIntro, 0, 0)
+
+    $nlBar = New-Object System.Windows.Forms.FlowLayoutPanel
+    $nlBar.AutoSize = $true
+    $nlBar.WrapContents = $false
+    $nlBar.Margin = New-Object System.Windows.Forms.Padding(0, (& $nlPx 8), 0, (& $nlPx 4))
+    $script:NlStartBtn = New-Object System.Windows.Forms.Button
+    $script:NlStartBtn.Text = "Start watching"
+    $script:NlStartBtn.Size = New-Object System.Drawing.Size((& $nlPx 150), (& $nlPx 32))
+    $script:NlStuckBtn = New-Object System.Windows.Forms.Button
+    $script:NlStuckBtn.Text = "NO is stuck now"
+    $script:NlStuckBtn.Size = New-Object System.Drawing.Size((& $nlPx 150), (& $nlPx 32))
+    $script:NlStuckBtn.Enabled = $false
+    $script:NlFullChk = New-Object System.Windows.Forms.CheckBox
+    $script:NlFullChk.AutoSize = $true
+    $script:NlFullChk.Text = "Full trace (adds file + registry; launch times not comparable)"
+    $script:NlFullChk.Margin = New-Object System.Windows.Forms.Padding((& $nlPx 12), (& $nlPx 8), 0, 0)
+    $nlOpenBtn = New-Object System.Windows.Forms.Button
+    $nlOpenBtn.Text = "Open folder"
+    $nlOpenBtn.Size = New-Object System.Drawing.Size((& $nlPx 110), (& $nlPx 32))
+    $nlBar.Controls.AddRange(@($script:NlStartBtn, $script:NlStuckBtn, $script:NlFullChk, $nlOpenBtn))
+    $nlRoot.Controls.Add($nlBar, 0, 1)
+
+    $script:NlStatus = New-Object System.Windows.Forms.Label
+    $script:NlStatus.AutoSize = $true
+    $script:NlStatus.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
+    $script:NlStatus.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $script:NlStatus.Margin = New-Object System.Windows.Forms.Padding(0, (& $nlPx 4), 0, (& $nlPx 8))
+    $script:NlStatus.Text = $(if ($script:NlIsAdmin) { "Not watching." } else { "Not watching. WinConfig is not running as administrator: launch times only, no trace." })
+    $nlRoot.Controls.Add($script:NlStatus, 0, 2)
+
+    $script:NlList = New-Object System.Windows.Forms.ListView
+    $script:NlList.View = [System.Windows.Forms.View]::Details
+    $script:NlList.FullRowSelect = $true
+    $script:NlList.Dock = [System.Windows.Forms.DockStyle]::Fill
+    foreach ($col in @(@('Started', 150), @('Launch time', 100), @('Outcome', 110), @('Trace', 70), @('Sent', 360))) { [void]$script:NlList.Columns.Add($col[0], (& $nlPx $col[1])) }
+    $nlRoot.Controls.Add($script:NlList, 0, 3)
+
+    $nlFoot = New-Object System.Windows.Forms.Label
+    $nlFoot.AutoSize = $true
+    $nlFoot.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
+    $nlFoot.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 110)
+    $nlFoot.Text = "Ready = NO's main window is showing (rule $($script:NlRules.ReadyRuleVersion)). Stuck launches send memory dumps of NO, which can contain client data. Files: $script:NlRoot"
+    $nlRoot.Controls.Add($nlFoot, 0, 4)
+
+    # ── state helpers ────────────────────────────────────────────────
+    $script:NlArm = {
+        $st = $script:NlState
+        $st.Seq++
+        $st.Session = $null
+        $st.TraceError = $null
+        $st.Level = $(if ($script:NlFullChk.Checked) { 'Full' } else { 'Light' })
+        $st.Known = @{}
+        foreach ($p in @(Get-Process -Name 'NO' -ErrorAction SilentlyContinue)) { $st.Known[$p.Id] = $true }
+        # The launch's folder exists from arming: the trace writes into it, so it can never be renamed.
+        $st.PendingFolder = Join-Path $script:NlRoot ("launch-{0}-{1}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $st.Seq)
+        New-Item -ItemType Directory -Force -Path $st.PendingFolder | Out-Null
+        if ($script:NlIsAdmin) {
+            $r = Start-NoLaunchEtwSession -SessionName (Get-NoLaunchSessionName -Sequence $st.Seq) -EtlPath (Join-Path $st.PendingFolder 'NO-launch.etl') -Level $st.Level
+            if ($r.Ok) { $st.Session = $r } else { $st.TraceError = "trace did not start: $($r.Error)" }
+        } else { $st.TraceError = 'WinConfig is not elevated' }
+        $st.Mode = 'Armed'
+        $waitText = "Watching. Launch NeurOptimal now (desktop shortcut, not as administrator)."
+        if ($st.Known.Count -gt 0) { $waitText = "Watching. NeurOptimal is already running -- that launch is not recorded. Close it and launch it again." }
+        if ($st.TraceError) { $waitText += " (No trace: $($st.TraceError).)" }
+        $script:NlStatus.Text = $waitText
+    }
+
+    $script:NlAddRow = {
+        param($launch)
+        $item = New-Object System.Windows.Forms.ListViewItem($launch.LaunchStart.ToString('yyyy-MM-dd HH:mm:ss'))
+        [void]$item.SubItems.Add('...')
+        [void]$item.SubItems.Add('In progress')
+        [void]$item.SubItems.Add($(if ($launch.EtlPath) { $launch.TraceLevel } else { 'none' }))
+        [void]$item.SubItems.Add('')
+        [void]$script:NlList.Items.Insert(0, $item)
+        return $item
+    }
+
+    # Runs a scriptblock in a background runspace with the two modules loaded.
+    $script:NlStartJob = {
+        param([string]$Kind, [scriptblock]$Body, [hashtable]$Data, $Row)
+        $sync = [hashtable]::Synchronized(@{ Stage = ''; Result = $null; Error = $null })
+        $ps = [powershell]::Create()
+        [void]$ps.AddScript({
+            param($ModulePaths, $Body, $Data, $Sync)
+            try {
+                foreach ($m in $ModulePaths) { Import-Module $m -Force -DisableNameChecking }
+                $Sync.Result = & ([scriptblock]::Create($Body.ToString())) $Data $Sync
+            } catch { $Sync.Error = $_.Exception.Message }
+        }).AddArgument($script:NlModulePaths).AddArgument($Body).AddArgument($Data).AddArgument($sync)
+        $handle = $ps.BeginInvoke()
+        [void]$script:NlJobs.Add(@{ Kind = $Kind; PS = $ps; Handle = $handle; Sync = $sync; Row = $Row; Data = $Data })
+    }
+
+    $script:NlDecide = {
+        param([string]$Outcome, [bool]$ByOperator)
+        $st = $script:NlState
+        $l = $st.Launch
+        if (-not $l) { return }
+        $l.Outcome = $Outcome
+        $l.MarkedStuckByOperator = $ByOperator
+        $st.Launch = $null
+        $script:NlStuckBtn.Enabled = $false
+        $l.Row.SubItems[1].Text = $(if ($null -ne $l.ReadyT) { '{0:N1} s' -f $l.ReadyT } else { '--' })
+        $l.Row.SubItems[2].Text = $(if ($Outcome -eq 'Stuck') { 'Stuck (capturing)' } else { $Outcome })
+        $l.Row.SubItems[4].Text = 'Packaging...'
+        $data = @{}
+        foreach ($k in @('LaunchId', 'Computer', 'ProcessId', 'LaunchStart', 'TraceLevel', 'Outcome', 'ReadyT', 'ReadyTitle', 'Context', 'Folder', 'SessionName', 'EtlPath', 'TraceError', 'MarkedStuckByOperator')) { $data[$k] = $l[$k] }
+        $data.Samples = $l.Samples.ToArray()
+        $data.WindowTimeline = $l.WindowTimeline.ToArray()
+        & $script:NlStartJob 'Finalize' {
+            param($d, $sync)
+            $f = Invoke-NoLaunchFinalize -Launch $d -OnStage { param($m) $sync.Stage = $m }
+            $sync.Stage = 'Sending'
+            $send = Send-NoLaunchPackage -Finalized $f -IncludeHeavy:($d.Outcome -eq 'Stuck') -OnStage { param($m) $sync.Stage = $m }
+            return @{ Finalized = $f; Send = $send }
+        } $data $l.Row
+        if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
+            try { Register-WinConfigSessionAction -Action "NO Launch Testing" -Detail ("Launch {0}: {1}{2}" -f $l.LaunchId, $Outcome, $(if ($null -ne $l.ReadyT) { " in $([math]::Round($l.ReadyT, 1)) s" })) -Category "Diagnostics" -ToolCategory "Other" -Result $(if ($Outcome -eq 'Ready') { 'PASS' } else { 'WARN' }) -Tier 0 -Summary "NO launch $Outcome" } catch { }
+        }
+        # Watch for the next launch at once: the old trace keeps running until its
+        # job stops it, and the stuck NO is already known so it is not re-detected.
+        if ($st.Mode -eq 'Launch' -and -not $st.Stopping) { & $script:NlArm }
+    }
+
+    $script:NlStop = {
+        $st = $script:NlState
+        $st.Stopping = $true
+        if ($st.Launch) { & $script:NlDecide 'WatchStopped' $false }
+        $st.Stopping = $false
+        if ($st.Session) { [void](Stop-NoLaunchEtwSession -SessionName $st.Session.SessionName); $st.Session = $null }
+        $st.Mode = 'Idle'
+        $script:NlStartBtn.Text = "Start watching"
+        $script:NlFullChk.Enabled = $true
+        $script:NlStatus.Text = "Not watching."
+    }
+
+    # ── the watch: 500 ms tick, NO sampled every second ──────────────
+    $script:NlTimer = New-Object System.Windows.Forms.Timer
+    $script:NlTimer.Interval = 500
+    $script:NlTimer.Add_Tick({
+        try {
+            $st = $script:NlState
+            $st.Tick++
+            foreach ($j in @($script:NlJobs)) {
+                if ($j.Sync.Stage -and -not $j.Handle.IsCompleted) { $j.Row.SubItems[4].Text = $j.Sync.Stage }
+                if (-not $j.Handle.IsCompleted) { continue }
+                try { [void]$j.PS.EndInvoke($j.Handle) } catch { }
+                $j.PS.Dispose()
+                $script:NlJobs.Remove($j)
+                $res = $j.Sync.Result
+                if ($j.Sync.Error -or -not $res) { $j.Row.SubItems[4].Text = "Failed: $($j.Sync.Error) -- files are in $($j.Data.Folder)"; continue }
+                $sum = $res.Finalized.Summary
+                $j.Row.SubItems[2].Text = $sum.Outcome
+                $send = $res.Send
+                $pkg = [string]$send.Package.Status
+                $heavy = @($send.Heavy)
+                $heavyOk = @($heavy | Where-Object { $_.Status -eq 'Uploaded' }).Count
+                $txt = switch ($pkg) { 'Uploaded' { 'Sent' } 'LocalOnly' { 'NOT sent -- saved on this PC' } 'Skipped' { 'Not sent (uploads not configured)' } default { "NOT sent: $($send.Package.Error)" } }
+                if ($heavy.Count) { $txt += "; dumps + trace: $heavyOk of $($heavy.Count) sent" }
+                $j.Row.SubItems[4].Text = $txt
+            }
+            if ($st.Mode -eq 'Armed') {
+                $p = @(Get-Process -Name 'NO' -ErrorAction SilentlyContinue | Where-Object { -not $st.Known.ContainsKey($_.Id) }) | Select-Object -First 1
+                if ($p) {
+                    $st.Known[$p.Id] = $true
+                    $st.LaunchesThisWatch++
+                    $start = $p.StartTime
+                    $lid = New-NoLaunchLaunchId -LaunchStart $start
+                    $launch = @{
+                        LaunchId = $lid; Computer = $env:COMPUTERNAME; ProcessId = $p.Id; Process = $p; LaunchStart = $start
+                        TraceLevel = $(if ($st.Session) { $st.Level } else { 'None' }); Folder = $st.PendingFolder
+                        SessionName = $(if ($st.Session) { $st.Session.SessionName } else { $null })
+                        EtlPath = $(if ($st.Session) { $st.Session.EtlPath } else { $null })
+                        # Read once, at launch: MySQL's state and the uptime matter at the start, and the exe path is unreadable after NO exits.
+                        Context = (Get-NoLaunchContext -Process $p -PriorLaunchesThisWatch ($st.LaunchesThisWatch - 1))
+                        TraceError = $st.TraceError; ReadyT = $null; ReadyTitle = $null; PostReadyTicks = 0
+                        Samples = (New-Object System.Collections.ArrayList); WindowTimeline = (New-Object System.Collections.ArrayList); LastWindows = $null
+                    }
+                    $st.Session = $null
+                    $launch.Row = & $script:NlAddRow $launch
+                    $st.Launch = $launch
+                    $st.Mode = 'Launch'
+                    $script:NlStuckBtn.Enabled = $true
+                }
+            }
+            if ($st.Mode -eq 'Launch' -and ($st.Tick % 2) -eq 0) {
+                $l = $st.Launch
+                $smp = Get-NoLaunchProcessSample -Process $l.Process -LaunchStart $l.LaunchStart
+                if (-not $smp) { & $script:NlDecide 'Exited' $false; return }
+                [void]$l.Samples.Add($smp)
+                $wins = @(Get-NoLaunchWindows -ProcessId $l.ProcessId)
+                $sig = Get-NoLaunchWindowSignature -Windows $wins
+                if ($sig -ne $l.LastWindows) {
+                    if ($wins.Count -eq 0) { [void]$l.WindowTimeline.Add([pscustomobject]@{ T = $smp.T; Hwnd = 0; Visible = $false; Class = ''; Title = '(no windows)' }) }
+                    foreach ($w in $wins) { [void]$l.WindowTimeline.Add([pscustomobject]@{ T = $smp.T; Hwnd = $w.Hwnd; Visible = $w.Visible; Class = $w.Class; Title = $w.Title }) }
+                    $l.LastWindows = $sig
+                }
+                if ($null -eq $l.ReadyT) {
+                    $ready = Test-NoLaunchReady -Windows $wins
+                    if ($ready.Ready) { $l.ReadyT = $smp.T; $l.ReadyTitle = $ready.Title }
+                }
+                if ($null -ne $l.ReadyT) {
+                    $l.PostReadyTicks++
+                    $script:NlStatus.Text = "NeurOptimal was ready after {0:N1} s. Finishing the record..." -f $l.ReadyT
+                    if ($l.PostReadyTicks -ge $script:NlRules.PostReadySeconds) { & $script:NlDecide 'Ready' $false }
+                } elseif ($smp.T -ge $script:NlRules.StuckAfterSeconds) {
+                    & $script:NlDecide 'Stuck' $false
+                } else {
+                    $script:NlStatus.Text = "NeurOptimal is starting: {0:N0} s (counts as stuck at {3} s). CPU {1:N1} s, {2} window(s)." -f $smp.T, $smp.CpuSec, $wins.Count, $script:NlRules.StuckAfterSeconds
+                }
+            }
+        } catch {
+            $script:NlStatus.Text = "Watch error: $($_.Exception.Message)"
+        }
+    })
+
+    $script:NlStartBtn.Add_Click({
+        if ($script:NlState.Mode -eq 'Idle') {
+            [void](Stop-NoLaunchStaleEtwSessions)
+            $script:NlState.LaunchesThisWatch = 0
+            & $script:NlArm
+            $script:NlStartBtn.Text = "Stop watching"
+            $script:NlFullChk.Enabled = $false
+            $script:NlTimer.Start()
+        } else {
+            & $script:NlStop
+        }
+    })
+    $script:NlStuckBtn.Add_Click({ if ($script:NlState.Mode -eq 'Launch') { & $script:NlDecide 'Stuck' $true } })
+    $nlOpenBtn.Add_Click({ New-Item -ItemType Directory -Force -Path $script:NlRoot | Out-Null; Start-Process explorer.exe $script:NlRoot })
+
+    $script:NlForm.Add_FormClosing({
+        param($s, $e)
+        $busy = @($script:NlJobs).Count
+        if ($e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing -and ($script:NlState.Mode -ne 'Idle' -or $busy -gt 0)) {
+            $msg = "Stop watching NO launches?"
+            if ($busy -gt 0) { $msg += "`r`n`r`n$busy launch record(s) are still being packaged or sent. They finish in the background while WinConfig stays open; closing WinConfig itself stops them." }
+            if ([System.Windows.Forms.MessageBox]::Show($msg, "NO Launch Testing", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question) -ne [System.Windows.Forms.DialogResult]::Yes) { $e.Cancel = $true; return }
+        }
+        try { if ($script:NlState.Mode -ne 'Idle') { & $script:NlStop } } catch { }
+        # A kernel trace left running keeps writing until reboot.
+        try { if ($script:NlState.Session) { [void](Stop-NoLaunchEtwSession -SessionName $script:NlState.Session.SessionName) } } catch { }
+        try { $script:NlTimer.Stop(); $script:NlTimer.Dispose() } catch { }
+    })
+
+    $script:NlForm.Show()
+}
 # ===== LOW DISK SPACE TESTING (LOW-DISK-001) =====
 #
 # WHAT THIS REPLACES. The field procedure was: save createdummy.bat to
@@ -16454,9 +16767,9 @@ foreach ($tabPage in $tabControl.TabPages) {
         # Used for: list population, panel creation, selection, badges
         $script:Categories = @(
             "Support",
+            "Testing",
             "Network",
             "Bluetooth",
-            "Graphics",
             "Updates",
             "NO Shortcuts",
             "Disk",
@@ -18325,11 +18638,18 @@ No system changes were made.
                 SupportsDryRun = $false
                 MutatesSystem = $false
             }
-            # Graphics tools
+            # Testing tools
             "Run Graphics Session Bench" = @{
                 Description = "Measure what NO's visualizer and media player cost across one session (read-only)"
-                Group = "Diagnostics"
+                Group = "Graphics Testing"
                 ToolId = "graphics-session-bench"
+                SupportsDryRun = $false
+                MutatesSystem = $false
+            }
+            "Watch NO Launches" = @{
+                Description = "Time every NO launch; capture and send stuck-on-licensing launches (read-only)"
+                Group = "NO Launch Testing"
+                ToolId = "no-launch-watch"
                 SupportsDryRun = $false
                 MutatesSystem = $false
             }
@@ -18345,7 +18665,7 @@ No system changes were made.
             "Network"      = @("Run Network Test", "Domain, IP && Ports Test", "Network Reset", "Flush DNS Cache", "Open Speedtest.net")
             "Audio"        = @("Remove Intel SST Audio Driver", "Restart Audio Service", "Sound Panel", "Run Bluetooth Diagnostics")
             "Bluetooth"    = @("Run Bluetooth Diagnostics", "Reset COM Port Numbers", "Clean Bluetooth Ports", "Full Bluetooth Stack Reset", "Disable USB Suspend")
-            "Graphics"     = @("Run Graphics Session Bench")
+            "Testing"      = @("Run Graphics Session Bench", "Watch NO Launches")
             "System"       = @("Copy System Info", "Copy Device Name", "Copy Serial Number", "Copy Computer Model", "Machine Identifiers", "Device Manager", "Task Manager", "Control Panel")
             "zAmp"         = @("Uninstall zAmp Drivers", "Repair zAmp Driver Trust")
             "Zengar UI"    = @("Apply Win 11 Start Menu", "Apply branding colors", "Pin Taskbar Icons", "Apply Win Update Icon")
@@ -19271,6 +19591,11 @@ $form.Add_FormClosing({
 
     if (Get-Command Write-WinConfigLog -ErrorAction SilentlyContinue) {
         Write-WinConfigLog -Action "Shutdown" -Message "WinConfig application closed"
+    }
+
+    # NO Launch Testing: a kernel trace left running keeps writing until reboot.
+    if (Get-Command Stop-NoLaunchStaleEtwSessions -ErrorAction SilentlyContinue) {
+        try { [void](Stop-NoLaunchStaleEtwSessions) } catch { }
     }
 
     # EPHEMERAL CLEANUP: Remove session temp root (zero-footprint)

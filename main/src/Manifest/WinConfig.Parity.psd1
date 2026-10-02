@@ -19,11 +19,13 @@
     # Categories in display order (SSOT)
     # Reordered 2026-09-01: Support, Network, Bluetooth promoted to the top --
     # the three categories support techs actually open on a call.
+    # 2026-10-02: Testing (bench + NO launch testing) replaces Graphics and
+    # sits under Support -- the tools the testing team opens.
     Categories = @(
         "Support"
+        "Testing"
         "Network"
         "Bluetooth"
-        "Graphics"
         "Updates"
         "NO Shortcuts"
         "Disk"
@@ -55,11 +57,12 @@
             "Full Bluetooth Stack Reset"
             "Disable USB Suspend"
         )
-        # GRAPHICS-BENCH-001 section 11.2. One long-running, read-only tool:
-        # the operator starts it, runs a whole NeurOptimal session, and stops
-        # it, and the results window stays up for the duration.
-        "Graphics" = @(
+        # Long-running, read-only test instruments. GRAPHICS-BENCH-001 section
+        # 11.2: the operator starts the bench, runs a whole NeurOptimal session,
+        # and stops it, and the results window stays up for the duration.
+        "Testing" = @(
             "Run Graphics Session Bench"
+            "Watch NO Launches"
         )
         "System" = @(
             "Copy System Info"
@@ -273,6 +276,12 @@
         "Low Disk Space Testing" = @{
             Description = "Hold this PC at a chosen free space, then restore it"
             Group = "Testing"
+        }
+
+        # Testing tools
+        "Watch NO Launches" = @{
+            Description = "Time every NO launch; capture and send stuck-on-licensing launches (read-only)"
+            Group = "NO Launch Testing"
         }
 
         # Support tools

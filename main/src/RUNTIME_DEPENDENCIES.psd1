@@ -58,7 +58,8 @@
         @{ Path = "src/Modules/TargetDeviceWatch.psm1" }    # Target device state machine (from winconfig-bluetooth)
         @{ Path = "src/Modules/BluetoothDeviceProbe.psm1" } # Deep device probe: Win32 BT API, streaming, patterns
         @{ Path = "src/Modules/LowDiskSpace.psm1" }     # LOW-DISK-001: reversible low-disk-space simulation (Disk tab)
-        @{ Path = "src/Modules/GraphicsBench.psm1" }        # GRAPHICS-BENCH-001: NO WebView2 surface measurement (Graphics tab)
+        @{ Path = "src/Modules/GraphicsBench.psm1" }        # GRAPHICS-BENCH-001: NO WebView2 surface measurement (Testing tab)
+        @{ Path = "src/Modules/NoLaunchWatch.psm1" }        # NO-LAUNCH-001: NO launch timing + stuck-on-licensing capture (Testing tab)
     )
 
     # Documentation of invariants (for governance reference)
