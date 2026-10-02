@@ -593,6 +593,86 @@ function Send-NoLaunchPackage {
 
 #endregion
 
+#region Local cleanup
+#
+# A stuck capture is 1.5-2.5 GB. Once EVERYTHING a launch had to send is in the
+# bucket, its folder is deleted -- but only when WinConfig closes, so the tester
+# can still open the files while WinConfig runs. Anything not confirmed sent
+# stays on the PC. The upload marker is the only evidence the sweep trusts.
+
+function Write-NoLaunchUploadMarker {
+    <#
+    .SYNOPSIS
+        Records what reached the bucket in <folder>\upload.json. AllSent is true only when the
+        package was uploaded and, for a stuck launch, every dump and the raw trace were too.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [hashtable]$Finalized, [Parameter(Mandatory)] $Send, [int]$OwnerPid = $PID)
+    $heavy = @($Send.Heavy)
+    $heavySent = @($heavy | Where-Object { $_.Status -eq 'Uploaded' }).Count
+    $allSent = ([string]$Send.Package.Status -eq 'Uploaded')
+    if ($Finalized.Summary.Outcome -eq 'Stuck') {
+        # Every heavy file on disk must have been sent, not just the ones attempted.
+        $onDisk = @(Get-NoLaunchHeavyFiles -Folder $Finalized.Folder).Count
+        $allSent = $allSent -and $heavySent -eq $heavy.Count -and $heavy.Count -ge $onDisk
+    }
+    $marker = [ordered]@{
+        AllSent       = [bool]$allSent
+        PackageStatus = [string]$Send.Package.Status
+        HeavySent     = $heavySent
+        HeavyTotal    = $heavy.Count
+        OwnerPid      = $OwnerPid
+        WrittenAt     = (Get-Date).ToString('o')
+    }
+    $marker | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Finalized.Folder 'upload.json') -Encoding UTF8
+    return $marker
+}
+
+function Remove-NoLaunchSentFolders {
+    <#
+    .SYNOPSIS
+        Called when WinConfig closes: deletes launch folders whose upload.json says AllSent,
+        and folders holding only a raw trace with no launch record (nothing to send or read).
+    .DESCRIPTION
+        Kept: anything not confirmed sent (failed or interrupted upload, uploads not
+        configured), and folders owned by another WinConfig that is still running.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$Root, [int]$CurrentPid = $PID)
+    $result = [ordered]@{ Removed = @(); Kept = @(); FreedBytes = [long]0 }
+    if (-not (Test-Path -LiteralPath $Root)) { return $result }
+    foreach ($dir in @(Get-ChildItem -LiteralPath $Root -Directory -Filter 'launch-*')) {
+        $files = @(Get-ChildItem -LiteralPath $dir.FullName -File -Recurse -ErrorAction SilentlyContinue)
+        $bytes = [long](($files | Measure-Object -Property Length -Sum).Sum)
+        $markerPath = Join-Path $dir.FullName 'upload.json'
+        $remove = $false
+        if (Test-Path -LiteralPath $markerPath) {
+            $m = $null
+            try { $m = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json } catch { }
+            if ($m -and $m.AllSent -eq $true) {
+                $owner = [int]$m.OwnerPid
+                # Another WinConfig still running may need its files; a dead owner (crash) does not.
+                $remove = ($owner -eq $CurrentPid -or -not (Get-Process -Id $owner -ErrorAction SilentlyContinue))
+            }
+        } elseif (@($files | Where-Object { $_.Extension -ne '.etl' }).Count -eq 0) {
+            # Only a raw trace, no launch record: armed and never launched, or a launch WinConfig closed on
+            # before it was packaged (its record lived in memory). Finalize always writes windows.csv.
+            $remove = $true
+        }
+        if (-not $remove) { $result.Kept += $dir.Name; continue }
+        try {
+            Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction Stop
+            $result.Removed += $dir.Name
+            $result.FreedBytes += $bytes
+        } catch {
+            $result.Kept += $dir.Name
+        }
+    }
+    return $result
+}
+
+#endregion
+
 Export-ModuleMember -Function @(
     'Get-NoLaunchEtwProviders'
     'Start-NoLaunchEtwSession'
@@ -622,4 +702,6 @@ Export-ModuleMember -Function @(
     'Get-NoLaunchHeavyFiles'
     'Invoke-NoLaunchFinalize'
     'Send-NoLaunchPackage'
+    'Write-NoLaunchUploadMarker'
+    'Remove-NoLaunchSentFolders'
 )

@@ -14829,7 +14829,7 @@ namespace WinConfigDiag {
         return
     }
     $nlMissing = @()
-    foreach ($nlFn in @('Start-NoLaunchEtwSession', 'Stop-NoLaunchEtwSession', 'Stop-NoLaunchStaleEtwSessions', 'Get-NoLaunchWindows', 'Test-NoLaunchReady', 'Get-NoLaunchProcessSample', 'Get-NoLaunchContext', 'Invoke-NoLaunchFinalize', 'Send-NoLaunchPackage', 'Send-WinConfigLargeFile')) {
+    foreach ($nlFn in @('Start-NoLaunchEtwSession', 'Stop-NoLaunchEtwSession', 'Stop-NoLaunchStaleEtwSessions', 'Get-NoLaunchWindows', 'Test-NoLaunchReady', 'Get-NoLaunchProcessSample', 'Get-NoLaunchContext', 'Invoke-NoLaunchFinalize', 'Send-NoLaunchPackage', 'Write-NoLaunchUploadMarker', 'Remove-NoLaunchSentFolders', 'Send-WinConfigLargeFile')) {
         if (-not (Get-Command $nlFn -ErrorAction SilentlyContinue)) { $nlMissing += $nlFn }
     }
     if ($nlMissing.Count -gt 0) {
@@ -14912,7 +14912,7 @@ namespace WinConfigDiag {
     $nlFoot.AutoSize = $true
     $nlFoot.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
     $nlFoot.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 110)
-    $nlFoot.Text = "Ready = NO's main window is showing (rule $($script:NlRules.ReadyRuleVersion)). Stuck launches send memory dumps of NO, which can contain client data. Files: $script:NlRoot"
+    $nlFoot.Text = "Ready = NO's main window is showing (rule $($script:NlRules.ReadyRuleVersion)). Stuck launches send memory dumps of NO, which can contain client data. Files: $script:NlRoot -- a launch's files are deleted from this PC when WinConfig closes, once everything has been sent."
     $nlRoot.Controls.Add($nlFoot, 0, 4)
 
     # ── state helpers ────────────────────────────────────────────────
@@ -14986,7 +14986,9 @@ namespace WinConfigDiag {
             $f = Invoke-NoLaunchFinalize -Launch $d -OnStage { param($m) $sync.Stage = $m }
             $sync.Stage = 'Sending'
             $send = Send-NoLaunchPackage -Finalized $f -IncludeHeavy:($d.Outcome -eq 'Stuck') -OnStage { param($m) $sync.Stage = $m }
-            return @{ Finalized = $f; Send = $send }
+            # The folder is deleted when WinConfig closes, and only if this says everything was sent.
+            $marker = $null; try { $marker = Write-NoLaunchUploadMarker -Finalized $f -Send $send } catch { }
+            return @{ Finalized = $f; Send = $send; Marker = $marker }
         } $data $l.Row
         if (Get-Command Register-WinConfigSessionAction -ErrorAction SilentlyContinue) {
             try { Register-WinConfigSessionAction -Action "NO Launch Testing" -Detail ("Launch {0}: {1}{2}" -f $l.LaunchId, $Outcome, $(if ($null -ne $l.ReadyT) { " in $([math]::Round($l.ReadyT, 1)) s" })) -Category "Diagnostics" -ToolCategory "Other" -Result $(if ($Outcome -eq 'Ready') { 'PASS' } else { 'WARN' }) -Tier 0 -Summary "NO launch $Outcome" } catch { }
@@ -15031,6 +15033,7 @@ namespace WinConfigDiag {
                 $heavyOk = @($heavy | Where-Object { $_.Status -eq 'Uploaded' }).Count
                 $txt = switch ($pkg) { 'Uploaded' { 'Sent' } 'LocalOnly' { 'NOT sent -- saved on this PC' } 'Skipped' { 'Not sent (uploads not configured)' } default { "NOT sent: $($send.Package.Error)" } }
                 if ($heavy.Count) { $txt += "; dumps + trace: $heavyOk of $($heavy.Count) sent" }
+                if ($res.Marker -and $res.Marker.AllSent) { $txt += ' (deleted from this PC when WinConfig closes)' } else { $txt += ' (kept on this PC)' }
                 $j.Row.SubItems[4].Text = $txt
             }
             if ($st.Mode -eq 'Armed') {
@@ -19596,6 +19599,12 @@ $form.Add_FormClosing({
     # NO Launch Testing: a kernel trace left running keeps writing until reboot.
     if (Get-Command Stop-NoLaunchStaleEtwSessions -ErrorAction SilentlyContinue) {
         try { [void](Stop-NoLaunchStaleEtwSessions) } catch { }
+    }
+    # NO Launch Testing: a stuck capture is gigabytes. Delete every launch whose files all
+    # reached the bucket -- only now, so they stayed openable while WinConfig ran. After the
+    # trace stop above, so no folder is still being written.
+    if (Get-Command Remove-NoLaunchSentFolders -ErrorAction SilentlyContinue) {
+        try { [void](Remove-NoLaunchSentFolders -Root (Join-Path $env:LOCALAPPDATA 'Temp\WinConfig-NoLaunch')) } catch { }
     }
 
     # EPHEMERAL CLEANUP: Remove session temp root (zero-footprint)
