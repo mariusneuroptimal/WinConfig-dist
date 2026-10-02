@@ -14928,7 +14928,7 @@ namespace WinConfigDiag {
     $nlFoot.AutoSize = $true
     $nlFoot.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
     $nlFoot.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 110)
-    $nlFoot.Text = "Ready = NO's main window is showing and Refreshing Licensing Information has closed (rule $($script:NlRules.ReadyRuleVersion)). Stuck launches send memory dumps of NO, which can contain client data. Files: $script:NlRoot -- a launch's files are deleted from this PC when NO Support Tool closes, once everything has been sent."
+    $nlFoot.Text = "Ready = NO's main window is showing and Refreshing Licensing Information has closed (rule $($script:NlRules.ReadyRuleVersion)). Stuck launches send memory dumps of NO, which can contain client data. Files: $script:NlRoot -- a launch's files are deleted from this PC when NO Support Tool is closed, once everything has been sent."
     $nlRoot.Controls.Add($nlFoot, 0, 5)
 
     # ── state helpers ────────────────────────────────────────────────
@@ -15056,7 +15056,7 @@ namespace WinConfigDiag {
                 $heavyOk = @($heavy | Where-Object { $_.Status -eq 'Uploaded' }).Count
                 $txt = switch ($pkg) { 'Uploaded' { 'Sent' } 'LocalOnly' { 'NOT sent -- saved on this PC' } 'Skipped' { 'Not sent (uploads not configured)' } default { "NOT sent: $($send.Package.Error)" } }
                 if ($heavy.Count) { $txt += "; dumps + trace: $heavyOk of $($heavy.Count) sent" }
-                if ($res.Marker -and $res.Marker.AllSent) { $txt += ' (deleted from this PC when NO Support Tool closes)' } else { $txt += ' (kept on this PC)' }
+                if ($res.Marker -and $res.Marker.AllSent) { $txt += ' -- files are deleted from this PC when NO Support Tool is closed' } else { $txt += ' -- files are kept on this PC' }
                 $j.Row.SubItems[4].Text = $txt
             }
             $busyN = @($script:NlJobs).Count
