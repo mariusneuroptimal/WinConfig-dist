@@ -14869,7 +14869,7 @@ namespace WinConfigDiag {
     $nlIntro = New-Object System.Windows.Forms.Label
     $nlIntro.AutoSize = $true
     $nlIntro.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
-    $nlIntro.Text = "Click Start watching, then launch NeurOptimal the normal way. Every launch is timed until NO is ready. If NO is not ready after $([int]($script:NlRules.StuckAfterSeconds / 60)) minutes, the launch counts as stuck: NO Support Tool records what NO is doing and sends it in full. Keep this window open; kill and relaunch NO as usual -- the next launch is recorded too."
+    $nlIntro.Text = "Click Start watching, then launch NeurOptimal the normal way. Every launch is timed until NO is ready. If NO is not ready after $([int]$script:NlRules.StuckAfterSeconds) seconds, the launch counts as stuck: NO Support Tool records what NO is doing and sends it in full. Keep this window open; kill and relaunch NO as usual -- the next launch is recorded too."
     $nlRoot.Controls.Add($nlIntro, 0, 0)
 
     $nlBar = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -14884,17 +14884,12 @@ namespace WinConfigDiag {
     $script:NlStuckBtn.Text = "Mark as stuck"
     $script:NlStuckBtn.Size = New-Object System.Drawing.Size((& $nlPx 150), (& $nlPx 32))
     $script:NlStuckBtn.Enabled = $false
-    $script:NlFullChk = New-Object System.Windows.Forms.CheckBox
-    $script:NlFullChk.AutoSize = $true
-    $script:NlFullChk.Text = "Full trace (adds file + registry; launch times not comparable)"
-    $script:NlFullChk.Margin = New-Object System.Windows.Forms.Padding((& $nlPx 12), (& $nlPx 8), 0, 0)
     $nlOpenBtn = New-Object System.Windows.Forms.Button
     $nlOpenBtn.Text = "Open folder"
     $nlOpenBtn.Size = New-Object System.Drawing.Size((& $nlPx 110), (& $nlPx 32))
-    $nlBar.Controls.AddRange(@($script:NlStartBtn, $script:NlStuckBtn, $script:NlFullChk, $nlOpenBtn))
+    $nlBar.Controls.AddRange(@($script:NlStartBtn, $script:NlStuckBtn, $nlOpenBtn))
     $nlTips = New-Object System.Windows.Forms.ToolTip
     $nlTips.SetToolTip($script:NlStuckBtn, "While a launch is being timed: count it as stuck now instead of waiting $([int]$script:NlRules.StuckAfterSeconds) s.")
-    $nlTips.SetToolTip($script:NlFullChk, "Applies to the next launch. Can be changed while watching.")
     $nlRoot.Controls.Add($nlBar, 0, 1)
 
     $script:NlStatus = New-Object System.Windows.Forms.Label
@@ -14937,7 +14932,8 @@ namespace WinConfigDiag {
         $st.Seq++
         $st.Session = $null
         $st.TraceError = $null
-        $st.Level = $(if ($script:NlFullChk.Checked) { 'Full' } else { 'Light' })
+        # From Start watching: light trace only. File + registry start when NO appears.
+        $st.Level = 'Light'
         $st.Known = @{}
         foreach ($p in @(Get-Process -Name 'NO' -ErrorAction SilentlyContinue)) { $st.Known[$p.Id] = $true }
         # The launch's folder exists from arming: the trace writes into it, so it can never be renamed.
@@ -14948,13 +14944,12 @@ namespace WinConfigDiag {
             if ($r.Ok) { $st.Session = $r } else { $st.TraceError = "trace did not start: $($r.Error)" }
         } else { $st.TraceError = 'NO Support Tool is not running as administrator' }
         $st.Mode = 'Armed'
-        $lvl = $(if ($st.Session) { "$($st.Level) trace" } else { 'no trace' })
-        $waitText = "Watching ($lvl). Launch NeurOptimal now."
+        $waitText = "Watching. Launch NeurOptimal now."
         if ($st.Known.Count -gt 0) {
             # Running NO is either a launch this watch just recorded, or one started before watching.
             $unrecorded = @($st.Known.Keys | Where-Object { -not $st.Recorded.ContainsKey($_) }).Count
-            if ($unrecorded -gt 0) { $waitText = "Watching ($lvl). NeurOptimal was already running when watching started, so that launch was not recorded. To record one, close NeurOptimal and launch it again." }
-            else { $waitText = "Watching ($lvl). To record another launch, close NeurOptimal and launch it again." }
+            if ($unrecorded -gt 0) { $waitText = "Watching. NeurOptimal was already running when watching started, so that launch was not recorded. To record one, close NeurOptimal and launch it again." }
+            else { $waitText = "Watching. To record another launch, close NeurOptimal and launch it again." }
         }
         if ($st.TraceError) { $waitText += " (No trace: $($st.TraceError).)" }
         $script:NlStatus.Text = $waitText
@@ -14965,7 +14960,7 @@ namespace WinConfigDiag {
         $item = New-Object System.Windows.Forms.ListViewItem($launch.LaunchStart.ToString('yyyy-MM-dd HH:mm:ss'))
         [void]$item.SubItems.Add('...')
         [void]$item.SubItems.Add('In progress')
-        [void]$item.SubItems.Add($(if ($launch.EtlPath) { $launch.TraceLevel } else { 'none' }))
+        [void]$item.SubItems.Add($(if ($launch.TraceLevel -ne 'None') { $launch.TraceLevel } else { 'none' }))
         [void]$item.SubItems.Add('')
         [void]$script:NlList.Items.Insert(0, $item)
         return $item
@@ -15001,7 +14996,7 @@ namespace WinConfigDiag {
         $l.Row.SubItems[4].Text = 'Working -- please wait: packaging'
         $l.Row.ForeColor = [System.Drawing.Color]::FromArgb(200, 110, 0)
         $data = @{}
-        foreach ($k in @('LaunchId', 'Computer', 'ProcessId', 'LaunchStart', 'TraceLevel', 'Outcome', 'ReadyT', 'ReadyTitle', 'Context', 'Folder', 'SessionName', 'EtlPath', 'TraceError', 'MarkedStuckByOperator')) { $data[$k] = $l[$k] }
+        foreach ($k in @('LaunchId', 'Computer', 'ProcessId', 'LaunchStart', 'TraceLevel', 'Outcome', 'ReadyT', 'ReadyTitle', 'Context', 'Folder', 'SessionName', 'EtlPath', 'FileSessionName', 'FileEtlPath', 'TraceError', 'MarkedStuckByOperator')) { $data[$k] = $l[$k] }
         $data.Samples = $l.Samples.ToArray()
         $data.WindowTimeline = $l.WindowTimeline.ToArray()
         & $script:NlStartJob 'Finalize' {
@@ -15073,11 +15068,20 @@ namespace WinConfigDiag {
                     $st.LaunchesThisWatch++
                     $start = $p.StartTime
                     $lid = New-NoLaunchLaunchId -LaunchStart $start
+                    # File + registry from the moment NO appears (system-wide; see NoLaunchWatch.psm1 header).
+                    $fr = $null
+                    if ($script:NlIsAdmin) {
+                        $fr = Start-NoLaunchEtwSession -SessionName ((Get-NoLaunchSessionName -Sequence $st.Seq) + '-files') -EtlPath (Join-Path $st.PendingFolder 'NO-launch-files.etl') -Level FileRegistry -MaxMB $script:NlRules.FileTraceMaxMB
+                        if (-not $fr.Ok) { $st.TraceError = (@($st.TraceError, "file + registry trace did not start: $($fr.Error)") | Where-Object { $_ }) -join '; '; $fr = $null }
+                    }
+                    $lvlNow = $(if ($st.Session -and $fr) { 'Full' } elseif ($st.Session) { 'Light' } elseif ($fr) { 'Files only' } else { 'None' })
                     $launch = @{
                         LaunchId = $lid; Computer = $env:COMPUTERNAME; ProcessId = $p.Id; Process = $p; LaunchStart = $start
-                        TraceLevel = $(if ($st.Session) { $st.Level } else { 'None' }); Folder = $st.PendingFolder
+                        TraceLevel = $lvlNow; Folder = $st.PendingFolder
                         SessionName = $(if ($st.Session) { $st.Session.SessionName } else { $null })
                         EtlPath = $(if ($st.Session) { $st.Session.EtlPath } else { $null })
+                        FileSessionName = $(if ($fr) { $fr.SessionName } else { $null })
+                        FileEtlPath = $(if ($fr) { $fr.EtlPath } else { $null })
                         # Read once, at launch: MySQL's state and the uptime matter at the start, and the exe path is unreadable after NO exits.
                         Context = (Get-NoLaunchContext -Process $p -PriorLaunchesThisWatch ($st.LaunchesThisWatch - 1))
                         TraceError = $st.TraceError; ReadyT = $null; ReadyTitle = $null; PostReadyTicks = 0
@@ -15114,10 +15118,8 @@ namespace WinConfigDiag {
                 } elseif ($smp.T -ge $script:NlRules.StuckAfterSeconds) {
                     & $script:NlDecide 'Stuck' $false
                 } else {
-                    $script:NlStatus.Text = "NeurOptimal is starting ({3}): {0:N0} s (counts as stuck at {2} s). CPU {1:N1} s." -f $smp.T, $smp.CpuSec, $script:NlRules.StuckAfterSeconds, $(if ($l.EtlPath) { "$($l.TraceLevel) trace" } else { 'no trace' })
+                    $script:NlStatus.Text = "NeurOptimal is starting ({3}): {0:N0} s (counts as stuck at {2} s). CPU {1:N1} s." -f $smp.T, $smp.CpuSec, $script:NlRules.StuckAfterSeconds, $(if ($l.TraceLevel -ne 'None') { "$($l.TraceLevel) trace" } else { 'no trace' })
                     if ($ready -and $ready.BlockedBy) { $script:NlStatus.Text += " Main window is up; waiting for '$($ready.BlockedBy)' to close." }
-                    $nextLvl = $(if ($script:NlFullChk.Checked) { 'Full' } else { 'Light' })
-                    if ($l.EtlPath -and $nextLvl -ne $l.TraceLevel) { $script:NlStatus.Text += " Next launch: $nextLvl trace." }
                 }
             }
         } catch {
@@ -15135,21 +15137,6 @@ namespace WinConfigDiag {
             $script:NlTimer.Start()
         } else {
             & $script:NlStop
-        }
-    })
-    $script:NlFullChk.Add_CheckedChanged({
-        $st = $script:NlState
-        $lvl = $(if ($script:NlFullChk.Checked) { 'Full' } else { 'Light' })
-        if ($st.Mode -eq 'Armed') {
-            # Nothing recorded yet: restart the waiting trace at the new level.
-            $old = $st.PendingFolder
-            if ($st.Session) { [void](Stop-NoLaunchEtwSession -SessionName $st.Session.SessionName); $st.Session = $null }
-            try { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction Stop } catch { }
-            & $script:NlArm
-        } elseif ($st.Mode -eq 'Launch') {
-            $script:NlStatus.Text = "$lvl trace will apply to the next launch; this one keeps $($st.Launch.TraceLevel)."
-        } else {
-            $script:NlStatus.Text = "Not watching. $lvl trace selected -- click Start watching, then launch NeurOptimal."
         }
     })
     $script:NlStuckBtn.Add_Click({ if ($script:NlState.Mode -eq 'Launch') { & $script:NlDecide 'Stuck' $true } })

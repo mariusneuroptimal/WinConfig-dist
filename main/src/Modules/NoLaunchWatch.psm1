@@ -10,10 +10,19 @@
 # WHAT IS READ. NO's own process (CPU, threads, its top-level window TITLES and
 # visibility -- window metadata, never screen content: no OCR of NO, hard rule),
 # and an ETW trace started BEFORE NO exists, filtered to NO's process id.
-#   Light (default): process/image loads, TCP/UDP, DNS -- cheap enough that
-#                    launch times stay comparable.
-#   Full (opt-in):   adds file opens and registry access, system-wide. Launch
-#                    times recorded under Full are flagged and not comparable.
+#   From Start watching:    process/image loads, TCP/UDP, DNS (light), so the
+#                           very start of NO is never missed.
+#   From the moment NO.exe appears: file opens and registry access. These are
+#                           kernel providers -- a process filter does not apply
+#                           to them (ETW enables PID-scoped providers in user
+#                           mode only) -- so this trace is system-wide. Started
+#                           at launch, not at Start watching: on MM06 the Event
+#                           Log service alone filled 1 GB in ~3 min, which wrapped
+#                           a Full trace started at arming before a stuck launch
+#                           ended. From launch, a stuck launch (90 s + 30 s
+#                           capture) stays well inside the 2 GB circular file.
+# Every launch is traced the same way, so launch times compare with each other
+# (not with records made before trace setup 2).
 #
 # WHAT IS NEVER DONE. NO is never launched, killed or written to by this module.
 # The operator launches NO; WinConfig runs elevated and a NO it started would
@@ -27,8 +36,9 @@
 
 $script:NoLaunchSchema          = 'no-launch/1'
 $script:NoLaunchReadyRuleVersion = 'provisional-2'
-$script:NoLaunchStuckAfterSec   = 180
+$script:NoLaunchStuckAfterSec   = 90
 $script:NoLaunchSessionPrefix   = 'WinConfigNoLaunch'
+$script:NoLaunchTraceSetup      = 'light-at-watch+file-registry-at-launch/2'
 
 #region Native helpers (window enumeration, minidump)
 
@@ -78,13 +88,14 @@ function Get-NoLaunchEtwProviders {
         Provider lines (logman -pf format: {GUID} keywords level) for a trace level.
     #>
     [CmdletBinding()]
-    param([ValidateSet('Light', 'Full')] [string]$Level = 'Light')
-    $lines = @(
-        '{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716} 0x50 0x5'                # Kernel-Process: process + image loads
-        '{7DD42A49-5329-4832-8DFD-43D979153A88} 0x30 0x5'                # Kernel-Network: TCP/UDP, IPv4 + IPv6
-        '{1C95126E-7EEA-49A9-A3FE-A378B03DDB4D} 0xFFFFFFFFFFFFFFFF 0x5'  # DNS-Client
-    )
-    if ($Level -eq 'Full') {
+    param([ValidateSet('Light', 'Full', 'FileRegistry')] [string]$Level = 'Light')
+    $lines = @()
+    if ($Level -ne 'FileRegistry') {
+        $lines += '{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716} 0x50 0x5'                # Kernel-Process: process + image loads
+        $lines += '{7DD42A49-5329-4832-8DFD-43D979153A88} 0x30 0x5'                # Kernel-Network: TCP/UDP, IPv4 + IPv6
+        $lines += '{1C95126E-7EEA-49A9-A3FE-A378B03DDB4D} 0xFFFFFFFFFFFFFFFF 0x5'  # DNS-Client
+    }
+    if ($Level -ne 'Light') {
         $lines += '{EDD08927-9CC4-4E65-B970-C2560FB5C289} 0x1CD0 0x5'    # Kernel-File: create (+name, op end, delete/rename)
         $lines += '{70EB4F03-C1DE-4F73-A051-33D13D5413BD} 0xFF30 0x5'    # Kernel-Registry: open/create/query/set/enum, no CloseKey
     }
@@ -100,7 +111,7 @@ function Start-NoLaunchEtwSession {
     param(
         [Parameter(Mandatory)] [string]$SessionName,
         [Parameter(Mandatory)] [string]$EtlPath,
-        [ValidateSet('Light', 'Full')] [string]$Level = 'Light',
+        [ValidateSet('Light', 'Full', 'FileRegistry')] [string]$Level = 'Light',
         [int]$MaxMB = 1024
     )
     $pf = "$EtlPath.providers.txt"
@@ -139,7 +150,7 @@ function Stop-NoLaunchStaleEtwSessions {
 
 function Get-NoLaunchRules {
     <# The thresholds the window and the summaries share. #>
-    return [pscustomobject]@{ ReadyRuleVersion = $script:NoLaunchReadyRuleVersion; StuckAfterSeconds = $script:NoLaunchStuckAfterSec; PostReadySeconds = 5 }
+    return [pscustomobject]@{ ReadyRuleVersion = $script:NoLaunchReadyRuleVersion; StuckAfterSeconds = $script:NoLaunchStuckAfterSec; PostReadySeconds = 5; TraceSetup = $script:NoLaunchTraceSetup; FileTraceMaxMB = 2048 }
 }
 
 function Get-NoLaunchSessionName {
@@ -482,7 +493,9 @@ function Get-NoLaunchSummary {
     $firstVis = @($timeline | Where-Object { $_.Visible -eq $true } | Select-Object -First 1)
     $atReady = $null
     if ($null -ne $Launch.ReadyT) { $atReady = @($samples | Where-Object { $_.T -le $Launch.ReadyT } | Select-Object -Last 1) }
-    $comparable = ($Launch.TraceLevel -ne 'Full')
+    # Comparable = traced the standard way (light from watch + file/registry from launch).
+    # A launch whose file trace failed, or with no trace, ran under different load.
+    $comparable = ($Launch.TraceLevel -eq 'Full')
     return [ordered]@{
         Schema                  = $script:NoLaunchSchema
         LaunchId                = $Launch.LaunchId
@@ -501,6 +514,7 @@ function Get-NoLaunchSummary {
         PeakWorkingSetMB        = $(if ($samples.Count) { ($samples | Measure-Object WorkingSetMB -Maximum).Maximum } else { $null })
         SampleCount             = $samples.Count
         TraceLevel              = $Launch.TraceLevel
+        TraceSetup              = $script:NoLaunchTraceSetup
         LaunchTimeComparable    = $comparable
         WindowTitlesSeen        = @($timeline | ForEach-Object { $_.Title } | Where-Object { $_ -and $_ -ne '(no windows)' } | Select-Object -Unique)
         Context                 = $Launch.Context
@@ -598,14 +612,16 @@ function Invoke-NoLaunchFinalize {
     }
     $endT = [math]::Round(((Get-Date) - $Launch.LaunchStart).TotalSeconds, 1)
     if ($Launch.SessionName) { [void](Stop-NoLaunchEtwSession -SessionName $Launch.SessionName) }
+    if ($Launch.FileSessionName) { [void](Stop-NoLaunchEtwSession -SessionName $Launch.FileSessionName) }
 
     @($Launch.Samples) | Select-Object T, CpuSec, WorkingSetMB, Threads, Handles | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath (Join-Path $folder 'samples.csv')
     @($Launch.WindowTimeline) | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath (Join-Path $folder 'windows.csv')
 
-    if ($Launch.EtlPath -and (Test-Path -LiteralPath $Launch.EtlPath)) {
+    $etls = @(@($Launch.EtlPath, $Launch.FileEtlPath) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    if ($etls.Count) {
         & $stage 'Reading the trace'
         try {
-            $rows = @(Get-NoLaunchEtwRows -EtlPath $Launch.EtlPath -ProcessId $Launch.ProcessId -LaunchStart $Launch.LaunchStart)
+            $rows = @($etls | ForEach-Object { Get-NoLaunchEtwRows -EtlPath $_ -ProcessId $Launch.ProcessId -LaunchStart $Launch.LaunchStart } | Sort-Object T)
             $rows | ForEach-Object { [pscustomobject]@{ T = $_.T; Provider = $_.Provider; Id = $_.Id; Op = $_.Op; Name = (Get-NoLaunchEtwRowName $_); Detail = (($_.Fields.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' | ') } } | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath (Join-Path $folder 'trace-NO.csv')
             $Launch.EtwDigest = Get-NoLaunchEtwDigest -Rows $rows -EndT $endT
         } catch {
