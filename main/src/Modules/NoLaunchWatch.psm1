@@ -78,6 +78,364 @@ public static class WinConfigNoLaunchNative {
 '@
 }
 
+if (-not ('WinConfigNoLaunchEtl' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Runtime.InteropServices;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+
+// Reads one process's events from an .etl file with the native ETW consumer
+// (OpenTrace/ProcessTrace). Events of other processes are skipped by header PID
+// before any decoding, which is what makes a system-wide trace cheap to read.
+// Matched events are decoded with TDH and rendered the way the Windows event
+// XML renders them, so rows equal the EventLogReader ones.
+public static class WinConfigNoLaunchEtl
+{
+    public sealed class Row
+    {
+        public double T { get; set; }                  // seconds since launch start
+        public string Provider { get; set; }           // without "Microsoft-Windows-"
+        public int Id { get; set; }
+        public string Op { get; set; }                 // opcode name ('' when none)
+        public System.Collections.Specialized.OrderedDictionary Fields { get; set; }
+        public string Name { get; set; }               // the one human-readable thing it touched
+    }
+
+    // Same rules as Get-NoLaunchEtwRowName.
+    static string RowName(Row r)
+    {
+        var f = r.Fields;
+        switch (r.Provider)
+        {
+            case "Kernel-Network":
+                if (f.Contains("daddr")) return r.Op + " " + NetAddress((string)f["daddr"]) + ":" + NetPort(f.Contains("dport") ? (string)f["dport"] : "");
+                return null;
+            case "DNS-Client": return f.Contains("QueryName") ? "DNS " + f["QueryName"] : null;
+            case "Kernel-Process": return f.Contains("ImageName") ? "load " + f["ImageName"] : null;
+            default:
+                foreach (var k in new[] { "FileName", "RelativeName", "KeyName", "ValueName" }) if (f.Contains(k)) return (string)f[k];
+                return null;
+        }
+    }
+    static bool Digits(string v) { if (string.IsNullOrEmpty(v)) return false; foreach (var c in v) if (c < '0' || c > '9') return false; return true; }
+    static string NetAddress(string v) { return Digits(v) ? new System.Net.IPAddress(long.Parse(v, CultureInfo.InvariantCulture)).ToString() : v; }
+    static string NetPort(string v) { if (!Digits(v)) return v; int p = int.Parse(v, CultureInfo.InvariantCulture); return (((p & 0xFF) << 8) | (p >> 8)).ToString(CultureInfo.InvariantCulture); }
+
+    static string Q(string v) { return "\"" + (v ?? "").Replace("\"", "\"\"") + "\""; }
+    // trace-NO.csv, same columns and quoting as Export-Csv -NoTypeInformation.
+    public static void WriteCsv(IEnumerable<Row> rows, string path)
+    {
+        using (var w = new System.IO.StreamWriter(path, false, new UTF8Encoding(true)))
+        {
+            w.WriteLine("\"T\",\"Provider\",\"Id\",\"Op\",\"Name\",\"Detail\"");
+            var sb = new StringBuilder();
+            foreach (var r in rows)
+            {
+                sb.Length = 0;
+                bool first = true;
+                foreach (System.Collections.DictionaryEntry e in r.Fields) { if (!first) sb.Append(" | "); sb.Append(e.Key).Append('=').Append(e.Value); first = false; }
+                w.Write(Q(r.T.ToString(CultureInfo.InvariantCulture))); w.Write(',');
+                w.Write(Q(r.Provider)); w.Write(','); w.Write(Q(r.Id.ToString(CultureInfo.InvariantCulture))); w.Write(',');
+                w.Write(Q(r.Op)); w.Write(','); w.Write(Q(r.Name)); w.Write(','); w.WriteLine(Q(sb.ToString()));
+            }
+        }
+    }
+
+    public sealed class Result
+    {
+        public List<Row> Rows = new List<Row>();
+        public string Error;
+        public int Undecoded;          // NO's events whose fields could not be decoded (row kept, no fields)
+    }
+
+    // Client session files (C:\zengar\sessions\<client>\<session>) are clinical data:
+    // keep that NO touched the sessions folder, never which client or session.
+    static readonly Regex SessionPath = new Regex(@"(\\zengar\\sessions\\)[^|]+", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    public static string Redact(string v) { return (v != null && v.IndexOf("sessions", StringComparison.OrdinalIgnoreCase) >= 0) ? SessionPath.Replace(v, "$1<redacted>") : v; }
+
+    // Reads several traces, merges them in time order (stable: file order breaks ties).
+    public static Result ReadAll(string[] paths, int processId, long launchStartFileTimeUtc)
+    {
+        var all = new Result();
+        foreach (var p in paths)
+        {
+            var r = Read(p, processId, launchStartFileTimeUtc);
+            all.Rows.AddRange(r.Rows);
+            all.Undecoded += r.Undecoded;
+            if (r.Error != null) all.Error = (all.Error == null ? "" : all.Error + "; ") + System.IO.Path.GetFileName(p) + ": " + r.Error;
+        }
+        all.Rows = all.Rows.OrderBy(x => x.T).ToList();
+        return all;
+    }
+
+    sealed class Prop
+    {
+        public string Name;
+        public ushort InType, OutType;
+        public ushort Flags;           // PROPERTY_FLAGS
+        public ushort Length;          // fixed length, or index of the length property
+        public ushort Count;           // fixed count, or index of the count property
+    }
+
+    sealed class Kind
+    {
+        public string Provider, Op;
+        public Prop[] Props;           // null = cannot decode by hand
+        public bool HasPid;            // template carries PID / ProcessID
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct EVENT_TRACE_HEADER
+    {
+        public ushort Size, FieldTypeFlags; public uint Version, ThreadId, ProcessId; public long TimeStamp; public Guid Guid; public uint KernelTime, UserTime;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct EVENT_TRACE
+    {
+        public EVENT_TRACE_HEADER Header; public uint InstanceId, ParentInstanceId; public Guid ParentGuid; public IntPtr MofData; public uint MofLength, ClientContext;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct SYSTEMTIME { public ushort a, b, c, d, e, f, g, h; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct TIME_ZONE_INFORMATION
+    {
+        public int Bias; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string StandardName; public SYSTEMTIME StandardDate; public int StandardBias;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DaylightName; public SYSTEMTIME DaylightDate; public int DaylightBias;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct TRACE_LOGFILE_HEADER
+    {
+        public uint BufferSize, Version, ProviderVersion, NumberOfProcessors; public long EndTime; public uint TimerResolution, MaximumFileSize, LogFileMode, BuffersWritten;
+        public Guid LogInstanceGuid; public IntPtr LoggerName, LogFileName; public TIME_ZONE_INFORMATION TimeZone; public long BootTime, PerfFreq, StartTime; public uint ReservedFlags, BuffersLost;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct EVENT_TRACE_LOGFILE
+    {
+        [MarshalAs(UnmanagedType.LPWStr)] public string LogFileName; [MarshalAs(UnmanagedType.LPWStr)] public string LoggerName;
+        public long CurrentTime; public uint BuffersRead, ProcessTraceMode; public EVENT_TRACE CurrentEvent; public TRACE_LOGFILE_HEADER LogfileHeader;
+        public IntPtr BufferCallback; public uint BufferSize, Filled, EventsLost; public IntPtr EventRecordCallback; public uint IsKernelTrace; public IntPtr Context;
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void EventRecordCallback(IntPtr record);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate uint BufferCallback(IntPtr logfile);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern ulong OpenTraceW(ref EVENT_TRACE_LOGFILE logfile);
+    [DllImport("advapi32.dll")] static extern uint ProcessTrace(ulong[] handles, uint count, IntPtr start, IntPtr end);
+    [DllImport("advapi32.dll")] static extern uint CloseTrace(ulong handle);
+    [DllImport("tdh.dll")] static extern uint TdhGetEventInformation(IntPtr evt, uint tdhContextCount, IntPtr tdhContext, IntPtr buffer, ref uint size);
+
+    const uint PROCESS_TRACE_MODE_EVENT_RECORD = 0x10000000;
+    const ushort EVENT_HEADER_FLAG_32_BIT_HEADER = 0x20;
+
+    // EVENT_RECORD offsets (EVENT_HEADER is 80 bytes on both bitnesses).
+    const int OffFlags = 4, OffPid = 12, OffTime = 16, OffProvider = 24, OffId = 40, OffVersion = 42, OffOpcode = 45, OffUserDataLength = 86;
+    static int OffUserData { get { return IntPtr.Size == 8 ? 96 : 92; } }
+
+    public static Result Read(string path, int processId, long launchStartFileTimeUtc)
+    {
+        var result = new Result();
+        var kinds = new Dictionary<string, Kind>();
+        string err = null;
+        EventRecordCallback cb = delegate (IntPtr rec)
+        {
+            try { OnEvent(rec, processId, launchStartFileTimeUtc, kinds, result); }
+            catch (Exception ex) { if (err == null) err = ex.Message; }
+        };
+        BufferCallback bcb = delegate (IntPtr lf) { return 1; };
+        var log = new EVENT_TRACE_LOGFILE();
+        log.LogFileName = path;
+        log.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD;
+        log.EventRecordCallback = Marshal.GetFunctionPointerForDelegate(cb);
+        log.BufferCallback = Marshal.GetFunctionPointerForDelegate(bcb);
+        ulong h = OpenTraceW(ref log);
+        bool invalid = (IntPtr.Size == 8) ? (h == 0xFFFFFFFFFFFFFFFFUL) : (h == 0x00000000FFFFFFFFUL || h == 0xFFFFFFFFFFFFFFFFUL);
+        if (invalid) { result.Error = "OpenTrace failed: " + Marshal.GetLastWin32Error(); return result; }
+        try
+        {
+            uint rc = ProcessTrace(new ulong[] { h }, 1, IntPtr.Zero, IntPtr.Zero);
+            if (rc != 0 && rc != 1223) err = err ?? ("ProcessTrace returned " + rc);
+        }
+        finally { CloseTrace(h); GC.KeepAlive(cb); GC.KeepAlive(bcb); }
+        result.Error = err;
+        return result;
+    }
+
+    static void OnEvent(IntPtr rec, int target, long launchStart, Dictionary<string, Kind> kinds, Result result)
+    {
+        int pid = Marshal.ReadInt32(rec, OffPid);
+        byte[] g = new byte[16]; Marshal.Copy(IntPtr.Add(rec, OffProvider), g, 0, 16);
+        var provider = new Guid(g);
+        ushort id = (ushort)Marshal.ReadInt16(rec, OffId);
+        byte version = Marshal.ReadByte(rec, OffVersion);
+        byte opcode = Marshal.ReadByte(rec, OffOpcode);
+        string key = provider.ToString() + "|" + id + "|" + version + "|" + opcode;
+        Kind kind;
+        if (!kinds.TryGetValue(key, out kind))
+        {
+            kind = Describe(rec);
+            kinds[key] = kind;
+        }
+        // Cheap skip: another process's event whose template cannot name a PID.
+        if (pid != target && !kind.HasPid) return;
+        List<KeyValuePair<string, string>> fields = null;
+        if (kind.Props != null)
+        {
+            ushort flags = (ushort)Marshal.ReadInt16(rec, OffFlags);
+            int ptrSize = (flags & EVENT_HEADER_FLAG_32_BIT_HEADER) != 0 ? 4 : 8;
+            IntPtr data = Marshal.ReadIntPtr(rec, OffUserData);
+            int len = (ushort)Marshal.ReadInt16(rec, OffUserDataLength);
+            fields = Decode(kind.Props, data, len, ptrSize);
+        }
+        if (fields == null)
+        {
+            // Undecodable: keep NO's event (counts and timing stay right), without fields.
+            if (pid != target) return;
+            result.Undecoded++;
+            fields = new List<KeyValuePair<string, string>>();
+        }
+        if (pid != target)
+        {
+            bool hit = false;
+            foreach (var f in fields) { if ((f.Key == "PID" || f.Key == "ProcessID") && f.Value == target.ToString(CultureInfo.InvariantCulture)) { hit = true; break; } }
+            if (!hit) return;
+        }
+        var row = new Row();
+        // Same arithmetic as (TimeCreated - LaunchStart).TotalSeconds rounded to ms.
+        row.T = Math.Round((Marshal.ReadInt64(rec, OffTime) - launchStart) * 1e-7, 3);
+        row.Provider = kind.Provider.StartsWith("Microsoft-Windows-", StringComparison.Ordinal) ? kind.Provider.Substring(18) : kind.Provider;
+        row.Id = id; row.Op = kind.Op;
+        row.Fields = new System.Collections.Specialized.OrderedDictionary();
+        foreach (var f in fields) if (!string.IsNullOrEmpty(f.Value) && !row.Fields.Contains(f.Key)) row.Fields.Add(f.Key, Redact(f.Value));
+        row.Name = RowName(row);
+        result.Rows.Add(row);
+    }
+
+    static Kind Describe(IntPtr rec)
+    {
+        var kind = new Kind { Provider = "", Op = "" };
+        uint size = 0;
+        TdhGetEventInformation(rec, 0, IntPtr.Zero, IntPtr.Zero, ref size);
+        if (size == 0) return kind;
+        IntPtr buf = Marshal.AllocHGlobal((int)size);
+        try
+        {
+            if (TdhGetEventInformation(rec, 0, IntPtr.Zero, buf, ref size) != 0) return kind;
+            // TRACE_EVENT_INFO: ProviderGuid(16) EventGuid(16) EventDescriptor(16) DecodingSource(4)
+            // ProviderNameOffset@52 LevelNameOffset@56 ChannelNameOffset@60 KeywordsNameOffset@64 TaskNameOffset@68
+            // OpcodeNameOffset@72 EventMessageOffset@76 ProviderMessageOffset@80 BinaryXMLOffset@84 BinaryXMLSize@88
+            // ActivityIDNameOffset@92 RelatedActivityIDNameOffset@96 PropertyCount@100 TopLevelPropertyCount@104 Flags@108
+            // EventPropertyInfoArray@112, 24 bytes each.
+            kind.Provider = Str(buf, Marshal.ReadInt32(buf, 52));
+            kind.Op = Str(buf, Marshal.ReadInt32(buf, 72)).Trim();
+            if (kind.Op.Length == 0 && Marshal.ReadByte(buf, 32 + 5) == 0) kind.Op = "Info";   // EventDescriptor.Opcode @ 32+5
+            int count = Marshal.ReadInt32(buf, 100);
+            int top = Marshal.ReadInt32(buf, 104);
+            if (count != top) return kind;      // structs: not decoded by hand
+            var props = new Prop[top];
+            for (int i = 0; i < top; i++)
+            {
+                IntPtr p = IntPtr.Add(buf, 112 + i * 24);
+                // EVENT_PROPERTY_INFO: Flags(4) NameOffset(4) union{InType(2) OutType(2) MapNameOffset(4)}
+                // union{count(2)|countPropertyIndex(2)} union{length(2)|lengthPropertyIndex(2)} Reserved(4)
+                var pr = new Prop();
+                pr.Flags = (ushort)Marshal.ReadInt32(p, 0);
+                pr.Name = Str(buf, Marshal.ReadInt32(p, 4));
+                pr.InType = (ushort)Marshal.ReadInt16(p, 8);
+                pr.OutType = (ushort)Marshal.ReadInt16(p, 10);
+                pr.Count = (ushort)Marshal.ReadInt16(p, 16);
+                pr.Length = (ushort)Marshal.ReadInt16(p, 18);
+                if ((pr.Flags & 0x1) != 0) return kind;       // PropertyStruct
+                if ((pr.Flags & 0x4) != 0 || pr.Count > 1) return kind;   // arrays
+                props[i] = pr;
+                if (pr.Name == "PID" || pr.Name == "ProcessID") kind.HasPid = true;
+            }
+            kind.Props = props;
+        }
+        finally { Marshal.FreeHGlobal(buf); }
+        return kind;
+    }
+
+    static string Str(IntPtr buf, int off) { return off > 0 ? Marshal.PtrToStringUni(IntPtr.Add(buf, off)) : ""; }
+
+    static List<KeyValuePair<string, string>> Decode(Prop[] props, IntPtr data, int len, int ptrSize)
+    {
+        var res = new List<KeyValuePair<string, string>>(props.Length);
+        var raw = new long[props.Length];
+        int off = 0;
+        for (int i = 0; i < props.Length; i++)
+        {
+            var p = props[i];
+            string v = null;
+            if (off > len) return null;
+            int lenParam = ((p.Flags & 0x2) != 0) ? (int)raw[p.Length] : p.Length;   // PropertyParamLength
+            switch (p.InType)
+            {
+                case 1: // UNICODESTRING
+                    {
+                        if ((p.Flags & 0x2) != 0 || p.Length > 0) { int n = lenParam; v = Marshal.PtrToStringUni(IntPtr.Add(data, off), n); off += n * 2; }
+                        else { int n = 0; while (off + n * 2 + 1 < len && Marshal.ReadInt16(data, off + n * 2) != 0) n++; v = Marshal.PtrToStringUni(IntPtr.Add(data, off), n); off += (n + 1) * 2; }
+                        break;
+                    }
+                case 2: // ANSISTRING
+                    {
+                        int n = 0; while (off + n < len && Marshal.ReadByte(data, off + n) != 0) n++;
+                        var b = new byte[n]; Marshal.Copy(IntPtr.Add(data, off), b, 0, n); v = Encoding.Default.GetString(b); off += n + 1; break;
+                    }
+                case 3: { sbyte x = (sbyte)Marshal.ReadByte(data, off); raw[i] = x; v = Num(x, p.OutType, 1); off += 1; break; }
+                case 4: { byte x = Marshal.ReadByte(data, off); raw[i] = x; v = Num(x, p.OutType, 1); off += 1; break; }
+                case 5: { short x = Marshal.ReadInt16(data, off); raw[i] = x; v = Num(x, p.OutType, 2); off += 2; break; }
+                case 6: { ushort x = (ushort)Marshal.ReadInt16(data, off); raw[i] = x; v = Num(x, p.OutType, 2); off += 2; break; }
+                case 7: { int x = Marshal.ReadInt32(data, off); raw[i] = x; v = Num(x, p.OutType, 4); off += 4; break; }
+                case 8: { uint x = (uint)Marshal.ReadInt32(data, off); raw[i] = x; v = Num(x, p.OutType, 4); off += 4; break; }
+                case 9: { long x = Marshal.ReadInt64(data, off); raw[i] = x; v = Num(x, p.OutType, 8); off += 8; break; }
+                case 10: { ulong x = (ulong)Marshal.ReadInt64(data, off); raw[i] = (long)x; v = Num(x, p.OutType, 8); off += 8; break; }
+                case 13: { int x = Marshal.ReadInt32(data, off); v = x != 0 ? "true" : "false"; off += 4; break; }
+                case 15: { var b = new byte[16]; Marshal.Copy(IntPtr.Add(data, off), b, 0, 16); v = "{" + new Guid(b).ToString().ToUpperInvariant() + "}"; off += 16; break; }
+                case 16: // POINTER
+                    {
+                        ulong x = ptrSize == 8 ? (ulong)Marshal.ReadInt64(data, off) : (uint)Marshal.ReadInt32(data, off);
+                        raw[i] = (long)x; v = "0x" + x.ToString("x", CultureInfo.InvariantCulture); off += ptrSize; break;
+                    }
+                case 17: // FILETIME
+                    {
+                        long x = Marshal.ReadInt64(data, off); off += 8;
+                        v = DateTime.FromFileTimeUtc(x).ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture);
+                        break;
+                    }
+                case 20: { uint x = (uint)Marshal.ReadInt32(data, off); raw[i] = x; v = x.ToString(CultureInfo.InvariantCulture); off += 4; break; }
+                case 21: { ulong x = (ulong)Marshal.ReadInt64(data, off); raw[i] = (long)x; v = x.ToString(CultureInfo.InvariantCulture); off += 8; break; }
+                case 14: // BINARY
+                    {
+                        int n = lenParam; var b = new byte[n]; Marshal.Copy(IntPtr.Add(data, off), b, 0, n); off += n;
+                        var sb = new StringBuilder(n * 2); foreach (var x in b) sb.Append(x.ToString("X2", CultureInfo.InvariantCulture)); v = sb.ToString(); break;
+                    }
+                case 19: // SID
+                    {
+                        // SID: revision(1) subCount(1) authority(6) subs(4*n)
+                        int sub = Marshal.ReadByte(data, off + 1); int n = 8 + 4 * sub;
+                        var b = new byte[n]; Marshal.Copy(IntPtr.Add(data, off), b, 0, n); off += n;
+                        v = new System.Security.Principal.SecurityIdentifier(b, 0).Value; break;
+                    }
+                default: return null;   // unknown type: caller drops the row (parity test catches it)
+            }
+            res.Add(new KeyValuePair<string, string>(p.Name, v));
+        }
+        return res;
+    }
+
+    static string Num(long x, ushort outType, int size) { return Hex(outType) ? "0x" + ((ulong)x & Mask(size)).ToString("X", CultureInfo.InvariantCulture) : x.ToString(CultureInfo.InvariantCulture); }
+    static string Num(ulong x, ushort outType, int size) { return Hex(outType) ? "0x" + x.ToString("X", CultureInfo.InvariantCulture) : x.ToString(CultureInfo.InvariantCulture); }
+    static ulong Mask(int size) { return size >= 8 ? ulong.MaxValue : ((1UL << (size * 8)) - 1); }
+    // HEXBINARY and HEXINT8/16/32/64 render in hex in event XML; NTSTATUS/HRESULT/WIN32ERROR stay decimal.
+    static bool Hex(ushort t) { return false; }
+}
+'@
+}
+
 #endregion
 
 #region ETW session
@@ -332,7 +690,32 @@ function Get-NoLaunchContext {
 function Get-NoLaunchEtwRows {
     <#
     .SYNOPSIS
-        Events from the trace that belong to one process, with T = seconds since launch.
+        One process's events from one or more traces, merged in time order, T = seconds since launch.
+    .DESCRIPTION
+        Native ETW consumer (WinConfigNoLaunchEtl): other processes' events are skipped by
+        header PID before decoding, so a system-wide trace costs ~5 s per GB instead of
+        ~150 s (MM06 2026-10-02: 238 MB file/registry trace 57 s -> 1.0 s; 1 GB Full trace
+        128 s -> 4.3 s; rows identical to the event-log reader except Op, which the event-log
+        reader got WRONG -- every Kernel-Network event carried the label of the first one
+        seen). Session file paths are redacted inside the reader.
+        If the native reader fails outright, falls back to the event-log reader per file.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string[]]$EtlPath, [Parameter(Mandatory)] [int]$ProcessId, [Parameter(Mandatory)] [datetime]$LaunchStart, [hashtable]$Stats = $null)
+    $paths = @($EtlPath | ForEach-Object { (Resolve-Path -LiteralPath $_).ProviderPath })
+    $r = [WinConfigNoLaunchEtl]::ReadAll([string[]]$paths, $ProcessId, $LaunchStart.ToFileTime())
+    if ($Stats) { $Stats.Reader = 'native'; $Stats.Undecoded = $r.Undecoded; $Stats.ReaderError = $r.Error }
+    if ($r.Error -and $r.Rows.Count -eq 0) {
+        if ($Stats) { $Stats.Reader = 'eventlog (native failed)' }
+        return @($paths | ForEach-Object { Get-NoLaunchEtwRowsEventLog -EtlPath $_ -ProcessId $ProcessId -LaunchStart $LaunchStart } | Sort-Object T)
+    }
+    return $r.Rows.ToArray()
+}
+
+function Get-NoLaunchEtwRowsEventLog {
+    <#
+    .SYNOPSIS
+        Fallback reader (event-log API). Events from the trace that belong to one process, with T = seconds since launch.
     .DESCRIPTION
         Header PID for in-process events; payload PID/ProcessID for kernel network and
         image events logged from System.
@@ -397,11 +780,11 @@ function Get-NoLaunchEtwRows {
                         $v = $props[$i].Value
                         if ($null -eq $v) { continue }
                         $t = & $render[$kind.Fmt[$i]] $v
-                        if ($t) { $fields[$kind.Names[$i]] = $t }
+                        if ($t) { $fields[$kind.Names[$i]] = [WinConfigNoLaunchEtl]::Redact($t) }
                     }
                 } else {
                     $x = [xml]$e.ToXml()
-                    foreach ($d in @($x.Event.EventData.Data)) { if ($d -and $d.'#text') { $fields[$d.Name] = $d.'#text' } }
+                    foreach ($d in @($x.Event.EventData.Data)) { if ($d -and $d.'#text') { $fields[$d.Name] = [WinConfigNoLaunchEtl]::Redact($d.'#text') } }
                 }
                 [void]$rows.Add([pscustomobject]@{
                     T        = [math]::Round(($e.TimeCreated - $LaunchStart).TotalSeconds, 3)
@@ -431,8 +814,9 @@ function ConvertFrom-NoLaunchNetPort {
 }
 
 function Get-NoLaunchEtwRowName {
-    <# The one human-readable thing an event touched. Pure. #>
+    <# The one human-readable thing an event touched. Pure. (Native rows carry it already.) #>
     param([object]$Row)
+    if ($Row -is [WinConfigNoLaunchEtl+Row]) { return $Row.Name }
     $f = $Row.Fields
     switch ($Row.Provider) {
         'Kernel-Network' { if ($f['daddr']) { return ('{0} {1}:{2}' -f $Row.Op, (ConvertFrom-NoLaunchNetAddress $f['daddr']), (ConvertFrom-NoLaunchNetPort $f['dport'])) } }
@@ -443,34 +827,87 @@ function Get-NoLaunchEtwRowName {
     return $null
 }
 
+function Write-NoLaunchTraceCsv {
+    <#
+    .SYNOPSIS
+        trace-NO.csv: T, Provider, Id, Op, Name, Detail -- same columns and quoting as Export-Csv, ~10x faster.
+    #>
+    [CmdletBinding()]
+    param([object[]]$Rows, [Parameter(Mandatory)] [string]$Path)
+    $native = @($Rows | Where-Object { $_ -isnot [WinConfigNoLaunchEtl+Row] }).Count -eq 0
+    if ($native) { [WinConfigNoLaunchEtl]::WriteCsv([WinConfigNoLaunchEtl+Row[]]@($Rows), $Path); return }
+    # Fallback rows (event-log reader): same file, PowerShell speed.
+    $q = { param($v) '"' + ([string]$v).Replace('"', '""') + '"' }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('"T","Provider","Id","Op","Name","Detail"')
+    foreach ($r in @($Rows)) {
+        $parts = New-Object System.Collections.Generic.List[string]
+        foreach ($k in $r.Fields.Keys) { $parts.Add("$k=$($r.Fields[$k])") }
+        [void]$sb.Append((& $q ([double]$r.T).ToString($inv))).Append(',').Append((& $q $r.Provider)).Append(',').Append((& $q $r.Id)).Append(',').Append((& $q $r.Op)).Append(',').Append((& $q (Get-NoLaunchEtwRowName $r))).Append(',').AppendLine((& $q ($parts -join ' | ')))
+    }
+    [System.IO.File]::WriteAllText($Path, $sb.ToString(), (New-Object System.Text.UTF8Encoding($true)))
+}
+
 function Get-NoLaunchEtwDigest {
     <#
     .SYNOPSIS
         Summary of NO's trace events: DNS, peers, when it went quiet, what it touched last. Pure.
+    .DESCRIPTION
+        Plain loops, not pipelines: a Full launch is ~40k rows, and Where-Object/Group-Object
+        over them cost ~7 s. Output is unchanged.
     #>
     param([object[]]$Rows, [double]$EndT = -1)
     $rows = @($Rows)
     $byProvider = [ordered]@{}
-    foreach ($g in ($rows | Group-Object Provider)) { $byProvider[$g.Name] = $g.Count }
-    # Each name once, at the time it was FIRST looked up.
-    $dns = @($rows | Where-Object { $_.Provider -eq 'DNS-Client' -and $_.Fields['QueryName'] } | Group-Object { $_.Fields['QueryName'] } | ForEach-Object { [pscustomobject]@{ T = [math]::Round(($_.Group | Measure-Object T -Minimum).Minimum, 1); Name = $_.Name } } | Sort-Object T)
-    $peers = @($rows | Where-Object { $_.Provider -eq 'Kernel-Network' -and $_.Fields['daddr'] } | ForEach-Object { '{0}:{1}' -f (ConvertFrom-NoLaunchNetAddress $_.Fields['daddr']), (ConvertFrom-NoLaunchNetPort $_.Fields['dport']) } | Group-Object | Sort-Object Count -Descending | ForEach-Object { [pscustomobject]@{ Peer = $_.Name; Events = $_.Count } })
-    $activity = @($rows | Where-Object { $_.Provider -ne 'Kernel-Process' })
-    $named = @($activity | ForEach-Object { $n = Get-NoLaunchEtwRowName $_; if ($n) { [pscustomobject]@{ T = $_.T; Provider = $_.Provider; Name = $n } } })
-    $lastT = $(if ($activity.Count) { ($activity | Measure-Object T -Maximum).Maximum } else { $null })
-    $perTen = [ordered]@{}
-    foreach ($g in ($rows | Group-Object { [int]([math]::Floor($_.T / 10) * 10) } | Sort-Object { [int]$_.Name })) { $perTen["$($g.Name)"] = $g.Count }
-    return [ordered]@{
-        EventCount         = $rows.Count
-        ByProvider         = $byProvider
-        DnsLookups         = $dns
-        RemotePeers        = $peers
-        ImageLoads         = @($rows | Where-Object { $_.Provider -eq 'Kernel-Process' -and $_.Fields['ImageName'] }).Count
-        LastActivityT      = $lastT
-        QuietForSecAtEnd   = $(if ($EndT -ge 0 -and $null -ne $lastT) { [math]::Round($EndT - $lastT, 1) } else { $null })
-        LastTouched        = @($named | Select-Object -Last 15)
-        EventsPerTenSec    = $perTen
+    $dnsFirst = [ordered]@{}
+    $peerKeys = New-Object System.Collections.Generic.List[string]
+    $perTenCount = @{}
+    $images = 0
+    $lastT = $null
+    foreach ($r in $rows) {
+        $prov = $r.Provider
+        if ($byProvider.Contains($prov)) { $byProvider[$prov]++ } else { $byProvider[$prov] = 1 }
+        $f = $r.Fields
+        if ($prov -eq 'DNS-Client' -and $f['QueryName']) {
+            $q = [string]$f['QueryName']
+            if (-not $dnsFirst.Contains($q) -or $r.T -lt $dnsFirst[$q]) { $dnsFirst[$q] = $r.T }
+        } elseif ($prov -eq 'Kernel-Network' -and $f['daddr']) {
+            $peerKeys.Add(('{0}:{1}' -f (ConvertFrom-NoLaunchNetAddress $f['daddr']), (ConvertFrom-NoLaunchNetPort $f['dport'])))
+        } elseif ($prov -eq 'Kernel-Process' -and $f['ImageName']) {
+            $images++
+        }
+        if ($prov -ne 'Kernel-Process' -and ($null -eq $lastT -or $r.T -gt $lastT)) { $lastT = [double]$r.T }
+        $bucket = [int]([math]::Floor($r.T / 10) * 10)
+        $perTenCount[$bucket] = 1 + [int]$perTenCount[$bucket]
     }
+    # Each name once, at the time it was FIRST looked up.
+    $dns = @($dnsFirst.GetEnumerator() | ForEach-Object { [pscustomobject]@{ T = [math]::Round([double]$_.Value, 1); Name = $_.Key } } | Sort-Object T)
+    $peers = @($peerKeys | Group-Object | Sort-Object Count -Descending | ForEach-Object { [pscustomobject]@{ Peer = $_.Name; Events = $_.Count } })
+    # The last 15 named activity rows, oldest first.
+    $named = New-Object System.Collections.Generic.List[object]
+    for ($i = $rows.Count - 1; $i -ge 0 -and $named.Count -lt 15; $i--) {
+        $r = $rows[$i]
+        if ($r.Provider -eq 'Kernel-Process') { continue }
+        $n = Get-NoLaunchEtwRowName $r
+        if ($n) { $named.Insert(0, [pscustomobject]@{ T = $r.T; Provider = $r.Provider; Name = $n }) }
+    }
+    $perTen = [ordered]@{}
+    foreach ($k in ($perTenCount.Keys | Sort-Object)) { $perTen["$k"] = $perTenCount[$k] }
+    # Built key by key: PS 5.1 fails to compile this as an [ordered] literal with these
+    # loop-typed locals ("Argument types do not match").
+    $out = [ordered]@{}
+    $out.EventCount = $rows.Count
+    $out.ByProvider = $byProvider
+    $out.DnsLookups = $dns
+    $out.RemotePeers = $peers
+    $out.ImageLoads = $images
+    $out.LastActivityT = $lastT
+    $out.QuietForSecAtEnd = $null
+    if ($EndT -ge 0 -and $null -ne $lastT) { $out.QuietForSecAtEnd = [math]::Round([double]$EndT - [double]$lastT, 1) }
+    $out.LastTouched = $named.ToArray()
+    $out.EventsPerTenSec = $perTen
+    return $out
 }
 
 #endregion
@@ -621,9 +1058,13 @@ function Invoke-NoLaunchFinalize {
     if ($etls.Count) {
         & $stage 'Reading the trace'
         try {
-            $rows = @($etls | ForEach-Object { Get-NoLaunchEtwRows -EtlPath $_ -ProcessId $Launch.ProcessId -LaunchStart $Launch.LaunchStart } | Sort-Object T)
-            $rows | ForEach-Object { [pscustomobject]@{ T = $_.T; Provider = $_.Provider; Id = $_.Id; Op = $_.Op; Name = (Get-NoLaunchEtwRowName $_); Detail = (($_.Fields.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' | ') } } | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath (Join-Path $folder 'trace-NO.csv')
+            $readStats = @{}
+            $rows = @(Get-NoLaunchEtwRows -EtlPath $etls -ProcessId $Launch.ProcessId -LaunchStart $Launch.LaunchStart -Stats $readStats)
+            Write-NoLaunchTraceCsv -Rows $rows -Path (Join-Path $folder 'trace-NO.csv')
             $Launch.EtwDigest = Get-NoLaunchEtwDigest -Rows $rows -EndT $endT
+            $Launch.EtwDigest.Reader = $readStats.Reader
+            $Launch.EtwDigest.UndecodedEvents = $readStats.Undecoded
+            if ($readStats.ReaderError) { $Launch.EtwDigest.ReaderError = $readStats.ReaderError }
         } catch {
             $Launch.EtwDigest = [ordered]@{ Error = $_.Exception.Message }
         }
@@ -772,6 +1213,8 @@ Export-ModuleMember -Function @(
     'ConvertFrom-NoLaunchNetAddress'
     'ConvertFrom-NoLaunchNetPort'
     'Get-NoLaunchEtwRows'
+    'Get-NoLaunchEtwRowsEventLog'
+    'Write-NoLaunchTraceCsv'
     'Get-NoLaunchEtwRowName'
     'Get-NoLaunchEtwDigest'
     'Get-NoLaunchSummary'
