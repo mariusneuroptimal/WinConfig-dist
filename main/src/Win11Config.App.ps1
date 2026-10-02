@@ -14842,7 +14842,7 @@ namespace WinConfigDiag {
     $script:NlModulePaths = @((Get-Command Invoke-NoLaunchFinalize).Module.Path, (Get-Command Send-WinConfigLargeFile).Module.Path)
     $script:NlIsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     $script:NlRoot = Join-Path $env:LOCALAPPDATA 'Temp\WinConfig-NoLaunch'
-    $script:NlState = @{ Mode = 'Idle'; Seq = 0; Session = $null; Launch = $null; Known = @{}; LaunchesThisWatch = 0; Tick = 0 }
+    $script:NlState = @{ Mode = 'Idle'; Seq = 0; Session = $null; Launch = $null; Known = @{}; Recorded = @{}; LaunchesThisWatch = 0; Tick = 0 }
     $script:NlRules = Get-NoLaunchRules
     $script:NlJobs = New-Object System.Collections.ArrayList
 
@@ -14860,16 +14860,16 @@ namespace WinConfigDiag {
     $nlRoot = New-Object System.Windows.Forms.TableLayoutPanel
     $nlRoot.Dock = [System.Windows.Forms.DockStyle]::Fill
     $nlRoot.ColumnCount = 1
-    $nlRoot.RowCount = 5
+    $nlRoot.RowCount = 6
     $nlRoot.Padding = New-Object System.Windows.Forms.Padding((& $nlPx 12))
-    foreach ($i in 0..4) { [void]$nlRoot.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) }
-    $nlRoot.RowStyles[3] = New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)
+    foreach ($i in 0..5) { [void]$nlRoot.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) }
+    $nlRoot.RowStyles[4] = New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)
     $script:NlForm.Controls.Add($nlRoot)
 
     $nlIntro = New-Object System.Windows.Forms.Label
     $nlIntro.AutoSize = $true
     $nlIntro.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
-    $nlIntro.Text = "Click Start watching, then launch NeurOptimal the normal way (desktop shortcut, not as administrator). Every launch is timed until NO is ready. If NO is not ready after $([int]($script:NlRules.StuckAfterSeconds / 60)) minutes, the launch counts as stuck: WinConfig records what NO is doing and sends it in full. Keep this window open; kill and relaunch NO as usual -- the next launch is recorded too."
+    $nlIntro.Text = "Click Start watching, then launch NeurOptimal the normal way. Every launch is timed until NO is ready. If NO is not ready after $([int]($script:NlRules.StuckAfterSeconds / 60)) minutes, the launch counts as stuck: WinConfig records what NO is doing and sends it in full. Keep this window open; kill and relaunch NO as usual -- the next launch is recorded too."
     $nlRoot.Controls.Add($nlIntro, 0, 0)
 
     $nlBar = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -14905,19 +14905,31 @@ namespace WinConfigDiag {
     $script:NlStatus.Text = $(if ($script:NlIsAdmin) { "Not watching." } else { "Not watching. WinConfig is not running as administrator: launch times only, no trace." })
     $nlRoot.Controls.Add($script:NlStatus, 0, 2)
 
+    # Shown while any launch is still being read or sent: closing WinConfig then loses it.
+    $script:NlBusy = New-Object System.Windows.Forms.Label
+    $script:NlBusy.AutoSize = $true
+    $script:NlBusy.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
+    $script:NlBusy.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $script:NlBusy.ForeColor = [System.Drawing.Color]::White
+    $script:NlBusy.BackColor = [System.Drawing.Color]::FromArgb(200, 110, 0)
+    $script:NlBusy.Padding = New-Object System.Windows.Forms.Padding((& $nlPx 6), (& $nlPx 4), (& $nlPx 6), (& $nlPx 4))
+    $script:NlBusy.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, (& $nlPx 8))
+    $script:NlBusy.Visible = $false
+    $nlRoot.Controls.Add($script:NlBusy, 0, 3)
+
     $script:NlList = New-Object System.Windows.Forms.ListView
     $script:NlList.View = [System.Windows.Forms.View]::Details
     $script:NlList.FullRowSelect = $true
     $script:NlList.Dock = [System.Windows.Forms.DockStyle]::Fill
     foreach ($col in @(@('Started', 150), @('Launch time', 100), @('Outcome', 110), @('Trace', 70), @('Sent', 360))) { [void]$script:NlList.Columns.Add($col[0], (& $nlPx $col[1])) }
-    $nlRoot.Controls.Add($script:NlList, 0, 3)
+    $nlRoot.Controls.Add($script:NlList, 0, 4)
 
     $nlFoot = New-Object System.Windows.Forms.Label
     $nlFoot.AutoSize = $true
     $nlFoot.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
     $nlFoot.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 110)
     $nlFoot.Text = "Ready = NO's main window is showing and Refreshing Licensing Information has closed (rule $($script:NlRules.ReadyRuleVersion)). Stuck launches send memory dumps of NO, which can contain client data. Files: $script:NlRoot -- a launch's files are deleted from this PC when WinConfig closes, once everything has been sent."
-    $nlRoot.Controls.Add($nlFoot, 0, 4)
+    $nlRoot.Controls.Add($nlFoot, 0, 5)
 
     # ── state helpers ────────────────────────────────────────────────
     $script:NlArm = {
@@ -14937,8 +14949,13 @@ namespace WinConfigDiag {
         } else { $st.TraceError = 'WinConfig is not elevated' }
         $st.Mode = 'Armed'
         $lvl = $(if ($st.Session) { "$($st.Level) trace" } else { 'no trace' })
-        $waitText = "Watching ($lvl). Launch NeurOptimal now (desktop shortcut, not as administrator)."
-        if ($st.Known.Count -gt 0) { $waitText = "Watching ($lvl). NeurOptimal is already running -- that launch is not recorded. Close it and launch it again." }
+        $waitText = "Watching ($lvl). Launch NeurOptimal now."
+        if ($st.Known.Count -gt 0) {
+            # Running NO is either a launch this watch just recorded, or one started before watching.
+            $unrecorded = @($st.Known.Keys | Where-Object { -not $st.Recorded.ContainsKey($_) }).Count
+            if ($unrecorded -gt 0) { $waitText = "Watching ($lvl). NeurOptimal was already running when watching started, so that launch was not recorded. To record one, close NeurOptimal and launch it again." }
+            else { $waitText = "Watching ($lvl). To record another launch, close NeurOptimal and launch it again." }
+        }
         if ($st.TraceError) { $waitText += " (No trace: $($st.TraceError).)" }
         $script:NlStatus.Text = $waitText
     }
@@ -14981,7 +14998,8 @@ namespace WinConfigDiag {
         $script:NlStuckBtn.Enabled = $false
         $l.Row.SubItems[1].Text = $(if ($null -ne $l.ReadyT) { '{0:N1} s' -f $l.ReadyT } else { '--' })
         $l.Row.SubItems[2].Text = $(if ($Outcome -eq 'Stuck') { 'Stuck (capturing)' } else { $Outcome })
-        $l.Row.SubItems[4].Text = 'Packaging...'
+        $l.Row.SubItems[4].Text = 'Working -- please wait: packaging'
+        $l.Row.ForeColor = [System.Drawing.Color]::FromArgb(200, 110, 0)
         $data = @{}
         foreach ($k in @('LaunchId', 'Computer', 'ProcessId', 'LaunchStart', 'TraceLevel', 'Outcome', 'ReadyT', 'ReadyTitle', 'Context', 'Folder', 'SessionName', 'EtlPath', 'TraceError', 'MarkedStuckByOperator')) { $data[$k] = $l[$k] }
         $data.Samples = $l.Samples.ToArray()
@@ -15022,11 +15040,12 @@ namespace WinConfigDiag {
             $st = $script:NlState
             $st.Tick++
             foreach ($j in @($script:NlJobs)) {
-                if ($j.Sync.Stage -and -not $j.Handle.IsCompleted) { $j.Row.SubItems[4].Text = $j.Sync.Stage }
+                if ($j.Sync.Stage -and -not $j.Handle.IsCompleted) { $j.Row.SubItems[4].Text = "Working -- please wait: $($j.Sync.Stage)" }
                 if (-not $j.Handle.IsCompleted) { continue }
                 try { [void]$j.PS.EndInvoke($j.Handle) } catch { }
                 $j.PS.Dispose()
                 $script:NlJobs.Remove($j)
+                $j.Row.ForeColor = [System.Drawing.SystemColors]::WindowText
                 $res = $j.Sync.Result
                 if ($j.Sync.Error -or -not $res) { $j.Row.SubItems[4].Text = "Failed: $($j.Sync.Error) -- files are in $($j.Data.Folder)"; continue }
                 $sum = $res.Finalized.Summary
@@ -15040,10 +15059,17 @@ namespace WinConfigDiag {
                 if ($res.Marker -and $res.Marker.AllSent) { $txt += ' (deleted from this PC when WinConfig closes)' } else { $txt += ' (kept on this PC)' }
                 $j.Row.SubItems[4].Text = $txt
             }
+            $busyN = @($script:NlJobs).Count
+            if ($busyN -gt 0) {
+                $script:NlBusy.Text = "Please wait: $busyN launch record(s) are still being read and sent. Keep this window and WinConfig open until the Sent column says Sent -- closing WinConfig now loses them."
+            }
+            # Assign, never compare: .Visible reads the inherited state.
+            $script:NlBusy.Visible = ($busyN -gt 0)
             if ($st.Mode -eq 'Armed') {
                 $p = @(Get-Process -Name 'NO' -ErrorAction SilentlyContinue | Where-Object { -not $st.Known.ContainsKey($_.Id) }) | Select-Object -First 1
                 if ($p) {
                     $st.Known[$p.Id] = $true
+                    $st.Recorded[$p.Id] = $true
                     $st.LaunchesThisWatch++
                     $start = $p.StartTime
                     $lid = New-NoLaunchLaunchId -LaunchStart $start
@@ -15103,6 +15129,7 @@ namespace WinConfigDiag {
         if ($script:NlState.Mode -eq 'Idle') {
             [void](Stop-NoLaunchStaleEtwSessions)
             $script:NlState.LaunchesThisWatch = 0
+            $script:NlState.Recorded = @{}
             & $script:NlArm
             $script:NlStartBtn.Text = "Stop watching"
             $script:NlTimer.Start()
