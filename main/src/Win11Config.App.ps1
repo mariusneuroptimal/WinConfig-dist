@@ -14869,7 +14869,7 @@ namespace WinConfigDiag {
     $nlIntro = New-Object System.Windows.Forms.Label
     $nlIntro.AutoSize = $true
     $nlIntro.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
-    $nlIntro.Text = "Click Start watching, then launch NeurOptimal the normal way. Every launch is timed until NO is ready. If NO is not ready after $([int]($script:NlRules.StuckAfterSeconds / 60)) minutes, the launch counts as stuck: WinConfig records what NO is doing and sends it in full. Keep this window open; kill and relaunch NO as usual -- the next launch is recorded too."
+    $nlIntro.Text = "Click Start watching, then launch NeurOptimal the normal way. Every launch is timed until NO is ready. If NO is not ready after $([int]($script:NlRules.StuckAfterSeconds / 60)) minutes, the launch counts as stuck: NO Support Tool records what NO is doing and sends it in full. Keep this window open; kill and relaunch NO as usual -- the next launch is recorded too."
     $nlRoot.Controls.Add($nlIntro, 0, 0)
 
     $nlBar = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -14902,7 +14902,7 @@ namespace WinConfigDiag {
     $script:NlStatus.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
     $script:NlStatus.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
     $script:NlStatus.Margin = New-Object System.Windows.Forms.Padding(0, (& $nlPx 4), 0, (& $nlPx 8))
-    $script:NlStatus.Text = $(if ($script:NlIsAdmin) { "Not watching." } else { "Not watching. WinConfig is not running as administrator: launch times only, no trace." })
+    $script:NlStatus.Text = $(if ($script:NlIsAdmin) { "Not watching." } else { "Not watching. NO Support Tool is not running as administrator: launch times only, no trace." })
     $nlRoot.Controls.Add($script:NlStatus, 0, 2)
 
     # Shown while any launch is still being read or sent: closing WinConfig then loses it.
@@ -14928,7 +14928,7 @@ namespace WinConfigDiag {
     $nlFoot.AutoSize = $true
     $nlFoot.MaximumSize = New-Object System.Drawing.Size((& $nlPx 820), 0)
     $nlFoot.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 110)
-    $nlFoot.Text = "Ready = NO's main window is showing and Refreshing Licensing Information has closed (rule $($script:NlRules.ReadyRuleVersion)). Stuck launches send memory dumps of NO, which can contain client data. Files: $script:NlRoot -- a launch's files are deleted from this PC when WinConfig closes, once everything has been sent."
+    $nlFoot.Text = "Ready = NO's main window is showing and Refreshing Licensing Information has closed (rule $($script:NlRules.ReadyRuleVersion)). Stuck launches send memory dumps of NO, which can contain client data. Files: $script:NlRoot -- a launch's files are deleted from this PC when NO Support Tool closes, once everything has been sent."
     $nlRoot.Controls.Add($nlFoot, 0, 5)
 
     # ── state helpers ────────────────────────────────────────────────
@@ -14946,7 +14946,7 @@ namespace WinConfigDiag {
         if ($script:NlIsAdmin) {
             $r = Start-NoLaunchEtwSession -SessionName (Get-NoLaunchSessionName -Sequence $st.Seq) -EtlPath (Join-Path $st.PendingFolder 'NO-launch.etl') -Level $st.Level
             if ($r.Ok) { $st.Session = $r } else { $st.TraceError = "trace did not start: $($r.Error)" }
-        } else { $st.TraceError = 'WinConfig is not elevated' }
+        } else { $st.TraceError = 'NO Support Tool is not running as administrator' }
         $st.Mode = 'Armed'
         $lvl = $(if ($st.Session) { "$($st.Level) trace" } else { 'no trace' })
         $waitText = "Watching ($lvl). Launch NeurOptimal now."
@@ -15056,12 +15056,12 @@ namespace WinConfigDiag {
                 $heavyOk = @($heavy | Where-Object { $_.Status -eq 'Uploaded' }).Count
                 $txt = switch ($pkg) { 'Uploaded' { 'Sent' } 'LocalOnly' { 'NOT sent -- saved on this PC' } 'Skipped' { 'Not sent (uploads not configured)' } default { "NOT sent: $($send.Package.Error)" } }
                 if ($heavy.Count) { $txt += "; dumps + trace: $heavyOk of $($heavy.Count) sent" }
-                if ($res.Marker -and $res.Marker.AllSent) { $txt += ' (deleted from this PC when WinConfig closes)' } else { $txt += ' (kept on this PC)' }
+                if ($res.Marker -and $res.Marker.AllSent) { $txt += ' (deleted from this PC when NO Support Tool closes)' } else { $txt += ' (kept on this PC)' }
                 $j.Row.SubItems[4].Text = $txt
             }
             $busyN = @($script:NlJobs).Count
             if ($busyN -gt 0) {
-                $script:NlBusy.Text = "Please wait: $busyN launch record(s) are still being read and sent. Keep this window and WinConfig open until the Sent column says Sent -- closing WinConfig now loses them."
+                $script:NlBusy.Text = "Please wait: $busyN launch record(s) are still being read and sent. Keep this window and NO Support Tool open until the Sent column says Sent -- closing NO Support Tool now loses them."
             }
             # Assign, never compare: .Visible reads the inherited state.
             $script:NlBusy.Visible = ($busyN -gt 0)
@@ -15114,7 +15114,7 @@ namespace WinConfigDiag {
                 } elseif ($smp.T -ge $script:NlRules.StuckAfterSeconds) {
                     & $script:NlDecide 'Stuck' $false
                 } else {
-                    $script:NlStatus.Text = "NeurOptimal is starting ({4}): {0:N0} s (counts as stuck at {3} s). CPU {1:N1} s, {2} window(s)." -f $smp.T, $smp.CpuSec, $wins.Count, $script:NlRules.StuckAfterSeconds, $(if ($l.EtlPath) { "$($l.TraceLevel) trace" } else { 'no trace' })
+                    $script:NlStatus.Text = "NeurOptimal is starting ({3}): {0:N0} s (counts as stuck at {2} s). CPU {1:N1} s." -f $smp.T, $smp.CpuSec, $script:NlRules.StuckAfterSeconds, $(if ($l.EtlPath) { "$($l.TraceLevel) trace" } else { 'no trace' })
                     if ($ready -and $ready.BlockedBy) { $script:NlStatus.Text += " Main window is up; waiting for '$($ready.BlockedBy)' to close." }
                     $nextLvl = $(if ($script:NlFullChk.Checked) { 'Full' } else { 'Light' })
                     if ($l.EtlPath -and $nextLvl -ne $l.TraceLevel) { $script:NlStatus.Text += " Next launch: $nextLvl trace." }
@@ -15160,7 +15160,7 @@ namespace WinConfigDiag {
         $busy = @($script:NlJobs).Count
         if ($e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing -and ($script:NlState.Mode -ne 'Idle' -or $busy -gt 0)) {
             $msg = "Stop watching NO launches?"
-            if ($busy -gt 0) { $msg += "`r`n`r`n$busy launch record(s) are still being packaged or sent. They finish in the background while WinConfig stays open; closing WinConfig itself stops them." }
+            if ($busy -gt 0) { $msg += "`r`n`r`n$busy launch record(s) are still being packaged or sent. They finish in the background while NO Support Tool stays open; closing NO Support Tool itself stops them." }
             if ([System.Windows.Forms.MessageBox]::Show($msg, "NO Launch Testing", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question) -ne [System.Windows.Forms.DialogResult]::Yes) { $e.Cancel = $true; return }
         }
         try { if ($script:NlState.Mode -ne 'Idle') { & $script:NlStop } } catch { }
