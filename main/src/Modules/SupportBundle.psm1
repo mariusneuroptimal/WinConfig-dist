@@ -1549,7 +1549,22 @@ function Get-WinConfigSupportCollectors {
                 } catch {
                     if ($_.Exception.Message -notmatch 'No events were found') { throw }
                 }
-                @{ Facts = @{ eventCount = $events.Count; events = $events; cap = $Context.Caps.EventSliceMax } }
+                # 3076 = audit-only: the image failed policy but WAS allowed to load. Kept
+                # out of `events` (signatures treat those as blocks) and queried separately
+                # so an audit flood cannot push real 3077 denies out of the slice.
+                $auditEvents = @()
+                try {
+                    $rawAudit = Get-WinEvent -FilterHashtable @{
+                        LogName = 'Microsoft-Windows-CodeIntegrity/Operational'
+                        Id      = 3076
+                    } -MaxEvents $Context.Caps.EventSliceMax -ErrorAction Stop
+                    $auditEvents = @($rawAudit | ForEach-Object {
+                        @{ id = $_.Id; time = $_.TimeCreated.ToString('o'); message = "$($_.Message)".Substring(0, [Math]::Min(500, "$($_.Message)".Length)) }
+                    })
+                } catch {
+                    if ($_.Exception.Message -notmatch 'No events were found') { throw }
+                }
+                @{ Facts = @{ eventCount = $events.Count; events = $events; auditEventCount = $auditEvents.Count; auditEvents = $auditEvents; cap = $Context.Caps.EventSliceMax } }
             }
         }
         @{
