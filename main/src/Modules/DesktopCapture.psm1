@@ -1,6 +1,6 @@
 # DesktopCapture.psm1
 # Compiled screen capture and top-level window identity, shared by the Flight
-# Recorder (Win11Config.App.ps1) and the NO Test Lab (testlab/, which packages
+# Recorder (Win11Config.App.ps1) and the NO Test Lab (the lab kit packages
 # this module unmodified). Extracted from App.ps1 2026-10-08 with the C# kept
 # byte-for-byte: the type names WinConfigDiag.ScreenGrab and
 # WinConfigDiag.WindowScan are unchanged, so the recorder's sampler runspace,
