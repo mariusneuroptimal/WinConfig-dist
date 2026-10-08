@@ -8169,55 +8169,17 @@ $buttonHandlers = @{
             # flag. If Add-Type is unavailable or blocked, the initializer
             # returns $false and the capture counts a failure -- it NEVER
             # throws, because nothing here may stop the recorder from launching
-            # or running.
+            # or running. The compiled type (WinConfigDiag.ScreenGrab) lives in
+            # DesktopCapture.psm1, shared with the NO Test Lab; a missing module
+            # throws CommandNotFound here and lands in the catch.
             $script:BtRec_ScreenCaptureReady = $null   # $null=untried, $true/$false=result
             function script:Initialize-BtScreenCapture {
                 if ($null -ne $script:BtRec_ScreenCaptureReady) { return $script:BtRec_ScreenCaptureReady }
                 try {
-                    if (-not ('WinConfigDiag.ScreenGrab' -as [type])) {
-                        $csharp = @"
-using System;
-using System.Drawing;
-using System.Drawing.Imaging;
-using System.Windows.Forms;
-
-namespace WinConfigDiag {
-    public static class ScreenGrab {
-        // Managed full-virtual-screen capture to a JPEG at the given quality.
-        // An NO error dialog can sit on any monitor, so the whole virtual
-        // desktop is taken rather than a guessed crop.
-        public static void CaptureVirtualScreenJpeg(string path, long quality) {
-            System.IO.File.WriteAllBytes(path, CaptureVirtualScreenJpegBytes(quality));
-        }
-
-        // The same capture into memory. The NO-window sampler thread grabs
-        // the pixels the instant a dialog appears and hands the bytes to the
-        // drain, which alone decides whether they are ever written to disk.
-        public static byte[] CaptureVirtualScreenJpegBytes(long quality) {
-            Rectangle area = SystemInformation.VirtualScreen;
-            using (Bitmap bmp = new Bitmap(area.Width, area.Height)) {
-                using (Graphics g = Graphics.FromImage(bmp)) {
-                    g.CopyFromScreen(area.Left, area.Top, 0, 0, bmp.Size);
-                }
-                ImageCodecInfo enc = null;
-                foreach (ImageCodecInfo c in ImageCodecInfo.GetImageEncoders()) {
-                    if (c.MimeType == "image/jpeg") { enc = c; break; }
-                }
-                using (EncoderParameters ep = new EncoderParameters(1)) {
-                    ep.Param[0] = new EncoderParameter(Encoder.Quality, quality);
-                    using (System.IO.MemoryStream ms = new System.IO.MemoryStream()) {
-                        bmp.Save(ms, enc, ep);
-                        return ms.ToArray();
+                    $script:BtRec_ScreenCaptureReady = [bool](Initialize-WinConfigScreenGrab)
+                    if (-not $script:BtRec_ScreenCaptureReady -and (Get-Command Write-BtLog -ErrorAction SilentlyContinue)) {
+                        Write-BtLog "  Screen-capture backend unavailable: $(Get-WinConfigDesktopCaptureError -Part ScreenGrab)" -Level 'WARN'
                     }
-                }
-            }
-        }
-    }
-}
-"@
-                        Add-Type -TypeDefinition $csharp -ReferencedAssemblies 'System.Drawing', 'System.Windows.Forms' -ErrorAction Stop
-                    }
-                    $script:BtRec_ScreenCaptureReady = [bool]('WinConfigDiag.ScreenGrab' -as [type])
                 } catch {
                     $script:BtRec_ScreenCaptureReady = $false
                     if (Get-Command Write-BtLog -ErrorAction SilentlyContinue) {
@@ -8492,73 +8454,17 @@ namespace WinConfigDiag {
             #
             # Compiled + lazy + fail-safe, exactly like the screen-capture
             # backend: if the P/Invoke will not compile the detector is simply
-            # off and the recorder is unaffected.
+            # off and the recorder is unaffected. The compiled type
+            # (WinConfigDiag.WindowScan: EnumWindows, IsWindowVisible,
+            # IsWindowEnabled, GetWindowThreadProcessId, GetWindowTextW --
+            # top-level only, no child windows, no class text) lives in
+            # DesktopCapture.psm1, shared with the NO Test Lab. A missing module
+            # throws CommandNotFound here and lands in the catch: detector off.
             $script:BtRec_WindowScanReady = $null
             function script:Initialize-BtWindowScan {
                 if ($null -ne $script:BtRec_WindowScanReady) { return $script:BtRec_WindowScanReady }
                 try {
-                    if (-not ('WinConfigDiag.WindowScan' -as [type])) {
-                        $wsCs = @"
-using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-
-namespace WinConfigDiag {
-    public static class WindowScan {
-        [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
-        [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hWnd);
-        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr hWnd, System.Text.StringBuilder text, int maxCount);
-        delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-
-        // Handles of visible top-level windows owned by the given PIDs.
-        // Returns HANDLES ONLY -- no titles, no class text, no content.
-        public static long[] TopLevelWindowsForPids(int[] pids) {
-            HashSet<uint> want = new HashSet<uint>();
-            foreach (int p in pids) { want.Add((uint)p); }
-            List<long> found = new List<long>();
-            EnumWindows(delegate(IntPtr h, IntPtr l) {
-                if (IsWindowVisible(h)) {
-                    uint wpid; GetWindowThreadProcessId(h, out wpid);
-                    if (want.Contains(wpid)) { found.Add(h.ToInt64()); }
-                }
-                return true;
-            }, IntPtr.Zero);
-            return found.ToArray();
-        }
-
-        // Identity of visible top-level windows owned by the given PIDs:
-        // "hwnd|enabled|title" per window. TOP-LEVEL TITLE AND ENABLED FLAG
-        // ONLY -- never child windows, never window content (a LabVIEW front
-        // panel's content is one drawn canvas anyway; its title bar is window
-        // METADATA the taskbar already shows). Added 2026-08-23 after the
-        // dialog-title discriminator was proven ('Arc Not Detected' = 12005
-        // class vs 'Arc Connection Lost' = 12006 danger window) and the VAULT
-        // visible-but-disabled boolean survived as the modal detector.
-        public static string[] DescribeTopLevelWindowsForPids(int[] pids) {
-            HashSet<uint> want = new HashSet<uint>();
-            foreach (int p in pids) { want.Add((uint)p); }
-            List<string> found = new List<string>();
-            EnumWindows(delegate(IntPtr h, IntPtr l) {
-                if (IsWindowVisible(h)) {
-                    uint wpid; GetWindowThreadProcessId(h, out wpid);
-                    if (want.Contains(wpid)) {
-                        System.Text.StringBuilder sb = new System.Text.StringBuilder(512);
-                        GetWindowTextW(h, sb, 512);
-                        found.Add(h.ToInt64().ToString() + "|" + (IsWindowEnabled(h) ? "1" : "0") + "|" + sb.ToString());
-                    }
-                }
-                return true;
-            }, IntPtr.Zero);
-            return found.ToArray();
-        }
-    }
-}
-"@
-                        Add-Type -TypeDefinition $wsCs -ErrorAction Stop
-                    }
-                    $script:BtRec_WindowScanReady = [bool]('WinConfigDiag.WindowScan' -as [type])
+                    $script:BtRec_WindowScanReady = [bool](Initialize-WinConfigWindowScan)
                 } catch {
                     $script:BtRec_WindowScanReady = $false
                 }
@@ -8575,13 +8481,14 @@ namespace WinConfigDiag {
                 }
                 $noPids = @($noPids | Where-Object { $_ } | Select-Object -Unique)
                 if (-not $noPids) { return @() }
-                try { return @([WinConfigDiag.WindowScan]::TopLevelWindowsForPids([int[]]$noPids)) } catch { return @() }
+                return @(Get-WinConfigWindowHandles -ProcessId $noPids)
             }
 
             # Per-window identity records (Hwnd/Enabled/Title) for the shot
             # record -- see the identity-not-content note above. Same lazy,
             # fail-safe shape as the handle scan: any failure returns @() and
-            # the trigger still fires on handles alone.
+            # the trigger still fires on handles alone. The "hwnd|enabled|title"
+            # parse is ConvertFrom-WinConfigWindowScanRows (DesktopCapture.psm1).
             function script:Get-BtNoWindowDescriptions {
                 param([string[]]$ProcessNames)
                 if (-not (script:Initialize-BtWindowScan)) { return @() }
@@ -8592,20 +8499,7 @@ namespace WinConfigDiag {
                 }
                 $noPids = @($noPids | Where-Object { $_ } | Select-Object -Unique)
                 if (-not $noPids) { return @() }
-                $rows = try { @([WinConfigDiag.WindowScan]::DescribeTopLevelWindowsForPids([int[]]$noPids)) } catch { @() }
-                $out = @()
-                foreach ($row in $rows) {
-                    # "hwnd|enabled|title"; the title may itself contain '|', so
-                    # split on the first two separators only.
-                    $parts = [string]$row -split '\|', 3
-                    if ($parts.Count -lt 3) { continue }
-                    $out += [pscustomobject]@{
-                        Hwnd    = [long]$parts[0]
-                        Enabled = ($parts[1] -eq '1')
-                        Title   = [string]$parts[2]
-                    }
-                }
-                return $out
+                return @(Get-WinConfigWindowDescriptions -ProcessId $noPids)
             }
 
             # The modal-state read the 08-21/08-23 field work proved out: the
@@ -15118,10 +15012,12 @@ namespace WinConfigDiag {
                 if ($ready.Ready) {
                     $l.PostReadyTicks++
                     $script:NlStatus.Text = "NeurOptimal was ready after {0:N1} s. Finishing the record..." -f $l.ReadyT
-                    if ($l.PostReadyTicks -ge $script:NlRules.PostReadySeconds) { & $script:NlDecide 'Ready' $false }
-                } elseif ($smp.T -ge $script:NlRules.StuckAfterSeconds -and -not $ready.Pending) {
-                    & $script:NlDecide 'Stuck' $false
-                } else {
+                }
+                # Ready/Stuck is decided by the module, so the NO Test Lab scores launches by the same rule.
+                $decision = Resolve-NoLaunchOutcome -Ready $ready -T $smp.T -PostReadyTicks $l.PostReadyTicks -Rules $script:NlRules
+                if ($decision) {
+                    & $script:NlDecide $decision $false
+                } elseif (-not $ready.Ready) {
                     $script:NlStatus.Text = "NeurOptimal is starting ({3}): {0:N0} s (counts as stuck at {2} s). CPU {1:N1} s." -f $smp.T, $smp.CpuSec, $script:NlRules.StuckAfterSeconds, $(if ($l.TraceLevel -ne 'None') { "$($l.TraceLevel) trace" } else { 'no trace' })
                     if ($rs.Revocations -gt 0 -and $ready.Sample.Blocker) { $script:NlStatus.Text += " '$($ready.Sample.Blocker)' came back after the main window showed; still timing." }
                     elseif ($ready.Sample.BlockedBy) { $script:NlStatus.Text += " Main window is up; waiting for '$($ready.Sample.BlockedBy)' to close." }

@@ -60,6 +60,7 @@
         @{ Path = "src/Modules/LowDiskSpace.psm1" }     # LOW-DISK-001: reversible low-disk-space simulation (Disk tab)
         @{ Path = "src/Modules/GraphicsBench.psm1" }        # GRAPHICS-BENCH-001: NO WebView2 surface measurement (Testing tab)
         @{ Path = "src/Modules/NoLaunchWatch.psm1" }        # NO-LAUNCH-001: NO launch timing + stuck-on-licensing capture (Testing tab)
+        @{ Path = "src/Modules/DesktopCapture.psm1" }       # Compiled screen capture + NO top-level window identity (Flight Recorder; NO Test Lab)
     )
 
     # Documentation of invariants (for governance reference)

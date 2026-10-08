@@ -628,6 +628,25 @@ function Update-NoLaunchReadyState {
     }
 }
 
+function Resolve-NoLaunchOutcome {
+    <#
+    .SYNOPSIS
+        The watch timer's decision for one sample: 'Ready', 'Stuck', or $null (keep timing). Pure.
+    .DESCRIPTION
+        Ready = the ready state has held for PostReadySeconds samples (PostReadyTicks counts
+        samples since ready, reset by a revocation). Stuck = StuckAfterSeconds have passed
+        and the main panel is not pending confirmation. One rule for every watcher: the
+        app's launch window and the NO Test Lab both decide here.
+    #>
+    param([Parameter(Mandatory)] $Ready, [Parameter(Mandatory)] [double]$T, [Parameter(Mandatory)] [int]$PostReadyTicks, [Parameter(Mandatory)] $Rules)
+    if ($Ready.Ready) {
+        if ($PostReadyTicks -ge $Rules.PostReadySeconds) { return 'Ready' }
+        return $null
+    }
+    if ($T -ge $Rules.StuckAfterSeconds -and -not $Ready.Pending) { return 'Stuck' }
+    return $null
+}
+
 function Get-NoLaunchProcessSample {
     <#
     .SYNOPSIS
@@ -1330,6 +1349,7 @@ Export-ModuleMember -Function @(
     'Test-NoLaunchReady'
     'New-NoLaunchReadyState'
     'Update-NoLaunchReadyState'
+    'Resolve-NoLaunchOutcome'
     'Get-NoLaunchProcessSample'
     'Get-NoLaunchThreadSnapshot'
     'Get-NoLaunchBusyThreads'

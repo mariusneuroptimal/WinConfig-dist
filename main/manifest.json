@@ -1,10 +1,9 @@
 {
-  "build_id": "37486946489-1",
-  "timestamp": "2026-10-06T15:22:41.5270212Z",
   "branch": "main",
-  "source_ref": "bd5568e77b08952ac10ab9f9690191193a20a13a",
-  "event": "push",
+  "build_id": "37832166588-1",
   "schema_version": "2.0",
+  "event": "push",
+  "source_ref": "6eda8932849b3bc2070e2a208af453cbee52e38a",
   "artifacts": [
     {
       "path": "Win11Config.ps1",
@@ -13,8 +12,8 @@
     },
     {
       "path": "src/Win11Config.App.ps1",
-      "size": 1234133,
-      "sha256": "d2385680589fedbef66a0294d1c4f988ba1ac53461083808b480d4bdb757257e"
+      "size": 1229305,
+      "sha256": "69d51016c9cb9dbb62ab36dbe0c2ba1ad0b5d4e71df91f64e1c1c3b6dd1fab2f"
     },
     {
       "path": "src/VERSION.psd1",
@@ -23,8 +22,8 @@
     },
     {
       "path": "src/RUNTIME_DEPENDENCIES.psd1",
-      "size": 4831,
-      "sha256": "ef9389a3268795d9e5aebbbf060403bce41569117cd44a409502905a26133d77"
+      "size": 4979,
+      "sha256": "e31b540cb887f1379ceaeaa37dd1ae6f1447065152e893c0061b7ad3f730fa34"
     },
     {
       "path": "src/Manifest/WinConfig.Tools.psd1",
@@ -173,8 +172,14 @@
     },
     {
       "path": "src/Modules/NoLaunchWatch.psm1",
-      "size": 70413,
-      "sha256": "278f8c6841f9ac060a17d9be6e0299444faba661935d6d1c0b8e040a0bd88b44"
+      "size": 71344,
+      "sha256": "902710539e50fa546f8c65b6cb1bbeecc3e2bfa2bc40ec542067bd2974ed6717"
+    },
+    {
+      "path": "src/Modules/DesktopCapture.psm1",
+      "size": 10727,
+      "sha256": "e3c0004e0ddfccf63333d4bbded81139feb6f71ab5a8b289c98908d39e77dead"
     }
-  ]
+  ],
+  "timestamp": "2026-10-08T19:28:21.4022239Z"
 }
