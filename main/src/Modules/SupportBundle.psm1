@@ -72,7 +72,17 @@ Set-StrictMode -Off
 #   bundle ever carried a hang/crash signature. ZEN-INI-001 withholds binary
 #   content (splashscreen.ini was an 800 KB non-text blob on that box) and
 #   ships size/mtime/sha256 in its place.
-$script:SupportBundleProbeVersion = '1.7.0'
+# 1.8.0 (2026-10-15): HS-134 — NO 4.0.0.11 failed to start with 'Bad Image'
+#   0xc0e90002 on C:\Zengar\data\HeadsetConnectionDiagnostics.dll plus a
+#   Windows Security toast for libcrypto-3-ni.dll: Smart App Control refusing
+#   code it cannot attribute to a publisher. The bundle captured the CI events
+#   but could not say WHICH policy blocked, whether Smart App Control was on,
+#   or that the DLL ships unsigned. WIN-CODEINT-001 now carries the event's
+#   fileName/processName/policyName/policyGuid/status from the event XML;
+#   WIN-SECURITY-001 carries smartAppControlState; new ZEN-BINSIG-001 records
+#   the Authenticode status of every .exe/.dll under C:\zengar (deny-list
+#   pruned) and the NI '*-ni.dll' set in System32.
+$script:SupportBundleProbeVersion = '1.8.0'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -200,6 +210,7 @@ $script:InstallLogTailLines  = 2000
 $script:SetupApiTailLines    = 3000
 $script:EventSliceMax        = 250
 $script:TreeListingMaxItems  = 5000
+$script:BinarySigMaxFiles    = 400
 $script:StagingMaxDirs       = 200
 $script:WebView2MaxSiblings  = 20
 $script:DefaultCollectorTimeoutSeconds = 45
@@ -1178,6 +1189,58 @@ function Get-WinConfigSupportCollectors {
             }
         }
         @{
+            Id = 'ZEN-BINSIG-001'; Ring = 1; RequiresAdmin = $false; RequiresZengar = $true
+            Script = {
+                param($Context)
+                # HS-134: Authenticode status of every binary NO ships, so an unsigned
+                # DLL is visible BEFORE Smart App Control / App Control blocks it.
+                # Pruned walk: deny-list dirs are never entered. Pruned by NAME at the
+                # root as well as by full path — Get-ChildItem returns long-form
+                # FullNames, so a root given in 8.3 form ('ZENGAR~1') never matches
+                # the joined deny paths (caught by the Pester fixture under %TEMP%).
+                # Paths are tracked relative while walking for the same reason.
+                # NI's '*-ni.dll' OpenSSL/zlib set lives in System32 but loads into
+                # NO.exe (libcrypto-3-ni.dll raised the HS-134 toast), so it is listed too.
+                $denyRoots = @($Context.DenyListAbsolute | ForEach-Object { $_.TrimEnd('\') })
+                $denyNames = @($Context.DenyListAbsolute | ForEach-Object { Split-Path -Leaf $_.TrimEnd('\') })
+                $max = $Context.Caps.BinarySigMaxFiles
+                $found = [System.Collections.ArrayList]::new()
+                $stack = New-Object System.Collections.Stack
+                $stack.Push(@{ path = $Context.ZengarRoot; rel = '' })
+                while ($stack.Count -gt 0) {
+                    $dir = $stack.Pop()
+                    foreach ($item in (Get-ChildItem -LiteralPath $dir.path -Force -ErrorAction SilentlyContinue)) {
+                        $rel = if ($dir.rel) { "$($dir.rel)\$($item.Name)" } else { $item.Name }
+                        if ($item.PSIsContainer) {
+                            $denied = ($denyRoots -contains $item.FullName.TrimEnd('\')) -or (-not $dir.rel -and $denyNames -contains $item.Name)
+                            if (-not $denied) { $stack.Push(@{ path = $item.FullName; rel = $rel }) }
+                        } elseif ($item.Extension -in '.exe', '.dll') {
+                            [void]$found.Add(@{ item = $item; scope = 'zengar'; rel = $rel })
+                        }
+                    }
+                }
+                $system32 = if ($Context.System32Dir) { $Context.System32Dir } else { Join-Path $env:SystemRoot 'System32' }
+                foreach ($item in @(Get-ChildItem -LiteralPath $system32 -Filter '*-ni.dll' -File -ErrorAction SilentlyContinue)) {
+                    [void]$found.Add(@{ item = $item; scope = 'system32-ni' })
+                }
+                $files = @()
+                foreach ($entry in @($found | Select-Object -First $max)) {
+                    $item = $entry.item
+                    $status = $null
+                    $signer = $null
+                    try {
+                        $sig = Get-AuthenticodeSignature -LiteralPath $item.FullName -ErrorAction Stop
+                        $status = "$($sig.Status)"
+                        if ($sig.SignerCertificate) { $signer = if ($sig.SignerCertificate.Subject -match 'CN=([^,]+)') { $Matches[1].Trim('"') } else { $sig.SignerCertificate.Subject } }
+                    } catch { $status = "Error: $($_.Exception.Message)" }
+                    $files += @{ path = $(if ($entry.rel) { $entry.rel } else { $item.FullName }); scope = $entry.scope; status = $status; signer = $signer; fileVersion = "$($item.VersionInfo.FileVersion)"; size = $item.Length; mtime = $item.LastWriteTime.ToString('o') }
+                }
+                $facts = @{ fileCount = $files.Count; files = $files; unsignedCount = @($files | Where-Object { $_.status -ne 'Valid' }).Count }
+                if ($found.Count -gt $max) { $facts.truncationMarker = "...truncated ($($found.Count - $max) more binaries)" }
+                @{ Facts = $facts }
+            }
+        }
+        @{
             Id = 'ZEN-INI-001'; Ring = 1; RequiresAdmin = $false; RequiresZengar = $true
             Script = {
                 param($Context)
@@ -1537,15 +1600,31 @@ function Get-WinConfigSupportCollectors {
             Script = {
                 param($Context)
                 # TRIAGE-GUIDE §1: 3077 = App Control deny, 3033 = signing level, 3004 = unsigned
+                # HS-134: the message alone cannot say WHICH policy blocked (Smart App
+                # Control vs an org App Control policy need different fixes) and its
+                # 500-char clip can cut the file path. The event XML carries both.
+                $toFact = {
+                    param($e)
+                    $fact = @{ id = $e.Id; time = $e.TimeCreated.ToString('o'); message = "$($e.Message)".Substring(0, [Math]::Min(500, "$($e.Message)".Length)) }
+                    try {
+                        $data = @{}
+                        foreach ($n in @(([xml]$e.ToXml()).Event.EventData.Data)) { if ($n.Name) { $data["$($n.Name)"] = "$($n.'#text')" } }
+                        if ($data['FileNameBuffer'])    { $fact.fileName    = $data['FileNameBuffer'] }
+                        if ($data['ProcessNameBuffer']) { $fact.processName = $data['ProcessNameBuffer'] }
+                        $policyName = if ($data['PolicyNameBuffer']) { $data['PolicyNameBuffer'] } else { $data['PolicyName'] }
+                        if ($policyName)          { $fact.policyName = $policyName }
+                        if ($data['PolicyGUID'])  { $fact.policyGuid = $data['PolicyGUID'] }
+                        if ($data['Status'] -match '^\d+$') { $fact.status = '0x{0:X8}' -f [uint32][int64]$data['Status'] }
+                    } catch { }
+                    $fact
+                }
                 $events = @()
                 try {
                     $raw = Get-WinEvent -FilterHashtable @{
                         LogName = 'Microsoft-Windows-CodeIntegrity/Operational'
                         Id      = @(3077, 3033, 3004)
                     } -MaxEvents $Context.Caps.EventSliceMax -ErrorAction Stop
-                    $events = @($raw | ForEach-Object {
-                        @{ id = $_.Id; time = $_.TimeCreated.ToString('o'); message = "$($_.Message)".Substring(0, [Math]::Min(500, "$($_.Message)".Length)) }
-                    })
+                    $events = @($raw | ForEach-Object { & $toFact $_ })
                 } catch {
                     if ($_.Exception.Message -notmatch 'No events were found') { throw }
                 }
@@ -1558,9 +1637,7 @@ function Get-WinConfigSupportCollectors {
                         LogName = 'Microsoft-Windows-CodeIntegrity/Operational'
                         Id      = 3076
                     } -MaxEvents $Context.Caps.EventSliceMax -ErrorAction Stop
-                    $auditEvents = @($rawAudit | ForEach-Object {
-                        @{ id = $_.Id; time = $_.TimeCreated.ToString('o'); message = "$($_.Message)".Substring(0, [Math]::Min(500, "$($_.Message)".Length)) }
-                    })
+                    $auditEvents = @($rawAudit | ForEach-Object { & $toFact $_ })
                 } catch {
                     if ($_.Exception.Message -notmatch 'No events were found') { throw }
                 }
@@ -1716,6 +1793,14 @@ function Get-WinConfigSupportCollectors {
                 } catch {
                     $facts.defenderExclusions = "Unavailable: $($_.Exception.Message)"
                 }
+                # HS-134: Smart App Control blocks code it cannot attribute to a
+                # publisher (0 = Off, 1 = On/enforcing, 2 = Evaluation). Absent on
+                # builds without it; recorded as null, never as Off.
+                $sac = $null
+                try {
+                    $sac = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -Name VerifiedAndReputablePolicyState -ErrorAction Stop).VerifiedAndReputablePolicyState
+                } catch { }
+                $facts.smartAppControlState = $sac
                 @{ Facts = $facts }
             }
         }
@@ -2338,6 +2423,7 @@ function Invoke-WinConfigSupportCollection {
             SetupApiTailLines   = $script:SetupApiTailLines
             EventSliceMax       = $script:EventSliceMax
             TreeListingMaxItems = $script:TreeListingMaxItems
+            BinarySigMaxFiles   = $script:BinarySigMaxFiles
             StagingMaxDirs      = $script:StagingMaxDirs
             WebView2MaxSiblings = $script:WebView2MaxSiblings
         }
