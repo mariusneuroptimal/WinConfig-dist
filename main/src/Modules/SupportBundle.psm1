@@ -82,7 +82,14 @@ Set-StrictMode -Off
 #   WIN-SECURITY-001 carries smartAppControlState; new ZEN-BINSIG-001 records
 #   the Authenticode status of every .exe/.dll under C:\zengar (deny-list
 #   pruned) and the NI '*-ni.dll' set in System32.
-$script:SupportBundleProbeVersion = '1.8.0'
+# 1.9.0 (2026-10-20): the post-26H2 component reinstall on SP9-I5-8GB-HS-T died
+#   extracting registryconfig.7z with an opaque E_FAIL: a windowless background
+#   SystemSettings.exe held C:\zengar\NO_Desktop_Wallpaper.png, which that
+#   archive overwrites. Nothing collected who holds FILES inside the root
+#   (ZEN-PROCESS-001 sees only process IMAGES there). New ZEN-FILELOCK-001 asks
+#   the Restart Manager (query only) for holders of every file under C:\zengar
+#   (deny-list pruned) and whether each held file can still be renamed.
+$script:SupportBundleProbeVersion = '1.9.0'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -211,6 +218,7 @@ $script:SetupApiTailLines    = 3000
 $script:EventSliceMax        = 250
 $script:TreeListingMaxItems  = 5000
 $script:BinarySigMaxFiles    = 400
+$script:FileLockMaxFiles     = 5000
 $script:StagingMaxDirs       = 200
 $script:WebView2MaxSiblings  = 20
 $script:DefaultCollectorTimeoutSeconds = 45
@@ -1388,6 +1396,192 @@ function Get-WinConfigSupportCollectors {
             }
         }
         @{
+            Id = 'ZEN-FILELOCK-001'; Ring = 1; RequiresAdmin = $false; RequiresZengar = $true
+            Script = {
+                param($Context)
+                # SP9-I5-8GB-HS-T 2026-10-20: the post-26H2 component reinstall died on
+                # 'Error while extracting archive ... registryconfig.7z: internal code:
+                # E_FAIL'. The archive overwrites C:\zengar\NO_Desktop_Wallpaper.png, and
+                # a windowless, suspended SystemSettings.exe (started by DcomLaunch, never
+                # opened by the user) held it open, so QtIFW could not rename it aside.
+                # ZEN-PROCESS-001 only sees processes whose IMAGE is inside the root; a
+                # foreign process holding a FILE inside it was invisible, and the bundle's
+                # top finding pointed at the zAmp service instead.
+                #
+                # Asks the Restart Manager which processes hold any file under the
+                # install root. RmGetList is a QUERY; RmShutdown / RmRestart are never
+                # referenced, so nothing here closes a handle or a process. Per-file
+                # attribution is by bisection: one query for the whole tree (the common
+                # case is zero holders), then halves only where something is held.
+                # renameBlocked opens each held file for DELETE access with full
+                # sharing -- the access QtIFW's rename-aside needs -- and closes it
+                # untouched: a sharing violation means some handle lacks FILE_SHARE_DELETE.
+                if (-not ('WinConfigSupport.FileLockQuery' -as [type])) {
+                    Add-Type -ErrorAction Stop -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace WinConfigSupport {
+    public static class FileLockQuery {
+        [StructLayout(LayoutKind.Sequential)] struct RM_UNIQUE_PROCESS { public int dwProcessId; public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct RM_PROCESS_INFO {
+            public RM_UNIQUE_PROCESS Process;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string strServiceShortName;
+            public int ApplicationType; public uint AppStatus; public uint TSSessionId; [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+        }
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)] static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, System.Text.StringBuilder strSessionKey);
+        [DllImport("rstrtmgr.dll")] static extern int RmEndSession(uint pSessionHandle);
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)] static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames, uint nApplications, IntPtr rgApplications, uint nServices, IntPtr rgsServiceNames);
+        [DllImport("rstrtmgr.dll")] static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo, [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr hObject);
+
+        // One row per holder: pid|appName|serviceShortName|applicationType|sessionId.
+        // Throws on a Restart Manager error so the caller records it, never as "no holders".
+        public static string[] Holders(string[] files) {
+            List<string> rows = new List<string>();
+            uint handle; System.Text.StringBuilder key = new System.Text.StringBuilder(33);
+            int rc = RmStartSession(out handle, 0, key);
+            if (rc != 0) { throw new InvalidOperationException("RmStartSession failed: " + rc); }
+            try {
+                rc = RmRegisterResources(handle, (uint)files.Length, files, 0, IntPtr.Zero, 0, IntPtr.Zero);
+                if (rc != 0) { throw new InvalidOperationException("RmRegisterResources failed: " + rc); }
+                uint needed = 0, count = 0, reasons = 0;
+                rc = RmGetList(handle, out needed, ref count, null, ref reasons);
+                if (rc == 234 /* ERROR_MORE_DATA */ && needed > 0) {
+                    RM_PROCESS_INFO[] info = new RM_PROCESS_INFO[needed];
+                    count = needed;
+                    rc = RmGetList(handle, out needed, ref count, info, ref reasons);
+                    if (rc != 0) { throw new InvalidOperationException("RmGetList failed: " + rc); }
+                    for (int i = 0; i < count; i++) {
+                        rows.Add(info[i].Process.dwProcessId + "|" + info[i].strAppName + "|" + info[i].strServiceShortName + "|" + info[i].ApplicationType + "|" + info[i].TSSessionId);
+                    }
+                } else if (rc != 0) { throw new InvalidOperationException("RmGetList failed: " + rc); }
+            } finally { RmEndSession(handle); }
+            return rows.ToArray();
+        }
+
+        // true = sharing violation on a DELETE-access open (rename/overwrite blocked);
+        // false = opened and closed; null = could not tell (access denied, gone, ...).
+        public static bool? RenameBlocked(string path) {
+            IntPtr h = CreateFileW(path, 0x00010000 /* DELETE */, 7 /* share read|write|delete */, IntPtr.Zero, 3 /* OPEN_EXISTING */, 0, IntPtr.Zero);
+            if (h == new IntPtr(-1)) { return Marshal.GetLastWin32Error() == 32 ? (bool?)true : null; }
+            CloseHandle(h);
+            return false;
+        }
+    }
+}
+"@
+                }
+
+                $root      = "$($Context.ZengarRoot)".TrimEnd('\')
+                $denyRoots = @($Context.DenyListAbsolute | ForEach-Object { $_.TrimEnd('\') })
+                $denyNames = @($Context.DenyListAbsolute | ForEach-Object { Split-Path -Leaf $_.TrimEnd('\') })
+                $max       = $Context.Caps.FileLockMaxFiles
+
+                # Same pruned walk as ZEN-BINSIG-001: deny-list dirs are never entered,
+                # pruned by name at the root too so an 8.3 root cannot bypass them.
+                $found = [System.Collections.ArrayList]::new()
+                $stack = New-Object System.Collections.Stack
+                $stack.Push(@{ path = $root; rel = '' })
+                while ($stack.Count -gt 0) {
+                    $dir = $stack.Pop()
+                    foreach ($item in (Get-ChildItem -LiteralPath $dir.path -Force -ErrorAction SilentlyContinue)) {
+                        $rel = if ($dir.rel) { "$($dir.rel)\$($item.Name)" } else { $item.Name }
+                        if ($item.PSIsContainer) {
+                            $denied = ($denyRoots -contains $item.FullName.TrimEnd('\')) -or (-not $dir.rel -and $denyNames -contains $item.Name)
+                            if (-not $denied) { $stack.Push(@{ path = $item.FullName; rel = $rel }) }
+                        } else {
+                            [void]$found.Add(@{ full = $item.FullName; rel = $rel })
+                        }
+                    }
+                }
+                $checked = @($found | Select-Object -First $max)
+
+                $facts = @{ installRoot = $root; checkedCount = $checked.Count; heldFiles = @(); holders = @(); heldCount = 0 }
+                if ($found.Count -gt $max) { $facts.truncationMarker = "...truncated ($($found.Count - $max) more files not checked)" }
+
+                # Bisection: a slice is split only while it has holders, so a tree with
+                # nothing held costs one query.
+                $held = [System.Collections.ArrayList]::new()
+                $work = New-Object System.Collections.Stack
+                if ($checked.Count -gt 0) { $work.Push(@($checked)) }
+                try {
+                    while ($work.Count -gt 0) {
+                        $slice = @($work.Pop())
+                        $rows = @([WinConfigSupport.FileLockQuery]::Holders([string[]]@($slice | ForEach-Object { $_.full })))
+                        if ($rows.Count -eq 0) { continue }
+                        if ($slice.Count -eq 1) { [void]$held.Add(@{ entry = $slice[0]; rows = $rows }); continue }
+                        $half = [int][Math]::Floor($slice.Count / 2)
+                        $work.Push(@($slice[0..($half - 1)]))
+                        $work.Push(@($slice[$half..($slice.Count - 1)]))
+                    }
+                } catch {
+                    # Partial attribution is still evidence; the error says it is partial.
+                    $facts.restartManagerError = "$($_.Exception.Message)"
+                }
+
+                $holders = @{}
+                $heldFiles = @()
+                foreach ($h in $held) {
+                    $pids = @()
+                    foreach ($row in $h.rows) {
+                        $parts = "$row" -split '\|', 5
+                        $holderPid = [int]$parts[0]
+                        $pids += $holderPid
+                        if (-not $holders.ContainsKey($holderPid)) {
+                            $holders[$holderPid] = @{ pid = $holderPid; appName = $parts[1]; serviceShortName = $parts[2]; applicationType = [int]$parts[3]; sessionId = [int]$parts[4] }
+                        }
+                    }
+                    $heldFiles += @{ path = $h.entry.rel; holderPids = @($pids | Sort-Object -Unique); renameBlocked = [WinConfigSupport.FileLockQuery]::RenameBlocked($h.entry.full) }
+                }
+
+                # Holder identity. Image paths of other users' processes need elevation;
+                # null is recorded, never guessed. hasWindow is only meaningful for a
+                # process in the collecting user's session.
+                $rootPrefix = "$root\"
+                foreach ($holderPid in @($holders.Keys)) {
+                    $row = $holders[$holderPid]
+                    $cim = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$holderPid" -ErrorAction SilentlyContinue
+                    $row.name = if ($cim) { "$($cim.Name)" } else { $null }
+                    $row.imagePath = if ($cim -and $cim.ExecutablePath) { "$($cim.ExecutablePath)" } else { $null }
+                    # A SYSTEM service's ExecutablePath is unreadable unelevated, but its
+                    # Win32_Service.PathName is not (same reasoning as ZEN-PROCESS-001).
+                    if (-not $row.imagePath -and $row.serviceShortName) {
+                        $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$($row.serviceShortName -replace "'", '')'" -ErrorAction SilentlyContinue
+                        $raw = "$($svc.PathName)"
+                        if ($raw.StartsWith('"')) { $close = $raw.IndexOf('"', 1); if ($close -gt 1) { $row.imagePath = $raw.Substring(1, $close - 1) } }
+                        elseif ($raw) { $idx = $raw.ToLowerInvariant().IndexOf('.exe'); $row.imagePath = if ($idx -ge 0) { $raw.Substring(0, $idx + 4) } else { $raw } }
+                    }
+                    $row.startTime = if ($cim -and $cim.CreationDate) { $cim.CreationDate.ToString('o') } else { $null }
+                    $row.parentPid = if ($cim) { [int]$cim.ParentProcessId } else { $null }
+                    # Only the svchost '-k <group>' is kept from the parent's command
+                    # line ('DcomLaunch' = started by COM, not by the user); a full
+                    # command line can carry credentials.
+                    $row.parentName = $null
+                    $row.parentServiceGroup = $null
+                    if ($cim) {
+                        $parent = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($cim.ParentProcessId)" -ErrorAction SilentlyContinue
+                        if ($parent) {
+                            $row.parentName = "$($parent.Name)"
+                            if ("$($parent.CommandLine)" -match '\s-k\s+(\S+)') { $row.parentServiceGroup = $Matches[1] }
+                        }
+                    }
+                    $row.insideInstallRoot = if ($row.imagePath) { $row.imagePath -like "$rootPrefix*" } else { $null }
+                    $proc = Get-Process -Id $holderPid -ErrorAction SilentlyContinue
+                    $row.hasWindow = if ($proc) { $proc.MainWindowHandle -ne [IntPtr]::Zero } else { $null }
+                }
+
+                $facts.heldFiles = @($heldFiles)
+                $facts.heldCount = @($heldFiles).Count
+                $facts.holders = @($holders.Values)
+                @{ Facts = $facts }
+            }
+        }
+        @{
             # RequiresZengar = $false: the database service lives outside the install
             # root and its state is a fact even when the root is damaged or gone.
             Id = 'ZEN-NOLIVE-001'; Ring = 1; RequiresAdmin = $false; RequiresZengar = $false; TimeoutSeconds = 45
@@ -2424,6 +2618,7 @@ function Invoke-WinConfigSupportCollection {
             EventSliceMax       = $script:EventSliceMax
             TreeListingMaxItems = $script:TreeListingMaxItems
             BinarySigMaxFiles   = $script:BinarySigMaxFiles
+            FileLockMaxFiles    = $script:FileLockMaxFiles
             StagingMaxDirs      = $script:StagingMaxDirs
             WebView2MaxSiblings = $script:WebView2MaxSiblings
         }
