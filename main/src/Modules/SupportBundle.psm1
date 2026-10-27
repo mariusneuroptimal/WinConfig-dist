@@ -89,7 +89,15 @@ Set-StrictMode -Off
 #   (ZEN-PROCESS-001 sees only process IMAGES there). New ZEN-FILELOCK-001 asks
 #   the Restart Manager (query only) for holders of every file under C:\zengar
 #   (deny-list pruned) and whether each held file can still be renamed.
-$script:SupportBundleProbeVersion = '1.9.0'
+# 1.10.0 (2026-10-27): two Surface Pro 9s lost BOTH USB-C ports after the 26H2
+#   feature update — no device enumerated, USB-C charging stopped, Surface Connect
+#   still charged, controllers showed no error, and an OS rollback did not help (it
+#   does not revert firmware). Nothing in the bundle could show that nothing was
+#   enumerating or what firmware had just been flashed. New WIN-USB-001 (any model):
+#   platform, UEFI ESRT firmware versions + last update attempt, USB host/connector
+#   state, every USB device node with last arrival/removal and built-in flag, power
+#   source, firmware/feature-update history, USB warnings/errors.
+$script:SupportBundleProbeVersion = '1.10.0'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -212,6 +220,18 @@ $script:OdbcInstRegPaths = @(
 # name makes that fail (-125006) and blocks the whole install behind a dialog.
 $script:NipkgPath = Join-Path $env:ProgramFiles 'National Instruments\NI Package Manager\nipkg.exe'
 
+# WIN-USB-001 (SP9 USB-C field reports, 2026-10-27). Providers that write USB
+# warnings/errors to the System log; UCMUCSICX writes only to its own Operational
+# log, which was EMPTY on two healthy Surfaces, so it is not read. The title match
+# selects the update-history rows that can change what sits under the ports:
+# firmware (OEM capsules are titled '<Vendor> - Firmware - <ver>' or, on Surface,
+# 'Surface Firmware Driver Update'), Surface drivers, and feature updates.
+$script:UsbEventProviders = @(
+    'Microsoft-Windows-USB-USBHUB3', 'Microsoft-Windows-USB-USBXHCI', 'Microsoft-Windows-USB-USB4DeviceRouter-EventLogs',
+    'Microsoft-Windows-USB-USBHUB', 'Microsoft-Windows-USB-USBPORT', 'usbehci'
+)
+$script:UpdateHistoryTitleMatch = 'Firmware|BIOS|UEFI|Surface|Thunderbolt|USB|Windows 1[01], version|Feature update'
+
 # Caps (size target for the whole bundle: < 10 MB — §7)
 $script:InstallLogTailLines  = 2000
 $script:SetupApiTailLines    = 3000
@@ -221,6 +241,11 @@ $script:BinarySigMaxFiles    = 400
 $script:FileLockMaxFiles     = 5000
 $script:StagingMaxDirs       = 200
 $script:WebView2MaxSiblings  = 20
+$script:UsbDeviceMax         = 150
+$script:UpdateHistoryScanMax = 1000
+$script:UpdateHistoryMax     = 60
+$script:UsbEventMax          = 100
+$script:UsbEventWindowDays   = 30
 $script:DefaultCollectorTimeoutSeconds = 45
 
 # Repo URL is parsed at runtime from maintenancetool.ini DefaultRepositories.
@@ -2286,6 +2311,187 @@ namespace WinConfigSupport {
             }
         }
 
+        @{
+            Id = 'WIN-USB-001'; Ring = 2; RequiresAdmin = $false; RequiresZengar = $false
+            Script = {
+                param($Context)
+                # SP9 field reports 2026-10-27: after the 26H2 feature update two Surface
+                # Pro 9s lost BOTH USB-C ports — the zAmp, flash drives, a phone and a hub
+                # never appeared in Device Manager and USB-C charging stopped, while Surface
+                # Connect charging still worked. The controllers showed no error, rolling
+                # back 26H2 did not help, and nothing in the bundle could show that NOTHING
+                # was enumerating, when the last USB device ever arrived, or which firmware
+                # had just been flashed (an OS rollback does not revert firmware).
+                #
+                # Model-agnostic FACTS: the platform, the UEFI ESRT firmware table (version
+                # + last update attempt), USB host/connector infrastructure state, every USB
+                # device node (present or not) with its last arrival/removal and whether it
+                # is built in, the power source, firmware/feature-update history, and USB
+                # warnings/errors. Read-only: nothing is installed, reset or restarted.
+                #
+                # Cost discipline (measured SP9 2026-10-27): per-device Get-PnpDeviceProperty
+                # is ~0.5 s EACH and Win32_Battery up to 1.6 s, which made a naive version
+                # 13-15 s. Here: one Get-PnpDevice, ONE batched property query, registry for
+                # platform + ESRT, SystemInformation for power — 1.1-2.6 s on that box.
+                $facts = @{}
+
+                $bios = Get-ItemProperty -LiteralPath 'HKLM:\HARDWARE\DESCRIPTION\System\BIOS' -ErrorAction SilentlyContinue
+                $facts.platform = @{
+                    manufacturer    = "$($bios.SystemManufacturer)"
+                    model           = "$($bios.SystemProductName)"
+                    sku             = "$($bios.SystemSKU)"
+                    biosVersion     = "$($bios.BIOSVersion)"
+                    biosReleaseDate = "$($bios.BIOSReleaseDate)"
+                }
+
+                $all = @(Get-PnpDevice -ErrorAction Stop)
+                $byId = @{}
+                foreach ($d in $all) { $byId["$($d.InstanceId)"] = $d }
+
+                # ESRT: one subkey per updatable firmware resource; the matching PnP node is
+                # UEFI\RES_{GUID}\0 and carries the friendly name. Values are REG_DWORD and
+                # vendor-encoded, so they ship as hex. LastAttemptStatus 0 = success.
+                $esrtRoot = 'HKLM:\HARDWARE\UEFI\ESRT'
+                $facts.esrtPresent = [bool](Test-Path -LiteralPath $esrtRoot)
+                $facts.firmware = @(if ($facts.esrtPresent) {
+                    Get-ChildItem -LiteralPath $esrtRoot -ErrorAction SilentlyContinue | ForEach-Object {
+                        $p = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+                        $node = $byId["UEFI\RES_$($_.PSChildName)\0"]
+                        @{
+                            guid                   = "$($_.PSChildName)"
+                            name                   = $(if ($node) { "$($node.FriendlyName)" } else { $null })
+                            deviceStatus           = $(if ($node) { "$($node.Status)" } else { $null })
+                            type                   = $(if ($null -ne $p.Type) { [int]$p.Type } else { $null })
+                            version                = $(if ($null -ne $p.Version) { '0x{0:X8}' -f $p.Version } else { $null })
+                            lowestSupportedVersion = $(if ($null -ne $p.LowestSupportedVersion) { '0x{0:X8}' -f $p.LowestSupportedVersion } else { $null })
+                            lastAttemptVersion     = $(if ($null -ne $p.LastAttemptVersion) { '0x{0:X8}' -f $p.LastAttemptVersion } else { $null })
+                            lastAttemptStatus      = $(if ($null -ne $p.LastAttemptStatus) { [int]$p.LastAttemptStatus } else { $null })
+                        }
+                    }
+                })
+
+                # Host controllers, root hubs, USB4 routers and USB-C connector managers.
+                # These stayed "OK" on the failed SP9 — recorded so that is visible, too.
+                $facts.infrastructure = @($all | Where-Object {
+                    "$($_.InstanceId)" -notlike 'USB\VID*' -and
+                    ("$($_.Class)" -in @('USB', 'UCM', 'UCMCLIENT') -or "$($_.FriendlyName)" -match 'USB4|UCSI|Type-C|USB Connector Manager')
+                } | ForEach-Object {
+                    @{ instanceId = "$($_.InstanceId)"; friendlyName = "$($_.FriendlyName)"; class = "$($_.Class)"; present = [bool]$_.Present; status = "$($_.Status)"; problem = "$($_.Problem)" }
+                })
+
+                # Every USB device node Windows remembers (interfaces of composite devices
+                # excluded). A non-present node is history: its last arrival says when that
+                # device last enumerated on this machine.
+                $usb = @($all | Where-Object { "$($_.InstanceId)" -like 'USB\VID*' -and "$($_.InstanceId)" -notmatch '&MI_' } |
+                    Sort-Object -Property @{ Expression = { [bool]$_.Present }; Descending = $true }, InstanceId)
+                $facts.usbDeviceTotal = $usb.Count
+                $max = $Context.Caps.UsbDeviceMax
+                if ($usb.Count -gt $max) {
+                    $facts.truncationMarker = "...truncated ($($usb.Count - $max) more USB device nodes)"
+                    $usb = @($usb | Select-Object -First $max)
+                }
+                # The batched query intermittently returns NO rows for some devices (SP9,
+                # 2026-10-27: 3 of 6 runs dropped a present zAmp and/or flash drive), so
+                # unanswered devices get one more batch, then present ones one at a time.
+                # Whatever is still unanswered is listed, never left to read as "unknown".
+                $props = @{}
+                $answered = @{}
+                $keyNames = @('DEVPKEY_Device_LastArrivalDate', 'DEVPKEY_Device_LastRemovalDate', 'DEVPKEY_Device_InLocalMachineContainer')
+                $fetch = {
+                    param([string[]]$List)
+                    foreach ($pr in @(Get-PnpDeviceProperty -InstanceId $List -KeyName $keyNames -ErrorAction Stop)) {
+                        $props["$($pr.InstanceId)|$($pr.KeyName)"] = $pr.Data
+                        $answered["$($pr.InstanceId)"] = $true
+                    }
+                }
+                if ($usb.Count -gt 0) {
+                    try {
+                        & $fetch @($usb | ForEach-Object { "$($_.InstanceId)" })
+                        $retry = @($usb | Where-Object { -not $answered["$($_.InstanceId)"] } | ForEach-Object { "$($_.InstanceId)" })
+                        $facts.devicePropertyRetried = $retry.Count
+                        if ($retry.Count -gt 0) { & $fetch $retry }
+                        foreach ($d in @($usb | Where-Object { $_.Present -and -not $answered["$($_.InstanceId)"] })) { & $fetch @("$($d.InstanceId)") }
+                    } catch {
+                        $facts.devicePropertyError = $_.Exception.Message
+                    }
+                    $facts.devicePropertyUnanswered = @($usb | Where-Object { -not $answered["$($_.InstanceId)"] } | ForEach-Object { "$($_.InstanceId)" })
+                }
+                $isoOrNull = { param($v) if ($v -is [datetime]) { $v.ToString('o') } else { $null } }
+                $facts.usbDevices = @($usb | ForEach-Object {
+                    $id = "$($_.InstanceId)"
+                    $builtIn = $props["$id|DEVPKEY_Device_InLocalMachineContainer"]
+                    @{
+                        instanceId   = $id
+                        friendlyName = "$($_.FriendlyName)"
+                        class        = "$($_.Class)"
+                        present      = [bool]$_.Present
+                        status       = "$($_.Status)"
+                        problem      = "$($_.Problem)"
+                        builtIn      = $(if ($builtIn -is [bool]) { $builtIn } else { $null })
+                        lastArrival  = (& $isoOrNull $props["$id|DEVPKEY_Device_LastArrivalDate"])
+                        lastRemoval  = (& $isoOrNull $props["$id|DEVPKEY_Device_LastRemovalDate"])
+                    }
+                })
+
+                # Power source. Cannot tell USB-C from a proprietary barrel/dock connector.
+                try {
+                    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+                    $pw = [System.Windows.Forms.SystemInformation]::PowerStatus
+                    $facts.power = @{
+                        acLine         = "$($pw.PowerLineStatus)"
+                        chargeStatus   = "$($pw.BatteryChargeStatus)"
+                        batteryPercent = $(if ($pw.BatteryLifePercent -le 1) { [int][math]::Round($pw.BatteryLifePercent * 100) } else { $null })
+                    }
+                } catch {
+                    $facts.power = @{ error = $_.Exception.Message }
+                }
+
+                # Firmware / feature-update history. IUpdateHistoryEntry.Date is UTC with
+                # Kind=Unspecified: on SP9 (Eastern) KB5127648 read 22:55 while its
+                # WindowsUpdateClient event 19 fired at 19:41-04:00 (23:41Z) — only UTC fits.
+                try {
+                    $searcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+                    $total = [int]$searcher.GetTotalHistoryCount()
+                    $facts.updateHistoryTotal = $total
+                    $scan = [Math]::Min($total, [int]$Context.Caps.UpdateHistoryScanMax)
+                    $hits = @(if ($scan -gt 0) {
+                        $searcher.QueryHistory(0, $scan) | Where-Object { "$($_.Title)" -match $Context.UpdateHistoryTitleMatch }
+                    })
+                    if ($hits.Count -gt $Context.Caps.UpdateHistoryMax) {
+                        $facts.updateHistoryTruncationMarker = "...truncated ($($hits.Count - $Context.Caps.UpdateHistoryMax) more matching entries)"
+                        $hits = @($hits | Select-Object -First $Context.Caps.UpdateHistoryMax)
+                    }
+                    $facts.updateHistory = @($hits | ForEach-Object {
+                        @{ dateUtc = ([datetime]$_.Date).ToString('yyyy-MM-ddTHH:mm:ssZ'); title = "$($_.Title)"; resultCode = [int]$_.ResultCode; operation = [int]$_.Operation }
+                    })
+                } catch {
+                    $facts.updateHistoryError = $_.Exception.Message
+                }
+
+                # USB warnings/errors in System. XPath, not -FilterHashtable: a provider
+                # name that does not exist on this machine must not fail the query.
+                # USBHUB3 196 ("USB device draining system power when system is idle") is
+                # excluded: it was 18/18 and 63/63 of these events on two healthy Surfaces
+                # and would starve the cap.
+                $provXPath = (@($Context.UsbEventProviders) | ForEach-Object { "@Name='$_'" }) -join ' or '
+                $windowMs = [long]$Context.Caps.UsbEventWindowDays * 86400000
+                $xpath = "*[System[Provider[$provXPath] and (Level=1 or Level=2 or Level=3) and EventID!=196 and TimeCreated[timediff(@SystemTime) <= $windowMs]]]"
+                try {
+                    $facts.usbEvents = @(Get-WinEvent -LogName 'System' -FilterXPath $xpath -MaxEvents $Context.Caps.UsbEventMax -ErrorAction Stop | ForEach-Object {
+                        $msg = "$($_.Message)"
+                        @{ time = $_.TimeCreated.ToString('o'); provider = "$($_.ProviderName)"; id = $_.Id; level = $_.Level; message = $msg.Substring(0, [Math]::Min(200, $msg.Length)) }
+                    })
+                } catch {
+                    if ($_.Exception.Message -notmatch 'No events were found') { $facts.usbEventsError = $_.Exception.Message }
+                    $facts.usbEvents = @()
+                }
+                $facts.usbEventWindowDays = $Context.Caps.UsbEventWindowDays
+                $facts.usbEventCap = $Context.Caps.UsbEventMax
+
+                @{ Facts = $facts }
+            }
+        }
+
         # ---------------- Ring 3 — Network layer (targeted, §5) ----------------
         @{
             Id = 'NET-REPO-001'; Ring = 3; RequiresAdmin = $false; RequiresZengar = $false; TimeoutSeconds = 60
@@ -2611,6 +2817,8 @@ function Invoke-WinConfigSupportCollection {
         NoProcessName      = $script:NoProcessName
         DbServiceNameLike  = $script:DbServiceNameLike
         DbPort             = $script:DbPort
+        UsbEventProviders  = $script:UsbEventProviders
+        UpdateHistoryTitleMatch = $script:UpdateHistoryTitleMatch
         Caps             = @{
             LiveSampleSeconds   = $script:LiveSampleSeconds
             InstallLogTailLines = $script:InstallLogTailLines
@@ -2621,6 +2829,11 @@ function Invoke-WinConfigSupportCollection {
             FileLockMaxFiles    = $script:FileLockMaxFiles
             StagingMaxDirs      = $script:StagingMaxDirs
             WebView2MaxSiblings = $script:WebView2MaxSiblings
+            UsbDeviceMax        = $script:UsbDeviceMax
+            UpdateHistoryScanMax = $script:UpdateHistoryScanMax
+            UpdateHistoryMax    = $script:UpdateHistoryMax
+            UsbEventMax         = $script:UsbEventMax
+            UsbEventWindowDays  = $script:UsbEventWindowDays
         }
     }
 
