@@ -1,9 +1,8 @@
 {
-  "event": "push",
-  "schema_version": "2.0",
-  "source_ref": "c723146490573794d6d24139833b6b7067749ed4",
   "branch": "main",
-  "build_id": "40530031546-1",
+  "event": "push",
+  "source_ref": "20db21aff7626d0029c80d14c22c590227a96659",
+  "build_id": "40533632606-1",
   "artifacts": [
     {
       "path": "Win11Config.ps1",
@@ -137,8 +136,8 @@
     },
     {
       "path": "src/Modules/SupportBundle.psm1",
-      "sha256": "7a91e712b8d31ceff6d21d44385a369bc7319e386d40a52931839745dae74376",
-      "size": 178913
+      "sha256": "8a048fe1f6c8529f3ef55259389d1c8f122bd9d8a97ca01691a8ba4f7c937a5e",
+      "size": 181828
     },
     {
       "path": "src/Modules/MachineIdentifiers.psm1",
@@ -181,5 +180,6 @@
       "size": 10723
     }
   ],
-  "timestamp": "2026-10-27T15:20:57.8513069Z"
+  "timestamp": "2026-10-27T15:42:39.8866656Z",
+  "schema_version": "2.0"
 }

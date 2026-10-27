@@ -97,7 +97,12 @@ Set-StrictMode -Off
 #   platform, UEFI ESRT firmware versions + last update attempt, USB host/connector
 #   state, every USB device node with last arrival/removal and built-in flag, power
 #   source, firmware/feature-update history, USB warnings/errors.
-$script:SupportBundleProbeVersion = '1.10.0'
+# 1.11.0 (2026-10-27): WIN-USB-001 gains uncleanRestarts[] (Kernel-Power 41 event
+#   data: bugcheck, long power-button press, press time). The dead-port remediation
+#   starts with a forced restart, and no bundle could confirm a tech had done one:
+#   WIN-EVENTS-001 clips the message text, which cannot tell a held power button
+#   from a crash.
+$script:SupportBundleProbeVersion = '1.11.0'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -246,6 +251,7 @@ $script:UpdateHistoryScanMax = 1000
 $script:UpdateHistoryMax     = 60
 $script:UsbEventMax          = 100
 $script:UsbEventWindowDays   = 30
+$script:RestartEventMax      = 20
 $script:DefaultCollectorTimeoutSeconds = 45
 
 # Repo URL is parsed at runtime from maintenancetool.ini DefaultRepositories.
@@ -2488,6 +2494,33 @@ namespace WinConfigSupport {
                 $facts.usbEventWindowDays = $Context.Caps.UsbEventWindowDays
                 $facts.usbEventCap = $Context.Caps.UsbEventMax
 
+                # Unclean restarts (Kernel-Power 41), same window. The remediation for dead
+                # ports starts with a forced restart, and a tech's "I did that" must be
+                # checkable: the message text (which WIN-EVENTS-001 clips) cannot tell a held
+                # power button from a crash, the event data can. Measured on SP9 2026-10-27
+                # after a user-held restart: LongPowerButtonPressDetected=true, BugcheckCode=0,
+                # PowerButtonTimestamp = the press (FILETIME UTC), ~27 s before the boot.
+                $restartXPath = "*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and EventID=41 and TimeCreated[timediff(@SystemTime) <= $windowMs]]]"
+                try {
+                    $facts.uncleanRestarts = @(Get-WinEvent -LogName 'System' -FilterXPath $restartXPath -MaxEvents $Context.Caps.RestartEventMax -ErrorAction Stop | ForEach-Object {
+                        $data = @{}
+                        foreach ($n in @(([xml]$_.ToXml()).Event.EventData.Data)) { $data["$($n.Name)"] = "$($n.'#text')" }
+                        $pressRaw = 0L
+                        [void][long]::TryParse("$($data['PowerButtonTimestamp'])", [ref]$pressRaw)
+                        @{
+                            time                         = $_.TimeCreated.ToString('o')
+                            bugcheckCode                 = $(if ("$($data['BugcheckCode'])" -match '^\d+$') { [long]$data['BugcheckCode'] } else { $null })
+                            longPowerButtonPressDetected = $(if ($data.ContainsKey('LongPowerButtonPressDetected')) { "$($data['LongPowerButtonPressDetected'])" -eq 'true' } else { $null })
+                            powerButtonPressUtc          = $(if ($pressRaw -gt 0) { [datetime]::FromFileTimeUtc($pressRaw).ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null })
+                            sleepInProgress              = $(if ("$($data['SleepInProgress'])" -match '^\d+$') { [int]$data['SleepInProgress'] } else { $null })
+                            connectedStandbyInProgress   = $(if ($data.ContainsKey('ConnectedStandbyInProgress')) { "$($data['ConnectedStandbyInProgress'])" -eq 'true' } else { $null })
+                        }
+                    })
+                } catch {
+                    if ($_.Exception.Message -notmatch 'No events were found') { $facts.uncleanRestartsError = $_.Exception.Message }
+                    $facts.uncleanRestarts = @()
+                }
+
                 @{ Facts = $facts }
             }
         }
@@ -2834,6 +2867,7 @@ function Invoke-WinConfigSupportCollection {
             UpdateHistoryMax    = $script:UpdateHistoryMax
             UsbEventMax         = $script:UsbEventMax
             UsbEventWindowDays  = $script:UsbEventWindowDays
+            RestartEventMax     = $script:RestartEventMax
         }
     }
 
