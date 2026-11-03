@@ -102,7 +102,16 @@ Set-StrictMode -Off
 #   starts with a forced restart, and no bundle could confirm a tech had done one:
 #   WIN-EVENTS-001 clips the message text, which cannot tell a held power button
 #   from a crash.
-$script:SupportBundleProbeVersion = '1.11.0'
+# 1.12.0 (2026-11-03): WIN-BT-001 collector. The lab discovery campaign
+#   (2026-10-22..30, headset 019) found a computer that hears Bluetooth worse
+#   than its neighbours on the same Intel driver, and made worse (not caused) by
+#   its own connected mouse/keyboard. Nothing in the bundle described the radio,
+#   the computer's own Bluetooth load, or its headset history, so no fleet
+#   correlation was possible. PASSIVE facts: radio identity/firmware/power
+#   settings, paired devices + connected-now + services, Windows' device cache
+#   (last seen / last connected), Bluetooth System-log events, Bluetooth services,
+#   Wi-Fi band. No search, connect, pair, or radio toggle; link keys never read.
+$script:SupportBundleProbeVersion = '1.12.0'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -237,6 +246,14 @@ $script:UsbEventProviders = @(
 )
 $script:UpdateHistoryTitleMatch = 'Firmware|BIOS|UEFI|Surface|Thunderbolt|USB|Windows 1[01], version|Feature update'
 
+# WIN-BT-001 (lab discovery campaign 2026-10-22..30). Providers that write
+# Bluetooth events to the System log. On MM06 30 days held BTHUSB 3/8/10/16/18/37
+# and HidBth 2; the rest are listed so other radios/stacks are not missed.
+$script:BtEventProviders = @(
+    'BTHUSB', 'BTHPORT', 'BthEnum', 'BthLEEnum', 'BthA2dp', 'BthHFEnum', 'BthMini', 'HidBth',
+    'Microsoft-Windows-Bluetooth-BthLEPrepairing', 'Microsoft-Windows-Bluetooth-Policy'
+)
+
 # Caps (size target for the whole bundle: < 10 MB — §7)
 $script:InstallLogTailLines  = 2000
 $script:SetupApiTailLines    = 3000
@@ -252,6 +269,11 @@ $script:UpdateHistoryMax     = 60
 $script:UsbEventMax          = 100
 $script:UsbEventWindowDays   = 30
 $script:RestartEventMax      = 20
+$script:BtCacheMax           = 100
+$script:BtServiceNodeMax     = 300
+$script:BtEventScanMax       = 2000
+$script:BtRecentEventMax     = 50
+$script:BtEventWindowDays    = 30
 $script:DefaultCollectorTimeoutSeconds = 45
 
 # Repo URL is parsed at runtime from maintenancetool.ini DefaultRepositories.
@@ -2525,6 +2547,327 @@ namespace WinConfigSupport {
             }
         }
 
+        @{
+            Id = 'WIN-BT-001'; Ring = 2; RequiresAdmin = $false; RequiresZengar = $false
+            Script = {
+                param($Context)
+                # Lab discovery campaign 2026-10-22..30 (headset 019, three computers):
+                # MM06 missed the headset in searches its neighbours answered, on the
+                # SAME Intel driver as SP9 which never missed; its own connected mouse
+                # and keyboard made it worse but were not the cause. A "headset not
+                # found" report can therefore come from the computer's reception, and
+                # the fleet can only show that by correlating radio identity, the
+                # computer's own Bluetooth load and its headset history - none of which
+                # any collector recorded.
+                #
+                # PASSIVE FACTS ONLY: PnP, the BTHPORT device cache, the radio's Device
+                # Parameters, services, the System log and `netsh wlan show interfaces`.
+                # Never searches (no inquiry, no WinRT discovery), never connects, pairs
+                # or toggles the radio - a search on a NO computer competes with NO's own
+                # and once failed a NO session start. BTHPORT\Parameters\Keys (link keys)
+                # is never opened.
+                $facts = @{}
+                $macOf = {
+                    param($Hex)
+                    $h = ("$Hex".ToLowerInvariant() -replace '[^0-9a-f]', '')
+                    if ($h.Length -ne 12) { return $null }
+                    (@(0..5 | ForEach-Object { $h.Substring($_ * 2, 2) })) -join ':'
+                }
+                $utcOf = { param($v) if ($v -is [datetime]) { $v.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null } }
+                $fileTimeUtc = {
+                    param($v)
+                    try { $n = [long]$v; if ($n -gt 0) { return [datetime]::FromFileTimeUtc($n).ToString('yyyy-MM-ddTHH:mm:ssZ') } } catch { }
+                    $null
+                }
+                $uuidName = @{
+                    '1101' = 'SerialPort'; '1108' = 'Headset'; '110A' = 'AudioSource'; '110B' = 'AudioSink'
+                    '110C' = 'AvrcpTarget'; '110E' = 'Avrcp'; '1112' = 'HeadsetGateway'; '111E' = 'Handsfree'
+                    '111F' = 'HandsfreeGateway'; '1124' = 'Hid'; '1200' = 'PnpInformation'; '1800' = 'GenericAccess'
+                    '1801' = 'GenericAttribute'; '180A' = 'DeviceInformation'; '180F' = 'Battery'; '1812' = 'HidOverGatt'
+                }
+                $kindOf = @{
+                    '1124' = 'hid'; '1812' = 'hid'; '1101' = 'serial'
+                    '1108' = 'audio'; '110A' = 'audio'; '110B' = 'audio'; '111E' = 'audio'; '1112' = 'audio'; '111F' = 'audio'
+                }
+                $majorClass = @{ 0 = 'Miscellaneous'; 1 = 'Computer'; 2 = 'Phone'; 3 = 'Network'; 4 = 'AudioVideo'; 5 = 'Peripheral'; 6 = 'Imaging'; 7 = 'Wearable'; 8 = 'Toy'; 9 = 'Health'; 31 = 'Uncategorized' }
+
+                # ---- Radios. Class Bluetooth minus the enumerator/child nodes.
+                # {A92F26CA-...} is the radio property set; on MM06 (Intel AX211-class,
+                # 23.160.0.9) 1 = address (UInt64, matched DeviceAddressCache), 2 =
+                # manufacturer id (2 = Intel), 4/6 = LMP/HCI version (Byte, 11 = 5.2),
+                # 5/7 = LMP subversion / HCI revision (UInt16).
+                $btClass = @(Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue)
+                $radioNodes = @($btClass | Where-Object { "$($_.InstanceId)" -notmatch '^(BTH|BTHENUM|BTHLE|BTHLEDEVICE|BTHHFENUM|BTHMINI|SWD)\\' })
+                $radioKeys = @(
+                    'DEVPKEY_Device_DriverVersion', 'DEVPKEY_Device_DriverDate', 'DEVPKEY_Device_DriverProvider', 'DEVPKEY_Device_FirmwareRevision',
+                    '{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 1', '{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 2', '{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 4',
+                    '{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 5', '{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 6', '{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 7'
+                )
+                $powerRows = @()
+                if ($radioNodes.Count -gt 0) {
+                    try { $powerRows = @(Get-CimInstance -Namespace 'root\WMI' -ClassName 'MSPower_DeviceEnable' -ErrorAction Stop) } catch { $facts.powerSettingError = $_.Exception.Message }
+                }
+                $facts.radios = @(foreach ($node in $radioNodes) {
+                    $id = "$($node.InstanceId)"
+                    $rp = @{}
+                    foreach ($pr in @($node | Get-PnpDeviceProperty -KeyName $radioKeys -ErrorAction SilentlyContinue)) { $rp["$($pr.KeyName)"] = $pr.Data }
+                    $dp = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Enum\$id\Device Parameters" -ErrorAction SilentlyContinue
+                    $addr = $null
+                    if ($null -ne $rp['{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 1']) { $addr = & $macOf ('{0:x12}' -f [uint64]$rp['{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 1']) }
+                    if (-not $addr -and $dp -and $dp.DeviceAddressCache) { $addr = & $macOf $dp.DeviceAddressCache }
+                    $pw = @($powerRows | Where-Object { "$($_.InstanceName)" -like "$id*" } | Select-Object -First 1)
+                    $num = { param($k) $v = $rp[$k]; if ($null -ne $v) { [long]$v } else { $null } }
+                    @{
+                        instanceId                = $id
+                        bus                       = ($id -split '\\')[0]
+                        vendorId                  = $(if ($id -match 'VID_([0-9A-Fa-f]{4})') { $Matches[1].ToUpperInvariant() } else { $null })
+                        productId                 = $(if ($id -match 'PID_([0-9A-Fa-f]{4})') { $Matches[1].ToUpperInvariant() } else { $null })
+                        friendlyName              = "$($node.FriendlyName)"
+                        present                   = [bool]$node.Present
+                        status                    = "$($node.Status)"
+                        problem                   = "$($node.Problem)"
+                        driverVersion             = $(if ($null -ne $rp['DEVPKEY_Device_DriverVersion']) { "$($rp['DEVPKEY_Device_DriverVersion'])" } else { $null })
+                        driverDate                = (& $utcOf $rp['DEVPKEY_Device_DriverDate'])
+                        driverProvider            = $(if ($null -ne $rp['DEVPKEY_Device_DriverProvider']) { "$($rp['DEVPKEY_Device_DriverProvider'])" } else { $null })
+                        firmwareRevision          = $(if ($null -ne $rp['DEVPKEY_Device_FirmwareRevision']) { "$($rp['DEVPKEY_Device_FirmwareRevision'])" } else { $null })
+                        address                   = $addr
+                        manufacturerId            = (& $num '{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 2')
+                        lmpVersion                = (& $num '{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 4')
+                        lmpSubversion             = (& $num '{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 5')
+                        hciVersion                = (& $num '{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 6')
+                        hciRevision               = (& $num '{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 7')
+                        # "Allow the computer to turn off this device to save power"
+                        allowPowerOff             = $(if ($pw.Count -gt 0) { [bool]$pw[0].Enable } else { $null })
+                        selectiveSuspended        = $(if ($dp -and $null -ne $dp.DeviceSelectiveSuspended) { [int]$dp.DeviceSelectiveSuspended } else { $null })
+                        enhancedPowerManagement   = $(if ($dp -and $null -ne $dp.EnhancedPowerManagementEnabled) { [int]$dp.EnhancedPowerManagementEnabled } else { $null })
+                        radioStateRaw             = $(if ($dp -and $null -ne $dp.RadioState) { [int]$dp.RadioState } else { $null })
+                    }
+                })
+                $facts.localAddresses = @($facts.radios | Where-Object { $_.address } | ForEach-Object { $_.address } | Sort-Object -Unique)
+
+                # ---- Paired devices (BTHENUM\DEV_ = classic, BTHLE\DEV_ = LE) and the
+                # service nodes under them. Present = still paired, NOT connected.
+                # Connected-now = {83DA6326-...} 15: on MM06 it read True for exactly the
+                # mouse and keyboard in use and False for the switched-off headset/audio.
+                $bth = @(Get-PnpDevice -InstanceId 'BTH*' -ErrorAction SilentlyContinue)
+                $devNodes = @($bth | Where-Object { "$($_.InstanceId)" -match '^(BTHENUM|BTHLE)\\DEV_[0-9A-Fa-f]{12}\\' })
+                $connKey = '{83DA6326-97A6-4088-9453-A1923F573B29} 15'
+                $aepKey = '{3B2CE006-5E61-4FDE-BAB8-9B8AAC9B26DF} 8'
+                $devKeys = @($connKey, $aepKey, 'DEVPKEY_Bluetooth_LastConnectedTime', 'DEVPKEY_Bluetooth_ClassOfDevice', 'DEVPKEY_Bluetooth_DeviceVID', 'DEVPKEY_Bluetooth_DevicePID')
+                # Pipeline input, not -InstanceId <array>: on MM06 the array form dropped
+                # one of six devices and duplicated another; the pipeline answered all six.
+                $dprops = @{}
+                $answered = @{}
+                $fetch = {
+                    param($Nodes)
+                    foreach ($pr in @($Nodes | Get-PnpDeviceProperty -KeyName $devKeys -ErrorAction SilentlyContinue)) {
+                        $dprops["$($pr.InstanceId)|$($pr.KeyName)"] = $pr.Data
+                        $answered["$($pr.InstanceId)"] = $true
+                    }
+                }
+                if ($devNodes.Count -gt 0) {
+                    & $fetch $devNodes
+                    $retry = @($devNodes | Where-Object { -not $answered["$($_.InstanceId)"] })
+                    $facts.devicePropertyRetried = $retry.Count
+                    foreach ($d in $retry) { & $fetch @($d) }
+                    $facts.devicePropertyUnanswered = @($devNodes | Where-Object { -not $answered["$($_.InstanceId)"] } | ForEach-Object { "$($_.InstanceId)" })
+                }
+
+                $servicesByMac = @{}
+                $localServices = @()
+                $serviceTotal = 0
+                foreach ($s in $bth) {
+                    $sid = "$($s.InstanceId)"
+                    if ($sid -notmatch '^(BTHENUM|BTHLEDEVICE)\\\{([0-9A-Fa-f-]{36})\}') { continue }
+                    $guid = $Matches[2].ToUpperInvariant()
+                    $mac = $null
+                    if ($sid -match '^BTHENUM\\' -and $sid -match '&([0-9A-Fa-f]{12})_[0-9A-Fa-f]+$') { $mac = $Matches[1] }
+                    elseif ($sid -match '_([0-9A-Fa-f]{12})\\[^\\]+$') { $mac = $Matches[1] }
+                    $uuid = $(if ($guid -match '^0000([0-9A-F]{4})-0000-1000-8000-00805F9B34FB$') { $Matches[1] } else { $guid })
+                    $serviceTotal++
+                    $row = @{
+                        uuid = $uuid; name = $uuidName[$uuid]; class = "$($s.Class)"; friendlyName = "$($s.FriendlyName)"
+                        present = [bool]$s.Present; status = "$($s.Status)"; problem = "$($s.Problem)"
+                    }
+                    if (-not $mac -or $mac -eq '000000000000') {
+                        # Local / incoming service nodes (e.g. LOCALMFG serial ports, FI-012).
+                        if ($localServices.Count -lt $Context.Caps.BtServiceNodeMax) { $localServices += ,$row }
+                        continue
+                    }
+                    $k = (& $macOf $mac)
+                    if (-not $servicesByMac.ContainsKey($k)) { $servicesByMac[$k] = @() }
+                    $servicesByMac[$k] += ,$row
+                }
+                $facts.serviceNodeTotal = $serviceTotal
+                $facts.localServiceNodes = @($localServices)
+
+                $facts.paired = @(foreach ($d in $devNodes) {
+                    $id = "$($d.InstanceId)"
+                    $null = $id -match '\\DEV_([0-9A-Fa-f]{12})\\'
+                    $mac = & $macOf $Matches[1]
+                    $aep = "$($dprops["$id|$aepKey"])"
+                    $cod = $dprops["$id|DEVPKEY_Bluetooth_ClassOfDevice"]
+                    $svc = @($servicesByMac[$mac] | Where-Object { $_ })
+                    $kinds = @($svc | ForEach-Object { $kindOf["$($_.uuid)"] } | Where-Object { $_ } | Sort-Object -Unique)
+                    $conn = $dprops["$id|$connKey"]
+                    @{
+                        address         = $mac
+                        transport       = $(if ($id -like 'BTHLE\*') { 'LE' } else { 'Classic' })
+                        name            = "$($d.FriendlyName)"
+                        present         = [bool]$d.Present
+                        status          = "$($d.Status)"
+                        connected       = $(if ($conn -is [bool]) { $conn } else { $null })
+                        lastConnected   = (& $utcOf $dprops["$id|DEVPKEY_Bluetooth_LastConnectedTime"])
+                        classOfDevice   = $(if ($null -ne $cod) { [long]$cod } else { $null })
+                        majorClass      = $(if ($null -ne $cod -and [long]$cod -ne 0) { $majorClass[[int](([long]$cod -shr 8) -band 0x1F)] } else { $null })
+                        vendorId        = $(if ($null -ne $dprops["$id|DEVPKEY_Bluetooth_DeviceVID"]) { [long]$dprops["$id|DEVPKEY_Bluetooth_DeviceVID"] } else { $null })
+                        productId       = $(if ($null -ne $dprops["$id|DEVPKEY_Bluetooth_DevicePID"]) { [long]$dprops["$id|DEVPKEY_Bluetooth_DevicePID"] } else { $null })
+                        # The AEP id names the LOCAL radio first: Bluetooth#Bluetooth<local>-<remote>.
+                        localRadio      = $(if ($aep -match '#Bluetooth(?:LE)?([0-9a-fA-F:]{17})-') { $Matches[1].ToLowerInvariant() } else { $null })
+                        kinds           = $kinds
+                        services        = $svc
+                    }
+                })
+                $connected = @($facts.paired | Where-Object { $_.connected -eq $true })
+                $facts.summary = @{
+                    radioCount      = $facts.radios.Count
+                    pairedTotal     = $facts.paired.Count
+                    connectedTotal  = $connected.Count
+                    connectedHid    = @($connected | Where-Object { $_.kinds -contains 'hid' }).Count
+                    connectedAudio  = @($connected | Where-Object { $_.kinds -contains 'audio' }).Count
+                    connectedSerial = @($connected | Where-Object { $_.kinds -contains 'serial' }).Count
+                    connectedLe     = @($connected | Where-Object { $_.transport -eq 'LE' }).Count
+                }
+
+                # ---- Windows' device cache: every device this computer has had contact
+                # with (name lookup / connection), paired or not, with LastSeen and
+                # LastConnected. NOT a log of everything heard: on MM06 neighbours heard
+                # in every search but never looked up were absent.
+                $cacheRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices'
+                $pairedSet = @{}
+                foreach ($p in $facts.paired) { $pairedSet["$($p.address)"] = $true }
+                $cache = @()
+                # A machine that never had a Bluetooth radio has no cache key: absence
+                # is a fact, not an error.
+                $facts.deviceCachePresent = [bool](Test-Path -LiteralPath $cacheRoot)
+                if ($facts.deviceCachePresent) { try {
+                    $cache = @(Get-ChildItem -LiteralPath $cacheRoot -ErrorAction Stop | ForEach-Object {
+                        $p = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+                        $mac = & $macOf $_.PSChildName
+                        $name = $null
+                        if ($p -and $p.Name -is [byte[]]) { $name = [Text.Encoding]::UTF8.GetString($p.Name).Trim([char]0) }
+                        $codRaw = $(if ($p -and $null -ne $p.COD) { [long]$p.COD } else { $null })
+                        @{
+                            address        = $mac
+                            name           = $name
+                            lastSeen       = $(if ($p) { & $fileTimeUtc $p.LastSeen } else { $null })
+                            lastConnected  = $(if ($p) { & $fileTimeUtc $p.LastConnected } else { $null })
+                            classOfDevice  = $codRaw
+                            majorClass     = $(if ($null -ne $codRaw -and $codRaw -ne 0) { $majorClass[[int](($codRaw -shr 8) -band 0x1F)] } else { $null })
+                            lmpVersion     = $(if ($p -and $null -ne $p.LmpVersion) { [long]$p.LmpVersion } else { $null })
+                            manufacturerId = $(if ($p -and $null -ne $p.ManufacturerId) { [long]$p.ManufacturerId } else { $null })
+                            vendorId       = $(if ($p -and $null -ne $p.VID) { [long]$p.VID } else { $null })
+                            productId      = $(if ($p -and $null -ne $p.PID) { [long]$p.PID } else { $null })
+                            paired         = [bool]$pairedSet["$mac"]
+                        }
+                    })
+                } catch {
+                    $facts.deviceCacheError = $_.Exception.Message
+                } }
+                $cache = @($cache | Sort-Object -Property @{ Expression = { "$($_.lastSeen)" }; Descending = $true })
+                $facts.deviceCacheTotal = $cache.Count
+                if ($cache.Count -gt $Context.Caps.BtCacheMax) {
+                    $facts.deviceCacheTruncationMarker ="...truncated ($($cache.Count - $Context.Caps.BtCacheMax) more cached devices)"
+                    $cache = @($cache | Select-Object -First $Context.Caps.BtCacheMax)
+                }
+                $facts.deviceCache = $cache
+
+                # ---- Bluetooth events in System. XPath, not -FilterHashtable: a provider
+                # that does not exist here must not fail the query. The remote address is
+                # read from the event DATA (BTHUSB 16 carries "(aa:bb:..)"), not the
+                # localized message. Caution for readers: the NO Support Tool's own
+                # Bluetooth probe can itself cause BTHUSB 16 - timestamp-match first.
+                $provXPath = (@($Context.BtEventProviders) | ForEach-Object { "@Name='$_'" }) -join ' or '
+                $windowMs = [long]$Context.Caps.BtEventWindowDays * 86400000
+                $xpath = "*[System[Provider[$provXPath] and TimeCreated[timediff(@SystemTime) <= $windowMs]]]"
+                $events = @()
+                try {
+                    $events = @(Get-WinEvent -LogName 'System' -FilterXPath $xpath -MaxEvents $Context.Caps.BtEventScanMax -ErrorAction Stop)
+                } catch {
+                    if ($_.Exception.Message -notmatch 'No events were found') { $facts.eventsError = $_.Exception.Message }
+                }
+                $facts.eventWindowDays = $Context.Caps.BtEventWindowDays
+                $facts.eventsScanned = $events.Count
+                $facts.eventScanCap = $Context.Caps.BtEventScanMax
+                $groups = @{}
+                $recent = @()
+                foreach ($e in $events) {
+                    $remote = $null
+                    foreach ($pv in @($e.Properties)) {
+                        if ("$($pv.Value)" -match '([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})') { $remote = $Matches[1].ToLowerInvariant(); break }
+                    }
+                    $gk = "$($e.ProviderName)|$($e.Id)|$($e.Level)"
+                    if (-not $groups.ContainsKey($gk)) {
+                        $groups[$gk] = @{ provider = "$($e.ProviderName)"; id = $e.Id; level = $e.Level; count = 0; firstUtc = $null; lastUtc = $null; remoteAddresses = @() }
+                    }
+                    $g = $groups[$gk]
+                    $g.count++
+                    $t = $e.TimeCreated.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                    if (-not $g.lastUtc) { $g.lastUtc = $t }
+                    $g.firstUtc = $t
+                    if ($remote -and $g.remoteAddresses -notcontains $remote -and $g.remoteAddresses.Count -lt 10) { $g.remoteAddresses += $remote }
+                    if ($recent.Count -lt $Context.Caps.BtRecentEventMax) {
+                        $msg = "$($e.Message)"
+                        $recent += ,@{ time = $t; provider = "$($e.ProviderName)"; id = $e.Id; level = $e.Level; remoteAddress = $remote; message = $msg.Substring(0, [Math]::Min(200, $msg.Length)) }
+                    }
+                }
+                $facts.eventCounts = @($groups.Values | Sort-Object -Property @{ Expression = { $_.count }; Descending = $true })
+                $facts.recentEvents = @($recent)
+
+                # ---- Bluetooth services (BluetoothUserService is per-user: _<suffix>).
+                $facts.services = @(Get-Service -Name 'bthserv', 'BthAvctpSvc', 'BTAGService', 'BluetoothUserService*' -ErrorAction SilentlyContinue | ForEach-Object {
+                    @{ name = "$($_.Name)"; status = "$($_.Status)"; startType = "$($_.StartType)" }
+                })
+
+                # ---- Wi-Fi band/channel (2.4 GHz shares the band with Bluetooth). SSID,
+                # BSSID and profile are deliberately NOT kept. Labels are English; other
+                # display languages record parseStatus instead of guessing.
+                $wifi = @{ interfaces = @(); parseStatus = 'NotAttempted' }
+                try {
+                    $out = @(& netsh.exe wlan show interfaces 2>&1 | ForEach-Object { "$_" })
+                    $wifi.exitCode = $LASTEXITCODE
+                    $cur = $null
+                    $list = @()
+                    foreach ($line in $out) {
+                        if ($line -notmatch '^\s*(Name|State|Radio type|Band|Channel|Signal|Receive rate \(Mbps\)|Transmit rate \(Mbps\))\s*:\s*(.*)$') { continue }
+                        $key = $Matches[1]; $val = $Matches[2].Trim()
+                        if ($key -eq 'Name') { $cur = @{ name = $val }; $list += ,$cur; continue }
+                        if ($null -eq $cur) { $cur = @{}; $list += ,$cur }
+                        switch ($key) {
+                            'State'                { $cur.state = $val }
+                            'Radio type'           { $cur.radioType = $val }
+                            'Band'                 { $cur.band = $val }
+                            'Channel'              { $cur.channel = $val }
+                            'Signal'               { $cur.signal = $val }
+                            'Receive rate (Mbps)'  { $cur.receiveRateMbps = $val }
+                            'Transmit rate (Mbps)' { $cur.transmitRateMbps = $val }
+                        }
+                    }
+                    $wifi.interfaces = @($list)
+                    $wifi.parseStatus = $(if ($list.Count -gt 0) { 'Ok' } elseif ($out.Count -gt 0) { 'NoRecognizedLines' } else { 'NoOutput' })
+                    if ($list.Count -eq 0 -and $out.Count -gt 0) {
+                        $first = "$(@($out | Where-Object { "$_".Trim() } | Select-Object -First 1))".Trim()
+                        $wifi.firstLine = $first.Substring(0, [Math]::Min(200, $first.Length))
+                    }
+                } catch {
+                    $wifi.parseStatus = "Unavailable: $($_.Exception.Message)"
+                }
+                $facts.wifi = $wifi
+
+                @{ Facts = $facts }
+            }
+        }
+
         # ---------------- Ring 3 — Network layer (targeted, §5) ----------------
         @{
             Id = 'NET-REPO-001'; Ring = 3; RequiresAdmin = $false; RequiresZengar = $false; TimeoutSeconds = 60
@@ -2852,6 +3195,7 @@ function Invoke-WinConfigSupportCollection {
         DbPort             = $script:DbPort
         UsbEventProviders  = $script:UsbEventProviders
         UpdateHistoryTitleMatch = $script:UpdateHistoryTitleMatch
+        BtEventProviders   = $script:BtEventProviders
         Caps             = @{
             LiveSampleSeconds   = $script:LiveSampleSeconds
             InstallLogTailLines = $script:InstallLogTailLines
@@ -2868,6 +3212,11 @@ function Invoke-WinConfigSupportCollection {
             UsbEventMax         = $script:UsbEventMax
             UsbEventWindowDays  = $script:UsbEventWindowDays
             RestartEventMax     = $script:RestartEventMax
+            BtCacheMax          = $script:BtCacheMax
+            BtServiceNodeMax    = $script:BtServiceNodeMax
+            BtEventScanMax      = $script:BtEventScanMax
+            BtRecentEventMax    = $script:BtRecentEventMax
+            BtEventWindowDays   = $script:BtEventWindowDays
         }
     }
 
