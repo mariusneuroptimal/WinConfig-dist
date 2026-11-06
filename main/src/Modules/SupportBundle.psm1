@@ -111,7 +111,7 @@ Set-StrictMode -Off
 #   settings, paired devices + connected-now + services, Windows' device cache
 #   (last seen / last connected), Bluetooth System-log events, Bluetooth services,
 #   Wi-Fi band. No search, connect, pair, or radio toggle; link keys never read.
-$script:SupportBundleProbeVersion = '1.12.0'
+$script:SupportBundleProbeVersion = '1.13.0'
 $script:SupportBundleToolId       = 'support-bundle-collect'
 
 $script:ZengarRootDefault = 'C:\zengar'
@@ -1951,25 +1951,51 @@ namespace WinConfigSupport {
             Id = 'WIN-EVENTS-001'; Ring = 2; RequiresAdmin = $false; RequiresZengar = $false
             Script = {
                 param($Context)
-                # Errors/warnings from the last 48h, capped — crash/install evidence
+                # Errors/warnings from the last 48h, capped — crash/install evidence.
+                # INST-00934 (2026-11-06): one Get-WinEvent error under -ErrorAction Stop
+                # lost BOTH logs on every bundle from the box. Keep what can be read,
+                # per log and per event, and say what could not. The empty result is
+                # matched on its error id because the message text is localized.
                 $facts = @{}
+                $failures = @()
                 foreach ($log in @('Application', 'System')) {
                     $events = @()
+                    $readErrors = @()
+                    $unreadable = 0
+                    $noMessage = 0
+                    $found = @()
+                    $errs = $null
                     try {
-                        $raw = Get-WinEvent -FilterHashtable @{
+                        $found = @(Get-WinEvent -FilterHashtable @{
                             LogName   = $log
                             Level     = @(1, 2, 3)
                             StartTime = (Get-Date).AddHours(-48)
-                        } -MaxEvents $Context.Caps.EventSliceMax -ErrorAction Stop
-                        $events = @($raw | ForEach-Object {
-                            @{ id = $_.Id; provider = "$($_.ProviderName)"; level = $_.Level; time = $_.TimeCreated.ToString('o')
-                               message = "$($_.Message)".Substring(0, [Math]::Min(300, "$($_.Message)".Length)) }
-                        })
+                        } -MaxEvents $Context.Caps.EventSliceMax -ErrorAction SilentlyContinue -ErrorVariable errs)
+                        $readErrors = @($errs | Where-Object { "$($_.FullyQualifiedErrorId)" -notlike 'NoMatchingEventsFound*' })
                     } catch {
-                        if ($_.Exception.Message -notmatch 'No events were found') { throw }
+                        if ("$($_.FullyQualifiedErrorId)" -notlike 'NoMatchingEventsFound*') { $readErrors = @($_) }
                     }
-                    $facts[$log] = @{ count = $events.Count; cap = $Context.Caps.EventSliceMax; windowHours = 48; events = $events }
+                    foreach ($record in $found) {
+                        try {
+                            $message = "$($record.Message)"
+                            if (-not $message) { $noMessage++ }
+                            $events += @{ id = $record.Id; provider = "$($record.ProviderName)"; level = $record.Level; time = $record.TimeCreated.ToString('o')
+                                          message = $message.Substring(0, [Math]::Min(300, $message.Length)) }
+                        } catch {
+                            $unreadable++
+                        }
+                    }
+                    $errorText = @($readErrors | ForEach-Object { $text = "$($_.Exception.Message)"; $text.Substring(0, [Math]::Min(200, $text.Length)) } | Select-Object -Unique -First 3)
+                    $readStatus = if ($readErrors.Count -eq 0 -and $unreadable -eq 0) { 'Ok' } elseif ($events.Count -gt 0) { 'Partial' } else { 'Failed' }
+                    if ($readStatus -eq 'Failed') { $failures += "${log}: $($errorText -join '; ')" }
+                    $facts[$log] = @{
+                        count = $events.Count; cap = $Context.Caps.EventSliceMax; windowHours = 48; events = $events
+                        readStatus = $readStatus; readErrorCount = $readErrors.Count; readErrors = $errorText
+                        unreadableEvents = $unreadable; eventsWithoutMessage = $noMessage
+                    }
                 }
+                # Nothing readable at all stays a collector Error, so the manifest says so.
+                if ($failures.Count -eq 2) { throw ($failures -join ' | ') }
                 @{ Facts = $facts }
             }
         }
